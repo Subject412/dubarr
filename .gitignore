@@ -17,7 +17,7 @@ testfiles/
 *.bak
 
 # Runtime dirs
-/data/
+data/
 /work/
 /vault/
 
@@ -26,8 +26,13 @@ node_modules/
 dist/
 target/
 /bin/
+/backend/dubarr
 *.db
 *.db-*
 *.sqlite
 *.sqlite-*
 .env
+
+# Secrets & keys — never commit
+.master.key
+*.keyfile

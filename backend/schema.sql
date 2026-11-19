@@ -1,0 +1,3 @@
+-- Dubarr schema — placeholder.
+-- T2 populates this file with the initial migration (goose-style, applied
+-- in order). Until then it deliberately contains no statements.

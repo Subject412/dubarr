@@ -5,7 +5,7 @@ Self-hosted dubbing-sync appliance. Domain language: `GLOSSARY.md`. Spec: `IDEA.
 ## Stack
 - Backend: Go 1.23+ (toolchain 1.27), module `github.com/Subject412/dubarr/backend`. Pure-Go SQLite (`modernc.org/sqlite`, WAL). REST + WebSocket. SPA embedded via `go:embed`.
 - DSP: Rust CLI `dubarr-sync` (edition 2021; clap, hound, rustfft, serde, serde_json). Reads WAV PCM slices. `offset_ms = t_target − t_donor`.
-- Frontend: React 18 + TypeScript + Vite + Tailwind; react-router; tanstack-query; wavesurfer.js (Sync Studio). Dark *arr-style UI.
+- Frontend: React 19 + TypeScript 7 + Vite 8 + Tailwind 4 (`@tailwindcss/vite`, `@theme` in CSS); react-router 7; tanstack-query 5; wavesurfer.js (Sync Studio, M5). Dark *arr-style UI. Lint: `oxlint`.
 - External tools: `ffmpeg`, `ffprobe`, `mkvmerge` on PATH; `/api/health` reports availability.
 - No Python anywhere. No app settings or secrets in env vars (only `--data-dir`/`--listen`/`--desktop`; PUID/PGID in Docker).
 

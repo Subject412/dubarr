@@ -87,11 +87,11 @@ _Avoid_: unknown track
 ### Policy & eligibility
 
 **Export Policy**:
-The configurable rules deciding which donor tracks are pre-selected and kept: target languages, original language, extra reference languages, commentary exclusion.
+The configurable rules deciding which donor tracks are pre-selected and kept: target languages, original language, extra reference languages, commentary exclusion. By default every policy-selected track is exported; keeping tracks beyond the policy requires explicit opt-in.
 _Avoid_: language rules, import policy
 
 **Tdarr Gate**:
-The filename-tag eligibility check ensuring only Tdarr-processed targets are synced/muxed; donor ingestion into the Vault is never gated.
+The filename-tag eligibility check ensuring only Tdarr-processed targets are synced/muxed; the tags mark the Tdarr node/GPU that processed the file. Donor ingestion into the Vault is never gated.
 _Avoid_: tag filter (when meaning the eligibility concept)
 
 **Eligibility Status**:

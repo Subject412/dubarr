@@ -1,10 +1,10 @@
-// Package store owns Dubarr's SQLite persistence layer: it creates DATA_DIR,
-// opens the WAL-mode database with hardened permissions, and applies the
-// forward-only migrations embedded from migrations/*.sql.
+// Store construction and permission hardening for the Dubarr database; see
+// doc.go for the package overview.
 package store
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -54,6 +54,12 @@ func Open(dataDir string) (*Store, error) {
 	if err := f.Close(); err != nil {
 		return nil, fmt.Errorf("store: close database file: %w", err)
 	}
+	// Tighten a pre-existing loose file now, before the driver opens it: WAL and
+	// -shm sidecars appear on the first write, so the db must not remain
+	// group/world readable during open+ping+migration.
+	if err := os.Chmod(dbPath, filePerm); err != nil {
+		return nil, fmt.Errorf("store: chmod database file: %w", err)
+	}
 
 	db, err := sql.Open("sqlite", dsn(dbPath))
 	if err != nil {
@@ -64,17 +70,14 @@ func Open(dataDir string) (*Store, error) {
 	db.SetMaxOpenConns(1)
 
 	if err := db.Ping(); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("store: ping database: %w", err)
+		return nil, errors.Join(fmt.Errorf("store: ping database: %w", err), db.Close())
 	}
-	if _, err := migrate(db); err != nil {
-		db.Close()
-		return nil, err
+	if _, err := migrate(db, embeddedMigrations); err != nil {
+		return nil, errors.Join(err, db.Close())
 	}
-	// WAL mode and migration writes must not widen the file mode.
+	// Belt and braces: WAL mode and migration writes must not widen the mode.
 	if err := os.Chmod(dbPath, filePerm); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("store: chmod database file: %w", err)
+		return nil, errors.Join(fmt.Errorf("store: chmod database file: %w", err), db.Close())
 	}
 
 	return &Store{DB: db, dataDir: dataDir, dbPath: dbPath}, nil
@@ -91,13 +94,17 @@ func dsn(dbPath string) string {
 		"&_pragma=synchronous(NORMAL)"
 }
 
-// Path returns the absolute database file path.
+// Path returns the database file path as configured, i.e.
+// filepath.Join(dataDir, DBFile). It is absolute only when the data directory
+// passed to Open was absolute; Open does not resolve it with filepath.Abs.
 func (s *Store) Path() string { return s.dbPath }
 
 // DataDir returns the directory the store was opened against.
 func (s *Store) DataDir() string { return s.dataDir }
 
-// Close releases the database handle.
+// Close releases the database handle and is idempotent. A Store is a
+// single-owner handle: use it from one goroutine at a time (or serialize access
+// yourself), since Close is not safe to race with queries on DB.
 func (s *Store) Close() error {
 	if s == nil || s.DB == nil {
 		return nil

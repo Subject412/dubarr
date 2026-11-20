@@ -12,7 +12,7 @@ import (
 )
 
 //go:embed migrations/*.sql
-var migrationFS embed.FS
+var embeddedMigrations embed.FS
 
 // migration is one forward-only schema revision embedded at build time.
 type migration struct {
@@ -21,10 +21,11 @@ type migration struct {
 	SQL     string
 }
 
-// loadMigrations reads migrations/<version>_<name>.sql, sorted ascending by
-// version. Filenames must start with a zero-padded integer (e.g. 0001_initial).
-func loadMigrations() ([]migration, error) {
-	entries, err := fs.ReadDir(migrationFS, "migrations")
+// loadMigrations reads migrations/<version>_<name>.sql from fsys, sorted
+// ascending by version. Filenames must start with a positive integer (e.g.
+// 0001_initial); duplicate versions are rejected.
+func loadMigrations(fsys fs.FS) ([]migration, error) {
+	entries, err := fs.ReadDir(fsys, "migrations")
 	if err != nil {
 		return nil, fmt.Errorf("read migrations dir: %w", err)
 	}
@@ -49,7 +50,7 @@ func loadMigrations() ([]migration, error) {
 		}
 		seen[version] = e.Name()
 
-		body, err := migrationFS.ReadFile(path.Join("migrations", e.Name()))
+		body, err := fs.ReadFile(fsys, path.Join("migrations", e.Name()))
 		if err != nil {
 			return nil, fmt.Errorf("read migration %q: %w", e.Name(), err)
 		}
@@ -67,16 +68,18 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
     applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 )`
 
-// migrate creates the version table and applies every migration whose version
-// is not yet recorded. Each migration runs in its own transaction, so a failure
-// leaves the recorded version untouched and the database at the previous
-// revision. It returns the highest applied version.
-func migrate(db *sql.DB) (int, error) {
+// migrate creates the version table and applies every migration in fsys whose
+// version is not yet recorded. Each migration runs in its own transaction, so a
+// failure leaves the recorded version untouched and the database at the
+// previous revision. Migrations are forward-only: an unapplied version below
+// the highest recorded version is an error, never a gap-fill. It returns the
+// highest applied version.
+func migrate(db *sql.DB, fsys fs.FS) (int, error) {
 	if _, err := db.Exec(schemaMigrationsDDL); err != nil {
 		return 0, fmt.Errorf("create schema_migrations: %w", err)
 	}
 
-	migrations, err := loadMigrations()
+	migrations, err := loadMigrations(fsys)
 	if err != nil {
 		return 0, err
 	}
@@ -99,10 +102,27 @@ func migrate(db *sql.DB) (int, error) {
 		return 0, fmt.Errorf("iterate applied migrations: %w", err)
 	}
 
-	latest := 0
+	// Forward-only: recorded versions are a lower bound. Applying an unapplied
+	// migration whose version sits below the highest recorded version would
+	// rewrite history out of order, so reject it instead of gap-filling.
+	highest := 0
+	for v := range applied {
+		if v > highest {
+			highest = v
+		}
+	}
+	for _, m := range migrations {
+		if !applied[m.Version] && m.Version < highest {
+			return highest, fmt.Errorf(
+				"migration %d (%s) is below already applied version %d; migrations are forward-only",
+				m.Version, m.Name, highest,
+			)
+		}
+	}
+
+	latest := highest
 	for _, m := range migrations {
 		if applied[m.Version] {
-			latest = m.Version
 			continue
 		}
 		if err := applyMigration(db, m); err != nil {

@@ -1,16 +1,50 @@
-// Command dubarr is the Dubarr appliance entrypoint.
-//
-// At M1 this binary only resolves and reports its runtime configuration; the
-// HTTP server, database bootstrap and feature wiring land in later tasks.
+// Command dubarr is the Dubarr appliance entrypoint: it opens DATA_DIR, wires
+// every backend package, serves the embedded SPA and shuts down gracefully.
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
+	"net"
+	"net/http"
 	"os"
+	"os/exec"
+	"os/signal"
+	"path"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/Subject412/dubarr/backend/internal/api"
+	"github.com/Subject412/dubarr/backend/internal/auth"
+	"github.com/Subject412/dubarr/backend/internal/health"
+	"github.com/Subject412/dubarr/backend/internal/secrets"
+	"github.com/Subject412/dubarr/backend/internal/settings"
+	"github.com/Subject412/dubarr/backend/internal/store"
+	"github.com/Subject412/dubarr/backend/web"
 )
+
+const (
+	// dataDirPerm is the required mode for DATA_DIR.
+	dataDirPerm = 0o700
+	// sessionTTL mirrors the auth package's 7-day session lifetime.
+	sessionTTL = 7 * 24 * time.Hour
+	// shutdownTimeout bounds graceful shutdown on SIGINT/SIGTERM.
+	shutdownTimeout = 10 * time.Second
+)
+
+// version is the build version reported by /api/health; overridable with
+// -ldflags "-X main.version=...".
+var version = "dev"
+
+// newServerFn builds the wired server. Tests replace it to keep secrets on the
+// 0600 keyfile path instead of touching the developer's OS keyring.
+var newServerFn = newServer
 
 // Config holds the resolved runtime configuration for the appliance.
 //
@@ -22,10 +56,8 @@ type Config struct {
 	DataDir string
 	// Listen is the host:port the HTTP server will bind to.
 	Listen string
-	// Desktop marks a desktop (native) deployment. This flag itself only opens
-	// the default browser via xdg-open (T6); it does not pick the secrets
-	// backend. Keyring-vs-keyfile is chosen by deployment detection — native
-	// installs use the OS keyring, the Docker image uses the 0600 keyfile (T4).
+	// Desktop marks a desktop (native) deployment and opens the default
+	// browser via xdg-open once the server is listening.
 	Desktop bool
 }
 
@@ -72,8 +104,225 @@ func writeUsage(w io.Writer) {
 	fs.PrintDefaults()
 }
 
-// run executes the command and returns its exit code so tests can drive it.
+// server owns the opened stores and the HTTP server. It is the composition
+// root: nothing outside this file constructs these packages.
+type server struct {
+	cfg      Config
+	store    *store.Store
+	secrets  *secrets.Service
+	settings *settings.Store
+	mux      *http.ServeMux
+	http     *http.Server
+
+	closeOnce sync.Once
+	closeErr  error
+}
+
+// newServer opens DATA_DIR, wires every package onto one mux and returns a
+// ready-to-serve server. secrets.Open uses the native production path (OS
+// keyring with 0600 keyfile fallback).
+func newServer(cfg Config) (*server, error) {
+	return newServerWithSecrets(cfg, secrets.DefaultOptions(cfg.DataDir))
+}
+
+// newServerWithSecrets is newServer with injectable secrets options so tests
+// never touch the developer's real keyring.
+func newServerWithSecrets(cfg Config, secOpts secrets.Options) (*server, error) {
+	if err := os.MkdirAll(cfg.DataDir, dataDirPerm); err != nil {
+		return nil, fmt.Errorf("create data dir: %w", err)
+	}
+	// MkdirAll keeps the mode of an existing directory; tighten it explicitly.
+	if err := os.Chmod(cfg.DataDir, dataDirPerm); err != nil {
+		return nil, fmt.Errorf("chmod data dir: %w", err)
+	}
+
+	st, err := store.Open(cfg.DataDir)
+	if err != nil {
+		return nil, fmt.Errorf("open store: %w", err)
+	}
+
+	sec, err := secrets.Open(st, secOpts)
+	if err != nil {
+		_ = st.Close()
+		return nil, fmt.Errorf("open secrets: %w", err)
+	}
+
+	settingsStore := settings.New(st.DB)
+	if err := settingsStore.Seed(context.Background(), cfg.DataDir); err != nil {
+		_ = st.Close()
+		return nil, fmt.Errorf("seed settings: %w", err)
+	}
+
+	mux := http.NewServeMux()
+
+	authSvc := auth.RegisterRoutes(mux, auth.Dependencies{
+		DB:               st.DB,
+		SessionTTL:       sessionTTL,
+		KeyringAvailable: sec.KeyringAvailable,
+	})
+
+	api.RegisterRoutes(mux, api.Dependencies{
+		DB:           st.DB,
+		Settings:     settingsStore,
+		RequireAdmin: authSvc.RequireAdmin,
+	})
+
+	health.RegisterRoutes(mux, health.Dependencies{
+		DB:               st.DB,
+		Version:          version,
+		KeyringAvailable: sec.KeyringAvailable,
+		SecretsInitialized: func() bool {
+			return sec != nil && sec.KeySource() != ""
+		},
+		AuthInitialized: func() bool {
+			var users int
+			if err := st.DB.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&users); err != nil {
+				return false
+			}
+			return users > 0
+		},
+	})
+
+	spa, err := newSPAHandler(web.FS)
+	if err != nil {
+		_ = st.Close()
+		return nil, fmt.Errorf("mount SPA: %w", err)
+	}
+	mux.Handle("/", spa)
+
+	s := &server{
+		cfg:      cfg,
+		store:    st,
+		secrets:  sec,
+		settings: settingsStore,
+		mux:      mux,
+	}
+	s.http = &http.Server{
+		Addr:              cfg.Listen,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+	}
+	return s, nil
+}
+
+// Handler exposes the wired mux (used by tests and embed checks).
+func (s *server) Handler() http.Handler { return s.mux }
+
+// Close releases the database handle. It is safe to call more than once.
+func (s *server) Close() error {
+	s.closeOnce.Do(func() {
+		if s.store != nil {
+			s.closeErr = s.store.Close()
+		}
+	})
+	return s.closeErr
+}
+
+// Serve binds cfg.Listen, reports the bound address through onListen and blocks
+// until ctx is cancelled or the server fails. Cancellation triggers a bounded
+// graceful shutdown; ErrServerClosed is reported as success.
+func (s *server) Serve(ctx context.Context, onListen func(addr string)) error {
+	ln, err := net.Listen("tcp", s.cfg.Listen)
+	if err != nil {
+		return fmt.Errorf("listen %s: %w", s.cfg.Listen, err)
+	}
+	addr := ln.Addr().String()
+	s.http.Addr = addr
+	if onListen != nil {
+		onListen(addr)
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		<-ctx.Done()
+		shutCtx, shutCancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer shutCancel()
+		_ = s.http.Shutdown(shutCtx)
+	}()
+
+	err = s.http.Serve(ln)
+	if errors.Is(err, http.ErrServerClosed) {
+		err = nil
+	}
+	if ctx.Err() != nil {
+		<-stopped
+	}
+	return err
+}
+
+// newSPAHandler serves the embedded SPA from root (backend/web). Unknown
+// non-API paths fall back to index.html so client-side routes deep-link, while
+// /api/* misses stay 404.
+func newSPAHandler(root fs.FS) (http.Handler, error) {
+	index, err := fs.ReadFile(root, "index.html")
+	if err != nil {
+		return nil, fmt.Errorf("embedded index.html: %w", err)
+	}
+	files := http.FileServerFS(root)
+
+	serveIndex := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(index)
+	}
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/api" {
+			http.NotFound(w, r)
+			return
+		}
+		name := strings.TrimPrefix(path.Clean(r.URL.Path), "/")
+		if name == "" || name == "." {
+			serveIndex(w, r)
+			return
+		}
+		if info, statErr := fs.Stat(root, name); statErr == nil && !info.IsDir() {
+			files.ServeHTTP(w, r)
+			return
+		}
+		serveIndex(w, r)
+	}), nil
+}
+
+// browserURL turns a listen address into a URL a desktop browser can open.
+func browserURL(addr string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "http://" + addr
+	}
+	switch host {
+	case "", "0.0.0.0", "::", "[::]":
+		host = "127.0.0.1"
+	}
+	return "http://" + net.JoinHostPort(host, port)
+}
+
+// openBrowser launches xdg-open detached. Failure is non-fatal: the URL is
+// printed either way.
+func openBrowser(url string) error {
+	cmd := exec.Command("xdg-open", url)
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	go func() { _ = cmd.Wait() }()
+	return nil
+}
+
+// run executes the command as the real CLI: SIGINT/SIGTERM cancel the server.
 func run(args []string, stdout, stderr io.Writer) int {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return runContext(ctx, args, stdout, stderr)
+}
+
+// runContext executes the command until ctx is cancelled. It returns the exit
+// code so tests can drive the whole lifecycle without sending signals.
+func runContext(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	cfg, err := parseFlags(args)
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -84,13 +333,33 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
-		fmt.Fprintf(stderr, "dubarr: create data dir %q: %v\n", cfg.DataDir, err)
+	srv, err := newServerFn(cfg)
+	if err != nil {
+		fmt.Fprintf(stderr, "dubarr: %v\n", err)
 		return 1
 	}
+	defer func() {
+		if cerr := srv.Close(); cerr != nil {
+			fmt.Fprintf(stderr, "dubarr: close: %v\n", cerr)
+		}
+	}()
 
-	fmt.Fprintf(stdout, "dubarr config:\n  data-dir: %s\n  listen:   %s\n  desktop:  %t\n",
-		cfg.DataDir, cfg.Listen, cfg.Desktop)
+	fmt.Fprintf(stdout, "dubarr: data-dir=%s version=%s\n", cfg.DataDir, version)
+
+	err = srv.Serve(ctx, func(addr string) {
+		fmt.Fprintf(stdout, "dubarr: listening on http://%s\n", addr)
+		if cfg.Desktop {
+			url := browserURL(addr)
+			if oerr := openBrowser(url); oerr != nil {
+				fmt.Fprintf(stderr, "dubarr: could not open browser: %v\n", oerr)
+			}
+		}
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "dubarr: %v\n", err)
+		return 1
+	}
+	fmt.Fprintln(stdout, "dubarr: shut down")
 	return 0
 }
 

@@ -26,6 +26,10 @@ type Dependencies struct {
 	DB *sql.DB
 	// SessionTTL overrides the default 7-day session lifetime when > 0.
 	SessionTTL time.Duration
+	// KeyringAvailable reports whether an OS keyring backend is usable, so
+	// /api/auth/status can tell the SPA whether to offer "remember in keyring"
+	// style flows. Optional: nil means "not available".
+	KeyringAvailable func() bool
 }
 
 // User is the authenticated principal exposed in API responses and in the
@@ -41,6 +45,8 @@ type User struct {
 type Service struct {
 	db  *sql.DB
 	ttl time.Duration
+	// keyringAvailable is nil unless the composition root supplies it.
+	keyringAvailable func() bool
 
 	mu  sync.RWMutex
 	key []byte
@@ -52,7 +58,7 @@ func New(deps Dependencies) *Service {
 	if ttl <= 0 {
 		ttl = defaultSessionTTL
 	}
-	return &Service{db: deps.DB, ttl: ttl}
+	return &Service{db: deps.DB, ttl: ttl, keyringAvailable: deps.KeyringAvailable}
 }
 
 // RegisterRoutes mounts every auth endpoint on mux and returns the service so

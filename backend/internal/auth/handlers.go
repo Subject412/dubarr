@@ -71,7 +71,26 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "could not read auth state")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]bool{"setup_required": users == 0})
+	// Probe the request's own credentials: valid session cookie or bearer token.
+	_, authErr := s.authenticate(r)
+	keyring := false
+	if s.keyringAvailable != nil {
+		keyring = s.keyringAvailable()
+	}
+	writeJSON(w, http.StatusOK, statusResponse{
+		Initialized:      users > 0,
+		Authenticated:    authErr == nil,
+		KeyringAvailable: keyring,
+	})
+}
+
+// statusResponse is the public /api/auth/status contract (IDEA.md): whether the
+// first-run admin exists, whether this caller is signed in, and whether an OS
+// keyring backend is usable. It carries no user identity or secret material.
+type statusResponse struct {
+	Initialized      bool `json:"initialized"`
+	Authenticated    bool `json:"authenticated"`
+	KeyringAvailable bool `json:"keyring_available"`
 }
 
 // handleSetup creates the first administrator exactly once. Any existing user

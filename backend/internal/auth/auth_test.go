@@ -173,11 +173,11 @@ func TestStatusReportsSetupRequired(t *testing.T) {
 		t.Fatalf("status endpoint: %d %s", code, body)
 	}
 	var st struct {
-		SetupRequired bool `json:"setup_required"`
+		Initialized bool `json:"initialized"`
 	}
 	decodeBody(t, body, &st)
-	if !st.SetupRequired {
-		t.Fatal("fresh database should require setup")
+	if st.Initialized {
+		t.Fatal("fresh database should not be initialized")
 	}
 }
 
@@ -232,11 +232,11 @@ func TestSetupCreatesAdminAndIsSetupOnce(t *testing.T) {
 		t.Fatalf("status: %d %s", code, body)
 	}
 	var stt struct {
-		SetupRequired bool `json:"setup_required"`
+		Initialized bool `json:"initialized"`
 	}
 	decodeBody(t, body, &stt)
-	if stt.SetupRequired {
-		t.Fatal("setup_required should be false after setup")
+	if !stt.Initialized {
+		t.Fatal("initialized should be true after setup")
 	}
 }
 

@@ -1,0 +1,601 @@
+// Package settings persists Dubarr's application configuration in the
+// `settings` key/value table and validates every write.
+//
+// Layout follows IDEA.md §4: one row per settings section, the row value being
+// the JSON object for that section. Section keys:
+//
+//	storage.paths      watch_dir, vault_dir, work_dir, media_roots
+//	languages.policy   target/reference languages, commentary exclusion, export mode
+//	target.tag_filter  Tdarr destination filename gate (ADR-0005)
+//	sync.defaults      max offset, checkpoint/preview sampling positions
+//	security.options   vault read-only, tag override, AV1 warnings
+//	mux.options        keep .bak, track title written into Matroska
+//	watch.options      watch-folder scan cadence and stability window
+//	arr.options        Radarr/Sonarr polling cadence
+//
+// mux/watch/arr sections are an extension of the IDEA.md key list: the spec
+// only names the first five, but the settled defaults for keep_bak, the track
+// title, the 10 s watch scan and the 300 s *arr poll need a home. They live as
+// separate sections rather than being smuggled into sync.defaults.
+//
+// Secret material NEVER belongs in a served section: auth.session_key and any
+// key that looks like a credential are rejected on write and stripped from
+// reads/exports.
+package settings
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/Subject412/dubarr/backend/internal/secrets"
+)
+
+// Section keys.
+const (
+	KeyStoragePaths    = "storage.paths"
+	KeyLanguagesPolicy = "languages.policy"
+	KeyTargetTagFilter = "target.tag_filter"
+	KeySyncDefaults    = "sync.defaults"
+	KeySecurityOptions = "security.options"
+	KeyMuxOptions      = "mux.options"
+	KeyWatchOptions    = "watch.options"
+	KeyArrOptions      = "arr.options"
+)
+
+var knownKeys = []string{
+	KeyStoragePaths, KeyLanguagesPolicy, KeyTargetTagFilter, KeySyncDefaults,
+	KeySecurityOptions, KeyMuxOptions, KeyWatchOptions, KeyArrOptions,
+}
+
+// KnownKeys returns the writable section keys in stable order.
+func KnownKeys() []string { return append([]string(nil), knownKeys...) }
+
+// StoragePaths are the five logical storage areas (IDEA.md §3.3). Empty values
+// mean "not configured yet" and are filled by the setup wizard.
+type StoragePaths struct {
+	WatchDir   string   `json:"watch_dir"`
+	VaultDir   string   `json:"vault_dir"`
+	WorkDir    string   `json:"work_dir"`
+	MediaRoots []string `json:"media_roots"`
+}
+
+// LanguagesPolicy drives automatic track selection and export.
+type LanguagesPolicy struct {
+	TargetImportLanguages   []string `json:"target_import_languages"`
+	ExtraReferenceLanguages []string `json:"extra_reference_languages"`
+	OriginalLanguageFromArr bool     `json:"original_language_from_arr"`
+	ExcludeCommentary       bool     `json:"exclude_commentary"`
+	// ExportMode is "rule_based" (only policy-selected tracks) or "all".
+	ExportMode string `json:"export_mode"`
+}
+
+// TargetTagFilter is the Tdarr destination filename gate (ADR-0005).
+type TargetTagFilter struct {
+	RequiredFilenameTags []string `json:"required_filename_tags"`
+	TagMatchMode         string   `json:"tag_match_mode"`
+	TagCaseSensitive     bool     `json:"tag_case_sensitive"`
+	ExcludedFilenameTags []string `json:"excluded_filename_tags"`
+	EnforceTagFilter     bool     `json:"enforce_tag_filter"`
+}
+
+// SyncDefaults bounds the automatic offset search and sampling windows.
+type SyncDefaults struct {
+	MaxOffsetSec           int   `json:"max_offset_sec"`
+	CheckpointPositionsPct []int `json:"checkpoint_positions_pct"`
+	CheckpointWindowSec    int   `json:"checkpoint_window_sec"`
+	PreviewPositionsPct    []int `json:"preview_positions_pct"`
+	PreviewWindowSec       int   `json:"preview_window_sec"`
+}
+
+// SecurityOptions are appliance-wide safety switches.
+type SecurityOptions struct {
+	VaultReadOnly         bool `json:"vault_read_only"`
+	AllowForceTagOverride bool `json:"allow_force_tag_override"`
+	RequireAV1Warning     bool `json:"require_av1_warning"`
+	RequireAV1Strict      bool `json:"require_av1_strict"`
+}
+
+// MuxOptions control atomic muxing side effects.
+type MuxOptions struct {
+	KeepBak         bool   `json:"keep_bak"`
+	TrackTitleInMKV string `json:"track_title_in_mkv"`
+}
+
+// WatchOptions configure donor-folder scanning. StabilityCheckIntervalSec is
+// how far apart the two size checks must be (>= 4 s per IDEA.md §3.5).
+type WatchOptions struct {
+	ScanIntervalSec           int `json:"scan_interval_sec"`
+	StabilityCheckIntervalSec int `json:"stability_check_interval_sec"`
+}
+
+// ArrOptions configure Radarr/Sonarr polling.
+type ArrOptions struct {
+	PollIntervalSec int  `json:"poll_interval_sec"`
+	ManualSync      bool `json:"manual_sync"`
+}
+
+// Store reads and writes settings sections on the shared database handle.
+type Store struct {
+	db *sql.DB
+}
+
+// New wraps an open database handle. It does not seed; call Seed once at
+// startup.
+func New(db *sql.DB) *Store { return &Store{db: db} }
+
+// DB exposes the underlying handle (used by the API layer for browse roots).
+func (s *Store) DB() *sql.DB { return s.db }
+
+// Defaults returns the settled first-run configuration. dataDir supplies the
+// default WORK_DIR (<DATA_DIR>/work); the other paths are deliberately empty so
+// the wizard forces an explicit choice.
+func Defaults(dataDir string) map[string]any {
+	workDir := ""
+	if dataDir != "" {
+		workDir = filepath.Join(dataDir, "work")
+	}
+	return map[string]any{
+		KeyStoragePaths: StoragePaths{
+			WorkDir:    workDir,
+			MediaRoots: []string{},
+		},
+		KeyLanguagesPolicy: LanguagesPolicy{
+			TargetImportLanguages:   []string{"pl"},
+			ExtraReferenceLanguages: []string{"en"},
+			OriginalLanguageFromArr: true,
+			ExcludeCommentary:       true,
+			ExportMode:              "rule_based",
+		},
+		KeyTargetTagFilter: TargetTagFilter{
+			RequiredFilenameTags: []string{"[ArcA310]"},
+			TagMatchMode:         "ANY",
+			TagCaseSensitive:     false,
+			ExcludedFilenameTags: []string{},
+			EnforceTagFilter:     true,
+		},
+		KeySyncDefaults: SyncDefaults{
+			MaxOffsetSec:           180,
+			CheckpointPositionsPct: []int{10, 25, 40, 55, 70, 85},
+			CheckpointWindowSec:    150,
+			PreviewPositionsPct:    []int{10, 25, 50, 75, 90},
+			PreviewWindowSec:       60,
+		},
+		KeySecurityOptions: SecurityOptions{
+			VaultReadOnly:         true,
+			AllowForceTagOverride: false,
+			RequireAV1Warning:     true,
+			RequireAV1Strict:      false,
+		},
+		KeyMuxOptions: MuxOptions{
+			KeepBak:         true,
+			TrackTitleInMKV: "Polski Dubbing",
+		},
+		KeyWatchOptions: WatchOptions{
+			ScanIntervalSec:           10,
+			StabilityCheckIntervalSec: 4,
+		},
+		KeyArrOptions: ArrOptions{
+			PollIntervalSec: 300,
+			ManualSync:      true,
+		},
+	}
+}
+
+// Seed inserts defaults with INSERT OR IGNORE, so it is safe on every startup
+// and never overwrites a value the user has edited.
+func (s *Store) Seed(ctx context.Context, dataDir string) error {
+	defaults := Defaults(dataDir)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("settings: begin seed: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, key := range knownKeys {
+		raw, err := json.Marshal(defaults[key])
+		if err != nil {
+			return fmt.Errorf("settings: marshal default %s: %w", key, err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, ?)`,
+			key, string(raw), time.Now().UTC().Format("2006-01-02 15:04:05")); err != nil {
+			return fmt.Errorf("settings: seed %s: %w", key, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("settings: commit seed: %w", err)
+	}
+	return nil
+}
+
+// Get returns the stored JSON for a writable section key.
+func (s *Store) Get(ctx context.Context, key string) (json.RawMessage, bool, error) {
+	if !isKnownKey(key) {
+		return nil, false, fmt.Errorf("settings: %q is not a settings section: %w", key, ErrUnknownKey)
+	}
+	var value string
+	err := s.db.QueryRowContext(ctx, `SELECT value FROM settings WHERE key = ?`, key).Scan(&value)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("settings: read %s: %w", key, err)
+	}
+	return json.RawMessage(value), true, nil
+}
+
+// All returns every readable section, already stripped of non-section rows.
+func (s *Store) All(ctx context.Context) (map[string]json.RawMessage, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT key, value FROM settings`)
+	if err != nil {
+		return nil, fmt.Errorf("settings: list: %w", err)
+	}
+	defer rows.Close()
+
+	out := make(map[string]json.RawMessage, len(knownKeys))
+	for rows.Next() {
+		var key, value string
+		if err := rows.Scan(&key, &value); err != nil {
+			return nil, fmt.Errorf("settings: scan: %w", err)
+		}
+		if !isKnownKey(key) || IsSensitiveKey(key) {
+			continue
+		}
+		out[key] = json.RawMessage(value)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("settings: iterate: %w", err)
+	}
+	return out, nil
+}
+
+// Set validates raw against the section's schema and persists it.
+func (s *Store) Set(ctx context.Context, key string, raw json.RawMessage) error {
+	normalized, err := normalize(key, raw)
+	if err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+		key, normalized, time.Now().UTC().Format("2006-01-02 15:04:05")); err != nil {
+		return fmt.Errorf("settings: write %s: %w", key, err)
+	}
+	return nil
+}
+
+// Apply validates every section in the payload before writing any of them, so a
+// bad section cannot leave a half-applied update behind.
+func (s *Store) Apply(ctx context.Context, updates map[string]json.RawMessage) error {
+	keys := make([]string, 0, len(updates))
+	for key := range updates {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	normalized := make(map[string]string, len(keys))
+	for _, key := range keys {
+		v, err := normalize(key, updates[key])
+		if err != nil {
+			return err
+		}
+		normalized[key] = v
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("settings: begin apply: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	now := time.Now().UTC().Format("2006-01-02 15:04:05")
+	for _, key := range keys {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
+			 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+			key, normalized[key], now); err != nil {
+			return fmt.Errorf("settings: write %s: %w", key, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("settings: commit apply: %w", err)
+	}
+	return nil
+}
+
+// Export is the sanitized configuration snapshot returned by
+// GET /api/settings/export.
+type Export struct {
+	ExportedAt string                     `json:"exported_at"`
+	Settings   map[string]json.RawMessage `json:"settings"`
+}
+
+// Export returns every non-sensitive row, with credential-looking fields masked.
+// Rows whose key looks like a secret (auth.session_key, arr.api_key, .masterkey,
+// password hashes, ...) are omitted entirely.
+func (s *Store) Export(ctx context.Context) (Export, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT key, value FROM settings`)
+	if err != nil {
+		return Export{}, fmt.Errorf("settings: export: %w", err)
+	}
+	defer rows.Close()
+
+	out := Export{
+		ExportedAt: time.Now().UTC().Format(time.RFC3339),
+		Settings:   map[string]json.RawMessage{},
+	}
+	for rows.Next() {
+		var key, value string
+		if err := rows.Scan(&key, &value); err != nil {
+			return Export{}, fmt.Errorf("settings: export scan: %w", err)
+		}
+		if IsSensitiveKey(key) {
+			continue
+		}
+		masked, err := maskFields(json.RawMessage(value))
+		if err != nil {
+			// A non-JSON legacy row must never leak verbatim; drop it.
+			continue
+		}
+		out.Settings[key] = masked
+	}
+	if err := rows.Err(); err != nil {
+		return Export{}, fmt.Errorf("settings: export iterate: %w", err)
+	}
+	return out, nil
+}
+
+// Errors returned by validation; API handlers map them to 400.
+var (
+	ErrUnknownKey   = errors.New("settings: unknown key")
+	ErrProtectedKey = errors.New("settings: protected key")
+	ErrInvalidValue = errors.New("settings: invalid value")
+)
+
+var protectedKeys = map[string]struct{}{
+	"auth.session_key":   {},
+	"secrets.master_key": {},
+}
+
+var secretKeyPattern = regexp.MustCompile(`(?i)(secret|passw|api[-_.]?key|token|hash|master[-_.]?key|credential|private[-_.]?key|session[-_.]?key)`)
+
+// IsSensitiveKey reports whether a settings row must never be served.
+func IsSensitiveKey(key string) bool {
+	if _, ok := protectedKeys[strings.ToLower(strings.TrimSpace(key))]; ok {
+		return true
+	}
+	return secretKeyPattern.MatchString(key)
+}
+
+// IsProtectedKey reports whether writers may ever touch the key.
+func IsProtectedKey(key string) bool { return IsSensitiveKey(key) }
+
+func isKnownKey(key string) bool {
+	for _, k := range knownKeys {
+		if k == key {
+			return true
+		}
+	}
+	return false
+}
+
+var iso1or3 = regexp.MustCompile(`^[a-z]{2,3}$`)
+
+// normalize validates a section payload and returns its canonical JSON.
+func normalize(key string, raw json.RawMessage) (string, error) {
+	key = strings.TrimSpace(key)
+	if IsProtectedKey(key) {
+		return "", fmt.Errorf("%w: %s", ErrProtectedKey, key)
+	}
+	if !isKnownKey(key) {
+		return "", fmt.Errorf("%w: %s", ErrUnknownKey, key)
+	}
+	if len(raw) == 0 {
+		return "", fmt.Errorf("%w: %s: empty body", ErrInvalidValue, key)
+	}
+
+	var (
+		v   any
+		err error
+	)
+	switch key {
+	case KeyStoragePaths:
+		var p StoragePaths
+		err = strict(raw, &p)
+		if err == nil {
+			err = validateStorage(&p)
+		}
+		v = p
+	case KeyLanguagesPolicy:
+		var p LanguagesPolicy
+		err = strict(raw, &p)
+		if err == nil {
+			err = validateLanguages(&p)
+		}
+		v = p
+	case KeyTargetTagFilter:
+		var p TargetTagFilter
+		err = strict(raw, &p)
+		if err == nil {
+			err = validateTagFilter(&p)
+		}
+		v = p
+	case KeySyncDefaults:
+		var p SyncDefaults
+		err = strict(raw, &p)
+		if err == nil {
+			err = validateSync(&p)
+		}
+		v = p
+	case KeySecurityOptions:
+		var p SecurityOptions
+		err = strict(raw, &p)
+		v = p
+	case KeyMuxOptions:
+		var p MuxOptions
+		err = strict(raw, &p)
+		if err == nil && strings.TrimSpace(p.TrackTitleInMKV) == "" {
+			err = errors.New("track_title_in_mkv is required")
+		}
+		v = p
+	case KeyWatchOptions:
+		var p WatchOptions
+		err = strict(raw, &p)
+		if err == nil && (p.ScanIntervalSec < 1 || p.ScanIntervalSec > 3600) {
+			err = errors.New("scan_interval_sec must be 1..3600")
+		}
+		if err == nil && p.StabilityCheckIntervalSec < 4 {
+			err = errors.New("stability_check_interval_sec must be >= 4")
+		}
+		v = p
+	case KeyArrOptions:
+		var p ArrOptions
+		err = strict(raw, &p)
+		if err == nil && (p.PollIntervalSec < 30 || p.PollIntervalSec > 86400) {
+			err = errors.New("poll_interval_sec must be 30..86400")
+		}
+		v = p
+	}
+	if err != nil {
+		return "", fmt.Errorf("%w: %s: %v", ErrInvalidValue, key, err)
+	}
+	blob, err := json.Marshal(v)
+	if err != nil {
+		return "", fmt.Errorf("%w: %s: %v", ErrInvalidValue, key, err)
+	}
+	return string(blob), nil
+}
+
+func strict(raw json.RawMessage, dst any) error {
+	dec := json.NewDecoder(strings.NewReader(string(raw)))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		return err
+	}
+	if dec.More() {
+		return errors.New("trailing data after JSON object")
+	}
+	return nil
+}
+
+func validateStorage(p *StoragePaths) error {
+	if p.MediaRoots == nil {
+		p.MediaRoots = []string{}
+	}
+	for _, path := range append([]string{p.WatchDir, p.VaultDir, p.WorkDir}, p.MediaRoots...) {
+		if path != "" && !filepath.IsAbs(path) {
+			return fmt.Errorf("path %q must be absolute", path)
+		}
+	}
+	return nil
+}
+
+func validateLanguages(p *LanguagesPolicy) error {
+	if p.TargetImportLanguages == nil {
+		p.TargetImportLanguages = []string{}
+	}
+	if p.ExtraReferenceLanguages == nil {
+		p.ExtraReferenceLanguages = []string{}
+	}
+	for _, code := range append(append([]string{}, p.TargetImportLanguages...), p.ExtraReferenceLanguages...) {
+		if !iso1or3.MatchString(code) {
+			return fmt.Errorf("language code %q must be a lowercase ISO 639-1/2 code", code)
+		}
+	}
+	switch p.ExportMode {
+	case "rule_based", "all":
+	default:
+		return errors.New(`export_mode must be "rule_based" or "all"`)
+	}
+	return nil
+}
+
+func validateTagFilter(p *TargetTagFilter) error {
+	if p.RequiredFilenameTags == nil {
+		p.RequiredFilenameTags = []string{}
+	}
+	if p.ExcludedFilenameTags == nil {
+		p.ExcludedFilenameTags = []string{}
+	}
+	switch strings.ToUpper(p.TagMatchMode) {
+	case "ALL", "ANY", "REGEX":
+		p.TagMatchMode = strings.ToUpper(p.TagMatchMode)
+	default:
+		return errors.New(`tag_match_mode must be ALL, ANY or REGEX`)
+	}
+	if p.EnforceTagFilter && len(p.RequiredFilenameTags) == 0 {
+		return errors.New("enforce_tag_filter requires at least one required_filename_tag")
+	}
+	return nil
+}
+
+func validateSync(p *SyncDefaults) error {
+	if p.MaxOffsetSec < 0 || p.MaxOffsetSec > 3600 {
+		return errors.New("max_offset_sec must be 0..3600")
+	}
+	if len(p.CheckpointPositionsPct) == 0 || len(p.PreviewPositionsPct) == 0 {
+		return errors.New("checkpoint and preview positions must not be empty")
+	}
+	for _, pos := range append(append([]int{}, p.CheckpointPositionsPct...), p.PreviewPositionsPct...) {
+		if pos < 0 || pos > 100 {
+			return fmt.Errorf("position %d must be 0..100", pos)
+		}
+	}
+	if p.CheckpointWindowSec < 1 || p.CheckpointWindowSec > 600 {
+		return errors.New("checkpoint_window_sec must be 1..600")
+	}
+	if p.PreviewWindowSec < 1 || p.PreviewWindowSec > 600 {
+		return errors.New("preview_window_sec must be 1..600")
+	}
+	return nil
+}
+
+// maskFields walks a JSON value and replaces the value of any
+// credential-looking field with a masked placeholder, so an operator-supplied
+// export cannot carry an embedded secret even inside a known section.
+func maskFields(raw json.RawMessage) (json.RawMessage, error) {
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return nil, err
+	}
+	masked := maskValue("", v)
+	blob, err := json.Marshal(masked)
+	if err != nil {
+		return nil, err
+	}
+	return blob, nil
+}
+
+func maskValue(key string, v any) any {
+	switch val := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(val))
+		for k, child := range val {
+			out[k] = maskValue(k, child)
+		}
+		return out
+	case []any:
+		out := make([]any, len(val))
+		for i, child := range val {
+			out[i] = maskValue(key, child)
+		}
+		return out
+	case string:
+		if key != "" && secretKeyPattern.MatchString(key) && val != "" {
+			return Mask(val)
+		}
+		return val
+	default:
+		return v
+	}
+}
+
+// Mask renders a credential as a display-only placeholder, delegating to
+// internal/secrets so exported values match the rest of the appliance.
+func Mask(secret string) string { return secrets.Mask(secret) }

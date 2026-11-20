@@ -4,6 +4,7 @@ import type {
   ReactNode,
   SelectHTMLAttributes,
 } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { cn } from '../lib/cn'
 
 type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger'
@@ -253,6 +254,14 @@ export function StringListEditor({
   addLabel?: string
   inputLabel: string
 }) {
+  const [text, setText] = useState('')
+
+  const add = () => {
+    const next = text.trim()
+    if (next && !values.includes(next)) onChange([...values, next])
+    setText('')
+  }
+
   return (
     <div className="space-y-2">
       <span className="block text-sm font-medium text-zinc-200">{label}</span>
@@ -279,26 +288,15 @@ export function StringListEditor({
         <Input
           aria-label={inputLabel}
           placeholder={placeholder}
+          value={text}
+          onChange={(event) => setText(event.target.value)}
           onKeyDown={(event) => {
             if (event.key !== 'Enter') return
             event.preventDefault()
-            const next = event.currentTarget.value.trim()
-            if (next && !values.includes(next)) onChange([...values, next])
-            event.currentTarget.value = ''
+            add()
           }}
         />
-        <Button
-          type="button"
-          variant="secondary"
-          size="sm"
-          onClick={(event) => {
-            const input = event.currentTarget.previousElementSibling
-            if (!(input instanceof HTMLInputElement)) return
-            const next = input.value.trim()
-            if (next && !values.includes(next)) onChange([...values, next])
-            input.value = ''
-          }}
-        >
+        <Button type="button" variant="secondary" size="sm" onClick={add}>
           {addLabel}
         </Button>
       </div>
@@ -317,18 +315,38 @@ export function ListEditor({
   label: string
   hint?: string
 }) {
+  const [text, setText] = useState(values.join(', '))
+  const editing = useRef(false)
+  const lastValues = useRef(values)
+
+  // Re-seed from the server only while the operator is not mid-edit.
+  useEffect(() => {
+    if (editing.current || lastValues.current === values) return
+    lastValues.current = values
+    setText(values.join(', '))
+  }, [values])
+
+  const commit = () => {
+    editing.current = false
+    const parsed = text
+      .split(',')
+      .map((part) => Number.parseInt(part.trim(), 10))
+      .filter((part) => Number.isFinite(part))
+    lastValues.current = parsed
+    setText(parsed.join(', '))
+    onChange(parsed)
+  }
+
   return (
     <Field label={label} hint={hint ?? 'Comma-separated percentages'} htmlFor={undefined}>
       <Input
         aria-label={label}
-        value={values.join(', ')}
-        onChange={(event) => {
-          const parsed = event.target.value
-            .split(',')
-            .map((part) => Number.parseInt(part.trim(), 10))
-            .filter((part) => Number.isFinite(part))
-          onChange(parsed)
+        value={text}
+        onFocus={() => {
+          editing.current = true
         }}
+        onChange={(event) => setText(event.target.value)}
+        onBlur={commit}
       />
     </Field>
   )

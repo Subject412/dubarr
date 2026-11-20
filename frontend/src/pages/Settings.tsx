@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import type {
   ArrOptions,
   LanguagesPolicy,
@@ -47,18 +47,31 @@ function Section<T extends object>({
   const [draft, setDraft] = useState<T>(value)
   const [status, setStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
   const [error, setError] = useState('')
+  const [dirty, setDirty] = useState(false)
+  const lastValue = useRef(value)
 
-  // Server data is the source of truth once it arrives.
-  // oxlint-disable-next-line react/set-state-in-effect
-  useEffect(() => setDraft(value), [value])
+  // A save elsewhere replaces the whole settings envelope, handing every card
+  // a fresh object identity. Adopt new server values, but never clobber a card
+  // that still has unsaved edits.
+  // oxlint-disable react/set-state-in-effect
+  useEffect(() => {
+    if (lastValue.current === value) return
+    lastValue.current = value
+    if (!dirty) setDraft(value)
+  }, [value, dirty])
+  // oxlint-enable react/set-state-in-effect
 
-  const update = (patch: Partial<T>) => setDraft((current) => ({ ...current, ...patch }))
+  const update = (patch: Partial<T>) => {
+    setDirty(true)
+    setDraft((current) => ({ ...current, ...patch }))
+  }
 
   const onSave = async () => {
     setStatus('saving')
     setError('')
     try {
       await save(sectionKey, draft)
+      setDirty(false)
       setStatus('saved')
     } catch (err) {
       setStatus('error')
@@ -135,7 +148,8 @@ export function SettingsPage() {
       const url = URL.createObjectURL(blob)
       const anchor = document.createElement('a')
       anchor.href = url
-      anchor.download = `dubarr-settings-${payload.exported_at || 'export'}.json`
+      const stamp = (payload.exported_at || 'export').replace(/[:]/g, '-')
+      anchor.download = `dubarr-settings-${stamp}.json`
       document.body.appendChild(anchor)
       anchor.click()
       anchor.remove()

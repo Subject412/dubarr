@@ -1,6 +1,4 @@
-import { useEffect } from 'react'
 import { NavLink, Outlet, useNavigate } from 'react-router-dom'
-import { UNAUTHORIZED_EVENT } from '../lib/api'
 import { useLogout, useMe } from '../lib/hooks'
 import { cn } from '../lib/cn'
 import { Badge, Button } from './ui'
@@ -16,13 +14,6 @@ export function AppShell() {
   const navigate = useNavigate()
   const me = useMe()
   const logout = useLogout()
-
-  // Any 401 from the API bounces the shell to the login screen.
-  useEffect(() => {
-    const handler = () => navigate('/login', { replace: true })
-    window.addEventListener(UNAUTHORIZED_EVENT, handler)
-    return () => window.removeEventListener(UNAUTHORIZED_EVENT, handler)
-  }, [navigate])
 
   const signOut = () => {
     logout.mutate(undefined, {

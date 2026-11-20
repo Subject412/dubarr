@@ -1,7 +1,10 @@
-import { Navigate, Outlet, Route, Routes } from 'react-router-dom'
+import { useEffect } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
+import { Navigate, Outlet, Route, Routes, useNavigate } from 'react-router-dom'
 import { AppShell } from './components/AppShell'
 import { Alert, Button, Spinner } from './components/ui'
-import { useAuthStatus } from './lib/hooks'
+import { UNAUTHORIZED_EVENT, type AuthStatus } from './lib/api'
+import { queryKeys, useAuthStatus } from './lib/hooks'
 import { LoginPage } from './pages/Login'
 import { PlaceholderPage } from './pages/Placeholder'
 import { SettingsPage } from './pages/Settings'
@@ -40,6 +43,22 @@ function AuthGate() {
 }
 
 function App() {
+  const navigate = useNavigate()
+  const queryClient = useQueryClient()
+
+  // Any 401 anywhere in the app (wizard, login, shell) drops the session and
+  // returns to sign-in instead of dead-ending on a stale route.
+  useEffect(() => {
+    const handler = () => {
+      queryClient.setQueryData<AuthStatus>(queryKeys.authStatus, (current) =>
+        current ? { ...current, authenticated: false } : current,
+      )
+      navigate('/login', { replace: true })
+    }
+    window.addEventListener(UNAUTHORIZED_EVENT, handler)
+    return () => window.removeEventListener(UNAUTHORIZED_EVENT, handler)
+  }, [navigate, queryClient])
+
   return (
     <Routes>
       <Route path="/setup" element={<SetupPage />} />

@@ -13,15 +13,16 @@ export function jsonResponse(body: unknown, status = 200): Response {
 export function renderWithProviders(
   ui: ReactElement,
   { route = '/' }: { route?: string } = {},
-): RenderResult {
+): RenderResult & { client: QueryClient } {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   })
-  return render(
+  const result = render(
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[route]}>{ui}</MemoryRouter>
     </QueryClientProvider>,
   )
+  return Object.assign(result, { client })
 }
 
 export function isMethod(init: RequestInit | undefined, method: string): boolean {

@@ -1,6 +1,6 @@
 import { useEffect, useState, type FormEvent } from 'react'
-import { Navigate, useNavigate } from 'react-router-dom'
-import { api, type LanguagesPolicy, type SecurityOptions, type StoragePaths, type TargetTagFilter } from '../lib/api'
+import { Link, Navigate, useNavigate } from 'react-router-dom'
+import { ApiError, api, type LanguagesPolicy, type SecurityOptions, type StoragePaths, type TargetTagFilter } from '../lib/api'
 import { DEFAULT_SETTINGS } from '../lib/defaults'
 import { useAuthStatus, useSaveSettings, useSettings, useSetup } from '../lib/hooks'
 import { PathField, PathListEditor } from '../components/PathPicker'
@@ -42,6 +42,7 @@ export function SetupPage() {
   const [security, setSecurity] = useState<SecurityOptions>(DEFAULT_SETTINGS['security.options'])
   const [stepError, setStepError] = useState('')
   const [adminCreated, setAdminCreated] = useState(false)
+  const [requiresLogin, setRequiresLogin] = useState(false)
 
   // Adopt anything already persisted (e.g. reseeding work_dir from the server).
   // oxlint-disable react/set-state-in-effect
@@ -91,6 +92,11 @@ export function SetupPage() {
       setAdminCreated(true)
       setStep(1)
     } catch (error) {
+      if (error instanceof ApiError && error.status === 409) {
+        setRequiresLogin(true)
+        setAdminError('Setup already completed on this appliance. Sign in with the existing account.')
+        return
+      }
       setAdminError(error instanceof Error ? error.message : 'Could not create the administrator.')
     }
   }
@@ -103,7 +109,12 @@ export function SetupPage() {
       setStorageError('Watch folder and vault folder are required.')
       return
     }
-    const invalid = [storage.watch_dir, storage.vault_dir, storage.work_dir]
+    const invalid = [
+      storage.watch_dir,
+      storage.vault_dir,
+      storage.work_dir,
+      ...(storage.media_roots ?? []),
+    ]
       .filter((path) => path.trim() !== '')
       .find((path) => !path.startsWith('/'))
     if (invalid !== undefined) {
@@ -196,6 +207,13 @@ export function SetupPage() {
                 </p>
               </div>
               {adminError && <Alert>{adminError}</Alert>}
+              {requiresLogin && (
+                <p className="text-sm text-zinc-400">
+                  <Link className="text-accent-400 underline" to="/login">
+                    Go to sign in
+                  </Link>
+                </p>
+              )}
               <Field label="Username" htmlFor="setup-username">
                 <Input
                   id="setup-username"

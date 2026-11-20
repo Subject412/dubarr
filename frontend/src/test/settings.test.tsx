@@ -148,10 +148,15 @@ describe('settings section save', () => {
 
     const putCall = fetchMock.mock.calls.find(([, init]) => isMethod(init, 'PUT'))
     const body = JSON.parse(String(putCall?.[1]?.body)) as {
-      settings: Record<string, { watch_dir: string }>
+      settings: Record<string, { watch_dir: string; vault_dir: string; work_dir: string; media_roots: string[] }>
     }
     expect(Object.keys(body.settings)).toEqual(['storage.paths'])
-    expect(body.settings['storage.paths'].watch_dir).toBe('/new/watch')
+    expect(body.settings['storage.paths']).toEqual({
+      watch_dir: '/new/watch',
+      vault_dir: '/vault',
+      work_dir: '/work',
+      media_roots: [],
+    })
     expect(await screen.findByText('saved')).toBeInTheDocument()
   })
 })

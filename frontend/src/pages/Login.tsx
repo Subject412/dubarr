@@ -1,13 +1,16 @@
 import { useState, type FormEvent } from 'react'
-import { useNavigate } from 'react-router-dom'
-import { useLogin } from '../lib/hooks'
+import { Navigate, useNavigate } from 'react-router-dom'
+import { useAuthStatus, useLogin } from '../lib/hooks'
 import { Alert, Button, Field, Input } from '../components/ui'
 
 export function LoginPage() {
   const navigate = useNavigate()
   const login = useLogin()
+  const status = useAuthStatus()
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
+
+  if (status.data?.authenticated) return <Navigate to="/library" replace />
 
   const submit = (event: FormEvent) => {
     event.preventDefault()

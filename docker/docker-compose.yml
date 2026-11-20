@@ -1,0 +1,26 @@
+# Dubarr appliance service.
+#
+#   cd docker && docker compose up --build
+#
+# Zero application environment: the only variables are PUID/PGID, consumed by
+# the entrypoint to pick the container user's uid/gid. Settings and secrets are
+# configured through the first-run wizard and stored in /config — never here.
+services:
+  dubarr:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: dubarr:latest
+    container_name: dubarr
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      PUID: "${PUID:-1000}"
+      PGID: "${PGID:-1000}"
+    volumes:
+      # Appliance state: database, master keyfile, cache. Persist this.
+      - ./config:/config
+      # Media roots. Point MEDIA_PATH at the host library; mounted read-only
+      # because the appliance never modifies source media in place.
+      - "${MEDIA_PATH:-./media}:/media:ro"

@@ -1,0 +1,58 @@
+# Build context hygiene: no media, secrets, runtime data or host build output
+# may enter the image. Sources and lockfiles stay included.
+
+# Version control / tooling
+.git
+.gitignore
+.github
+*.md
+!frontend/*.md
+
+# Runtime state and fixtures — never baked into the image
+testfiles/
+data/
+/work/
+/vault/
+work/
+vault/
+cache/
+scratch/
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+.master.key
+*.keyfile
+.env
+.env.*
+
+# Media
+*.mkv
+*.mp4
+*.avi
+*.mov
+*.m4v
+*.webm
+*.wav
+*.flac
+*.mp3
+*.mka
+*.srt
+*.ass
+*.vtt
+
+# Host build artifacts (rebuilt inside the image)
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+target/
+/bin/
+backend/dubarr
+backend/web/**
+!backend/web/doc.go
+
+# Local editor noise
+.DS_Store
+*.swp
+*.log

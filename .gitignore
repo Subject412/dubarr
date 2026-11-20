@@ -20,6 +20,10 @@ target/
 *.sqlite-*
 .env
 
+# Docker appliance runtime dirs (compose bind mounts)
+/docker/config/
+/docker/media/
+
 # Secrets & keys — never commit
 .master.key
 *.keyfile

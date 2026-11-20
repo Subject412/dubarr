@@ -1,25 +1,12 @@
-# Media fixtures & runtime data — never commit
+# Media fixtures & runtime data — never commit.
+# Media lives only in the fixture/runtime dirs below (testfiles/, data/,
+# /work/, /vault/), so no media extension globs are needed here. Do NOT add
+# globs like *.ts: that would silently ignore TypeScript sources repo-wide.
 testfiles/
-*.mkv
-*.mp4
-*.avi
-*.ts
-*.m2ts
-*.wav
-*.flac
-*.ac3
-*.dts
-*.eac3
-*.opus
-*.mka
-*.mp3
-*.aac
-*.bak
-
-# Runtime dirs
 data/
 /work/
 /vault/
+*.bak
 
 # Build artifacts (expanded at bootstrap)
 node_modules/

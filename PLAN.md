@@ -22,7 +22,7 @@ Execution: subagent-driven-development (fresh implementer per task → spec revi
 - `dubarr-sync --max-offset-sec` default 180.
 - `--desktop` = open default browser at listen addr (`xdg-open`); no embedded webview v1.
 - Watch scan 10s (stability: two size checks ≥4s apart); arr sync manual + 5-min poll.
-- Go directive 1.23, Rust edition 2021, module `github.com/Subject412/dubarr/backend`.
+- Go directive 1.26 (floor required by modernc.org/sqlite v1.62; toolchain 1.27), Rust edition 2021, module `github.com/Subject412/dubarr/backend`. Docker build image must be golang 1.27+.
 - License: MIT. Deferred: GitHub remote/push, Windows CI, Linux CI (post-M1).
 
 ## Fixture matrix (testfiles/, originals read-only, tests on copies)

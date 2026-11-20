@@ -128,29 +128,69 @@ func TestHealthReportsMissingToolGracefully(t *testing.T) {
 	}
 }
 
+// TestHealthDetectsRealHostTools validates that the real, un-wired service
+// detects the host's installed binaries and their versions. It is a detection
+// test, not a timeout test (TestHealthDoesNotHangOnHungTool covers bounding), so
+// it gets a generous probe budget: on a loaded machine a cold `ffmpeg -version`
+// can take well over the production default, and a spurious deadline expiry
+// would show up here as an empty version.
 func TestHealthDetectsRealHostTools(t *testing.T) {
 	svc := New(Dependencies{})
-	mux := http.NewServeMux()
-	svc.RegisterRoutes(mux)
-	rec := httptest.NewRecorder()
-	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/health", nil))
+	svc.probeTimeout = 15 * time.Second
 
-	var body struct {
-		Tools map[string]struct {
-			Available bool   `json:"available"`
-			Version   string `json:"version"`
-			Path      string `json:"path"`
-		} `json:"tools"`
+	type toolBody struct {
+		Available bool   `json:"available"`
+		Version   string `json:"version"`
+		Path      string `json:"path"`
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
-		t.Fatalf("decode: %v", err)
+	probe := func() map[string]toolBody {
+		var body struct {
+			Tools map[string]toolBody `json:"tools"`
+		}
+		mux := http.NewServeMux()
+		svc.RegisterRoutes(mux)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/health", nil))
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode: %v (body %s)", err, rec.Body.String())
+		}
+		return body.Tools
 	}
-	for _, name := range []string{"ffmpeg", "ffprobe", "mkvmerge"} {
+	names := []string{"ffmpeg", "ffprobe", "mkvmerge"}
+	onPath := make(map[string]bool, len(names))
+	for _, name := range names {
 		if _, err := exec.LookPath(name); err != nil {
 			t.Logf("skipping %s: not on PATH", name)
 			continue
 		}
-		tool := body.Tools[name]
+		onPath[name] = true
+	}
+	if len(onPath) == 0 {
+		t.Skip("no host tool from the default set is on PATH")
+	}
+
+	// One retry: a probe can still lose the race against a saturated machine,
+	// and this test exists to prove detection works, not to grade latency.
+	const attempts = 2
+	var tools map[string]toolBody
+	for attempt := 1; attempt <= attempts; attempt++ {
+		tools = probe()
+		complete := true
+		for name := range onPath {
+			if tools[name].Version == "" {
+				complete = false
+			}
+		}
+		if complete {
+			break
+		}
+		if attempt < attempts {
+			t.Logf("attempt %d: a version came back empty under load, retrying", attempt)
+		}
+	}
+
+	for name := range onPath {
+		tool := tools[name]
 		if !tool.Available {
 			t.Errorf("%s available = false, want true", name)
 		}

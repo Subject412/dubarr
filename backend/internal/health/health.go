@@ -22,7 +22,12 @@ import (
 var defaultTools = []string{"ffmpeg", "ffprobe", "mkvmerge", "dubarr-sync"}
 
 // versionProbeTimeout bounds how long a single `<tool> -version` call may take.
-const versionProbeTimeout = 2 * time.Second
+//
+// The bound is a hang guard, not a performance budget: a wedged binary must
+// cost at most this long. It is deliberately generous because appliances run
+// under load (docker builds, transcodes) and a cold `ffmpeg -version` start can
+// take a couple of seconds on a loaded box.
+const versionProbeTimeout = 5 * time.Second
 
 // dbPingTimeout bounds the database liveness check.
 const dbPingTimeout = 2 * time.Second

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"errors"
 	"flag"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -86,9 +88,10 @@ func TestRunHelpPrintsUsageAndExitsZero(t *testing.T) {
 
 func TestRunReportsUsageErrorsOnStderr(t *testing.T) {
 	cases := map[string][]string{
-		"positional": {"serve"},
-		"empty dir":  {"--data-dir", ""},
-		"unknown":    {"--nope"},
+		"positional":   {"serve"},
+		"empty dir":    {"--data-dir", ""},
+		"empty listen": {"--listen", ""},
+		"unknown":      {"--nope"},
 	}
 	for name, args := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -103,5 +106,68 @@ func TestRunReportsUsageErrorsOnStderr(t *testing.T) {
 				t.Errorf("run(%v) wrote to stdout: %q", args, stdout.String())
 			}
 		})
+	}
+}
+
+func TestParseFlagsRejectsEmptyListen(t *testing.T) {
+	if _, err := parseFlags([]string{"--listen", ""}); err == nil {
+		t.Fatal("parseFlags accepted an empty --listen")
+	}
+}
+
+// TestRunSuccess exercises the happy path: the data directory is created with
+// 0700 permissions and the resolved configuration is reported on stdout.
+func TestRunSuccess(t *testing.T) {
+	parent := t.TempDir()
+	dataDir := filepath.Join(parent, "data")
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--data-dir", dataDir, "--listen", "127.0.0.1:9999"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("run() = %d, want 0 (stderr: %q)", code, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("run() wrote to stderr: %q", stderr.String())
+	}
+
+	out := stdout.String()
+	for _, want := range []string{dataDir, "127.0.0.1:9999", "desktop:  false"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("config summary missing %q; got:\n%s", want, out)
+		}
+	}
+
+	info, err := os.Stat(dataDir)
+	if err != nil {
+		t.Fatalf("stat data dir: %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("%s was not created as a directory", dataDir)
+	}
+	if perm := info.Mode().Perm(); perm != 0o700 {
+		t.Errorf("data dir perm = %o, want 700", perm)
+	}
+}
+
+// TestRunMkdirFailure checks that an unusable data-dir is reported on stderr
+// with exit code 1. The parent of the data dir is a regular file, so
+// os.MkdirAll fails with ENOTDIR.
+func TestRunMkdirFailure(t *testing.T) {
+	parent := t.TempDir()
+	blocker := filepath.Join(parent, "blocker")
+	if err := os.WriteFile(blocker, []byte("not a directory"), 0o600); err != nil {
+		t.Fatalf("write blocker file: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--data-dir", filepath.Join(blocker, "data")}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("run() = %d, want 1", code)
+	}
+	if stderr.Len() == 0 {
+		t.Error("run() wrote no error to stderr")
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("run() wrote to stdout: %q", stdout.String())
 	}
 }

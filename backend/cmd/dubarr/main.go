@@ -56,6 +56,9 @@ func parseFlags(args []string) (Config, error) {
 	if cfg.DataDir == "" {
 		return Config{}, errors.New("--data-dir must not be empty")
 	}
+	if cfg.Listen == "" {
+		return Config{}, errors.New("--listen must not be empty")
+	}
 	return cfg, nil
 }
 

@@ -23,7 +23,7 @@ Execution: subagent-driven-development (fresh implementer per task → spec revi
 - `--desktop` = open default browser at listen addr (`xdg-open`); no embedded webview v1.
 - Watch scan 10s (stability: two size checks ≥4s apart); arr sync manual + 5-min poll.
 - Go directive 1.23, Rust edition 2021, module `github.com/Subject412/dubarr/backend`.
-- License: PolyForm Noncommercial 1.0.0. Deferred: GitHub remote/push, Windows CI, Linux CI (post-M1).
+- License: MIT. Deferred: GitHub remote/push, Windows CI, Linux CI (post-M1).
 
 ## Fixture matrix (testfiles/, originals read-only, tests on copies)
 | Pair | Donor | Target | Proves |

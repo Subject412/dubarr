@@ -1,6 +1,6 @@
 # Dubarr — Agent Contract
 
-Self-hosted dubbing-sync appliance. Domain language: `GLOSSARY.md`. Spec: `IDEA.md` (read-only reference). Decisions: `docs/adr/` — do not contradict an ADR without a new one. License: PolyForm Noncommercial 1.0.0 (`LICENSE`) — free for non-commercial use.
+Self-hosted dubbing-sync appliance. Domain language: `GLOSSARY.md`. Spec: `IDEA.md` (read-only reference). Decisions: `docs/adr/` — do not contradict an ADR without a new one. License: MIT (`LICENSE`).
 
 ## Stack
 - Backend: Go 1.23+ (toolchain 1.27), module `github.com/Subject412/dubarr/backend`. Pure-Go SQLite (`modernc.org/sqlite`, WAL). REST + WebSocket. SPA embedded via `go:embed`.

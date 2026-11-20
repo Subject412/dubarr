@@ -280,11 +280,14 @@ export function SettingsPage() {
                       id="tag-match-mode"
                       value={draft.tag_match_mode}
                       onChange={(event) =>
-                        update({ tag_match_mode: event.target.value === 'ALL' ? 'ALL' : 'ANY' })
+                        update({
+                          tag_match_mode: event.target.value as TargetTagFilter['tag_match_mode'],
+                        })
                       }
                     >
                       <option value="ANY">ANY — at least one tag</option>
                       <option value="ALL">ALL — every tag</option>
+                      <option value="REGEX">REGEX — regular expression</option>
                     </Select>
                   </Field>
                   <div className="space-y-1">

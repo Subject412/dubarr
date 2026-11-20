@@ -155,3 +155,105 @@ describe('settings section save', () => {
     expect(await screen.findByText('saved')).toBeInTheDocument()
   })
 })
+
+describe('tag match mode (IDEA.md §3.5, ADR-0005)', () => {
+  const tagFilter = (mode: string) => ({
+    required_filename_tags: ['[ArcA310]'],
+    tag_match_mode: mode,
+    tag_case_sensitive: false,
+    excluded_filename_tags: [],
+    enforce_tag_filter: true,
+  })
+
+  function mockSettingsFetch(mode: string): ReturnType<typeof vi.fn> {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/api/settings')) {
+        return jsonResponse({ settings: { 'target.tag_filter': tagFilter(mode) } })
+      }
+      return jsonResponse({ error: 'unexpected' }, 404)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    return fetchMock
+  }
+
+  function putTagFilter(fetchMock: ReturnType<typeof vi.fn>) {
+    const put = fetchMock.mock.calls.find(([, init]) => isMethod(init, 'PUT'))
+    expect(put).toBeDefined()
+    const body = JSON.parse(String(put?.[1]?.body)) as {
+      settings: { 'target.tag_filter': { tag_match_mode: string; required_filename_tags: string[] } }
+    }
+    return body.settings['target.tag_filter']
+  }
+
+  it('offers ANY, ALL and REGEX and saves REGEX in the PUT payload', async () => {
+    const user = userEvent.setup()
+    const fetchMock = mockSettingsFetch('ANY')
+    renderWithProviders(<SettingsPage />, { route: '/settings' })
+    expect(await screen.findByRole('heading', { name: 'Target tag filter' })).toBeInTheDocument()
+
+    const select = screen.getByLabelText('Tag match mode') as HTMLSelectElement
+    expect(Array.from(select.options).map((option) => option.value)).toEqual(['ANY', 'ALL', 'REGEX'])
+
+    await user.selectOptions(select, 'REGEX')
+    await user.click(screen.getByLabelText('Save Target tag filter'))
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([, init]) => isMethod(init, 'PUT'))).toBe(true)
+    })
+    expect(putTagFilter(fetchMock).tag_match_mode).toBe('REGEX')
+  })
+
+  it('renders a stored REGEX mode selected and round-trips it on save', async () => {
+    const user = userEvent.setup()
+    const fetchMock = mockSettingsFetch('REGEX')
+    renderWithProviders(<SettingsPage />, { route: '/settings' })
+    expect(await screen.findByRole('heading', { name: 'Target tag filter' })).toBeInTheDocument()
+
+    const select = screen.getByLabelText('Tag match mode') as HTMLSelectElement
+    expect(select).toHaveValue('REGEX')
+
+    await user.click(screen.getByLabelText('Save Target tag filter'))
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([, init]) => isMethod(init, 'PUT'))).toBe(true)
+    })
+    const saved = putTagFilter(fetchMock)
+    expect(saved.tag_match_mode).toBe('REGEX')
+    expect(saved.required_filename_tags).toEqual(['[ArcA310]'])
+  })
+})
+
+describe('setup wizard tag filter step', () => {
+  it('offers REGEX and saves it without coercing to ANY', async () => {
+    const user = userEvent.setup()
+    const fetchMock = mockFetch()
+    renderWithProviders(<SetupPage />, { route: '/setup' })
+
+    await user.type(screen.getByLabelText('Username'), 'admin')
+    await user.type(screen.getByLabelText('Password'), 'longenough')
+    await user.type(screen.getByLabelText('Confirm password'), 'longenough')
+    await user.click(screen.getByRole('button', { name: /create administrator/i }))
+    expect(await screen.findByRole('heading', { name: 'Storage paths' })).toBeInTheDocument()
+
+    await user.type(screen.getByLabelText('Watch folder'), '/watch')
+    await user.type(screen.getByLabelText('Vault folder'), '/vault')
+    await user.click(screen.getByRole('button', { name: /save & continue/i }))
+    expect(await screen.findByRole('heading', { name: 'Languages & tags' })).toBeInTheDocument()
+
+    const select = screen.getByLabelText('Tag match mode') as HTMLSelectElement
+    expect(Array.from(select.options).map((option) => option.value)).toEqual(['ANY', 'ALL', 'REGEX'])
+
+    await user.selectOptions(select, 'REGEX')
+    await user.click(screen.getByRole('button', { name: /save & continue/i }))
+    await waitFor(() => {
+      const puts = fetchMock.mock.calls.filter(([, init]) => isMethod(init, 'PUT'))
+      expect(puts.length).toBeGreaterThan(1)
+      expect(String(puts[puts.length - 1]?.[1]?.body)).toContain('target.tag_filter')
+    })
+    const puts = fetchMock.mock.calls.filter(([, init]) => isMethod(init, 'PUT'))
+    const put = puts[puts.length - 1]
+    const body = JSON.parse(String(put?.[1]?.body)) as {
+      settings: Record<string, { tag_match_mode?: string }>
+    }
+    expect(body.settings['target.tag_filter'].tag_match_mode).toBe('REGEX')
+  })
+})

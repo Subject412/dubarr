@@ -332,12 +332,13 @@ export function SetupPage() {
                     onChange={(event) =>
                       setTagFilter({
                         ...tagFilter,
-                        tag_match_mode: event.target.value === 'ALL' ? 'ALL' : 'ANY',
+                        tag_match_mode: event.target.value as TargetTagFilter['tag_match_mode'],
                       })
                     }
                   >
                     <option value="ANY">ANY</option>
                     <option value="ALL">ALL</option>
+                    <option value="REGEX">REGEX</option>
                   </Select>
                 </Field>
                 <div className="space-y-1">

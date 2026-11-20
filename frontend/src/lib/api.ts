@@ -59,7 +59,7 @@ export type LanguagesPolicy = {
 
 export type TargetTagFilter = {
   required_filename_tags: string[]
-  tag_match_mode: 'ANY' | 'ALL'
+  tag_match_mode: 'ANY' | 'ALL' | 'REGEX'
   tag_case_sensitive: boolean
   excluded_filename_tags: string[]
   enforce_tag_filter: boolean

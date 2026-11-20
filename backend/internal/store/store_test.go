@@ -135,18 +135,25 @@ func TestOpenIsIdempotent(t *testing.T) {
 	}
 	defer s2.Close()
 
+	migs, err := loadMigrations(embeddedMigrations)
+	if err != nil {
+		t.Fatalf("load migrations: %v", err)
+	}
+	wantRows := len(migs)
+	wantVersion := migs[len(migs)-1].Version
+
 	var rows, version int
 	if err := s2.DB.QueryRow(`SELECT count(*) FROM schema_migrations`).Scan(&rows); err != nil {
 		t.Fatalf("count migrations: %v", err)
 	}
-	if rows != 1 {
-		t.Errorf("schema_migrations rows = %d, want 1", rows)
+	if rows != wantRows {
+		t.Errorf("schema_migrations rows = %d, want %d", rows, wantRows)
 	}
 	if err := s2.DB.QueryRow(`SELECT max(version) FROM schema_migrations`).Scan(&version); err != nil {
 		t.Fatalf("max version: %v", err)
 	}
-	if version != 1 {
-		t.Errorf("latest version = %d, want 1", version)
+	if version != wantVersion {
+		t.Errorf("latest version = %d, want %d", version, wantVersion)
 	}
 
 	// Tables must still be intact after the second open.

@@ -335,7 +335,9 @@ func (s *Store) Export(ctx context.Context) (Export, error) {
 		if err := rows.Scan(&key, &value); err != nil {
 			return Export{}, fmt.Errorf("settings: export scan: %w", err)
 		}
-		if IsSensitiveKey(key) {
+		// Whitelist sections: an unknown (or future) row is not part of the
+		// export contract, so it can never leak even under a benign-looking name.
+		if !isKnownKey(key) || IsSensitiveKey(key) {
 			continue
 		}
 		masked, err := maskFields(json.RawMessage(value))
@@ -355,6 +357,7 @@ func (s *Store) Export(ctx context.Context) (Export, error) {
 var (
 	ErrUnknownKey   = errors.New("settings: unknown key")
 	ErrProtectedKey = errors.New("settings: protected key")
+	ErrInvalidKey   = errors.New("settings: invalid key")
 	ErrInvalidValue = errors.New("settings: invalid value")
 )
 
@@ -389,7 +392,11 @@ var iso1or3 = regexp.MustCompile(`^[a-z]{2,3}$`)
 
 // normalize validates a section payload and returns its canonical JSON.
 func normalize(key string, raw json.RawMessage) (string, error) {
-	key = strings.TrimSpace(key)
+	// Reject padded keys instead of trimming: Set/Apply persist the key as given,
+	// so " sync.defaults " would land as an orphan row All() never returns.
+	if key == "" || key != strings.TrimSpace(key) {
+		return "", fmt.Errorf("%w: %q must not be empty or padded with whitespace", ErrInvalidKey, key)
+	}
 	if IsProtectedKey(key) {
 		return "", fmt.Errorf("%w: %s", ErrProtectedKey, key)
 	}
@@ -398,6 +405,12 @@ func normalize(key string, raw json.RawMessage) (string, error) {
 	}
 	if len(raw) == 0 {
 		return "", fmt.Errorf("%w: %s: empty body", ErrInvalidValue, key)
+	}
+	// A JSON null token (or an array/scalar) decodes into a struct as a no-op,
+	// which would persist an all-zero section: nulls must never reach a decoder.
+	body := strings.TrimSpace(string(raw))
+	if len(body) == 0 || body[0] != '{' {
+		return "", fmt.Errorf("%w: %s: section payload must be a JSON object", ErrInvalidValue, key)
 	}
 
 	var (

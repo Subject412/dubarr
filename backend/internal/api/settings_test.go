@@ -5,11 +5,13 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Subject412/dubarr/backend/internal/auth"
@@ -345,5 +347,144 @@ func TestBrowseSetupModeAllowsAbsolutePaths(t *testing.T) {
 	code, body = h.do(http.MethodGet, "/api/system/browse?path=relative/path", nil)
 	if code != http.StatusBadRequest {
 		t.Fatalf("setup-mode relative browse = %d, want 400: %s", code, body)
+	}
+}
+
+// A null section decodes into a no-op struct, which would silently zero the
+// safety switches (and, for storage.paths, clear every root so /api/system/browse
+// falls back to unrestricted setup mode).
+func TestSettingsPutRejectsNullSections(t *testing.T) {
+	h := newHarness(t)
+	h.setupAdmin()
+	code, body := h.do(http.MethodPut, "/api/settings", map[string]any{
+		"settings": map[string]any{
+			settings.KeySecurityOptions: nil,
+			settings.KeyStoragePaths:    nil,
+		},
+	})
+	if code != http.StatusBadRequest {
+		t.Fatalf("PUT null sections = %d, want 400: %s", code, body)
+	}
+	env := h.getSettings()
+	var sec settings.SecurityOptions
+	if err := json.Unmarshal(env.Settings[settings.KeySecurityOptions], &sec); err != nil {
+		t.Fatalf("decode security: %v", err)
+	}
+	if !sec.VaultReadOnly || !sec.RequireAV1Warning {
+		t.Errorf("null write disabled safety switches: %+v", sec)
+	}
+	var sp settings.StoragePaths
+	if err := json.Unmarshal(env.Settings[settings.KeyStoragePaths], &sp); err != nil {
+		t.Fatalf("decode storage: %v", err)
+	}
+	if sp.WorkDir != filepath.Join(h.dataDir, "work") {
+		t.Errorf("null write cleared storage.paths: %+v", sp)
+	}
+}
+
+func newBareServer(t *testing.T, deps Dependencies) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	RegisterRoutes(mux, deps)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func assertAllUnavailable(t *testing.T, srv *httptest.Server) {
+	t.Helper()
+	cases := []struct{ method, path, body string }{
+		{http.MethodGet, "/api/settings", ""},
+		{http.MethodPut, "/api/settings", `{"settings":{"security.options":null}}`},
+		{http.MethodGet, "/api/settings/export", ""},
+		{http.MethodGet, "/api/system/browse?path=/", ""},
+	}
+	for _, tc := range cases {
+		req, err := http.NewRequest(tc.method, srv.URL+tc.path, strings.NewReader(tc.body))
+		if err != nil {
+			t.Fatalf("new request: %v", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s %s: %v", tc.method, tc.path, err)
+		}
+		payload, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Errorf("%s %s = %d, want 503 (%s)", tc.method, tc.path, resp.StatusCode, payload)
+		}
+	}
+}
+
+// Fail closed: without an injected admin middleware no route may run.
+func TestFailClosedWithoutAdminMiddleware(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(dir)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	srv := newBareServer(t, Dependencies{DB: st.DB, Settings: settings.New(st.DB)})
+	assertAllUnavailable(t, srv)
+}
+
+// Fail closed: with auth wired but no store, every route answers 503.
+func TestFailClosedWithoutSettingsStore(t *testing.T) {
+	passthrough := func(next http.Handler) http.Handler { return next }
+	srv := newBareServer(t, Dependencies{RequireAdmin: passthrough})
+	assertAllUnavailable(t, srv)
+}
+
+func TestBrowseRejectsNULAndUnreadableDirs(t *testing.T) {
+	h := newHarness(t)
+	h.setupAdmin()
+	if code, body := h.do(http.MethodGet, "/api/system/browse?path=%00", nil); code != http.StatusBadRequest {
+		t.Fatalf("NUL-byte path = %d, want 400: %s", code, body)
+	}
+
+	root := t.TempDir()
+	locked := filepath.Join(root, "locked")
+	if err := os.Mkdir(locked, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if code, body := h.do(http.MethodPut, "/api/settings", map[string]any{
+		"settings": map[string]any{settings.KeyStoragePaths: map[string]any{
+			"watch_dir": "", "vault_dir": "", "work_dir": filepath.Join(h.dataDir, "work"),
+			"media_roots": []string{root},
+		}},
+	}); code != http.StatusOK {
+		t.Fatalf("configure storage = %d: %s", code, body)
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permission bits")
+	}
+	if err := os.Chmod(locked, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
+	if code, body := h.do(http.MethodGet, "/api/system/browse?path="+locked, nil); code != http.StatusForbidden {
+		t.Fatalf("unreadable directory = %d, want 403: %s", code, body)
+	}
+}
+
+// TOCTOU guard: the directory is re-resolved after the open, so a path swapped
+// for a symlink pointing outside the roots is refused rather than listed.
+func TestListDirRejectsSymlinkSwap(t *testing.T) {
+	svc := &Service{}
+	root := t.TempDir()
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "leak.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "swapped")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.listDir(link, []string{root}); err == nil {
+		t.Fatal("listDir listed a directory reached through a symlink outside the roots")
+	}
+	if _, err := svc.listDir(root, []string{root}); err != nil {
+		t.Fatalf("listDir on a real root: %v", err)
 	}
 }

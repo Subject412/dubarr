@@ -103,6 +103,8 @@ func (s *Service) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case errors.Is(err, settings.ErrProtectedKey):
 			writeError(w, http.StatusBadRequest, "setting is protected and cannot be changed through the API")
+		case errors.Is(err, settings.ErrInvalidKey):
+			writeError(w, http.StatusBadRequest, "setting key is invalid")
 		case errors.Is(err, settings.ErrUnknownKey):
 			writeError(w, http.StatusBadRequest, "unknown setting key")
 		case errors.Is(err, settings.ErrInvalidValue):

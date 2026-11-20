@@ -230,3 +230,102 @@ func TestExportExcludesSecrets(t *testing.T) {
 		t.Errorf("export dropped a normal setting")
 	}
 }
+
+func mustGet(t *testing.T, s *Store, ctx context.Context, key string) json.RawMessage {
+	t.Helper()
+	raw, ok, err := s.Get(ctx, key)
+	if err != nil || !ok {
+		t.Fatalf("Get(%s): %v ok=%v", key, err, ok)
+	}
+	return raw
+}
+
+// A null JSON token decodes into a struct as a no-op, so without an explicit
+// object check it would persist an all-zero section: security.options would lose
+// vault_read_only/require_av1_warning and storage.paths would lose its roots.
+func TestSetRejectsNullAndNonObjectSections(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	dir := t.TempDir()
+	if err := s.Seed(ctx, dir); err != nil {
+		t.Fatalf("Seed: %v", err)
+	}
+	for _, key := range KnownKeys() {
+		for _, body := range []string{"null", " []", `"text"`, "true", "42", "null "} {
+			if err := s.Set(ctx, key, json.RawMessage(body)); err == nil {
+				t.Errorf("Set(%q, %s) accepted a non-object section payload", key, body)
+			}
+		}
+	}
+
+	sec := decode[SecurityOptions](t, mustGet(t, s, ctx, KeySecurityOptions))
+	if !sec.VaultReadOnly || !sec.RequireAV1Warning || sec.AllowForceTagOverride || sec.RequireAV1Strict {
+		t.Errorf("security.options changed by a rejected write: %+v", sec)
+	}
+	sp := decode[StoragePaths](t, mustGet(t, s, ctx, KeyStoragePaths))
+	if sp.WorkDir != filepath.Join(dir, "work") || len(sp.MediaRoots) != 0 {
+		t.Errorf("storage.paths changed by a rejected write: %+v", sp)
+	}
+	if sp.MediaRoots == nil {
+		t.Error("media_roots became null")
+	}
+}
+
+// Keys are validated after trimming, but must be persisted exactly as the
+// caller supplied them; a padded key would create an orphan row All() never
+// returns.
+func TestSetRejectsWhitespaceKeys(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	if err := s.Seed(ctx, t.TempDir()); err != nil {
+		t.Fatalf("Seed: %v", err)
+	}
+	payload := json.RawMessage(`{"max_offset_sec":240,"checkpoint_positions_pct":[10],"checkpoint_window_sec":150,"preview_positions_pct":[10],"preview_window_sec":60}`)
+	for _, key := range []string{" " + KeySyncDefaults, KeySyncDefaults + " ", "	" + KeySyncDefaults + "\n", ""} {
+		if err := s.Set(ctx, key, payload); err == nil {
+			t.Errorf("Set(%q) accepted a key with surrounding whitespace", key)
+		}
+	}
+	if err := s.Apply(ctx, map[string]json.RawMessage{" " + KeySyncDefaults + " ": payload}); err == nil {
+		t.Error("Apply accepted a key with surrounding whitespace")
+	}
+	var n int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM settings WHERE key LIKE '%sync.defaults%'`).Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("rows matching sync.defaults = %d, want only the seeded row", n)
+	}
+}
+
+// Export is the last line of defence: only whitelisted section keys may leave
+// the appliance, so an unknown future row cannot leak even if its name does not
+// look like a credential.
+func TestExportWhitelistsKnownKeys(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	if err := s.Seed(ctx, t.TempDir()); err != nil {
+		t.Fatalf("Seed: %v", err)
+	}
+	for key, val := range map[string]string{
+		"plugin.config":  `{"name":"x","endpoint":"http://example.invalid"}`,
+		"future.setting": `{"label":"plain"}`,
+	} {
+		if _, err := s.db.ExecContext(ctx,
+			`INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`, key, val); err != nil {
+			t.Fatalf("insert %s: %v", key, err)
+		}
+	}
+	exp, err := s.Export(ctx)
+	if err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+	for _, key := range []string{"plugin.config", "future.setting"} {
+		if _, ok := exp.Settings[key]; ok {
+			t.Errorf("export included non-section key %q", key)
+		}
+	}
+	if _, ok := exp.Settings[KeyMuxOptions]; !ok {
+		t.Error("export dropped a whitelisted section")
+	}
+}

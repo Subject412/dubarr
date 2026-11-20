@@ -13,6 +13,8 @@ import (
 	"github.com/Subject412/dubarr/backend/internal/settings"
 )
 
+var errPathEscaped = errors.New("api: path escaped the configured storage roots")
+
 type browseEntry struct {
 	Name  string `json:"name"`
 	Path  string `json:"path"`
@@ -82,7 +84,14 @@ func (s *Service) handleBrowse(w http.ResponseWriter, r *http.Request) {
 	}
 	info, err := os.Stat(resolved)
 	if err != nil {
-		writeError(w, http.StatusNotFound, "directory not found")
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			writeError(w, http.StatusNotFound, "directory not found")
+		case errors.Is(err, os.ErrPermission):
+			writeError(w, http.StatusForbidden, "directory is not accessible")
+		default:
+			writeError(w, http.StatusBadRequest, "path cannot be resolved")
+		}
 		return
 	}
 	if !info.IsDir() {
@@ -148,6 +157,18 @@ func (s *Service) listDir(dir string, roots []string) ([]browseEntry, error) {
 		return nil, err
 	}
 	defer f.Close()
+
+	// TOCTOU guard: dir was EvalSymlinks-resolved before the open, but the path
+	// could have been swapped for a symlink in between. Re-resolve it now and
+	// require the very same real directory, still inside the roots. Portable on
+	// purpose (no openat2), so Windows keeps working.
+	if recheck, err := filepath.EvalSymlinks(dir); err != nil {
+		return nil, err
+	} else if recheck != dir {
+		return nil, errPathEscaped
+	} else if len(roots) > 0 && !withinAny(roots, recheck) {
+		return nil, errPathEscaped
+	}
 
 	names, err := f.Readdirnames(-1)
 	if err != nil && !errors.Is(err, io.EOF) {

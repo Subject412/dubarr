@@ -54,8 +54,10 @@ type Dependencies struct {
 	AuthInitialized func() bool
 	// LookPath resolves a binary on PATH (defaults to exec.LookPath).
 	LookPath func(string) (string, error)
-	// VersionCommand returns the first line of `<path> -version`.
-	VersionCommand func(name, path string) (string, error)
+	// VersionCommand returns the first line of `<path> -version`. The context
+	// carries the probe deadline, so implementations must abort on ctx.Done()
+	// rather than block on a wedged binary.
+	VersionCommand func(ctx context.Context, name, path string) (string, error)
 	// Tools overrides the reported tool set (defaults to defaultTools).
 	Tools []string
 }
@@ -68,7 +70,8 @@ type Service struct {
 	secretsInitialized func() bool
 	authInitialized    func() bool
 	lookPath           func(string) (string, error)
-	versionCommand     func(name, path string) (string, error)
+	versionCommand     func(ctx context.Context, name, path string) (string, error)
+	probeTimeout       time.Duration
 	tools              []string
 }
 
@@ -82,6 +85,7 @@ func New(deps Dependencies) *Service {
 		authInitialized:    deps.AuthInitialized,
 		lookPath:           deps.LookPath,
 		versionCommand:     deps.VersionCommand,
+		probeTimeout:       versionProbeTimeout,
 		tools:              deps.Tools,
 	}
 	if s.lookPath == nil {
@@ -172,7 +176,11 @@ func (s *Service) probeTools(ctx context.Context) map[string]toolStatus {
 			continue
 		}
 		status := toolStatus{Available: true, Path: path}
-		line, verr := s.versionCommand(name, path)
+		// Bound each probe individually: a tool that hangs must only cost
+		// versionProbeTimeout and must not stall the public endpoint.
+		tctx, cancel := context.WithTimeout(ctx, s.probeTimeout)
+		line, verr := s.versionCommand(tctx, name, path)
+		cancel()
 		if verr == nil {
 			status.Version = parseVersion(line)
 		}
@@ -185,10 +193,18 @@ func (s *Service) flag(fn func() bool) bool { return fn != nil && fn() }
 
 // probeVersion runs `<path> -version` (falling back to --version) and returns
 // the first non-empty output line. Failures are non-fatal.
-func probeVersion(name, path string) (string, error) {
+//
+// The context bounds the whole probe: exec.CommandContext kills the child when
+// the deadline expires (or the request is cancelled), so a wedged binary can
+// never make the caller wait indefinitely. The timeout is also applied here so
+// direct callers get the same guarantee as the HTTP path.
+func probeVersion(ctx context.Context, name, path string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, versionProbeTimeout)
+	defer cancel()
+
 	var lastErr error
 	for _, flag := range []string{"-version", "--version"} {
-		cmd := exec.Command(path, flag)
+		cmd := exec.CommandContext(ctx, path, flag)
 		combined, err := cmd.CombinedOutput()
 		if err != nil {
 			lastErr = err

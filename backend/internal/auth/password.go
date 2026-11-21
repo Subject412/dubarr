@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -21,6 +22,32 @@ const (
 	argonKeyLen  uint32 = 32
 	argonSaltLen        = 16
 )
+
+// Maximum cost parameters accepted from a stored PHC string. They sit well
+// above the defaults so hashes can be re-costed later, but they stop a corrupt
+// or hostile hash from making VerifyPassword allocate gigabytes or iterate for
+// hours: a stored hash must never be able to take the process down.
+const (
+	maxArgonMemory  uint32 = 256 * 1024 // KiB
+	maxArgonTime    uint32 = 10
+	maxArgonThreads uint8  = 16
+	maxArgonSaltLen        = 64
+	maxArgonKeyLen         = 1024
+)
+
+// argonParams is the parsed form of a verified-format Argon2id PHC string.
+type argonParams struct {
+	memory     uint32
+	iterations uint32
+	threads    uint8
+	salt       []byte
+	key        []byte
+}
+
+// hashPassword is the hashing seam the setup handler calls; tests replace it
+// to prove an already-initialised appliance rejects setup without paying the
+// Argon2id cost.
+var hashPassword = HashPassword
 
 // ErrInvalidHash reports a stored hash that is not a well-formed Argon2id PHC
 // string. Callers treat it as an authentication failure, never as a panic.
@@ -46,41 +73,83 @@ func HashPassword(password string) (string, error) {
 // VerifyPassword reports whether password matches the Argon2id PHC string in
 // encoded. It re-derives the key with the parameters recorded in the hash and
 // compares in constant time, so it stays correct if the cost parameters are
-// raised later.
+// raised later (up to maxArgon*).
 func VerifyPassword(encoded, password string) (bool, error) {
-	parts := strings.Split(encoded, "$")
-	if len(parts) != 6 || parts[0] != "" || parts[1] != "argon2id" {
-		return false, ErrInvalidHash
+	p, err := parseArgon2id(encoded)
+	if err != nil {
+		return false, err
 	}
 
-	var version int
-	if _, err := fmt.Sscanf(parts[2], "v=%d", &version); err != nil || version != argon2.Version {
-		return false, ErrInvalidHash
-	}
-
-	var memory, iterations uint32
-	var threads uint8
-	if _, err := fmt.Sscanf(parts[3], "m=%d,t=%d,p=%d", &memory, &iterations, &threads); err != nil {
-		return false, ErrInvalidHash
-	}
-	if memory == 0 || iterations == 0 || threads == 0 {
-		return false, ErrInvalidHash
-	}
-
-	salt, err := decodeStdB64(parts[4])
-	if err != nil || len(salt) == 0 {
-		return false, ErrInvalidHash
-	}
-	want, err := decodeStdB64(parts[5])
-	if err != nil || len(want) == 0 {
-		return false, ErrInvalidHash
-	}
-
-	got := argon2.IDKey([]byte(password), salt, iterations, memory, threads, uint32(len(want)))
-	if subtle.ConstantTimeCompare(got, want) != 1 {
+	got := argon2.IDKey([]byte(password), p.salt, p.iterations, p.memory, p.threads, uint32(len(p.key)))
+	if subtle.ConstantTimeCompare(got, p.key) != 1 {
 		return false, nil
 	}
 	return true, nil
+}
+
+// parseArgon2id strictly parses a stored PHC string, accepting only the exact
+// canonical layout:
+//
+//	$argon2id$v=19$m=<n>,t=<n>,p=<n>$<b64 salt>$<b64 hash>
+//
+// fmt.Sscanf-style parsing accepts trailing garbage and reordered fields, and
+// an untrusted m=/t= can make argon2.IDKey allocate or spin arbitrarily long,
+// so every field, its order and its bound are checked explicitly here.
+func parseArgon2id(encoded string) (argonParams, error) {
+	var p argonParams
+
+	parts := strings.Split(encoded, "$")
+	if len(parts) != 6 || parts[0] != "" || parts[1] != "argon2id" {
+		return p, ErrInvalidHash
+	}
+
+	version, ok := strings.CutPrefix(parts[2], "v=")
+	if !ok || version != strconv.FormatUint(uint64(argon2.Version), 10) {
+		return p, ErrInvalidHash
+	}
+
+	fields := strings.Split(parts[3], ",")
+	if len(fields) != 3 {
+		return p, ErrInvalidHash
+	}
+	names := [3]string{"m=", "t=", "p="}
+	values := [3]uint64{}
+	for i, name := range names {
+		value, ok := strings.CutPrefix(fields[i], name)
+		if !ok || value == "" {
+			return p, ErrInvalidHash
+		}
+		n, err := strconv.ParseUint(value, 10, 32)
+		// Reject non-canonical spellings (leading zeros, a "+" sign, ...) so
+		// the stored representation has exactly one accepted form.
+		if err != nil || strconv.FormatUint(n, 10) != value {
+			return p, ErrInvalidHash
+		}
+		values[i] = n
+	}
+	// Zero is meaningless for every parameter; absurd values are a DoS vector.
+	if values[0] == 0 || values[1] == 0 || values[2] == 0 ||
+		values[0] > uint64(maxArgonMemory) ||
+		values[1] > uint64(maxArgonTime) ||
+		values[2] > uint64(maxArgonThreads) {
+		return p, ErrInvalidHash
+	}
+
+	salt, err := decodeStdB64(parts[4])
+	if err != nil || len(salt) == 0 || len(salt) > maxArgonSaltLen {
+		return p, ErrInvalidHash
+	}
+	key, err := decodeStdB64(parts[5])
+	if err != nil || len(key) == 0 || len(key) > maxArgonKeyLen {
+		return p, ErrInvalidHash
+	}
+
+	p.memory = uint32(values[0])
+	p.iterations = uint32(values[1])
+	p.threads = uint8(values[2])
+	p.salt = salt
+	p.key = key
+	return p, nil
 }
 
 // decodeStdB64 accepts both padded and unpadded standard base64.

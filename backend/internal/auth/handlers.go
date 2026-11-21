@@ -111,13 +111,27 @@ func (s *Service) handleSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	hash, err := HashPassword(req.Password)
+	ctx := r.Context()
+
+	// Fail fast: a completed setup must be rejected before paying the Argon2id
+	// cost, so replaying setup cannot be used to burn CPU. The transaction
+	// below re-checks under the write lock to close the concurrent-setup race.
+	var existing int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM users`).Scan(&existing); err != nil {
+		writeError(w, http.StatusInternalServerError, "could not create account")
+		return
+	}
+	if existing > 0 {
+		writeError(w, http.StatusConflict, "setup has already been completed")
+		return
+	}
+
+	hash, err := hashPassword(req.Password)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "could not create account")
 		return
 	}
 
-	ctx := r.Context()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "could not create account")

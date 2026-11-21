@@ -318,6 +318,8 @@ export function ListEditor({
   const [text, setText] = useState(values.join(', '))
   const editing = useRef(false)
   const lastValues = useRef(values)
+  // Draft text as it was when focus started; used to tell "untouched" from "edited".
+  const focusText = useRef(text)
 
   // Re-seed from the server only while the operator is not mid-edit.
   useEffect(() => {
@@ -328,6 +330,15 @@ export function ListEditor({
 
   const commit = () => {
     editing.current = false
+    // A refetch may have landed while focused (the effect above deliberately
+    // skipped it). If the operator did not change the text, there is no intent
+    // to commit: adopt the fresh server values instead of writing back the
+    // stale draft captured before the refetch.
+    if (text === focusText.current) {
+      lastValues.current = values
+      setText(values.join(', '))
+      return
+    }
     const parsed = text
       .split(',')
       .map((part) => Number.parseInt(part.trim(), 10))
@@ -344,6 +355,7 @@ export function ListEditor({
         value={text}
         onFocus={() => {
           editing.current = true
+          focusText.current = text
         }}
         onChange={(event) => setText(event.target.value)}
         onBlur={commit}

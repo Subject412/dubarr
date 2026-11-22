@@ -1,6 +1,7 @@
 package arr
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -37,6 +38,11 @@ type Radarr interface {
 	Client
 	// Movies lists the Radarr library.
 	Movies(ctx context.Context) ([]Movie, error)
+	// RescanMovie asks Radarr to rescan one movie's files (command
+	// RescanMovie). It is the movieId-scoped rescan: DownloadedMoviesScan
+	// only accepts path/downloadClientId/importMode and cannot target a
+	// single movie.
+	RescanMovie(ctx context.Context, movieID int) error
 }
 
 // Sonarr is the Sonarr-specific client surface.
@@ -44,6 +50,8 @@ type Sonarr interface {
 	Client
 	// Series lists the Sonarr library.
 	Series(ctx context.Context) ([]Series, error)
+	// RescanSeries asks Sonarr to rescan one series (command RescanSeries).
+	RescanSeries(ctx context.Context, seriesID int) error
 }
 
 // core performs authenticated JSON GETs against one base URL.
@@ -172,6 +180,25 @@ func (c *SonarrClient) Series(ctx context.Context) ([]Series, error) {
 	return out, err
 }
 
+// RescanMovie implements Radarr. It posts the RescanMovie command; Radarr's
+// DownloadedMoviesScan command is path-based and takes no movieId.
+func (c *RadarrClient) RescanMovie(ctx context.Context, movieID int) error {
+	body := struct {
+		Name    string `json:"name"`
+		MovieID int    `json:"movieId"`
+	}{Name: "RescanMovie", MovieID: movieID}
+	return c.post(ctx, "/api/v3/command", body)
+}
+
+// RescanSeries implements Sonarr.
+func (c *SonarrClient) RescanSeries(ctx context.Context, seriesID int) error {
+	body := struct {
+		Name     string `json:"name"`
+		SeriesID int    `json:"seriesId"`
+	}{Name: "RescanSeries", SeriesID: seriesID}
+	return c.post(ctx, "/api/v3/command", body)
+}
+
 // get performs one authenticated GET and decodes a 2xx JSON body into out.
 // Errors are scrubbed of the API key and response body.
 func (c *core) get(ctx context.Context, path string, out any) error {
@@ -197,6 +224,36 @@ func (c *core) get(ctx context.Context, path string, out any) error {
 
 	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
 		return fmt.Errorf("arr: decode GET %s response: %w", path, err)
+	}
+	return nil
+}
+
+// post performs one authenticated JSON POST. A 2xx response is success; the
+// body is discarded. Errors are scrubbed of the API key and response body.
+func (c *core) post(ctx context.Context, path string, payload any) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("arr: encode POST %s body: %w", path, err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("arr: build request %s: %w", path, err)
+	}
+	req.Header.Set("X-Api-Key", c.apiKey)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("%w: POST %s: %w", ErrNetwork, path, scrub(err, c.apiKey))
+	}
+	defer resp.Body.Close()
+
+	switch {
+	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+		return fmt.Errorf("%w: POST %s: HTTP %d", ErrAuth, path, resp.StatusCode)
+	case resp.StatusCode < 200 || resp.StatusCode > 299:
+		return &StatusError{Code: resp.StatusCode, Method: http.MethodPost, Path: path}
 	}
 	return nil
 }

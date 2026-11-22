@@ -89,6 +89,14 @@ type RecordedRequest struct {
 	APIKey string
 }
 
+// CommandRequest is one decoded POST /api/v3/command body. Only the fields
+// Dubarr sends are modelled; a real instance accepts more.
+type CommandRequest struct {
+	Name     string `json:"name"`
+	MovieID  int    `json:"movieId"`
+	SeriesID int    `json:"seriesId"`
+}
+
 // Server is a running fake *arr instance.
 type Server struct {
 	*httptest.Server
@@ -99,6 +107,7 @@ type Server struct {
 	failStatus int
 	delay      time.Duration
 	requests   []RecordedRequest
+	commands   []CommandRequest
 }
 
 // New starts a fake of the given kind. An empty apiKey falls back to
@@ -127,6 +136,25 @@ func New(kind Kind, apiKey string, fx Fixtures) *Server {
 	}))
 	mux.HandleFunc("/api/v3/rootfolder", s.handle(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, nonNil(fx.RootFolders))
+	}))
+	// Commands are shared by both products; the fake records the decoded body
+	// so tests can assert the exact command name and id.
+	mux.HandleFunc("/api/v3/command", s.handle(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"message": "method not allowed"})
+			return
+		}
+		var cmd CommandRequest
+		if err := json.NewDecoder(r.Body).Decode(&cmd); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"message": "invalid command body"})
+			return
+		}
+		s.mu.Lock()
+		s.commands = append(s.commands, cmd)
+		s.mu.Unlock()
+		writeJSON(w, http.StatusCreated, map[string]any{
+			"id": 1, "name": cmd.Name, "status": "queued",
+		})
 	}))
 	switch kind {
 	case Radarr:
@@ -167,6 +195,14 @@ func (s *Server) Requests() []RecordedRequest {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]RecordedRequest(nil), s.requests...)
+}
+
+// Commands returns a copy of the decoded command bodies seen so far, oldest
+// first.
+func (s *Server) Commands() []CommandRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]CommandRequest(nil), s.commands...)
 }
 
 func (s *Server) handle(next http.HandlerFunc) http.HandlerFunc {

@@ -3,6 +3,7 @@ package arr_test
 import (
 	"context"
 	"errors"
+	"net/http"
 	"testing"
 	"time"
 
@@ -359,3 +360,109 @@ func TestBaseURLTrailingSlashIsAccepted(t *testing.T) {
 }
 
 const httpMethodGet = "GET"
+
+// TestRadarrRescanMoviePostsCommand proves the rescan uses the Radarr v3
+// RescanMovie command (movieId is not a field of DownloadedMoviesScan, whose
+// only inputs are path/downloadClientId/importMode).
+func TestRadarrRescanMoviePostsCommand(t *testing.T) {
+	ctx := context.Background()
+	srv := arrmock.New(arrmock.Radarr, "", radarrFixtures())
+	defer srv.Close()
+
+	c, err := arr.NewRadarrClient(srv.URL, srv.APIKey(), time.Second)
+	if err != nil {
+		t.Fatalf("NewRadarrClient: %v", err)
+	}
+	var client arr.Radarr = c
+	if err := client.RescanMovie(ctx, 7); err != nil {
+		t.Fatalf("RescanMovie: %v", err)
+	}
+
+	cmds := srv.Commands()
+	if len(cmds) != 1 {
+		t.Fatalf("commands = %+v, want exactly one", cmds)
+	}
+	if want := (arrmock.CommandRequest{Name: "RescanMovie", MovieID: 7}); cmds[0] != want {
+		t.Errorf("command = %+v, want %+v", cmds[0], want)
+	}
+	reqs := srv.Requests()
+	last := reqs[len(reqs)-1]
+	if last.Method != http.MethodPost || last.Path != "/api/v3/command" {
+		t.Errorf("last request = %s %s, want POST /api/v3/command", last.Method, last.Path)
+	}
+	if last.APIKey != srv.APIKey() {
+		t.Errorf("X-Api-Key = %q, want the configured key", last.APIKey)
+	}
+}
+
+func TestSonarrRescanSeriesPostsCommand(t *testing.T) {
+	ctx := context.Background()
+	srv := arrmock.New(arrmock.Sonarr, "", sonarrFixtures())
+	defer srv.Close()
+
+	c, err := arr.NewSonarrClient(srv.URL, srv.APIKey(), time.Second)
+	if err != nil {
+		t.Fatalf("NewSonarrClient: %v", err)
+	}
+	var client arr.Sonarr = c
+	if err := client.RescanSeries(ctx, 3); err != nil {
+		t.Fatalf("RescanSeries: %v", err)
+	}
+
+	cmds := srv.Commands()
+	if len(cmds) != 1 {
+		t.Fatalf("commands = %+v, want exactly one", cmds)
+	}
+	if want := (arrmock.CommandRequest{Name: "RescanSeries", SeriesID: 3}); cmds[0] != want {
+		t.Errorf("command = %+v, want %+v", cmds[0], want)
+	}
+	reqs := srv.Requests()
+	last := reqs[len(reqs)-1]
+	if last.Method != http.MethodPost || last.Path != "/api/v3/command" {
+		t.Errorf("last request = %s %s, want POST /api/v3/command", last.Method, last.Path)
+	}
+}
+
+func TestRescanCommandErrorModel(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("auth failure", func(t *testing.T) {
+		srv := arrmock.New(arrmock.Radarr, "", arrmock.Fixtures{})
+		defer srv.Close()
+		c, err := arr.NewRadarrClient(srv.URL, "wrong-key", time.Second)
+		if err != nil {
+			t.Fatalf("NewRadarrClient: %v", err)
+		}
+		if err := c.RescanMovie(ctx, 7); !errors.Is(err, arr.ErrAuth) {
+			t.Fatalf("RescanMovie error = %v, want ErrAuth", err)
+		}
+		if got := len(srv.Commands()); got != 0 {
+			t.Errorf("mock recorded %d commands after auth failure, want 0", got)
+		}
+	})
+
+	t.Run("unexpected status", func(t *testing.T) {
+		srv := arrmock.New(arrmock.Sonarr, "", arrmock.Fixtures{})
+		defer srv.Close()
+		srv.FailAll(500)
+		c, err := arr.NewSonarrClient(srv.URL, srv.APIKey(), time.Second)
+		if err != nil {
+			t.Fatalf("NewSonarrClient: %v", err)
+		}
+		if err := c.RescanSeries(ctx, 3); !errors.Is(err, arr.ErrUnexpectedStatus) {
+			t.Fatalf("RescanSeries error = %v, want ErrUnexpectedStatus", err)
+		}
+	})
+
+	t.Run("network failure", func(t *testing.T) {
+		srv := arrmock.New(arrmock.Radarr, "", arrmock.Fixtures{})
+		c, err := arr.NewRadarrClient(srv.URL, srv.APIKey(), time.Second)
+		if err != nil {
+			t.Fatalf("NewRadarrClient: %v", err)
+		}
+		srv.Close()
+		if err := c.RescanMovie(ctx, 7); !errors.Is(err, arr.ErrNetwork) {
+			t.Fatalf("RescanMovie error = %v, want ErrNetwork", err)
+		}
+	})
+}

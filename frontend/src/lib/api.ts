@@ -201,6 +201,54 @@ export type VaultResponse = {
   items: VaultItem[]
 }
 
+export type SyncJobStatus = 'queued' | 'running' | 'done' | 'failed'
+
+/** One multi-point correlation sample persisted in the job's DriftReport. */
+export type SyncCheckpoint = {
+  position_pct: number
+  slice_start_sec: number
+  slice_len_sec: number
+  offset_ms: number
+  correlation_quality: number
+}
+
+export type SyncVerdict = 'ok' | 'drifting' | 'unreliable' | 'out_of_range'
+
+export type SyncReport = {
+  verdict: SyncVerdict | string
+  offsets_ms: number[]
+  qualities: number[]
+  max_drift_ms: number
+  classification: string
+  checkpoints: SyncCheckpoint[]
+  sync_method: string
+  reason?: string
+}
+
+export type SyncJob = {
+  id: number
+  status: SyncJobStatus | string
+  vault_track_id: number
+  target_library_cache_id: number
+  target_video_path?: string
+  target_lang_iso2?: string
+  sync_method?: string
+  calculated_offset_ms: number
+  report?: SyncReport
+  error_message?: string
+  created_at?: string
+  updated_at?: string
+}
+
+export type SyncJobsResponse = {
+  items: SyncJob[]
+}
+
+export type CreateSyncJobBody = {
+  vault_track_id: number
+  target_library_cache_id: number
+}
+
 export class ApiError extends Error {
   readonly status: number
 
@@ -275,6 +323,13 @@ export const api = {
   searchLibrary: (q: string) =>
     request<LibrarySearchResponse>(`/api/imports/search-library?q=${encodeURIComponent(q)}`),
   vault: () => request<VaultResponse>('/api/vault'),
+  syncJobs: () => request<SyncJobsResponse>('/api/sync/jobs'),
+  syncJob: (id: number) => request<SyncJob>(`/api/sync/jobs/${id}`),
+  createSyncJob: (body: CreateSyncJobBody) =>
+    request<SyncJob>('/api/sync/jobs', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
   approveQueueItem: (id: number, libraryCacheId?: number) =>
     request<QueueTransition>(`/api/queue/${id}/approve`, {
       method: 'POST',

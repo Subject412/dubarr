@@ -10,11 +10,14 @@ import {
   api,
   type AuthStatus,
   type BrowseResponse,
+  type CreateSyncJobBody,
   type Health,
   type LibrarySearchResponse,
   type QueueResponse,
   type QueueTransition,
   type SettingsEnvelope,
+  type SyncJob,
+  type SyncJobsResponse,
   type User,
   type VaultResponse,
 } from './api'
@@ -26,6 +29,8 @@ export const queryKeys = {
   health: ['health'] as const,
   queue: ['queue'] as const,
   vault: ['vault'] as const,
+  syncJobs: ['sync', 'jobs'] as const,
+  syncJob: (id: number) => ['sync', 'jobs', id] as const,
   browse: (path: string) => ['browse', path] as const,
   librarySearch: (q: string) => ['library', 'search', q] as const,
 }
@@ -78,6 +83,41 @@ export function useVault(): UseQueryResult<VaultResponse> {
     queryKey: queryKeys.vault,
     queryFn: api.vault,
     staleTime: 10_000,
+  })
+}
+
+export function useSyncJobs(): UseQueryResult<SyncJobsResponse> {
+  return useQuery({
+    queryKey: queryKeys.syncJobs,
+    queryFn: api.syncJobs,
+    staleTime: 5_000,
+  })
+}
+
+/**
+ * One job detail. Polls while the job is queued/running so the Sync Studio
+ * flips to the report without a manual refresh; a terminal status stops it.
+ */
+export function useSyncJob(id: number | null): UseQueryResult<SyncJob> {
+  return useQuery({
+    queryKey: queryKeys.syncJob(id ?? 0),
+    queryFn: () => api.syncJob(id as number),
+    enabled: id !== null,
+    refetchInterval: (query) => {
+      const status = query.state.data?.status
+      return status === 'queued' || status === 'running' ? 1_500 : false
+    },
+  })
+}
+
+export function useCreateSyncJob(): UseMutationResult<SyncJob, Error, CreateSyncJobBody> {
+  const client = useQueryClient()
+  return useMutation({
+    mutationFn: (body) => api.createSyncJob(body),
+    onSuccess: (job) => {
+      client.setQueryData(queryKeys.syncJob(job.id), job)
+      void client.invalidateQueries({ queryKey: queryKeys.syncJobs })
+    },
   })
 }
 

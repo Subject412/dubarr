@@ -10,6 +10,7 @@ import { PlaceholderPage } from './pages/Placeholder'
 import { QueuePage } from './pages/Queue'
 import { SettingsPage } from './pages/Settings'
 import { SetupPage } from './pages/Setup'
+import { SyncPage } from './pages/Sync'
 import { SystemPage } from './pages/System'
 import { VaultPage } from './pages/Vault'
 
@@ -83,16 +84,7 @@ function App() {
             element={<QueuePage />}
           />
           <Route path="/vault" element={<VaultPage />} />
-          <Route
-            path="/sync"
-            element={
-              <PlaceholderPage
-                title="Sync Studio"
-                milestone="M5"
-                description="Checkpoint previews, offset tuning and mux review."
-              />
-            }
-          />
+          <Route path="/sync" element={<SyncPage />} />
           <Route path="/settings" element={<SettingsPage />} />
           <Route path="/system" element={<SystemPage />} />
           <Route path="*" element={<Navigate to="/library" replace />} />

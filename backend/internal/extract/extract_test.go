@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -31,21 +32,26 @@ func tool(t *testing.T, name string) string {
 // payload source that needs no ffmpeg.
 func writeTestWAV(t *testing.T, path string) {
 	t.Helper()
-	const (
-		sampleRate = 8000
-		samples    = 800
-		dataLen    = samples * 2
-	)
+	writeTestWAVTrack(t, path, 0.1, 1)
+}
+
+// writeTestWAVTrack writes a PCM WAV of the given length and channel count at
+// 8 kHz, 16 bit.
+func writeTestWAVTrack(t *testing.T, path string, seconds float64, channels int) {
+	t.Helper()
+	const sampleRate = 8000
+	samples := int(math.Round(seconds * sampleRate))
+	dataLen := samples * 2 * channels
 	var buf bytes.Buffer
 	buf.WriteString("RIFF")
 	binary.Write(&buf, binary.LittleEndian, uint32(36+dataLen))
 	buf.WriteString("WAVEfmt ")
 	binary.Write(&buf, binary.LittleEndian, uint32(16))
 	binary.Write(&buf, binary.LittleEndian, uint16(1))
-	binary.Write(&buf, binary.LittleEndian, uint16(1))
+	binary.Write(&buf, binary.LittleEndian, uint16(channels))
 	binary.Write(&buf, binary.LittleEndian, uint32(sampleRate))
-	binary.Write(&buf, binary.LittleEndian, uint32(sampleRate*2))
-	binary.Write(&buf, binary.LittleEndian, uint16(2))
+	binary.Write(&buf, binary.LittleEndian, uint32(sampleRate*2*channels))
+	binary.Write(&buf, binary.LittleEndian, uint16(2*channels))
 	binary.Write(&buf, binary.LittleEndian, uint16(16))
 	buf.WriteString("data")
 	binary.Write(&buf, binary.LittleEndian, uint32(dataLen))
@@ -70,6 +76,56 @@ func buildDonor(t *testing.T, dir, name string, langs ...string) string {
 		t.Fatalf("mkvmerge: %v: %s", err, outp)
 	}
 	return out
+}
+
+// testDonorTrack is one audio track of a synthetic donor.
+type testDonorTrack struct {
+	lang     string
+	seconds  float64
+	channels int
+}
+
+// buildVideoDonor renders a tiny MPEG-4 video track and muxes it in front of
+// one PCM audio track per testDonorTrack with mkvmerge. This mirrors a real
+// donor shape: the video stream occupies container index 0, so ffprobe's audio
+// stream indices (1, 2, ...) no longer match mkvmerge's audio-only ids.
+func buildVideoDonor(t *testing.T, dir, name string, tracks ...testDonorTrack) string {
+	t.Helper()
+	return buildTracksDonor(t, dir, name, true, tracks...)
+}
+
+// buildAudioDonor muxes PCM audio tracks only, so container indices still line
+// up with mkvmerge's audio ids.
+func buildAudioDonor(t *testing.T, dir, name string, tracks ...testDonorTrack) string {
+	t.Helper()
+	return buildTracksDonor(t, dir, name, false, tracks...)
+}
+
+func buildTracksDonor(t *testing.T, dir, name string, withVideo bool, tracks ...testDonorTrack) string {
+	t.Helper()
+	mkvmerge := tool(t, "mkvmerge")
+
+	args := []string{"-o", filepath.Join(dir, name), "--quiet"}
+	if withVideo {
+		ffmpeg := tool(t, "ffmpeg")
+		video := filepath.Join(dir, "video.mkv")
+		vid := exec.Command(ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+			"-f", "lavfi", "-i", "testsrc=size=64x64:rate=5:duration=1",
+			"-c:v", "mpeg4", "-an", video)
+		if outp, err := vid.CombinedOutput(); err != nil {
+			t.Fatalf("ffmpeg video fixture: %v: %s", err, outp)
+		}
+		args = append(args, video)
+	}
+	for i, tr := range tracks {
+		wav := filepath.Join(dir, fmt.Sprintf("track-%d.wav", i))
+		writeTestWAVTrack(t, wav, tr.seconds, tr.channels)
+		args = append(args, "--language", "0:"+tr.lang, wav)
+	}
+	if outp, err := exec.Command(mkvmerge, args...).CombinedOutput(); err != nil {
+		t.Fatalf("mkvmerge donor: %v: %s", err, outp)
+	}
+	return filepath.Join(dir, name)
 }
 
 type harness struct {
@@ -184,6 +240,100 @@ func TestExtractionSucceedsAndStagesLosslessTrack(t *testing.T) {
 	if processed, err := h.worker.ProcessOnce(h.ctx); err != nil || processed {
 		t.Fatalf("second ProcessOnce = (%v, %v), want (false, nil)", processed, err)
 	}
+}
+
+// stagedByLang returns the staged output whose name contains segment (".pl.",
+// ".en."), or "" when none does.
+func (h *harness) stagedByLang(id int64, segment string) string {
+	h.t.Helper()
+	entries, err := os.ReadDir(h.stagingDir(id))
+	if err != nil {
+		h.t.Fatalf("staging dir: %v", err)
+	}
+	for _, entry := range entries {
+		if strings.Contains(entry.Name(), segment) {
+			return filepath.Join(h.stagingDir(id), entry.Name())
+		}
+	}
+	return ""
+}
+
+// assertStagedTrack re-probes one staged file and checks codec, channels and
+// duration against the donor track it came from.
+func (h *harness) assertStagedTrack(path, codec string, channels int, duration time.Duration) {
+	h.t.Helper()
+	if path == "" {
+		h.t.Fatal("expected a staged output, found none")
+	}
+	info, err := h.worker.prober.Probe(h.ctx, path)
+	if err != nil {
+		h.t.Fatalf("probe staged %s: %v", path, err)
+	}
+	if len(info.Tracks) != 1 {
+		h.t.Fatalf("%s has %d audio tracks, want 1", path, len(info.Tracks))
+	}
+	got := info.Tracks[0]
+	if got.Codec != codec || got.Channels != channels {
+		h.t.Errorf("%s = %s/%d channels, want %s/%d", path, got.Codec, got.Channels, codec, channels)
+	}
+	if delta := info.Duration - duration; delta > DurationTolerance || delta < -DurationTolerance {
+		h.t.Errorf("%s duration %v, want %v (±%v)", path, info.Duration, duration, DurationTolerance)
+	}
+}
+
+// TestExtractionPairsAudioTracksPositionallyWithVideoStream is the M3-1 review
+// regression: a donor with a video stream shifts ffprobe's audio stream indices
+// to 1..N while mkvmerge's audio-only id list starts at 0..N-1, so indexing the
+// id list by the ffprobe stream index panicked.
+func TestExtractionPairsAudioTracksPositionallyWithVideoStream(t *testing.T) {
+	h := newHarness(t)
+	donor := buildVideoDonor(t, t.TempDir(), "Video Donor.mkv",
+		testDonorTrack{lang: "pol", seconds: 1, channels: 1},
+		testDonorTrack{lang: "eng", seconds: 1, channels: 2},
+	)
+	id := h.seedExtracting(donor)
+
+	processed, err := h.worker.ProcessOnce(h.ctx)
+	if err != nil || !processed {
+		t.Fatalf("ProcessOnce = (%v, %v), want (true, nil)", processed, err)
+	}
+	if status, msg := h.status(id); status != "completed" || msg != "" {
+		t.Fatalf("status = %q err %q, want completed with no error", status, msg)
+	}
+	// Distinct channel counts prove the positional pairing is correct, not just
+	// that extraction happened to survive.
+	h.assertStagedTrack(h.stagedByLang(id, ".pl."), "pcm_s16le", 1, time.Second)
+	h.assertStagedTrack(h.stagedByLang(id, ".en."), "pcm_s16le", 2, time.Second)
+}
+
+// TestExtractionValidatesPerTrackDonorDuration covers the review case where
+// unequal-length donor audio tracks were validated against the container
+// duration (here 10s) and falsely failed.
+func TestExtractionValidatesPerTrackDonorDuration(t *testing.T) {
+	h := newHarness(t)
+	donor := buildAudioDonor(t, t.TempDir(), "Unequal Donor.mkv",
+		testDonorTrack{lang: "pol", seconds: 3, channels: 1},
+		testDonorTrack{lang: "eng", seconds: 10, channels: 1},
+	)
+	media, err := h.worker.prober.Probe(h.ctx, donor)
+	if err != nil {
+		t.Fatalf("probe donor: %v", err)
+	}
+	if media.Duration < 9*time.Second {
+		t.Fatalf("donor container duration = %v, want the 10s track's length", media.Duration)
+	}
+	id := h.seedExtracting(donor)
+
+	processed, err := h.worker.ProcessOnce(h.ctx)
+	if err != nil || !processed {
+		t.Fatalf("ProcessOnce = (%v, %v), want (true, nil)", processed, err)
+	}
+	if status, msg := h.status(id); status != "completed" || msg != "" {
+		t.Fatalf("status = %q err %q, want completed with no error", status, msg)
+	}
+	// The 3s track must validate against 3s, not the 10s container duration.
+	h.assertStagedTrack(h.stagedByLang(id, ".pl."), "pcm_s16le", 1, 3*time.Second)
+	h.assertStagedTrack(h.stagedByLang(id, ".en."), "pcm_s16le", 1, 10*time.Second)
 }
 
 func TestExtractionFailsOnCorruptDonorAndWipesStaging(t *testing.T) {

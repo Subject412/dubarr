@@ -33,8 +33,12 @@
 // Tracks are chosen with gate.SplitExportTracks over probe output, using
 // languages.policy plus the arr original language of the matched library row
 // (export_mode "all" additionally keeps extra tracks that carry a real
-// language). Each extracted file is re-probed: codec and channel count must
-// match the donor track and the duration must stay within DurationTolerance of
-// the donor's. The worker is serialized (concurrency 1) and reaps staging
-// directories left behind by a previous boot at startup.
+// language). mkvmerge's audio-only ids are paired with the probed audio tracks
+// positionally — never through ffprobe's container-wide stream index, which a
+// video stream shifts. Each extracted file is re-probed: codec and channel
+// count must match the donor track and the duration must stay within
+// DurationTolerance of that track's own donor duration (mkvmerge's per-track
+// duration, falling back to the container duration when the file carries none).
+// The worker is serialized (concurrency 1) and reaps staging directories left
+// behind by a previous boot at startup.
 package extract

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -62,13 +63,13 @@ func (w *Worker) processJob(ctx context.Context, job store.ImportExtractionJob) 
 		return err
 	}
 
-	mkvIDs, err := w.audioTrackIDs(ctx, donor)
+	mkvTracks, err := w.audioTracks(ctx, donor)
 	if err != nil {
 		return err
 	}
-	if len(mkvIDs) != len(media.Tracks) {
+	if len(mkvTracks) != len(media.Tracks) {
 		return fmt.Errorf("extract: donor %s: mkvmerge reports %d audio tracks, probe reports %d",
-			donor, len(mkvIDs), len(media.Tracks))
+			donor, len(mkvTracks), len(media.Tracks))
 	}
 
 	bin, err := w.mkvextractBinary()
@@ -78,21 +79,36 @@ func (w *Worker) processJob(ctx context.Context, job store.ImportExtractionJob) 
 	base := strings.TrimSuffix(job.Filename, filepath.Ext(job.Filename))
 	args := []string{"tracks", donor}
 	outputs := make([]string, 0, len(tracks))
+	durations := make([]time.Duration, 0, len(tracks))
 	for _, track := range tracks {
+		// mkvmerge's audio ids are not ffprobe stream indices: the video stream
+		// shifts every container index. Pair the probed track with the mkvmerge
+		// entry at the same position among the audio streams instead.
+		pos, err := audioPosition(media.Tracks, track.Index)
+		if err != nil {
+			return fmt.Errorf("extract: donor %s: %w", donor, err)
+		}
 		lang := track.LanguageISO1
 		if lang == "" {
 			lang = "und"
 		}
 		out := filepath.Join(jobDir, fmt.Sprintf("%s.%s.%d.mka", base, lang, track.Index))
-		args = append(args, fmt.Sprintf("%d:%s", mkvIDs[track.Index], out))
+		args = append(args, fmt.Sprintf("%d:%s", mkvTracks[pos].ID, out))
 		outputs = append(outputs, out)
+		// Validate against this track's own donor duration: donor audio tracks
+		// may differ in length, so the container duration is only a fallback.
+		duration := mkvTracks[pos].Duration
+		if duration <= 0 {
+			duration = media.Duration
+		}
+		durations = append(durations, duration)
 	}
 	if outp, err := w.run(ctx, bin, args...); err != nil {
 		return fmt.Errorf("extract: mkvextract %s: %w: %s", donor, err, firstLine(outp))
 	}
 
 	for i, out := range outputs {
-		if err := validateExtraction(ctx, w.prober, out, tracks[i], media.Duration); err != nil {
+		if err := validateExtraction(ctx, w.prober, out, tracks[i], durations[i]); err != nil {
 			return err
 		}
 	}
@@ -133,10 +149,18 @@ func (w *Worker) selectTracks(ctx context.Context, job store.ImportExtractionJob
 	return selected, nil
 }
 
-// audioTrackIDs returns mkvextract's track ids for the donor's audio tracks,
-// in container order (which matches probe's audio-stream order). mkvextract
-// ids are not ffprobe stream indices, so they must come from mkvmerge -J.
-func (w *Worker) audioTrackIDs(ctx context.Context, donor string) ([]int, error) {
+// mkvAudioTrack is one audio track as mkvmerge identifies it: the id
+// mkvextract addresses and the track's own duration (zero when the container
+// does not expose one).
+type mkvAudioTrack struct {
+	ID       int
+	Duration time.Duration
+}
+
+// audioTracks returns mkvmerge's audio track entries for the donor, in
+// container order (which matches probe's audio-stream order). mkvextract ids
+// are not ffprobe stream indices, so they must come from mkvmerge -J.
+func (w *Worker) audioTracks(ctx context.Context, donor string) ([]mkvAudioTrack, error) {
 	bin, err := w.mkvmergeBinary()
 	if err != nil {
 		return nil, err
@@ -147,20 +171,85 @@ func (w *Worker) audioTrackIDs(ctx context.Context, donor string) ([]int, error)
 	}
 	var doc struct {
 		Tracks []struct {
-			ID   int    `json:"id"`
-			Type string `json:"type"`
+			ID         int    `json:"id"`
+			Type       string `json:"type"`
+			Properties struct {
+				// Duration is nanoseconds across formats that store it.
+				Duration json.RawMessage `json:"duration"`
+				// TagDuration is mkvmerge's DURATION statistic
+				// ("HH:MM:SS.nnnnnnnnn"), present for most Matroska files.
+				TagDuration string `json:"tag_duration"`
+			} `json:"properties"`
 		} `json:"tracks"`
 	}
 	if err := json.Unmarshal(outp, &doc); err != nil {
 		return nil, fmt.Errorf("extract: decode mkvmerge identification of %s: %w", donor, err)
 	}
-	ids := make([]int, 0, len(doc.Tracks))
+	tracks := make([]mkvAudioTrack, 0, len(doc.Tracks))
 	for _, track := range doc.Tracks {
-		if track.Type == "audio" {
-			ids = append(ids, track.ID)
+		if track.Type != "audio" {
+			continue
+		}
+		duration := parseNanoDuration(track.Properties.Duration)
+		if duration <= 0 {
+			duration = parseTagDuration(track.Properties.TagDuration)
+		}
+		tracks = append(tracks, mkvAudioTrack{ID: track.ID, Duration: duration})
+	}
+	return tracks, nil
+}
+
+// audioPosition maps a probed track's container-wide stream index to its
+// ordinal among the donor's audio streams; that ordinal pairs it with the
+// matching mkvmerge audio entry.
+func audioPosition(probed []probe.AudioTrack, streamIndex int) (int, error) {
+	for i, track := range probed {
+		if track.Index == streamIndex {
+			return i, nil
 		}
 	}
-	return ids, nil
+	return -1, fmt.Errorf("audio stream %d not found in probe result", streamIndex)
+}
+
+// parseNanoDuration decodes mkvmerge's properties.duration, which is a JSON
+// number of nanoseconds (occasionally a numeric string).
+func parseNanoDuration(raw json.RawMessage) time.Duration {
+	if len(raw) == 0 {
+		return 0
+	}
+	var nanos float64
+	if err := json.Unmarshal(raw, &nanos); err != nil {
+		var text string
+		if err := json.Unmarshal(raw, &text); err != nil {
+			return 0
+		}
+		if v, err := strconv.ParseFloat(text, 64); err == nil {
+			nanos = v
+		} else {
+			return 0
+		}
+	}
+	if nanos <= 0 {
+		return 0
+	}
+	return time.Duration(math.Round(nanos))
+}
+
+// parseTagDuration decodes mkvmerge's "HH:MM:SS.nnnnnnnnn" duration statistic.
+func parseTagDuration(raw string) time.Duration {
+	parts := strings.Split(strings.TrimSpace(raw), ":")
+	if len(parts) != 3 {
+		return 0
+	}
+	hours, errH := strconv.Atoi(parts[0])
+	minutes, errM := strconv.Atoi(parts[1])
+	seconds, errS := strconv.ParseFloat(parts[2], 64)
+	if errH != nil || errM != nil || errS != nil || hours < 0 || minutes < 0 || seconds < 0 {
+		return 0
+	}
+	return time.Duration(hours)*time.Hour +
+		time.Duration(minutes)*time.Minute +
+		time.Duration(math.Round(seconds*float64(time.Second)))
 }
 
 // validateExtraction re-probes an extracted file and checks it against the

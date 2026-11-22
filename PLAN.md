@@ -72,5 +72,11 @@ Full acceptance pass: container zero-env build+start, wizard creates admin + per
 - M2-5 — Tdarr Gate eligibility: `[ArcA310]` tag gate (settled; force-override OFF): tag-eligible vs waiting_for_tags classification on candidates; rule-based export policy (policy tracks default, extras opt-in — settled).
 - M2-6 — Approval Queue: backend queue API + frontend queue UI; donor drop → approval card pre-selected (target + matched donor, languages, eligibility badge); approve/reject actions (no mux in M2 — approval only).
 - M3: approve → lossless extraction → validated .mka → atomic immutable Vault (0444) + Vault UI. Acceptance: .{iso2}.mka + sha256 + zero staging leftovers.
+
+### M3 tasks (drafted at gate, 2026-11-22)
+- M3-1 — Extraction worker: consume `extracting` queue rows; mkvextract lossless audio from the donor into work dir; validate the extracted track (codec/channels via probe; duration sanity vs donor); per-job staging dir under work/, cleanup on failure; concurrency 1 (serialized jobs); crash-safe (stale staging dirs reaped at boot).
+- M3-2 — Vault write pipeline: normalize to `.{iso2}.mka` naming per GLOSSARY; sha256 sidecar manifest; single atomic rename into vault dir; write-once (refuse overwrite existing vault entry); final perms 0444, dir 0555 where supported; vault dir from storage.paths.vault_dir.
+- M3-3 — Vault UI: vault page listing entries (name, size, sha256, source target/donor, created); no delete-by-default (`.bak`-style opt-in clean is settled for M4+); read-only.
+- M3-4 — Approve→Vault integration: approve action triggers extraction→vault pipeline end-to-end; queue status advances to vaulted (or failed with reason); acceptance run: Shrek-like fixture produces valid .pl.mka + sha256, zero staging leftovers on success AND failure paths.
 - M4: Rust dubarr-sync + Copy-on-Work + Reference Language Resolver + checkpoints + drift regression. Acceptance: cargo/go tests 100%; Vault byte-identical (RO-mount); accurate same-lang & lowpass reports.
 - M5: Sync Studio + tag-gated atomic mux + arr Rescan. Acceptance: Shrek end-to-end; Minions fails loudly if ambiguous; zero vault/video modification, zero untagged mux, zero secret leaks.

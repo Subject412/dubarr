@@ -10,12 +10,14 @@ const navItems = [
   { to: '/sync', label: 'Sync Studio', icon: '◉', hint: 'M5' },
   { to: '/settings', label: 'Settings', icon: '⚙' },
   { to: '/system', label: 'System', icon: '♥' },
+  { to: '/tokens', label: 'API Tokens', icon: '⚿', admin: true },
 ]
 
 export function AppShell() {
   const navigate = useNavigate()
   const me = useMe()
   const logout = useLogout()
+  const visibleNav = navItems.filter((item) => !item.admin || me.data?.is_admin)
 
   const signOut = () => {
     logout.mutate(undefined, {
@@ -36,7 +38,7 @@ export function AppShell() {
           </div>
         </div>
         <nav className="flex-1 space-y-1 p-3">
-          {navItems.map((item) => (
+          {visibleNav.map((item) => (
             <NavLink
               key={item.to}
               to={item.to}
@@ -84,7 +86,7 @@ export function AppShell() {
         </header>
 
         <nav className="flex gap-1 overflow-x-auto border-b border-ink-800 bg-ink-900 px-3 py-2 md:hidden">
-          {navItems.map((item) => (
+          {visibleNav.map((item) => (
             <NavLink
               key={item.to}
               to={item.to}

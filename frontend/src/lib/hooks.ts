@@ -8,6 +8,8 @@ import {
 import { useEffect, useState } from 'react'
 import {
   api,
+  type ApiTokenCreated,
+  type ApiTokensResponse,
   type AuthStatus,
   type BrowseResponse,
   type CreateSyncJobBody,
@@ -33,6 +35,7 @@ export const queryKeys = {
   syncJob: (id: number) => ['sync', 'jobs', id] as const,
   browse: (path: string) => ['browse', path] as const,
   librarySearch: (q: string) => ['library', 'search', q] as const,
+  tokens: ['auth', 'tokens'] as const,
 }
 
 /** Public first-run probe; drives the route gate. */
@@ -147,6 +150,33 @@ export function useRejectQueueItem(): UseMutationResult<QueueTransition, Error, 
     mutationFn: (id) => api.rejectQueueItem(id),
     onSuccess: () => {
       void client.invalidateQueries({ queryKey: queryKeys.queue })
+    },
+  })
+}
+
+export function useTokens(): UseQueryResult<ApiTokensResponse> {
+  return useQuery({
+    queryKey: queryKeys.tokens,
+    queryFn: api.tokens,
+  })
+}
+
+export function useCreateToken(): UseMutationResult<ApiTokenCreated, Error, string> {
+  const client = useQueryClient()
+  return useMutation({
+    mutationFn: (name) => api.createToken(name),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: queryKeys.tokens })
+    },
+  })
+}
+
+export function useRevokeToken(): UseMutationResult<void, Error, number> {
+  const client = useQueryClient()
+  return useMutation({
+    mutationFn: (id) => api.revokeToken(id),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: queryKeys.tokens })
     },
   })
 }

@@ -249,6 +249,25 @@ export type CreateSyncJobBody = {
   target_library_cache_id: number
 }
 
+/** Masked API token as returned by GET /api/auth/tokens (never the plaintext). */
+export type ApiToken = {
+  id: number
+  name: string
+  /** Leading characters stored for display, e.g. `dub_AbCdEfGh`. */
+  prefix: string
+  created_at: string
+  last_used_at?: string | null
+}
+
+export type ApiTokensResponse = {
+  tokens: ApiToken[]
+}
+
+/** POST /api/auth/tokens response: the plaintext token is present only here. */
+export type ApiTokenCreated = ApiToken & {
+  token: string
+}
+
 export class ApiError extends Error {
   readonly status: number
 
@@ -338,4 +357,11 @@ export const api = {
     }),
   rejectQueueItem: (id: number) =>
     request<QueueTransition>(`/api/queue/${id}/reject`, { method: 'POST' }),
+  tokens: () => request<ApiTokensResponse>('/api/auth/tokens'),
+  createToken: (name: string) =>
+    request<ApiTokenCreated>('/api/auth/tokens', {
+      method: 'POST',
+      body: JSON.stringify({ name }),
+    }),
+  revokeToken: (id: number) => request<void>(`/api/auth/tokens/${id}`, { method: 'DELETE' }),
 }

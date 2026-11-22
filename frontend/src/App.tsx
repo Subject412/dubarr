@@ -4,7 +4,7 @@ import { Navigate, Outlet, Route, Routes, useNavigate } from 'react-router-dom'
 import { AppShell } from './components/AppShell'
 import { Alert, Button, Spinner } from './components/ui'
 import { UNAUTHORIZED_EVENT, type AuthStatus } from './lib/api'
-import { queryKeys, useAuthStatus } from './lib/hooks'
+import { queryKeys, useAuthStatus, useMe } from './lib/hooks'
 import { LoginPage } from './pages/Login'
 import { PlaceholderPage } from './pages/Placeholder'
 import { QueuePage } from './pages/Queue'
@@ -12,6 +12,7 @@ import { SettingsPage } from './pages/Settings'
 import { SetupPage } from './pages/Setup'
 import { SyncPage } from './pages/Sync'
 import { SystemPage } from './pages/System'
+import { TokensPage } from './pages/Tokens'
 import { VaultPage } from './pages/Vault'
 
 /**
@@ -42,6 +43,29 @@ function AuthGate() {
 
   if (!status.data.initialized) return <Navigate to="/setup" replace />
   if (!status.data.authenticated) return <Navigate to="/login" replace />
+  return <Outlet />
+}
+
+/**
+ * Admin-only route: /api/auth/me decides. Tokens are an admin capability, so a
+ * non-admin who guesses the URL is sent back to the library instead.
+ */
+function AdminRoute() {
+  const me = useMe()
+
+  if (me.isPending) {
+    return (
+      <div className="py-10">
+        <Spinner label="Checking permissions…" />
+      </div>
+    )
+  }
+
+  if (me.isError) {
+    return <Alert>Could not verify admin access: {me.error.message}</Alert>
+  }
+
+  if (!me.data.is_admin) return <Navigate to="/library" replace />
   return <Outlet />
 }
 
@@ -87,6 +111,9 @@ function App() {
           <Route path="/sync" element={<SyncPage />} />
           <Route path="/settings" element={<SettingsPage />} />
           <Route path="/system" element={<SystemPage />} />
+          <Route element={<AdminRoute />}>
+            <Route path="/tokens" element={<TokensPage />} />
+          </Route>
           <Route path="*" element={<Navigate to="/library" replace />} />
         </Route>
       </Route>

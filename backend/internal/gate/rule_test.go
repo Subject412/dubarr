@@ -12,7 +12,7 @@ func TestRuleClassifyAny(t *testing.T) {
 		Mode:     MatchAny,
 		Enforce:  true,
 	}
-	got := r.Classify("Shrek (2001).mkv", []Tag{{Name: "DUBARR_GATE", Value: "[arcA310]"}})
+	got := r.Classify("Shrek (2001) [arcA310].mkv")
 	if got.Status != StatusEligible {
 		t.Fatalf("status = %q, want eligible", got.Status)
 	}
@@ -20,7 +20,7 @@ func TestRuleClassifyAny(t *testing.T) {
 		t.Errorf("matched = %v, want [[ArcA310]]", got.Matched)
 	}
 
-	got = r.Classify("Shrek (2001).mkv", []Tag{{Name: "TITLE", Value: "Shrek"}})
+	got = r.Classify("Shrek (2001).mkv")
 	if got.Status != StatusWaitingForTags {
 		t.Fatalf("status = %q, want waiting_for_tags", got.Status)
 	}
@@ -31,44 +31,52 @@ func TestRuleClassifyAny(t *testing.T) {
 
 func TestRuleClassifyAll(t *testing.T) {
 	r := Rule{Required: []string{"[A]", "[B]"}, Mode: MatchAll, Enforce: true}
-	if got := r.Classify("f.mkv", []Tag{{Name: "X", Value: "[A]"}}); got.Status != StatusWaitingForTags {
+	if got := r.Classify("f [A].mkv"); got.Status != StatusWaitingForTags {
 		t.Errorf("one of two present: status = %q, want waiting_for_tags", got.Status)
 	}
-	got := r.Classify("f.mkv", []Tag{{Name: "X", Value: "[A] [B]"}})
+	got := r.Classify("f [A] [B].mkv")
 	if got.Status != StatusEligible {
 		t.Errorf("both present: status = %q, want eligible", got.Status)
 	}
 }
 
 func TestRuleClassifyCaseSensitivity(t *testing.T) {
-	tags := []Tag{{Name: "GATE", Value: "[arca310]"}}
-	if got := (Rule{Required: []string{"[ArcA310]"}, Mode: MatchAny, Enforce: true}).Classify("f.mkv", tags); got.Status != StatusEligible {
+	if got := (Rule{Required: []string{"[ArcA310]"}, Mode: MatchAny, Enforce: true}).Classify("f [arca310].mkv"); got.Status != StatusEligible {
 		t.Errorf("case-insensitive default: status = %q, want eligible", got.Status)
 	}
-	if got := (Rule{Required: []string{"[ArcA310]"}, Mode: MatchAny, CaseSensitive: true, Enforce: true}).Classify("f.mkv", tags); got.Status != StatusWaitingForTags {
+	if got := (Rule{Required: []string{"[ArcA310]"}, Mode: MatchAny, CaseSensitive: true, Enforce: true}).Classify("f [arca310].mkv"); got.Status != StatusWaitingForTags {
 		t.Errorf("case-sensitive: status = %q, want waiting_for_tags", got.Status)
 	}
 }
 
 func TestRuleClassifyRegex(t *testing.T) {
 	r := Rule{Required: []string{`\[ArcA31\d\]`}, Mode: MatchRegex, Enforce: true}
-	if got := r.Classify("f.mkv", []Tag{{Name: "GATE", Value: "[ArcA310]"}}); got.Status != StatusEligible {
+	if got := r.Classify("f [ArcA310].mkv"); got.Status != StatusEligible {
 		t.Errorf("regex match: status = %q, want eligible", got.Status)
 	}
-	if got := r.Classify("f.mkv", []Tag{{Name: "GATE", Value: "[ArcA999]"}}); got.Status != StatusWaitingForTags {
+	if got := r.Classify("f [ArcA999].mkv"); got.Status != StatusWaitingForTags {
 		t.Errorf("regex miss: status = %q, want waiting_for_tags", got.Status)
 	}
 	// An invalid pattern must never make an untagged file eligible.
-	if got := (Rule{Required: []string{`[`}, Mode: MatchRegex, Enforce: true}).Classify("f.mkv", nil); got.Status != StatusWaitingForTags {
+	if got := (Rule{Required: []string{`[`}, Mode: MatchRegex, Enforce: true}).Classify("f.mkv"); got.Status != StatusWaitingForTags {
 		t.Errorf("invalid regex: status = %q, want waiting_for_tags", got.Status)
 	}
 }
 
 func TestRuleClassifyFilenameTags(t *testing.T) {
 	r := Rule{Required: []string{"[ArcA310]"}, Mode: MatchAny, Enforce: true}
-	got := r.Classify("Shrek (2001) [ArcA310].mkv", nil)
+	got := r.Classify("Shrek (2001) [ArcA310].mkv")
 	if got.Status != StatusEligible {
 		t.Fatalf("filename tag: status = %q, want eligible", got.Status)
+	}
+}
+
+// TestRuleClassifyIgnoresDirectoryMarkers pins ADR-0005: only the base filename
+// decides eligibility, never another path component.
+func TestRuleClassifyIgnoresDirectoryMarkers(t *testing.T) {
+	r := Rule{Required: []string{"[ArcA310]"}, Mode: MatchAny, Enforce: true}
+	if got := r.Classify("/media/[ArcA310]/Shrek (2001).mkv"); got.Status != StatusWaitingForTags {
+		t.Errorf("marker in directory: status = %q, want waiting_for_tags", got.Status)
 	}
 }
 
@@ -79,7 +87,7 @@ func TestRuleClassifyExcluded(t *testing.T) {
 		Mode:     MatchAny,
 		Enforce:  true,
 	}
-	got := r.Classify("f.mkv", []Tag{{Name: "GATE", Value: "[ArcA310] [Broken]"}})
+	got := r.Classify("f [ArcA310] [Broken].mkv")
 	if got.Status != StatusWaitingForTags {
 		t.Errorf("excluded tag present: status = %q, want waiting_for_tags", got.Status)
 	}
@@ -87,12 +95,12 @@ func TestRuleClassifyExcluded(t *testing.T) {
 
 func TestRuleClassifyEnforceOff(t *testing.T) {
 	r := Rule{Required: []string{"[ArcA310]"}, Mode: MatchAny}
-	if got := r.Classify("f.mkv", nil); got.Status != StatusEligible {
+	if got := r.Classify("f.mkv"); got.Status != StatusEligible {
 		t.Errorf("enforce off: status = %q, want eligible", got.Status)
 	}
 	// No required tags means nothing to wait for.
 	r = Rule{Mode: MatchAny, Enforce: true}
-	if got := r.Classify("f.mkv", nil); got.Status != StatusEligible {
+	if got := r.Classify("f.mkv"); got.Status != StatusEligible {
 		t.Errorf("no required tags: status = %q, want eligible", got.Status)
 	}
 }

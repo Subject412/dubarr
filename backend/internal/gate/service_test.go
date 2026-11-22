@@ -23,11 +23,7 @@ func newTestService(t *testing.T) (*Service, *store.Store) {
 		TagMatchMode:         "ANY",
 		EnforceTagFilter:     true,
 	})
-	tagger := New(Dependencies{
-		MKVMergePath:   mkvTool(t, "mkvmerge"),
-		MKVExtractPath: mkvTool(t, "mkvextract"),
-	})
-	return NewService(rule, tagger, st), st
+	return NewService(rule, st), st
 }
 
 func TestServiceClassifiesAndPersists(t *testing.T) {
@@ -43,10 +39,11 @@ func TestServiceClassifiesAndPersists(t *testing.T) {
 		t.Fatalf("RecordImportCandidate: %v", err)
 	}
 
-	tagged := buildTestMKV(t, filepath.Join(dir), "tagged.mkv", "[ArcA310]")
-	targetPath := filepath.Join(filepath.Dir(tagged), "target.mkv")
-	if err := os.Rename(tagged, targetPath); err != nil {
-		t.Fatalf("rename target: %v", err)
+	// ADR-0005: only the filename carries eligibility, so no container tag is
+	// written — the marker lives in the name.
+	targetPath := filepath.Join(dir, "target [ArcA310].mkv")
+	if err := os.WriteFile(targetPath, []byte("target"), 0o600); err != nil {
+		t.Fatalf("write target: %v", err)
 	}
 
 	res, err := svc.ClassifyCandidate(ctx, source, targetPath)
@@ -81,7 +78,10 @@ func TestServiceWaitingForTags(t *testing.T) {
 	if _, err := st.RecordImportCandidate(ctx, source, filepath.Base(source), 5); err != nil {
 		t.Fatalf("RecordImportCandidate: %v", err)
 	}
-	target := buildTestMKV(t, dir, "untagged.mkv", "")
+	target := filepath.Join(dir, "untagged.mkv")
+	if err := os.WriteFile(target, []byte("target"), 0o600); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
 
 	res, err := svc.ClassifyCandidate(ctx, source, target)
 	if err != nil {

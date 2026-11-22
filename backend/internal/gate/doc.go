@@ -16,9 +16,10 @@
 //     or values — so tag content is extracted with the companion `mkvextract
 //     tags` (same mkvtoolnix package, same host/Docker image).
 //
-// Classification is a pure function of the observed tags (Rule.Classify), so
-// the policy is testable without any media. Service binds a Tagger and the
-// import-queue store to persist the outcome per candidate.
+// Classification is a pure function of the target filename (Rule.Classify):
+// ADR-0005 makes the filename the only source of eligibility, so container tags
+// are read for informational/display purposes only and never broaden the gate.
+// Service binds the import-queue store to persist the outcome per candidate.
 //
 // The export-policy split (SplitExportTracks) is likewise pure: it partitions
 // probed audio tracks into the policy import set (dub + original + reference

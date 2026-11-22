@@ -98,9 +98,11 @@ func TestTaggerReadsContainerTags(t *testing.T) {
 		t.Fatalf("container tags = %+v, want DUBARR_GATE=[ArcA310]", tags.Container)
 	}
 
+	// ADR-0005: tags are informational only. A container marker never makes a
+	// target eligible — the filename must carry it.
 	r := Rule{Required: []string{"[ArcA310]"}, Mode: MatchAny, Enforce: true}
-	if got := r.Classify(filepath.Base(path), tags.Container); got.Status != StatusEligible {
-		t.Errorf("classification = %+v, want eligible", got)
+	if got := r.Classify(filepath.Base(path)); got.Status != StatusWaitingForTags {
+		t.Errorf("classification = %+v, want waiting_for_tags", got)
 	}
 }
 
@@ -113,8 +115,11 @@ func TestTaggerUntaggedFileHasNoGateTag(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
+	if len(tags.Container) != 0 {
+		t.Errorf("container tags = %+v, want none", tags.Container)
+	}
 	r := Rule{Required: []string{"[ArcA310]"}, Mode: MatchAny, Enforce: true}
-	if got := r.Classify(filepath.Base(path), tags.Container); got.Status != StatusWaitingForTags {
+	if got := r.Classify(filepath.Base(path)); got.Status != StatusWaitingForTags {
 		t.Errorf("classification = %+v, want waiting_for_tags", got)
 	}
 }

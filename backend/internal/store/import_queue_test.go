@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
@@ -154,3 +155,121 @@ func TestImportCandidateGateUnknownCandidate(t *testing.T) {
 	}
 }
 
+func TestImportCandidateGateNullParsedJSON(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	const source = "/media/watch/Null.mkv"
+	if _, err := s.RecordImportCandidate(ctx, source, "Null.mkv", 10); err != nil {
+		t.Fatalf("RecordImportCandidate: %v", err)
+	}
+	if _, err := s.DB.ExecContext(ctx,
+		`UPDATE import_queue SET parsed_raw_json = 'null' WHERE source_file_path = ?`, source); err != nil {
+		t.Fatalf("seed parsed_raw_json: %v", err)
+	}
+
+	if err := s.SetImportCandidateGate(ctx, source, ImportGateStatus{Status: "eligible"}); err != nil {
+		t.Fatalf("SetImportCandidateGate on null payload: %v", err)
+	}
+	got, ok, err := s.ImportCandidateGate(ctx, source)
+	if err != nil || !ok {
+		t.Fatalf("ImportCandidateGate: %v ok=%v", err, ok)
+	}
+	if got.Status != "eligible" {
+		t.Errorf("status = %q, want eligible", got.Status)
+	}
+}
+
+func TestImportCandidateGatePreservesLargeIntegers(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	const source = "/media/watch/Big.mkv"
+	if _, err := s.RecordImportCandidate(ctx, source, "Big.mkv", 10); err != nil {
+		t.Fatalf("RecordImportCandidate: %v", err)
+	}
+	// 2^53+1 and an int64 near the maximum: float64 cannot round-trip either.
+	const seeded = `{"title":"Big","media_id":9007199254740993,"ids":[9223372036854775807,1]}`
+	if _, err := s.DB.ExecContext(ctx,
+		`UPDATE import_queue SET parsed_raw_json = ? WHERE source_file_path = ?`, seeded, source); err != nil {
+		t.Fatalf("seed parsed_raw_json: %v", err)
+	}
+
+	if err := s.SetImportCandidateGate(ctx, source, ImportGateStatus{Status: "eligible"}); err != nil {
+		t.Fatalf("SetImportCandidateGate: %v", err)
+	}
+
+	var raw string
+	if err := s.DB.QueryRowContext(ctx,
+		`SELECT parsed_raw_json FROM import_queue WHERE source_file_path = ?`, source).Scan(&raw); err != nil {
+		t.Fatalf("select parsed_raw_json: %v", err)
+	}
+	for _, want := range []string{
+		`"media_id":9007199254740993`,
+		`"ids":[9223372036854775807,1]`,
+		`"title":"Big"`,
+	} {
+		if !strings.Contains(raw, want) {
+			t.Errorf("parsed_raw_json = %s, want member %s preserved byte-exact", raw, want)
+		}
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &doc); err != nil {
+		t.Fatalf("parsed_raw_json is not an object: %v (%s)", err, raw)
+	}
+	if _, ok := doc[gateJSONKey]; !ok {
+		t.Errorf("gate key missing: %s", raw)
+	}
+}
+
+func TestImportCandidateGateConcurrentSets(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	const source = "/media/watch/Race.mkv"
+	if _, err := s.RecordImportCandidate(ctx, source, "Race.mkv", 10); err != nil {
+		t.Fatalf("RecordImportCandidate: %v", err)
+	}
+	if _, err := s.DB.ExecContext(ctx,
+		`UPDATE import_queue SET parsed_raw_json = ? WHERE source_file_path = ?`,
+		`{"title":"Race","media_id":9007199254740993}`, source); err != nil {
+		t.Fatalf("seed parsed_raw_json: %v", err)
+	}
+
+	const workers = 8
+	errs := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		go func(i int) {
+			errs <- s.SetImportCandidateGate(ctx, source, ImportGateStatus{Status: "eligible"})
+		}(i)
+	}
+	for i := 0; i < workers; i++ {
+		if err := <-errs; err != nil {
+			t.Errorf("concurrent SetImportCandidateGate: %v", err)
+		}
+	}
+
+	var raw string
+	if err := s.DB.QueryRowContext(ctx,
+		`SELECT parsed_raw_json FROM import_queue WHERE source_file_path = ?`, source).Scan(&raw); err != nil {
+		t.Fatalf("select parsed_raw_json: %v", err)
+	}
+	if !strings.Contains(raw, `"media_id":9007199254740993`) {
+		t.Errorf("concurrent writes lost parse payload: %s", raw)
+	}
+	if !strings.Contains(raw, `"gate"`) {
+		t.Errorf("concurrent writes lost gate member: %s", raw)
+	}
+}

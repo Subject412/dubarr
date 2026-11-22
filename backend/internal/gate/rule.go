@@ -81,17 +81,18 @@ func RuleFromTagFilter(tf settings.TargetTagFilter) Rule {
 	}
 }
 
-// Classify evaluates the gate against a target filename and its container tags.
+// Classify evaluates the gate against a target filename.
 //
-// Requirements are matched, in order of precedence, against:
-//   - the target's base filename (ADR-0005: Tdarr writes the marker there), and
-//   - every container tag rendered as "NAME=value".
+// Eligibility is decided solely by the base filename: ADR-0005 settles that
+// Tdarr writes the processed-tag marker into the name, and nothing else may
+// broaden eligibility. Container tags are informational only (see Tagger) and
+// are deliberately not an input here.
 //
 // ANY is satisfied by one required tag, ALL by all of them; REGEX treats each
 // required entry as a regular expression and any match satisfies the gate.
-// Excluded tags always win: a target carrying one is waiting_for_tags even
+// Excluded tags always win: a filename carrying one is waiting_for_tags even
 // when every required tag is present.
-func (r Rule) Classify(filename string, tags []Tag) Result {
+func (r Rule) Classify(filename string) Result {
 	res := Result{Matched: []string{}, Missing: []string{}}
 	required := trimAll(r.Required)
 	if !r.Enforce || len(required) == 0 {
@@ -99,7 +100,7 @@ func (r Rule) Classify(filename string, tags []Tag) Result {
 		return res
 	}
 
-	hay := r.haystack(filename, tags)
+	hay := r.haystack(filename)
 	for _, want := range required {
 		if r.matches(want, hay) {
 			res.Matched = append(res.Matched, want)
@@ -128,23 +129,17 @@ func (r Rule) Classify(filename string, tags []Tag) Result {
 	return res
 }
 
-// haystack renders the searchable strings for a target: the base filename plus
-// one entry per container tag. Entries are lower-cased unless the rule is
-// case-sensitive.
-func (r Rule) haystack(filename string, tags []Tag) []string {
-	hay := make([]string, 0, len(tags)+1)
-	if base := filepath.Base(filename); filename != "" && base != "." {
-		hay = append(hay, base)
-	}
-	for _, tag := range tags {
-		hay = append(hay, tag.Name+"="+tag.Value)
+// haystack renders the searchable strings for a target: the base filename only.
+// The entry is lower-cased unless the rule is case-sensitive.
+func (r Rule) haystack(filename string) []string {
+	base := filepath.Base(filename)
+	if filename == "" || base == "." {
+		return nil
 	}
 	if !r.CaseSensitive {
-		for i, v := range hay {
-			hay[i] = strings.ToLower(v)
-		}
+		base = strings.ToLower(base)
 	}
-	return hay
+	return []string{base}
 }
 
 // matches reports whether want is present in the haystack under the rule's

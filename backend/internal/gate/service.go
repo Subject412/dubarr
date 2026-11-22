@@ -19,23 +19,25 @@ type CandidateStore interface {
 }
 
 // Service classifies import-queue candidates and records the verdict.
-type Service struct {
-	rule   Rule
-	tagger *Tagger
-	store  CandidateStore
-}
-
-// NewService wires the gate rule, tag reader and import-queue store.
-func NewService(rule Rule, tagger *Tagger, st CandidateStore) *Service {
-	return &Service{rule: rule, tagger: tagger, store: st}
-}
-
-// ClassifyCandidate evaluates sourcePath's target and persists the result on
-// the candidate.
 //
-// An empty or missing target yields missing_target without invoking mkvtoolnix.
-// A target that exists but cannot be read is an error, not a verdict: silently
-// marking it waiting_for_tags would hide a broken file or missing tool from the
+// Classification is filename-only (ADR-0005); container tags are informational
+// and are read through Tagger, not consulted here.
+type Service struct {
+	rule  Rule
+	store CandidateStore
+}
+
+// NewService wires the gate rule and the import-queue store.
+func NewService(rule Rule, st CandidateStore) *Service {
+	return &Service{rule: rule, store: st}
+}
+
+// ClassifyCandidate evaluates sourcePath's target filename and persists the
+// result on the candidate.
+//
+// An empty or missing target yields missing_target without reading the file
+// beyond a stat. A target that cannot be stat'ed is an error, not a verdict:
+// silently marking it waiting_for_tags would hide a broken path from the
 // operator.
 func (s *Service) ClassifyCandidate(ctx context.Context, sourcePath, targetPath string) (Result, error) {
 	res := Result{TargetPath: targetPath, Matched: []string{}, Missing: []string{}}
@@ -53,11 +55,7 @@ func (s *Service) ClassifyCandidate(ctx context.Context, sourcePath, targetPath 
 		case info.IsDir():
 			res.Status = StatusMissingTarget
 		default:
-			tags, err := s.tagger.Read(ctx, targetPath)
-			if err != nil {
-				return Result{}, err
-			}
-			res = s.rule.Classify(filepath.Base(targetPath), tags.Container)
+			res = s.rule.Classify(filepath.Base(targetPath))
 			res.TargetPath = targetPath
 		}
 	}

@@ -70,11 +70,30 @@ const gateJSONKey = "gate"
 // SetImportCandidateGate records the gate classification for sourcePath,
 // preserving any arr parse payload already stored in parsed_raw_json.
 //
+// The payload is decoded as raw JSON members and the gate member is replaced by
+// its raw encoding, so every other member — including integers beyond 2^53 that
+// float64 would round — is preserved byte-exact. A JSON null payload is treated
+// as an empty object.
+//
+// The read and the write run in one transaction so a concurrent classification
+// cannot overwrite a gate decision made between the two statements.
+//
 // It reports an error when the candidate is unknown rather than silently doing
 // nothing: a classification that does not reach the queue is a wiring bug.
 func (s *Store) SetImportCandidateGate(ctx context.Context, sourcePath string, status ImportGateStatus) error {
+	gateRaw, err := json.Marshal(status)
+	if err != nil {
+		return fmt.Errorf("store: encode import candidate gate: %w", err)
+	}
+
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("store: begin import candidate gate: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op once committed
+
 	var raw sql.NullString
-	err := s.DB.QueryRowContext(ctx,
+	err = tx.QueryRowContext(ctx,
 		`SELECT parsed_raw_json FROM import_queue WHERE source_file_path = ?`, sourcePath).Scan(&raw)
 	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("store: import candidate %s not found", sourcePath)
@@ -83,19 +102,22 @@ func (s *Store) SetImportCandidateGate(ctx context.Context, sourcePath string, s
 		return fmt.Errorf("store: read import candidate %s: %w", sourcePath, err)
 	}
 
-	doc := map[string]any{}
-	if raw.Valid && strings.TrimSpace(raw.String) != "" {
-		if err := json.Unmarshal([]byte(raw.String), &doc); err != nil {
+	doc := map[string]json.RawMessage{}
+	if payload := strings.TrimSpace(raw.String); raw.Valid && payload != "" && payload != "null" {
+		if err := json.Unmarshal([]byte(payload), &doc); err != nil {
 			return fmt.Errorf("store: import candidate %s: parsed_raw_json is not a JSON object: %w", sourcePath, err)
 		}
+		if doc == nil {
+			doc = map[string]json.RawMessage{}
+		}
 	}
-	doc[gateJSONKey] = status
+	doc[gateJSONKey] = gateRaw
 	encoded, err := json.Marshal(doc)
 	if err != nil {
 		return fmt.Errorf("store: encode import candidate gate: %w", err)
 	}
 
-	res, err := s.DB.ExecContext(ctx,
+	res, err := tx.ExecContext(ctx,
 		`UPDATE import_queue SET parsed_raw_json = ?, updated_at = CURRENT_TIMESTAMP
 		 WHERE source_file_path = ?`, string(encoded), sourcePath)
 	if err != nil {
@@ -105,6 +127,9 @@ func (s *Store) SetImportCandidateGate(ctx context.Context, sourcePath string, s
 		return fmt.Errorf("store: record import candidate gate rows affected: %w", err)
 	} else if n != 1 {
 		return fmt.Errorf("store: import candidate %s not found", sourcePath)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("store: commit import candidate gate: %w", err)
 	}
 	return nil
 }

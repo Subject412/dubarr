@@ -468,7 +468,7 @@ func (s *Service) runAnalysis(ctx context.Context, rec store.SyncJobRecord) (ana
 
 	engine := s.engine
 	if engine == nil {
-		runner, err := sync.New("")
+		runner, err := sync.New("", sync.WithTimeout(analyze.JobTimeout(cfg)))
 		if err != nil {
 			return analyze.Report{}, err
 		}

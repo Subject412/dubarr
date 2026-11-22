@@ -188,6 +188,44 @@ func (s *Store) ListVaultTracks(ctx context.Context) ([]VaultTrackListing, error
 	return out, nil
 }
 
+// VaultTrackByID returns the audio_tracks row with id. found is false for an
+// unknown id. It is a read-only lookup used by Copy-on-Work staging to learn
+// the expected SHA-256 of a track before copying it out of the vault.
+func (s *Store) VaultTrackByID(ctx context.Context, id int64) (VaultTrackRecord, bool, error) {
+	var (
+		rec             VaultTrackRecord
+		season, episode sql.NullInt64
+	)
+	err := s.DB.QueryRowContext(ctx, `
+		SELECT vault_media_id, season_number, episode_number, group_uuid,
+		       lang_iso2, COALESCE(lang_iso3, ''), variant, is_original_lang,
+		       file_path, sha256, codec, channels, channel_count,
+		       COALESCE(bitrate_bps, 0), COALESCE(sample_rate, 0),
+		       COALESCE(source_fps, 0), COALESCE(duration_ms, 0),
+		       COALESCE(source_release_name, ''), COALESCE(notes, '')
+		FROM audio_tracks WHERE id = ?`, id).
+		Scan(&rec.VaultMediaID, &season, &episode, &rec.GroupUUID,
+			&rec.LangISO2, &rec.LangISO3, &rec.Variant, &rec.IsOriginalLang,
+			&rec.FilePath, &rec.SHA256, &rec.Codec, &rec.Channels, &rec.ChannelCount,
+			&rec.BitrateBPS, &rec.SampleRate, &rec.SourceFPS, &rec.DurationMS,
+			&rec.SourceReleaseName, &rec.Notes)
+	if errors.Is(err, sql.ErrNoRows) {
+		return VaultTrackRecord{}, false, nil
+	}
+	if err != nil {
+		return VaultTrackRecord{}, false, fmt.Errorf("store: read vault track %d: %w", id, err)
+	}
+	if season.Valid {
+		v := int(season.Int64)
+		rec.SeasonNumber = &v
+	}
+	if episode.Valid {
+		v := int(episode.Int64)
+		rec.EpisodeNumber = &v
+	}
+	return rec, true, nil
+}
+
 func nullableID(id int64) any {
 	if id <= 0 {
 		return nil

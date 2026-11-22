@@ -494,3 +494,174 @@ func TestMismatchErrorHasNoKeyMaterial(t *testing.T) {
 		}
 	}
 }
+
+// TestRekeyRestoresOldKeyfileOnInstallFailure covers the crash window between
+// installing the new keyfile and committing: when the install fails, the old
+// keyfile must come back from the .prev backup so the old key stays usable.
+func TestRekeyRestoresOldKeyfileOnInstallFailure(t *testing.T) {
+	dir := t.TempDir()
+	st := bootStore(t, dir)
+	svc, err := Open(st, Options{DataDir: dir})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := svc.Set("api.key", "keep-me"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	installedPath := filepath.Join(dir, MasterKeyFile)
+	oldKeyfile, err := os.ReadFile(installedPath)
+	if err != nil {
+		t.Fatalf("read old keyfile: %v", err)
+	}
+
+	newPath := filepath.Join(t.TempDir(), "new-master.key")
+	writeKeyfile(t, newPath, secondKey(t))
+
+	origInstall := installKeyfileNow
+	installKeyfileNow = func(string, []byte) error { return errors.New("injected install failure") }
+	t.Cleanup(func() { installKeyfileNow = origInstall })
+
+	st2 := bootStore(t, dir)
+	defer st2.Close()
+	if err := Rekey(st2, Options{DataDir: dir}, newPath); err == nil {
+		t.Fatal("Rekey succeeded although installing the keyfile failed")
+	}
+
+	restored, err := os.ReadFile(installedPath)
+	if err != nil {
+		t.Fatalf("read restored keyfile: %v", err)
+	}
+	if !bytes.Equal(restored, oldKeyfile) {
+		t.Fatal("the old keyfile was not restored after a failed install")
+	}
+	if _, err := os.Stat(installedPath + ".prev"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("keyfile backup was left behind (stat err = %v)", err)
+	}
+	if got := recordedSource(t, st2); got != SourceKeyfile {
+		t.Fatalf("marker after failed rekey = %q, want keyfile", got)
+	}
+	if err := st2.Close(); err != nil {
+		t.Fatalf("close second store: %v", err)
+	}
+
+	// The old keyfile still opens the collection.
+	st3 := bootStore(t, dir)
+	defer st3.Close()
+	svc3, err := Open(st3, Options{DataDir: dir})
+	if err != nil {
+		t.Fatalf("Open after failed rekey: %v", err)
+	}
+	if got, err := svc3.Get("api.key"); err != nil || got != "keep-me" {
+		t.Fatalf("Get after failed rekey = %q, %v; want keep-me", got, err)
+	}
+}
+
+// TestRekeyInstallsExplicitKeyfile: with an explicit keyfile configured, rekey
+// must rotate that keyfile and keep pinning the explicit-keyfile source.
+func TestRekeyInstallsExplicitKeyfile(t *testing.T) {
+	dir := t.TempDir()
+	explicitPath := filepath.Join(dir, "operator.key")
+	writeKeyfile(t, explicitPath, testKey(t))
+
+	st := bootStore(t, dir)
+	svc, err := Open(st, Options{DataDir: dir, KeyfilePath: explicitPath})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if svc.KeySource() != SourceExplicitKeyfile {
+		t.Fatalf("initial source = %q, want explicit-keyfile", svc.KeySource())
+	}
+	if err := svc.Set("b", "beta"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	newPath := filepath.Join(t.TempDir(), "rotated.key")
+	newKey := secondKey(t)
+	writeKeyfile(t, newPath, newKey)
+
+	st2 := bootStore(t, dir)
+	if err := Rekey(st2, Options{DataDir: dir, KeyfilePath: explicitPath}, newPath); err != nil {
+		t.Fatalf("Rekey: %v", err)
+	}
+	if got := recordedSource(t, st2); got != SourceExplicitKeyfile {
+		t.Fatalf("marker after rekey = %q, want explicit-keyfile", got)
+	}
+	installed, err := readKeyfile(explicitPath)
+	if err != nil {
+		t.Fatalf("read explicit keyfile: %v", err)
+	}
+	if !bytes.Equal(installed, newKey) {
+		t.Fatal("rekey did not install the new key at the explicit keyfile path")
+	}
+	if _, err := os.Stat(filepath.Join(dir, MasterKeyFile)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("rekey created DATA_DIR/.master.key although an explicit keyfile is pinned (stat err = %v)", err)
+	}
+	if err := st2.Close(); err != nil {
+		t.Fatalf("close second store: %v", err)
+	}
+
+	st3 := bootStore(t, dir)
+	defer st3.Close()
+	svc3, err := Open(st3, Options{DataDir: dir, KeyfilePath: explicitPath})
+	if err != nil {
+		t.Fatalf("Open after rekey: %v", err)
+	}
+	if got, err := svc3.Get("b"); err != nil || got != "beta" {
+		t.Fatalf("Get after rekey = %q, %v; want beta", got, err)
+	}
+}
+
+// TestCorruptKeySourceMarkerIsFatal: an unrecognised marker is never treated as
+// a source and never silently re-pinned, even with an empty collection.
+func TestCorruptKeySourceMarkerIsFatal(t *testing.T) {
+	t.Run("with secrets", func(t *testing.T) {
+		dir := t.TempDir()
+		st := bootStore(t, dir)
+		svc, err := Open(st, Options{DataDir: dir})
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		if err := svc.Set("a", "alpha"); err != nil {
+			t.Fatalf("Set: %v", err)
+		}
+		if _, err := st.DB.Exec(`UPDATE settings SET value = 'garbage' WHERE key = ?`, KeySourceSetting); err != nil {
+			t.Fatalf("corrupt marker: %v", err)
+		}
+		if err := st.Close(); err != nil {
+			t.Fatalf("close store: %v", err)
+		}
+
+		st2 := bootStore(t, dir)
+		defer st2.Close()
+		if _, err := Open(st2, Options{DataDir: dir}); !errors.Is(err, ErrKeySourceMismatch) {
+			t.Fatalf("Open error = %v, want ErrKeySourceMismatch", err)
+		}
+		if got := recordedSource(t, st2); got != "garbage" {
+			t.Fatalf("marker was rewritten to %q", got)
+		}
+	})
+
+	t.Run("without secrets", func(t *testing.T) {
+		dir := t.TempDir()
+		st := bootStore(t, dir)
+		if _, err := Open(st, Options{DataDir: dir}); err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		if _, err := st.DB.Exec(`UPDATE settings SET value = '' WHERE key = ?`, KeySourceSetting); err != nil {
+			t.Fatalf("corrupt marker: %v", err)
+		}
+		if _, err := Open(st, Options{DataDir: dir}); !errors.Is(err, ErrKeySourceMismatch) {
+			t.Fatalf("Open error = %v, want ErrKeySourceMismatch", err)
+		}
+		if got := recordedSource(t, st); got != "" {
+			t.Fatalf("empty marker was re-pinned to %q", got)
+		}
+	})
+}

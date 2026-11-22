@@ -50,6 +50,8 @@ func (e *SourceMismatchError) Error() string {
 func (e *SourceMismatchError) Is(target error) bool { return target == ErrKeySourceMismatch }
 
 // readKeySource returns the pinned source, or "" when no marker is recorded.
+// A marker outside the documented Source set is an error: silently treating it
+// as no marker would re-pin the DATA_DIR and strand every existing secret.
 func readKeySource(db *sql.DB) (Source, error) {
 	var value string
 	err := db.QueryRow(`SELECT value FROM settings WHERE key = ?`, KeySourceSetting).Scan(&value)
@@ -59,7 +61,21 @@ func readKeySource(db *sql.DB) (Source, error) {
 	if err != nil {
 		return "", fmt.Errorf("secrets: read key source marker: %w", err)
 	}
-	return Source(value), nil
+	source := Source(value)
+	if !source.valid() {
+		return "", fmt.Errorf("%w: unrecognised key source marker %q", ErrKeySourceMismatch, value)
+	}
+	return source, nil
+}
+
+// valid reports whether s is one of the documented Source constants.
+func (s Source) valid() bool {
+	switch s {
+	case SourceExplicitKeyfile, SourcePassphrase, SourceKeyring, SourceKeyfile:
+		return true
+	default:
+		return false
+	}
 }
 
 // countUserSecrets counts secrets rows excluding the sentinel. This is the
@@ -245,7 +261,9 @@ func repinEmpty(db *sql.DB, opts Options, previous Source) (*Service, error) {
 
 // Rekey decrypts every user secret with the currently recorded key and
 // re-encrypts it under the key at keyfilePath in one transaction, then installs
-// that key as DATA_DIR/.master.key and pins SourceKeyfile. A single
+// that key as the keyfile the next boot resolves (opts.KeyfilePath when set,
+// DATA_DIR/.master.key otherwise) and pins the matching source. The previous
+// keyfile is kept as <path>.prev until the commit succeeds. A single
 // undecryptable row aborts the operation before any write.
 func Rekey(st *store.Store, opts Options, keyfilePath string) error {
 	if st == nil || st.DB == nil {
@@ -331,10 +349,30 @@ func Rekey(st *store.Store, opts Options, keyfilePath string) error {
 		}
 	}
 
+	// Install the new key where the next boot will look: the operator's
+	// explicit keyfile when one is configured, DATA_DIR/.master.key otherwise.
+	// A recorded explicit-keyfile source always implies a configured keyfile,
+	// because resolving the old key above needs it.
 	installedPath := filepath.Join(opts.DataDir, MasterKeyFile)
+	pinSource := SourceKeyfile
+	if opts.KeyfilePath != "" || recorded == SourceExplicitKeyfile {
+		pinSource = SourceExplicitKeyfile
+	}
+	if opts.KeyfilePath != "" {
+		installedPath = opts.KeyfilePath
+	}
+
 	backup, existed, readErr := readFileMaybe(installedPath)
 	if readErr != nil {
 		return fmt.Errorf("secrets: rekey: read existing keyfile: %w", readErr)
+	}
+	// Persist the old keyfile before the new one replaces it so a crash before
+	// the commit leaves .prev behind and the old key recoverable.
+	backupPath := installedPath + ".prev"
+	if existed {
+		if err := writeFileAtomic(backupPath, backup); err != nil {
+			return fmt.Errorf("secrets: rekey: back up existing keyfile: %w", err)
+		}
 	}
 
 	tx, err := st.DB.Begin()
@@ -343,7 +381,7 @@ func Rekey(st *store.Store, opts Options, keyfilePath string) error {
 	}
 	fail := func(cause error) error {
 		_ = tx.Rollback()
-		if restoreErr := restoreFile(installedPath, backup, existed); restoreErr != nil {
+		if restoreErr := restoreKeyfile(installedPath, backupPath, existed); restoreErr != nil {
 			return errors.Join(cause, restoreErr)
 		}
 		return cause
@@ -364,7 +402,7 @@ func Rekey(st *store.Store, opts Options, keyfilePath string) error {
 	if _, err := tx.Exec(
 		`INSERT INTO settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)
 		 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP`,
-		KeySourceSetting, string(SourceKeyfile),
+		KeySourceSetting, string(pinSource),
 	); err != nil {
 		return fail(fmt.Errorf("secrets: rekey: write marker: %w", err))
 	}
@@ -377,12 +415,15 @@ func Rekey(st *store.Store, opts Options, keyfilePath string) error {
 	}
 
 	// Make the new key durable before the database commit so a successful
-	// commit can always be reopened.
-	if err := installKeyfile(installedPath, newKey); err != nil {
+	// commit can always be reopened. The old key stays in .prev until then.
+	if err := installKeyfileNow(installedPath, newKey); err != nil {
 		return fail(fmt.Errorf("secrets: rekey: install keyfile: %w", err))
 	}
 	if err := tx.Commit(); err != nil {
 		return fail(fmt.Errorf("secrets: rekey: commit: %w", err))
+	}
+	if err := os.Remove(backupPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		log.Printf("WARN secrets: rekey: remove keyfile backup %q: %v", backupPath, err)
 	}
 	return nil
 }
@@ -399,21 +440,37 @@ func readFileMaybe(path string) ([]byte, bool, error) {
 	return content, true, nil
 }
 
-// restoreFile puts back a previous keyfile, or removes one that did not exist.
-func restoreFile(path string, content []byte, existed bool) error {
+// restoreKeyfile puts back the pre-rekey keyfile from its .prev backup, or
+// removes a keyfile that did not exist before, then drops the backup. A failed
+// rekey must leave no stray key material behind.
+func restoreKeyfile(path, backupPath string, existed bool) error {
 	if !existed {
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("secrets: rekey: remove new keyfile: %w", err)
 		}
-		return nil
+	} else {
+		content, err := os.ReadFile(backupPath)
+		if err != nil {
+			return fmt.Errorf("secrets: rekey: read keyfile backup: %w", err)
+		}
+		if err := writeFileAtomic(path, content); err != nil {
+			return fmt.Errorf("secrets: rekey: restore keyfile backup: %w", err)
+		}
 	}
-	return writeFileAtomic(path, content)
+	if err := os.Remove(backupPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("secrets: rekey: remove keyfile backup: %w", err)
+	}
+	return nil
 }
 
 // installKeyfile writes key material as DATA_DIR/.master.key, 0600.
 func installKeyfile(path string, key []byte) error {
 	return writeFileAtomic(path, []byte(encodeKey(key)+"\n"))
 }
+
+// installKeyfileNow is the install step used by Rekey. Tests swap it to force
+// the crash-window failure (install done, commit not yet) and prove rollback.
+var installKeyfileNow = installKeyfile
 
 // writeFileAtomic writes content 0600 via a temporary sibling and a rename.
 func writeFileAtomic(path string, content []byte) error {

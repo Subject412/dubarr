@@ -33,7 +33,7 @@ type Dependencies struct {
 // Service holds the resolved dependencies for the registered handlers.
 type Service struct {
 	store        *settings.Store
-	secrets      *secrets.Service
+	secrets      arrSecretStore
 	requireAdmin func(http.Handler) http.Handler
 }
 
@@ -52,7 +52,13 @@ func RegisterRoutes(mux *http.ServeMux, deps Dependencies) *Service {
 	if store == nil && deps.DB != nil {
 		store = settings.New(deps.DB)
 	}
-	svc := &Service{store: store, secrets: deps.Secrets, requireAdmin: deps.RequireAdmin}
+	// Keep the field a nil interface when no secret service is wired: a typed
+	// nil *secrets.Service inside the interface would make arrReady pass.
+	var sec arrSecretStore
+	if deps.Secrets != nil {
+		sec = deps.Secrets
+	}
+	svc := &Service{store: store, secrets: sec, requireAdmin: deps.RequireAdmin}
 
 	admin := func(h http.HandlerFunc) http.Handler {
 		if svc.requireAdmin == nil {

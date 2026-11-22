@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Subject412/dubarr/backend/internal/arr"
@@ -26,6 +27,21 @@ import (
 // arrTestTimeout bounds a connection-test ping so a black-holed instance cannot
 // pin a request handler.
 const arrTestTimeout = 10 * time.Second
+
+// arrSecretStore is the subset of secrets.Service the arr handlers use. Keeping
+// it an interface lets tests inject failures at the delete/set seam so the
+// ordering guarantees below stay pinned by tests.
+type arrSecretStore interface {
+	Set(key, plaintext string) error
+	Get(key string) (string, error)
+	Delete(key string) error
+}
+
+// arrConnectionsMu serializes the read-modify-write of the arr.connections
+// section. Handlers load the section, mutate their instance and save it back;
+// without a lock two concurrent upserts (or an upsert racing a delete) would
+// both write a stale slice and the later write would drop the other change.
+var arrConnectionsMu sync.Mutex
 
 // arrConnectionView is a connection as served by the API: the key is masked.
 type arrConnectionView struct {
@@ -145,6 +161,10 @@ func (s *Service) handleUpsertArr(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Serialize the load -> mutate -> save sequence; see arrConnectionsMu.
+	arrConnectionsMu.Lock()
+	defer arrConnectionsMu.Unlock()
+
 	conns, err := s.loadArrConnections(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "could not read arr connections")
@@ -158,7 +178,8 @@ func (s *Service) handleUpsertArr(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if idx < 0 && req.APIKey == "" {
+	created := idx < 0
+	if created && req.APIKey == "" {
 		writeError(w, http.StatusBadRequest, "api_key is required when adding a connection")
 		return
 	}
@@ -188,6 +209,13 @@ func (s *Service) handleUpsertArr(w http.ResponseWriter, r *http.Request) {
 		conns.Instances = append(conns.Instances, conn)
 	}
 	if err := s.saveArrConnections(r.Context(), conns); err != nil {
+		// Compensate for the secret-first write on a failed create: nothing in
+		// the section will point at that key, so drop it instead of leaving an
+		// orphan behind. On an update the key belongs to the existing
+		// connection, so deleting it would break a working instance.
+		if created && req.APIKey != "" {
+			_ = s.secrets.Delete(arrSecretKey(kind))
+		}
 		writeError(w, http.StatusInternalServerError, "could not save arr connection")
 		return
 	}
@@ -212,6 +240,11 @@ func (s *Service) handleDeleteArr(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "unknown arr kind")
 		return
 	}
+	// Serialize with upsert so a delete cannot resurrect a concurrently
+	// updated section.
+	arrConnectionsMu.Lock()
+	defer arrConnectionsMu.Unlock()
+
 	conns, err := s.loadArrConnections(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "could not read arr connections")
@@ -228,13 +261,17 @@ func (s *Service) handleDeleteArr(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "arr connection not found")
 		return
 	}
+	// Remove the secret first. Delete is idempotent, so a retry after an
+	// interrupted attempt succeeds; dropping the key before the metadata means
+	// a later metadata failure leaves a connection that can be re-keyed, never
+	// orphaned key material with no listing to clean it up from.
+	if err := s.secrets.Delete(arrSecretKey(kind)); err != nil {
+		writeError(w, http.StatusInternalServerError, "could not delete arr credentials")
+		return
+	}
 	conns.Instances = append(conns.Instances[:idx], conns.Instances[idx+1:]...)
 	if err := s.saveArrConnections(r.Context(), conns); err != nil {
 		writeError(w, http.StatusInternalServerError, "could not delete arr connection")
-		return
-	}
-	if err := s.secrets.Delete(arrSecretKey(kind)); err != nil {
-		writeError(w, http.StatusInternalServerError, "could not delete arr credentials")
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

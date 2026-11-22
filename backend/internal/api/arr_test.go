@@ -5,11 +5,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Subject412/dubarr/backend/internal/arr/arrmock"
 	"github.com/Subject412/dubarr/backend/internal/auth"
@@ -21,6 +25,14 @@ import (
 // newArrHarness wires the settings API with an encrypted secret service backed
 // by a fixed test key, so no OS keyring is involved.
 func newArrHarness(t *testing.T) (*harness, *secrets.Service) {
+	t.Helper()
+	h, _, sec := newArrHarnessWithSeam(t)
+	return h, sec
+}
+
+// newArrHarnessWithSeam also returns the api Service so a test can replace the
+// secrets seam (handlers read it per request, after registration).
+func newArrHarnessWithSeam(t *testing.T) (*harness, *Service, *secrets.Service) {
 	t.Helper()
 	dir := t.TempDir()
 	st, err := store.Open(dir)
@@ -43,7 +55,7 @@ func newArrHarness(t *testing.T) (*harness, *secrets.Service) {
 
 	mux := http.NewServeMux()
 	authSvc := auth.RegisterRoutes(mux, auth.Dependencies{DB: st.DB})
-	RegisterRoutes(mux, Dependencies{
+	svc := RegisterRoutes(mux, Dependencies{
 		DB:           st.DB,
 		Settings:     settingsStore,
 		Secrets:      sec,
@@ -53,7 +65,49 @@ func newArrHarness(t *testing.T) (*harness, *secrets.Service) {
 	t.Cleanup(srv.Close)
 	jar, _ := cookiejar.New(nil)
 	return &harness{t: t, db: st.DB, dataDir: dir, mux: mux, server: srv,
-		client: &http.Client{Jar: jar}}, sec
+		client: &http.Client{Jar: jar}}, svc, sec
+}
+
+// fakeArrSecrets wraps the real encrypted store so tests can fail Delete or run
+// a hook once a key has been written, making the ordering guarantees observable.
+type fakeArrSecrets struct {
+	inner     *secrets.Service
+	mu        sync.Mutex
+	deletes   []string
+	deleteErr error
+	afterSet  func()
+	inSet     func()
+}
+
+func (f *fakeArrSecrets) Set(key, plaintext string) error {
+	if err := f.inner.Set(key, plaintext); err != nil {
+		return err
+	}
+	if f.inSet != nil {
+		f.inSet()
+	}
+	if f.afterSet != nil {
+		f.afterSet()
+	}
+	return nil
+}
+
+func (f *fakeArrSecrets) Get(key string) (string, error) { return f.inner.Get(key) }
+
+func (f *fakeArrSecrets) Delete(key string) error {
+	f.mu.Lock()
+	f.deletes = append(f.deletes, key)
+	f.mu.Unlock()
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
+	return f.inner.Delete(key)
+}
+
+func (f *fakeArrSecrets) deletedKeys() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.deletes...)
 }
 
 type arrListResponse struct {
@@ -314,5 +368,139 @@ func TestArrRoutesUnavailableWithoutSecretService(t *testing.T) {
 	code, body := h.do(http.MethodGet, "/api/settings/arr", nil)
 	if code != http.StatusServiceUnavailable {
 		t.Fatalf("GET without secrets = %d, want 503: %s", code, body)
+	}
+}
+
+// TestArrDeleteRemovesSecretBeforeMetadata pins the fix: if the secret delete
+// fails, the metadata must still be there so the operator can retry (the key is
+// not orphaned, it is still reachable through the connection row).
+func TestArrDeleteRemovesSecretBeforeMetadata(t *testing.T) {
+	h, svc, real := newArrHarnessWithSeam(t)
+	h.setupAdmin()
+	if code, body := h.do(http.MethodPut, "/api/settings/arr/radarr", map[string]any{
+		"base_url": "http://radarr:7878", "api_key": "abcdef-1234", "enabled": true,
+	}); code != http.StatusOK {
+		t.Fatalf("create = %d: %s", code, body)
+	}
+
+	fake := &fakeArrSecrets{inner: real, deleteErr: errors.New("secret store unavailable")}
+	svc.secrets = fake
+
+	code, body := h.do(http.MethodDelete, "/api/settings/arr/radarr", nil)
+	if code != http.StatusInternalServerError {
+		t.Fatalf("delete with failing secret store = %d, want 500: %s", code, body)
+	}
+	if got := fake.deletedKeys(); len(got) != 1 || got[0] != "arr.radarr.api_key" {
+		t.Fatalf("secret delete attempts = %v, want the delete to be tried first", got)
+	}
+	if res := h.listArr(); len(res.Instances) != 1 {
+		t.Fatalf("metadata was dropped before the secret: %+v", res.Instances)
+	}
+	if key, err := real.Get("arr.radarr.api_key"); err != nil || key != "abcdef-1234" {
+		t.Fatalf("secret after failed delete = %q, %v", key, err)
+	}
+}
+
+// TestArrDeleteToleratesAlreadyMissingSecret covers the retry path: the previous
+// attempt removed the key but not the metadata, so the retry must succeed.
+func TestArrDeleteToleratesAlreadyMissingSecret(t *testing.T) {
+	h, sec := newArrHarness(t)
+	h.setupAdmin()
+	if code, body := h.do(http.MethodPut, "/api/settings/arr/sonarr", map[string]any{
+		"base_url": "http://sonarr:8989", "api_key": "abcdef-1234", "enabled": true,
+	}); code != http.StatusOK {
+		t.Fatalf("create = %d: %s", code, body)
+	}
+	if err := sec.Delete("arr.sonarr.api_key"); err != nil {
+		t.Fatalf("pre-delete secret: %v", err)
+	}
+	if code, body := h.do(http.MethodDelete, "/api/settings/arr/sonarr", nil); code != http.StatusNoContent {
+		t.Fatalf("retry delete = %d: %s", code, body)
+	}
+	if res := h.listArr(); len(res.Instances) != 0 {
+		t.Fatalf("instances after retry delete = %+v", res.Instances)
+	}
+}
+
+// TestArrUpsertCompensatesSecretWhenSaveFails makes the section save fail after
+// the key was written (closing the DB) and asserts the handler deletes that key
+// instead of leaving an orphan.
+func TestArrUpsertCompensatesSecretWhenSaveFails(t *testing.T) {
+	h, svc, real := newArrHarnessWithSeam(t)
+	h.setupAdmin()
+
+	fake := &fakeArrSecrets{inner: real, afterSet: func() { _ = h.db.Close() }}
+	svc.secrets = fake
+
+	body := strings.NewReader(`{"base_url":"http://radarr:7878","api_key":"abcdef-1234","enabled":true}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/settings/arr/radarr", body)
+	req.SetPathValue("kind", "radarr")
+	rec := httptest.NewRecorder()
+	svc.handleUpsertArr(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("upsert with failing save = %d, want 500: %s", rec.Code, rec.Body.String())
+	}
+	if got := fake.deletedKeys(); len(got) != 1 || got[0] != "arr.radarr.api_key" {
+		t.Fatalf("compensating deletes = %v, want the freshly written secret removed", got)
+	}
+}
+
+// TestArrConcurrentUpsertsKeepBothConnections would lose one instance without
+// the section mutex: both writers load the same empty slice and the last save
+// wins. The inSet hook makes the overlap deterministic — the first writer to
+// reach the secret write waits briefly for a second one, so without the lock
+// both have already read the stale section when they save.
+func TestArrConcurrentUpsertsKeepBothConnections(t *testing.T) {
+	h, svc, real := newArrHarnessWithSeam(t)
+	h.setupAdmin()
+
+	var inSet int32
+	fake := &fakeArrSecrets{inner: real}
+	fake.inSet = func() {
+		if atomic.AddInt32(&inSet, 1) == 1 {
+			deadline := time.Now().Add(250 * time.Millisecond)
+			for atomic.LoadInt32(&inSet) < 2 && time.Now().Before(deadline) {
+				time.Sleep(time.Millisecond)
+			}
+		}
+	}
+	svc.secrets = fake
+
+	var wg sync.WaitGroup
+	errs := make(chan string, 64)
+	for i := 0; i < 4; i++ {
+		for _, kind := range []string{"radarr", "sonarr"} {
+			wg.Add(1)
+			go func(kind string, i int) {
+				defer wg.Done()
+				payload := fmt.Sprintf(`{"base_url":"http://%s-%d:7878","api_key":"key-%s-%d"}`,
+					kind, i, kind, i)
+				req := httptest.NewRequest(http.MethodPut, "/api/settings/arr/"+kind, strings.NewReader(payload))
+				req.SetPathValue("kind", kind)
+				rec := httptest.NewRecorder()
+				svc.handleUpsertArr(rec, req)
+				if rec.Code != http.StatusOK {
+					errs <- fmt.Sprintf("%s #%d = %d: %s", kind, i, rec.Code, rec.Body.String())
+				}
+			}(kind, i)
+		}
+	}
+	wg.Wait()
+	close(errs)
+	for e := range errs {
+		t.Error(e)
+	}
+
+	list := h.listArr()
+	if len(list.Instances) != 2 {
+		t.Fatalf("instances after concurrent upserts = %+v, want both kinds", list.Instances)
+	}
+	seen := map[string]bool{}
+	for _, inst := range list.Instances {
+		if seen[inst.Kind] {
+			t.Fatalf("duplicate instance for %s: %+v", inst.Kind, list.Instances)
+		}
+		seen[inst.Kind] = true
 	}
 }

@@ -140,6 +140,13 @@ func (s *Service) handleList(w http.ResponseWriter, r *http.Request) {
 			MissingTags:      row.Gate.MissingTags,
 			DonorCandidates:  pairDonors(row.TargetPath, patterns),
 		}
+		// Post-approval rows leave the list, but when a donor was persisted
+		// (e.g. re-listing before extraction) the card must agree with it.
+		if row.DonorPath != "" {
+			for i := range item.DonorCandidates {
+				item.DonorCandidates[i].Selected = item.DonorCandidates[i].Path == row.DonorPath
+			}
+		}
 		if item.MatchedTags == nil {
 			item.MatchedTags = []string{}
 		}
@@ -152,7 +159,52 @@ func (s *Service) handleList(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) handleApprove(w http.ResponseWriter, r *http.Request) {
-	s.transition(w, r, "extracting")
+	if s.store == nil || s.store.DB == nil {
+		writeError(w, http.StatusServiceUnavailable, "queue store is not configured")
+		return
+	}
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeError(w, http.StatusBadRequest, "invalid queue id")
+		return
+	}
+
+	// Resolve the donor exactly as the approval card does, then persist it with
+	// the status transition so the extractor never has to re-pair (and never
+	// mistakes the candidate file for the donor).
+	target, err := s.store.ImportCandidateTarget(r.Context(), id)
+	if err != nil {
+		switch {
+		case errors.Is(err, store.ErrImportCandidateNotFound):
+			writeError(w, http.StatusNotFound, "queue item not found")
+		case errors.Is(err, store.ErrImportCandidateState):
+			writeError(w, http.StatusConflict, "queue item is no longer pending approval")
+		default:
+			writeError(w, http.StatusInternalServerError, "could not read the queue item")
+		}
+		return
+	}
+	if strings.TrimSpace(target) == "" {
+		writeError(w, http.StatusConflict, "no matched library target to pair a donor with")
+		return
+	}
+	donors := pairDonors(target, s.donorPatterns(r.Context()))
+	if len(donors) == 0 {
+		writeError(w, http.StatusConflict, "no donor paired: no sibling file matches the donor patterns")
+		return
+	}
+	if err := s.store.SetImportCandidateDonor(r.Context(), id, donors[0].Path); err != nil {
+		switch {
+		case errors.Is(err, store.ErrImportCandidateNotFound):
+			writeError(w, http.StatusNotFound, "queue item not found")
+		case errors.Is(err, store.ErrImportCandidateState):
+			writeError(w, http.StatusConflict, "queue item is no longer pending approval")
+		default:
+			writeError(w, http.StatusInternalServerError, "could not update the queue item")
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, transitionResponse{ID: id, Status: "extracting"})
 }
 
 func (s *Service) handleReject(w http.ResponseWriter, r *http.Request) {

@@ -45,7 +45,12 @@ func (w *Worker) processJob(ctx context.Context, job store.ImportExtractionJob) 
 		}
 	}()
 
-	donor := job.SourceFilePath
+	// The donor is the file selected at approval time; the queue row's
+	// source_file_path is the candidate drop and must never stand in for it.
+	donor := job.DonorPath
+	if strings.TrimSpace(donor) == "" {
+		return fmt.Errorf("extract: job %d: no donor paired", job.ID)
+	}
 	info, err := os.Stat(donor)
 	if err != nil {
 		return fmt.Errorf("extract: donor %s: %w", donor, err)
@@ -173,7 +178,7 @@ func channelLayout(track probe.AudioTrack) string {
 // already removed by SplitExportTracks when excluded.
 func (w *Worker) selectTracks(ctx context.Context, job store.ImportExtractionJob, media *probe.MediaInfo) ([]probe.AudioTrack, error) {
 	if len(media.Tracks) == 0 {
-		return nil, fmt.Errorf("extract: donor %s has no audio tracks", job.SourceFilePath)
+		return nil, fmt.Errorf("extract: donor %s has no audio tracks", job.DonorPath)
 	}
 	policy := settings.LanguagesPolicy{}
 	if w.settings != nil {
@@ -195,7 +200,7 @@ func (w *Worker) selectTracks(ctx context.Context, job store.ImportExtractionJob
 		}
 	}
 	if len(selected) == 0 {
-		return nil, fmt.Errorf("extract: donor %s: no audio track matches the export policy", job.SourceFilePath)
+		return nil, fmt.Errorf("extract: donor %s: no audio track matches the export policy", job.DonorPath)
 	}
 	return selected, nil
 }

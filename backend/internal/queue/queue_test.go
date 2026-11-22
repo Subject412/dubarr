@@ -138,14 +138,23 @@ func (h *harness) seedCandidate(t *testing.T, targetName, gateStatus string, aud
 	return id
 }
 
+var donorName = "Minions and Monsters 2026 PL.DUB.MD.1080p.AMZN.WEB-DL.XviD-MAXX.mp4"
+
+// writeDonor creates the sibling donor the queue pairs with h.media targets.
+func (h *harness) writeDonor(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(h.media, donorName)
+	if err := os.WriteFile(path, []byte("donor"), 0o644); err != nil {
+		t.Fatalf("write donor: %v", err)
+	}
+	return path
+}
+
 func TestListQueuePairsDonorAndExposesGate(t *testing.T) {
 	h := newHarness(t)
 	id := h.seedCandidate(t, "Minions and Monsters (2026) - [ArcA310][Remux-2160p][HDR10][Opus 7.1][AV1][imdb-tt32890033]-FraMeSToR.mkv", "eligible", `["en","pl"]`)
 
-	donor := filepath.Join(h.media, "Minions and Monsters 2026 PL.DUB.MD.1080p.AMZN.WEB-DL.XviD-MAXX.mp4")
-	if err := os.WriteFile(donor, []byte("donor"), 0o644); err != nil {
-		t.Fatalf("write donor: %v", err)
-	}
+	donor := h.writeDonor(t)
 
 	rec := h.request(http.MethodGet, "/api/queue")
 	if rec.Code != http.StatusOK {
@@ -211,17 +220,27 @@ func TestListQueueShowsWaitingForTags(t *testing.T) {
 func TestApproveAndRejectTransitions(t *testing.T) {
 	h := newHarness(t)
 	id := h.seedCandidate(t, "Target [ArcA310].mkv", "eligible", `["en"]`)
+	donor := h.writeDonor(t)
 
 	rec := h.request(http.MethodPost, "/api/queue/"+itoa(id)+"/approve")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("approve = %d, body %s", rec.Code, rec.Body.String())
 	}
-	var status string
-	if err := h.db.QueryRow(`SELECT status FROM import_queue WHERE id = ?`, id).Scan(&status); err != nil {
+	var status, raw string
+	if err := h.db.QueryRow(`SELECT status, COALESCE(parsed_raw_json, '{}') FROM import_queue WHERE id = ?`, id).Scan(&status, &raw); err != nil {
 		t.Fatalf("status: %v", err)
+	}
+	var doc struct {
+		Donor string `json:"donor"`
+	}
+	if err := json.Unmarshal([]byte(raw), &doc); err != nil {
+		t.Fatalf("decode parsed_raw_json: %v", err)
 	}
 	if status != "extracting" {
 		t.Errorf("status after approve = %q, want extracting", status)
+	}
+	if doc.Donor != donor {
+		t.Errorf("persisted donor = %q, want %q", doc.Donor, donor)
 	}
 
 	// The candidate is no longer pending: a second action is a conflict.
@@ -230,6 +249,26 @@ func TestApproveAndRejectTransitions(t *testing.T) {
 	}
 	if rec := h.request(http.MethodPost, "/api/queue/99999/reject"); rec.Code != http.StatusNotFound {
 		t.Errorf("unknown candidate = %d, want 404", rec.Code)
+	}
+}
+
+// TestApproveWithoutDonorStaysPending pins the live failure: an eligible target
+// with no sibling donor must not enter extracting (the extractor would then
+// probe the target file as if it were the donor).
+func TestApproveWithoutDonorStaysPending(t *testing.T) {
+	h := newHarness(t)
+	id := h.seedCandidate(t, "Target [ArcA310].mkv", "eligible", `["en"]`)
+
+	rec := h.request(http.MethodPost, "/api/queue/"+itoa(id)+"/approve")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("approve without donor = %d, want 409, body %s", rec.Code, rec.Body.String())
+	}
+	var status string
+	if err := h.db.QueryRow(`SELECT status FROM import_queue WHERE id = ?`, id).Scan(&status); err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if status != "pending_approval" {
+		t.Errorf("status after rejected approve = %q, want pending_approval", status)
 	}
 }
 

@@ -57,6 +57,58 @@ func queueRow(t *testing.T, s *Store, ctx context.Context, id int64) (status, me
 	return status, message
 }
 
+func TestSetImportCandidateDonor(t *testing.T) {
+	s, ctx, ids := extractionFixture(t, map[string]string{"/w/candidate.mkv": "pending_approval"})
+	id := ids["/w/candidate.mkv"]
+	donor := "/w/Minions PL.DUB 1080p.mkv"
+
+	if err := s.SetImportCandidateDonor(ctx, id, donor); err != nil {
+		t.Fatalf("SetImportCandidateDonor: %v", err)
+	}
+	if status, _ := queueRow(t, s, ctx, id); status != "extracting" {
+		t.Fatalf("status = %q, want extracting", status)
+	}
+	job, ok, err := s.NextImportExtraction(ctx)
+	if err != nil || !ok {
+		t.Fatalf("NextImportExtraction = (ok=%v, err=%v), want a job", ok, err)
+	}
+	if job.DonorPath != donor {
+		t.Errorf("DonorPath = %q, want %q", job.DonorPath, donor)
+	}
+
+	// The transition is one-shot: a row that already left pending_approval
+	// cannot be re-paired.
+	if err := s.SetImportCandidateDonor(ctx, id, "/w/other.mkv"); !errors.Is(err, ErrImportCandidateState) {
+		t.Errorf("second SetImportCandidateDonor error = %v, want ErrImportCandidateState", err)
+	}
+	if err := s.SetImportCandidateDonor(ctx, 4242, donor); !errors.Is(err, ErrImportCandidateNotFound) {
+		t.Errorf("unknown id error = %v, want ErrImportCandidateNotFound", err)
+	}
+	if err := s.SetImportCandidateDonor(ctx, id, "  "); err == nil {
+		t.Error("empty donor path accepted")
+	}
+}
+
+// TestSetImportCandidateDonorPreservesGate pins the additive JSON contract: the
+// donor member is written next to the existing gate verdict.
+func TestSetImportCandidateDonorPreservesGate(t *testing.T) {
+	s, ctx, ids := extractionFixture(t, map[string]string{"/w/candidate.mkv": "pending_approval"})
+	id := ids["/w/candidate.mkv"]
+	if err := s.SetImportCandidateGate(ctx, "/w/candidate.mkv", ImportGateStatus{Status: "eligible", TargetPath: "/media/target.mkv"}); err != nil {
+		t.Fatalf("SetImportCandidateGate: %v", err)
+	}
+	if err := s.SetImportCandidateDonor(ctx, id, "/w/donor PL.DUB.mkv"); err != nil {
+		t.Fatalf("SetImportCandidateDonor: %v", err)
+	}
+	gate, ok, err := s.ImportCandidateGate(ctx, "/w/candidate.mkv")
+	if err != nil || !ok {
+		t.Fatalf("ImportCandidateGate = (ok=%v, err=%v), want the preserved verdict", ok, err)
+	}
+	if gate.Status != "eligible" || gate.TargetPath != "/media/target.mkv" {
+		t.Errorf("gate = %+v, want eligible for /media/target.mkv", gate)
+	}
+}
+
 func TestNextImportExtraction(t *testing.T) {
 	s, ctx, ids := extractionFixture(t, map[string]string{
 		"/w/pending.mkv":     "pending_approval",

@@ -70,6 +70,10 @@ type ImportGateStatus struct {
 // underscore-free name keeps it distinct from arr /api/v3/parse payload keys.
 const gateJSONKey = "gate"
 
+// donorJSONKey is the parsed_raw_json member holding the donor file path
+// selected at approval time. Like gateJSONKey it needs no migration.
+const donorJSONKey = "donor"
+
 // SetImportCandidateGate records the gate classification for sourcePath,
 // preserving any arr parse payload already stored in parsed_raw_json.
 //
@@ -169,6 +173,125 @@ func (s *Store) ImportCandidateGate(ctx context.Context, sourcePath string) (Imp
 	return status, true, nil
 }
 
+// ImportCandidateTarget returns the target path paired with a pending_approval
+// candidate: the gate verdict's target when one was recorded, otherwise the
+// matched arr library row's target. An unknown id reports
+// ErrImportCandidateNotFound and a row that already left pending_approval
+// reports ErrImportCandidateState, so approve cannot pair against a stale row.
+func (s *Store) ImportCandidateTarget(ctx context.Context, id int64) (string, error) {
+	var (
+		status      string
+		raw         sql.NullString
+		cacheTarget sql.NullString
+	)
+	err := s.DB.QueryRowContext(ctx, `
+		SELECT iq.status, iq.parsed_raw_json, alc.target_file_path
+		FROM import_queue iq
+		LEFT JOIN arr_library_cache alc ON alc.id = iq.matched_library_cache_id
+		WHERE iq.id = ?`, id).Scan(&status, &raw, &cacheTarget)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrImportCandidateNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("store: read import candidate %d target: %w", id, err)
+	}
+	if status != "pending_approval" {
+		return "", ErrImportCandidateState
+	}
+	target := cacheTarget.String
+	if payload := strings.TrimSpace(raw.String); raw.Valid && payload != "" && payload != "null" {
+		var doc map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(payload), &doc); err != nil {
+			return "", fmt.Errorf("store: import candidate %d: parsed_raw_json is not a JSON object: %w", id, err)
+		}
+		if blob, ok := doc[gateJSONKey]; ok {
+			var gate ImportGateStatus
+			if err := json.Unmarshal(blob, &gate); err != nil {
+				return "", fmt.Errorf("store: decode import candidate %d gate: %w", id, err)
+			}
+			if gate.TargetPath != "" {
+				target = gate.TargetPath
+			}
+		}
+	}
+	return target, nil
+}
+
+// SetImportCandidateDonor persists the donor selection and moves the candidate
+// from pending_approval to extracting in one transaction.
+//
+// The donor path is stored as a "donor" member inside parsed_raw_json (see
+// gateJSONKey for why no migration is involved), so the extraction worker reads
+// exactly the donor the approval card showed instead of falling back to the
+// candidate file. The conditional status guard means a racing approve/reject
+// cannot attach a donor to a row that already left pending_approval.
+func (s *Store) SetImportCandidateDonor(ctx context.Context, id int64, donorPath string) error {
+	if strings.TrimSpace(donorPath) == "" {
+		return fmt.Errorf("store: import candidate %d: donor path is empty", id)
+	}
+	donorRaw, err := json.Marshal(donorPath)
+	if err != nil {
+		return fmt.Errorf("store: encode import candidate donor: %w", err)
+	}
+
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("store: begin import candidate donor: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op once committed
+
+	var raw sql.NullString
+	err = tx.QueryRowContext(ctx,
+		`SELECT parsed_raw_json FROM import_queue WHERE id = ?`, id).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrImportCandidateNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("store: read import candidate %d: %w", id, err)
+	}
+
+	doc := map[string]json.RawMessage{}
+	if payload := strings.TrimSpace(raw.String); raw.Valid && payload != "" && payload != "null" {
+		if err := json.Unmarshal([]byte(payload), &doc); err != nil {
+			return fmt.Errorf("store: import candidate %d: parsed_raw_json is not a JSON object: %w", id, err)
+		}
+		if doc == nil {
+			doc = map[string]json.RawMessage{}
+		}
+	}
+	doc[donorJSONKey] = donorRaw
+	encoded, err := json.Marshal(doc)
+	if err != nil {
+		return fmt.Errorf("store: encode import candidate donor: %w", err)
+	}
+
+	res, err := tx.ExecContext(ctx,
+		`UPDATE import_queue SET parsed_raw_json = ?, status = 'extracting', updated_at = CURRENT_TIMESTAMP
+		 WHERE id = ? AND status = 'pending_approval'`, string(encoded), id)
+	if err != nil {
+		return fmt.Errorf("store: record import candidate %d donor: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: record import candidate %d donor rows: %w", id, err)
+	}
+	if n != 1 {
+		var status string
+		qerr := tx.QueryRowContext(ctx, `SELECT status FROM import_queue WHERE id = ?`, id).Scan(&status)
+		if errors.Is(qerr, sql.ErrNoRows) {
+			return ErrImportCandidateNotFound
+		}
+		if qerr != nil {
+			return fmt.Errorf("store: read import candidate %d: %w", id, qerr)
+		}
+		return ErrImportCandidateState
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("store: commit import candidate donor: %w", err)
+	}
+	return nil
+}
+
 // ImportCandidateSummary is one pending approval-queue row joined with the
 // matched arr library target and the stored gate verdict. String fields are
 // empty when the candidate has no match or classification yet.
@@ -189,6 +312,9 @@ type ImportCandidateSummary struct {
 	Eligibility      string
 	Gate             ImportGateStatus
 	HasGate          bool
+	// DonorPath is the donor persisted at approval time (empty for rows that
+	// never stored a selection).
+	DonorPath string
 }
 
 // ListPendingImportCandidates returns every donor awaiting approval, newest
@@ -261,6 +387,11 @@ func (s *Store) ListPendingImportCandidates(ctx context.Context) ([]ImportCandid
 					c.Eligibility = c.Gate.Status
 				}
 			}
+			if blob, ok := doc[donorJSONKey]; ok {
+				if err := json.Unmarshal(blob, &c.DonorPath); err != nil {
+					return nil, fmt.Errorf("store: decode import candidate %d donor: %w", c.ID, err)
+				}
+			}
 		}
 		if c.Eligibility == "" {
 			c.Eligibility = "missing_target"
@@ -319,6 +450,10 @@ type ImportExtractionJob struct {
 	FileSize         int64
 	SelectedExports  string
 	OriginalLanguage string
+	// DonorPath is the donor file persisted by the approval step. The worker
+	// extracts from it; an empty value is a row that was never paired and must
+	// not fall back to SourceFilePath.
+	DonorPath string
 	// Match metadata from arr_library_cache (media_type is "movie" or
 	// "episode"; empty when the donor has no matched target).
 	Title         string
@@ -336,12 +471,12 @@ type ImportExtractionJob struct {
 func (s *Store) NextImportExtraction(ctx context.Context) (ImportExtractionJob, bool, error) {
 	var (
 		job                               ImportExtractionJob
-		orig, title, mediaType            sql.NullString
+		orig, title, mediaType, raw       sql.NullString
 		year, tmdb, tvdb, season, episode sql.NullInt64
 	)
 	err := s.DB.QueryRowContext(ctx, `
 		SELECT iq.id, iq.source_file_path, iq.filename, iq.file_size,
-		       iq.selected_exports_json, alc.original_language_iso2,
+		       iq.selected_exports_json, iq.parsed_raw_json, alc.original_language_iso2,
 		       alc.title, alc.media_type, alc.year, alc.tmdb_id, alc.tvdb_id,
 		       alc.season_number, alc.episode_number
 		FROM import_queue iq
@@ -349,13 +484,24 @@ func (s *Store) NextImportExtraction(ctx context.Context) (ImportExtractionJob, 
 		WHERE iq.status = 'extracting'
 		ORDER BY iq.created_at, iq.id
 		LIMIT 1`).Scan(&job.ID, &job.SourceFilePath, &job.Filename, &job.FileSize,
-		&job.SelectedExports, &orig, &title, &mediaType, &year, &tmdb, &tvdb,
+		&job.SelectedExports, &raw, &orig, &title, &mediaType, &year, &tmdb, &tvdb,
 		&season, &episode)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ImportExtractionJob{}, false, nil
 	}
 	if err != nil {
 		return ImportExtractionJob{}, false, fmt.Errorf("store: next import extraction: %w", err)
+	}
+	if payload := strings.TrimSpace(raw.String); raw.Valid && payload != "" && payload != "null" {
+		var doc map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(payload), &doc); err != nil {
+			return ImportExtractionJob{}, false, fmt.Errorf("store: next import extraction %d: parsed_raw_json is not a JSON object: %w", job.ID, err)
+		}
+		if blob, ok := doc[donorJSONKey]; ok {
+			if err := json.Unmarshal(blob, &job.DonorPath); err != nil {
+				return ImportExtractionJob{}, false, fmt.Errorf("store: next import extraction %d: decode donor: %w", job.ID, err)
+			}
+		}
 	}
 	job.OriginalLanguage = orig.String
 	job.Title = title.String

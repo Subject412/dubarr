@@ -164,22 +164,36 @@ func newHarness(t *testing.T) *harness {
 	return &harness{t: t, ctx: context.Background(), db: st, data: dir, work: filepath.Join(dir, "work"), worker: w}
 }
 
-// seedExtracting registers a donor and moves it to the extracting state,
-// returning its queue id.
+// seedExtracting registers a donor, pairs it with itself and moves it to the
+// extracting state, returning its queue id.
 func (h *harness) seedExtracting(sourcePath string) int64 {
+	h.t.Helper()
+	return h.seedApproved(sourcePath, sourcePath)
+}
+
+// seedApproved registers a candidate whose persisted donor is donorPath, then
+// moves it to extracting. An empty donorPath marks the row extracting without a
+// stored donor (the never-paired state).
+func (h *harness) seedApproved(sourcePath, donorPath string) int64 {
 	h.t.Helper()
 	created, err := h.db.RecordImportCandidate(h.ctx, sourcePath, filepath.Base(sourcePath), 1)
 	if err != nil || !created {
 		h.t.Fatalf("RecordImportCandidate: created=%v err=%v", created, err)
 	}
-	if _, err := h.db.DB.ExecContext(h.ctx,
-		`UPDATE import_queue SET status = 'extracting' WHERE source_file_path = ?`, sourcePath); err != nil {
-		h.t.Fatalf("mark extracting: %v", err)
-	}
 	var id int64
 	if err := h.db.DB.QueryRowContext(h.ctx,
 		`SELECT id FROM import_queue WHERE source_file_path = ?`, sourcePath).Scan(&id); err != nil {
 		h.t.Fatalf("queue id: %v", err)
+	}
+	if donorPath != "" {
+		if err := h.db.SetImportCandidateDonor(h.ctx, id, donorPath); err != nil {
+			h.t.Fatalf("SetImportCandidateDonor: %v", err)
+		}
+		return id
+	}
+	if _, err := h.db.DB.ExecContext(h.ctx,
+		`UPDATE import_queue SET status = 'extracting' WHERE id = ?`, id); err != nil {
+		h.t.Fatalf("mark extracting: %v", err)
 	}
 	return id
 }
@@ -377,6 +391,47 @@ func TestExtractionFailsOnMissingDonor(t *testing.T) {
 	status, msg := h.status(id)
 	if status != "failed" || !strings.Contains(msg, "no such file") {
 		t.Fatalf("status = %q err %q, want failed mentioning the missing donor", status, msg)
+	}
+	if _, err := os.Stat(h.stagingDir(id)); !os.IsNotExist(err) {
+		t.Fatalf("staging dir present after missing donor (stat err = %v)", err)
+	}
+}
+
+func TestExtractionUsesPersistedDonor(t *testing.T) {
+	h := newHarness(t)
+	donor := buildDonor(t, t.TempDir(), "Approved Donor PL.DUB.mkv", "pol", "eng")
+	// The queue's source_file_path is an unrelated drop; only the persisted
+	// donor may be probed and extracted.
+	candidate := filepath.Join(t.TempDir(), "candidate.mkv")
+	id := h.seedApproved(candidate, donor)
+
+	processed, err := h.worker.ProcessOnce(h.ctx)
+	if err != nil || !processed {
+		t.Fatalf("ProcessOnce = (%v, %v), want (true, nil)", processed, err)
+	}
+	if status, msg := h.status(id); status != "completed" || msg != "" {
+		t.Fatalf("status = %q err %q, want completed with no error", status, msg)
+	}
+	if h.stagedByLang(id, ".pl.") == "" || h.stagedByLang(id, ".en.") == "" {
+		t.Error("expected the persisted donor's pl and en tracks to be staged")
+	}
+}
+
+// TestExtractionFailsWithoutPersistedDonor pins the live bug: a row that was
+// never paired must fail loudly instead of probing the candidate file (which
+// here is a perfectly valid donor, so a fallback would wrongly succeed).
+func TestExtractionFailsWithoutPersistedDonor(t *testing.T) {
+	h := newHarness(t)
+	candidate := buildDonor(t, t.TempDir(), "Looks Like A Donor PL.DUB.mkv", "pol", "eng")
+	id := h.seedApproved(candidate, "")
+
+	processed, err := h.worker.ProcessOnce(h.ctx)
+	if err != nil || !processed {
+		t.Fatalf("ProcessOnce = (%v, %v), want (true, nil)", processed, err)
+	}
+	status, msg := h.status(id)
+	if status != "failed" || !strings.Contains(msg, "no donor paired") {
+		t.Fatalf("status = %q err %q, want failed with \"no donor paired\"", status, msg)
 	}
 	if _, err := os.Stat(h.stagingDir(id)); !os.IsNotExist(err) {
 		t.Fatalf("staging dir present after missing donor (stat err = %v)", err)

@@ -63,6 +63,14 @@ Full acceptance pass: container zero-env build+start, wizard creates admin + per
 
 ## Milestones 2–5 (outline; detailed tasks drafted at each gate)
 - M2: arr clients (mock-first) + watch scanner + ffprobe/ISO-2 + Tdarr Gate eligibility + Approval Queue UI. Acceptance: donor drop → approval card pre-selected; eligible vs waiting_for_tags.
+
+### M2 tasks (drafted at gate, 2026-11-22)
+- M2-1 — Mock-first arr integration: `internal/arr` client interface (Radarr + Sonarr REST v3) with a mock server implementation (ADR-0007); real client behind the same interface; table-driven tests against mocks (list series/movies, quality profiles, paths, test-connection). No live keys in tests.
+- M2-2 — Arr settings + key storage: base URLs + API keys stored via `internal/secrets` (UI-only entry, never env/chat); settings CRUD + connection-test endpoint; per-arr enabled flag.
+- M2-3 — Watch scanner: `internal/watch` periodic scan (10s default, settled), detects new media files in configured roots (canonicalized paths, symlink-confined), debounces, registers candidates in DB.
+- M2-4 — ffprobe probe + ISO-639-2: probe target/donor audio tracks (codec, channels, language tags) via ffprobe; map language names/codes to ISO-639-2; cache probe results per file (mtime-keyed).
+- M2-5 — Tdarr Gate eligibility: `[ArcA310]` tag gate (settled; force-override OFF): tag-eligible vs waiting_for_tags classification on candidates; rule-based export policy (policy tracks default, extras opt-in — settled).
+- M2-6 — Approval Queue: backend queue API + frontend queue UI; donor drop → approval card pre-selected (target + matched donor, languages, eligibility badge); approve/reject actions (no mux in M2 — approval only).
 - M3: approve → lossless extraction → validated .mka → atomic immutable Vault (0444) + Vault UI. Acceptance: .{iso2}.mka + sha256 + zero staging leftovers.
 - M4: Rust dubarr-sync + Copy-on-Work + Reference Language Resolver + checkpoints + drift regression. Acceptance: cargo/go tests 100%; Vault byte-identical (RO-mount); accurate same-lang & lowpass reports.
 - M5: Sync Studio + tag-gated atomic mux + arr Rescan. Acceptance: Shrek end-to-end; Minions fails loudly if ambiguous; zero vault/video modification, zero untagged mux, zero secret leaks.

@@ -15,7 +15,7 @@ use crate::{SyncError, MIN_SLICE_SAMPLES};
 pub struct Analysis {
     /// `t_target - t_donor` in samples (positive delays the donor).
     pub offset_samples: i64,
-    /// Normalized correlation coefficient at the peak, clamped to `0..=1`.
+    /// Peak prominence over the median lag response, clamped to `0..=1`.
     pub quality: f32,
 }
 
@@ -57,7 +57,8 @@ fn energy(prefix: &[f64], start: usize, len: usize) -> f64 {
 /// Correlate a target slice against a donor slice sampled at the same rate.
 ///
 /// `window_sec` bounds the absolute offset searched. The returned quality is the
-/// normalized cross-correlation coefficient at the best lag (`0.0..=1.0`).
+/// peak's prominence over the median lag response (`0.0..=1.0`), see
+/// [`peak_prominence`].
 pub fn analyze(
     target: &[f32],
     donor: &[f32],
@@ -129,6 +130,7 @@ pub fn analyze(
     let min_overlap = 16.max(nx.min(ny) / 20);
 
     let mut best: Option<(i64, f64)> = None;
+    let mut scores: Vec<f64> = Vec::new();
     for lag in -(max_lag as i64)..=(max_lag as i64) {
         let (count, x_start, y_start) = if lag >= 0 {
             let l = lag as usize;
@@ -151,6 +153,7 @@ pub fn analyze(
             continue;
         }
         let ncc = (raw / denom).clamp(-1.0, 1.0);
+        scores.push(ncc);
         match best {
             None => best = Some((lag, ncc)),
             Some((_, current)) if ncc > current => best = Some((lag, ncc)),
@@ -159,8 +162,41 @@ pub fn analyze(
     }
 
     let (offset_samples, peak) = best.ok_or(SyncError::NoValidLag)?;
+    let quality = peak_prominence(peak, &scores);
     Ok(Analysis {
         offset_samples,
-        quality: peak.max(0.0) as f32,
+        quality,
     })
+}
+
+/// Peak prominence of the normalized cross-correlation function, in `0..=1`.
+///
+/// `quality = (peak - median) / (1 - median)`, clamped to `0..=1`, where
+/// `median` is the median NCC over every scored lag. This is scale-invariant
+/// (NCC already removes gain) and layout-independent: the median is a robust
+/// baseline that does not move with the number of searched lags, so a longer
+/// slice or a wider search window cannot inflate or deflate the score.
+///
+/// Two natural-looking alternatives were measured on the golden fixtures and
+/// rejected: `(peak - median) / (peak - min)` pins pure noise near 0.5 because
+/// a symmetric noise distribution has `min ~= -peak` (measured 0.505 on white
+/// noise vs 0.71..0.86 on clean alignment), and `peak / mean_of_rest` is
+/// unbounded and explodes because the mean of unrelated lags is ~0 (measured
+/// magnitudes of 1e3..1e5, with unstable sign). The chosen form separates the
+/// fixtures cleanly: white noise 0.02, structured-but-unrelated 0.42, clean
+/// alignment 0.80..1.00, and 6 dB SNR speech 0.80.
+fn peak_prominence(peak: f64, scores: &[f64]) -> f32 {
+    if scores.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = scores.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = sorted[sorted.len() / 2];
+    let headroom = 1.0 - median;
+    let prominence = if headroom <= 1e-12 {
+        0.0
+    } else {
+        (peak - median) / headroom
+    };
+    prominence.clamp(0.0, 1.0) as f32
 }

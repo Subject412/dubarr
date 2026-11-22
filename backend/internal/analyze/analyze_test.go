@@ -72,7 +72,7 @@ func requireEngine(t *testing.T) Engine {
 	if builtBinary == "" {
 		t.Skip("dubarr-sync binary not built")
 	}
-	r, err := sync.New(builtBinary)
+	r, err := sync.New(builtBinary, sync.WithTimeout(JobTimeout(DefaultConfig())))
 	if err != nil {
 		t.Fatalf("sync.New: %v", err)
 	}
@@ -282,14 +282,14 @@ func TestAnalyzeVerdictPrecedence(t *testing.T) {
 		{
 			name:        "single weak checkpoint is unreliable",
 			offsets:     stable,
-			qualities:   []float64{hi, hi, 0.2, hi, hi, hi},
+			qualities:   []float64{hi, hi, 0.05, hi, hi, hi},
 			wantVerdict: VerdictUnreliable, wantClass: ClassificationUnreliable,
 			wantMaxDriftMS: 15,
 		},
 		{
 			name:        "unreliable outranks drifting",
 			offsets:     drifting,
-			qualities:   []float64{hi, hi, 0.1, hi, hi, hi},
+			qualities:   []float64{hi, hi, 0.02, hi, hi, hi},
 			wantVerdict: VerdictUnreliable, wantClass: ClassificationUnreliable,
 			wantMaxDriftMS: 1500,
 		},

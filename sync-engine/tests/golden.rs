@@ -96,3 +96,42 @@ fn stereo_target_is_mixed_down() {
     .to_string();
     assert_offset(&payload, 1_000.0, 2.0, 0.4);
 }
+
+#[test]
+fn unrelated_noise_is_low_quality() {
+    // Two independent white-noise programmes share no structure, so the NCC has
+    // no true peak: the peak-prominence metric must stay near zero even though
+    // some lag is always "the best". This guards the M4 semantics change from
+    // the raw coefficient (which could read high on a lucky noise peak).
+    let dir = TempDir::new("garbage");
+    let sr = 8_000u32;
+    let mut rng_t = common::Lcg::new(0x1111_1111);
+    let mut rng_d = common::Lcg::new(0x2222_2222);
+    let target: Vec<f32> = (0..20 * sr as usize)
+        .map(|_| rng_t.next_f32() * 0.5)
+        .collect();
+    let donor: Vec<f32> = (0..20 * sr as usize)
+        .map(|_| rng_d.next_f32() * 0.5)
+        .collect();
+    let target_path = dir.path().join("target.wav");
+    let donor_path = dir.path().join("donor.wav");
+    common::write_wav_mono_i16(&target_path, sr, &target);
+    common::write_wav_mono_i16(&donor_path, sr, &donor);
+    let payload = serde_json::json!({
+        "target": { "path": target_path },
+        "donor": { "path": donor_path },
+        "slice_start_sec": 5.0,
+        "slice_len_sec": 10.0,
+        "window_sec": 5.0,
+    })
+    .to_string();
+    let output = common::run_cli(&payload);
+    assert!(output.status.success());
+    let json = stdout_json(&output);
+    let quality = json["correlation_quality"].as_f64().expect("quality");
+    println!("white-noise quality={quality:.3}");
+    assert!(
+        quality <= 0.10,
+        "unrelated noise quality {quality:.3} must stay in the garbage band"
+    );
+}

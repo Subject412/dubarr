@@ -29,6 +29,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"time"
 
 	"github.com/Subject412/dubarr/backend/internal/probe"
 	"github.com/Subject412/dubarr/backend/internal/reflang"
@@ -61,13 +62,52 @@ var DefaultCheckpointPositionsPct = []int{10, 25, 40, 55, 70, 85}
 const StableSpreadThresholdMS = 40.0
 
 // LowQualityThreshold is the correlation_quality floor below which a
-// checkpoint is not trusted. IDEA.md specifies no threshold for
-// correlation_quality, so 0.25 is an implementation choice: peaks that weak
-// are barely distinguishable from noise. Offsets beyond the searchable window
-// surface as boundary peaks with degraded quality, so a low-quality
-// checkpoint is usually a non-match rather than a real offset and yields
-// [VerdictUnreliable].
-const LowQualityThreshold = 0.25
+// checkpoint is not trusted. correlation_quality is now the peak's prominence
+// over the median lag response ((peak-median)/(1-median)), not the raw NCC
+// coefficient: measured on the acceptance fixtures it is 0.14..0.55 for real
+// same-language podcast/dub material (Shrek, 2160p remux vs 1080p WEB-DL) and
+// 0.02 for unrelated white noise, while the synthetic clean goldens sit at
+// 0.80..1.00. 0.10 is chosen to sit clearly above the noise band while leaving
+// headroom below the weakest genuine checkpoint; the former 0.25 was tuned for
+// the raw coefficient and rejected valid real-world matches. A low-quality
+// checkpoint is still treated as a non-match rather than a real offset and
+// yields [VerdictUnreliable].
+const LowQualityThreshold = 0.10
+
+// Per-job engine timeout. One correlation job scans the whole widened slice
+// (190 s with the settled defaults), which is far longer than sync.Runner's
+// 30 s default: the engine must decode and correlate every lag at the source
+// rate. The budget therefore scales with the slice instead of using one fixed
+// value.
+const (
+	// JobTimeoutBaseMS is the fixed setup/startup allowance per job.
+	JobTimeoutBaseMS = 30_000
+	// JobTimeoutPer10SecMS adds one second per ten seconds of analysed slice.
+	JobTimeoutPer10SecMS = 1_000
+	// MinJobTimeoutMS floors the derived budget so short slices and debug
+	// builds (unoptimised correlation) still fit comfortably.
+	MinJobTimeoutMS = 120_000
+)
+
+// DefaultJobTimeout returns the per-checkpoint engine budget for a slice of
+// sliceLenSec: JobTimeoutBaseMS + one second per ten seconds, floored at
+// MinJobTimeoutMS. With the settled 190 s slice this is 120 s.
+func DefaultJobTimeout(sliceLenSec float64) time.Duration {
+	ms := JobTimeoutBaseMS + int(math.Ceil(sliceLenSec/10))*JobTimeoutPer10SecMS
+	if ms < MinJobTimeoutMS {
+		ms = MinJobTimeoutMS
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+// JobTimeout is the effective per-checkpoint budget for cfg: the explicit
+// [Config.JobTimeout] when set, otherwise [DefaultJobTimeout] for cfg's slice.
+func JobTimeout(cfg Config) time.Duration {
+	if cfg.JobTimeout > 0 {
+		return cfg.JobTimeout
+	}
+	return DefaultJobTimeout(searchWindowSec(cfg))
+}
 
 // Verdicts reported to the sync job status and consumed by M5.
 const (
@@ -96,6 +136,10 @@ type Config struct {
 	CheckpointPositionsPct []int `json:"checkpoint_positions_pct"`
 	CheckpointWindowSec    int   `json:"checkpoint_window_sec"`
 	MaxOffsetSec           int   `json:"max_offset_sec"`
+	// JobTimeout bounds one engine job per checkpoint. Zero selects
+	// [DefaultJobTimeout] for the analysed slice; callers that construct a
+	// sync.Runner should pass the same value via sync.WithTimeout.
+	JobTimeout time.Duration `json:"-"`
 }
 
 // DefaultConfig returns the settled sync.defaults checkpoint policy.
@@ -174,6 +218,11 @@ type Report struct {
 // at the 150 s checkpoint window could never report an offset near the ±180 s
 // bound and [VerdictOutOfRange] would be unreachable. WindowSec is set to the
 // actual slice length, so the engine searches the whole analysed slice.
+//
+// Each checkpoint runs with its own deadline, [JobTimeout] (120 s for the
+// settled slice, or [Config.JobTimeout] when set). A sync.Runner built for the
+// production chain must use the same value through sync.WithTimeout: the
+// runner's own default is shorter than a 190 s correlation job.
 func Analyze(ctx context.Context, engine Engine, cfg Config, req Request) (Report, error) {
 	if engine == nil {
 		return Report{}, fmt.Errorf("analyze: nil engine")
@@ -226,7 +275,9 @@ func Analyze(ctx context.Context, engine Engine, cfg Config, req Request) (Repor
 			SliceLenSec:   length,
 			WindowSec:     &search,
 		}
-		result, err := engine.Run(ctx, job)
+		jobCtx, cancel := context.WithTimeout(ctx, JobTimeout(cfg))
+		result, err := engine.Run(jobCtx, job)
+		cancel()
 		if err != nil {
 			return Report{}, fmt.Errorf("analyze: checkpoint %d%%: %w", pct, err)
 		}

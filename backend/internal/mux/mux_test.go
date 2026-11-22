@@ -129,15 +129,60 @@ func videoStreamHash(t *testing.T, path string) string {
 	return got
 }
 
+// tempLeftovers lists scratch files of the form <target>.<tag>-<rand>.tmp still
+// sitting beside target. The match is a plain prefix/suffix comparison on the
+// directory entry names, never a glob: the target base legitimately contains
+// glob metacharacters (e.g. the Tdarr marker "[TDARR]"), so a Glob pattern
+// built from it matches nothing and the check silently passes.
+func tempLeftovers(target string) ([]string, error) {
+	dir, base := filepath.Dir(target), filepath.Base(target)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	prefix, suffix := base+".", ".tmp"
+	var matches []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if name := e.Name(); strings.HasPrefix(name, prefix) && strings.HasSuffix(name, suffix) {
+			matches = append(matches, filepath.Join(dir, name))
+		}
+	}
+	return matches, nil
+}
+
 // noTempsLeft fails when any *.dubarr*.tmp scratch file survived beside target.
 func noTempsLeft(t *testing.T, target string) {
 	t.Helper()
-	matches, err := filepath.Glob(target + ".*.tmp")
+	matches, err := tempLeftovers(target)
 	if err != nil {
-		t.Fatalf("glob temps: %v", err)
+		t.Fatalf("list temps: %v", err)
 	}
 	if len(matches) > 0 {
 		t.Errorf("leftover temp files: %v", matches)
+	}
+}
+
+// TestTempLeftoversCatchesSeededScratch guards the check above from going dead
+// again: a seeded scratch file next to a "[TDARR]" target must be reported.
+func TestTempLeftoversCatchesSeededScratch(t *testing.T) {
+	h := newHarness(t)
+	if got, err := tempLeftovers(h.target); err != nil || len(got) != 0 {
+		t.Fatalf("tempLeftovers on clean dir = %v, %v; want none", got, err)
+	}
+
+	leftover := h.target + ".dubarr-0123456789abcdef.tmp"
+	if err := os.WriteFile(leftover, []byte("stale"), 0o644); err != nil {
+		t.Fatalf("seed leftover temp: %v", err)
+	}
+	got, err := tempLeftovers(h.target)
+	if err != nil {
+		t.Fatalf("tempLeftovers: %v", err)
+	}
+	if len(got) != 1 || got[0] != leftover {
+		t.Fatalf("tempLeftovers = %v, want [%s]", got, leftover)
 	}
 }
 

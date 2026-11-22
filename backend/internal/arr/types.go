@@ -26,6 +26,8 @@ type Movie struct {
 	Monitored        bool     `json:"monitored"`
 	HasFile          bool     `json:"hasFile"`
 	OriginalLanguage Language `json:"originalLanguage"`
+	// MovieFile is the imported file, nil when HasFile is false.
+	MovieFile *MediaFile `json:"movieFile"`
 }
 
 // Series is the subset of a Sonarr /api/v3/series record Dubarr needs.
@@ -38,6 +40,9 @@ type Series struct {
 	FolderName       string `json:"folderName"`
 	QualityProfileID int    `json:"qualityProfileId"`
 	Monitored        bool   `json:"monitored"`
+	// OriginalLanguage is the series' original audio language (Sonarr v4 /
+	// v3 API returns it on the series object); empty when the instance omits it.
+	OriginalLanguage Language `json:"originalLanguage"`
 }
 
 // QualityProfile is a named quality profile from /api/v3/qualityprofile.

@@ -1,0 +1,530 @@
+package arrsync
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/Subject412/dubarr/backend/internal/arr"
+	"github.com/Subject412/dubarr/backend/internal/arr/arrmock"
+	"github.com/Subject412/dubarr/backend/internal/secrets"
+	"github.com/Subject412/dubarr/backend/internal/settings"
+	"github.com/Subject412/dubarr/backend/internal/store"
+)
+
+// rig is one appliance data dir with settings, secrets and the real store.
+type rig struct {
+	t        *testing.T
+	store    *store.Store
+	settings *settings.Store
+	secrets  *secrets.Service
+}
+
+func newRig(t *testing.T) *rig {
+	t.Helper()
+	dir := t.TempDir()
+	st, err := store.Open(dir)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	settingsStore := settings.New(st.DB)
+	if err := settingsStore.Seed(context.Background(), dir); err != nil {
+		t.Fatalf("seed settings: %v", err)
+	}
+	sec, err := secrets.Open(st, secrets.Options{DataDir: dir})
+	if err != nil {
+		t.Fatalf("secrets.Open: %v", err)
+	}
+	return &rig{t: t, store: st, settings: settingsStore, secrets: sec}
+}
+
+// configure stores the arr.connections section.
+func (r *rig) configure(conns ...settings.ArrConnection) {
+	r.t.Helper()
+	raw, err := json.Marshal(settings.ArrConnections{Instances: conns})
+	if err != nil {
+		r.t.Fatalf("marshal connections: %v", err)
+	}
+	if err := r.settings.Set(r.context(), settings.KeyArrConnections, raw); err != nil {
+		r.t.Fatalf("set connections: %v", err)
+	}
+}
+
+// context returns the test context; the rig is per-test and never cancelled.
+func (r *rig) context() context.Context { return context.Background() }
+
+// key stores the API key the secret store hands the poller for one kind.
+func (r *rig) key(kind, apiKey string) {
+	r.t.Helper()
+	if err := r.secrets.Set("arr."+kind+".api_key", apiKey); err != nil {
+		r.t.Fatalf("store secret %s: %v", kind, err)
+	}
+}
+
+func (r *rig) newPoller(interval time.Duration) *Poller {
+	r.t.Helper()
+	p, err := New(Deps{
+		Store:    r.store,
+		Settings: r.settings,
+		Secrets:  r.secrets,
+		Interval: interval,
+		Timeout:  2 * time.Second,
+		Logf:     r.t.Logf,
+	})
+	if err != nil {
+		r.t.Fatalf("New: %v", err)
+	}
+	return p
+}
+
+// radarrServer starts a fake Radarr holding one tagged and one fileless movie.
+func radarrServer(t *testing.T) *arrmock.Server {
+	t.Helper()
+	srv := arrmock.New(arrmock.Radarr, "key-radarr", arrmock.Fixtures{
+		Movies: []arrmock.Movie{
+			{
+				ID: 7, Title: "Shrek", Year: 2001, TmdbID: 808, HasFile: true,
+				Path:             "/media/movies/Shrek (2001)",
+				OriginalLanguage: arrmock.Language{ID: 1, Name: "English"},
+				MovieFile: &arrmock.MovieFile{
+					ID: 3, MovieID: 7,
+					RelativePath: "Shrek (2001) [ArcA310].mkv",
+					Path:         "/media/movies/Shrek (2001)/Shrek (2001) [ArcA310].mkv",
+				},
+			},
+			{
+				ID: 9, Title: "Minions", Year: 2015, TmdbID: 211672, HasFile: false,
+				Path:             "/media/movies/Minions (2015)",
+				OriginalLanguage: arrmock.Language{ID: 1, Name: "English"},
+			},
+		},
+	})
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// sonarrServer starts a fake Sonarr holding one tagged episode, one untagged
+// episode and one fileless episode.
+func sonarrServer(t *testing.T) *arrmock.Server {
+	t.Helper()
+	srv := arrmock.New(arrmock.Sonarr, "key-sonarr", arrmock.Fixtures{
+		Series: []arrmock.Series{
+			{ID: 3, Title: "The Expanse", Year: 2015, TvdbID: 280619,
+				Path: "/media/tv/The Expanse", OriginalLanguage: arrmock.Language{ID: 2, Name: "English"}},
+		},
+		Episodes: []arrmock.Episode{
+			{
+				ID: 42, SeriesID: 3, SeasonNumber: 1, EpisodeNumber: 1, Title: "Dulcinea", HasFile: true,
+				EpisodeFile: &arrmock.EpisodeFile{
+					ID: 7, SeriesID: 3, SeasonNumber: 1,
+					Path: "/media/tv/The Expanse/Season 01/S01E01 [ArcA310].mkv",
+				},
+			},
+			{
+				ID: 43, SeriesID: 3, SeasonNumber: 1, EpisodeNumber: 2, Title: "The Big Empty", HasFile: true,
+				EpisodeFile: &arrmock.EpisodeFile{
+					ID: 8, SeriesID: 3, SeasonNumber: 1,
+					Path: "/media/tv/The Expanse/Season 01/S01E02.mkv",
+				},
+			},
+			{ID: 44, SeriesID: 3, SeasonNumber: 1, EpisodeNumber: 3, Title: "Remember the Cant"},
+		},
+	})
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestSyncCachesMoviesAndEpisodes is the M6-1 acceptance path: one pass caches
+// Radarr movies and Sonarr episodes with resolved target paths and gate
+// verdicts, and creates the arr_instances rows the cache points at.
+func TestSyncCachesMoviesAndEpisodes(t *testing.T) {
+	r := newRig(t)
+	radarr := radarrServer(t)
+	sonarr := sonarrServer(t)
+	r.configure(
+		settings.ArrConnection{Kind: "radarr", BaseURL: radarr.URL, Enabled: true},
+		settings.ArrConnection{Kind: "sonarr", BaseURL: sonarr.URL, Enabled: true},
+	)
+	r.key("radarr", radarr.APIKey())
+	r.key("sonarr", sonarr.APIKey())
+
+	p := r.newPoller(time.Minute)
+	stats, err := p.Sync(context.Background())
+	if err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if stats.Instances != 2 || stats.Failed != 0 {
+		t.Fatalf("stats = %+v, want 2 instances", stats)
+	}
+	if stats.Inserted != 5 {
+		t.Fatalf("inserted = %d, want 5 (2 movies + 3 episodes), stats %+v", stats.Inserted, stats)
+	}
+
+	rows := readCache(t, r.store)
+	if len(rows) != 5 {
+		t.Fatalf("cache rows = %d, want 5", len(rows))
+	}
+
+	shrek := rows["movie|7"]
+	if shrek.MediaType != "movie" || shrek.SeriesID != 0 || shrek.Title != "Shrek" ||
+		shrek.Year != 2001 || shrek.TMDBID != 808 || shrek.OriginalLanguageISO2 != "en" {
+		t.Errorf("shrek row = %+v", shrek)
+	}
+	if shrek.TargetFilePath != "/media/movies/Shrek (2001)/Shrek (2001) [ArcA310].mkv" ||
+		!shrek.MatchesTargetTags || shrek.EligibilityStatus != "eligible" {
+		t.Errorf("shrek target/gate = %q %v %q", shrek.TargetFilePath, shrek.MatchesTargetTags, shrek.EligibilityStatus)
+	}
+
+	minions := rows["movie|9"]
+	if minions.TargetFilePath != "" || minions.MatchesTargetTags || minions.EligibilityStatus != "missing_target" {
+		t.Errorf("fileless movie = %+v", minions)
+	}
+
+	taggedEpisode := rows["episode|42"]
+	if taggedEpisode.SeriesID != 3 || taggedEpisode.TVDBID != 280619 || taggedEpisode.SeasonNumber == nil ||
+		*taggedEpisode.SeasonNumber != 1 || taggedEpisode.EpisodeNumber == nil || *taggedEpisode.EpisodeNumber != 1 ||
+		taggedEpisode.EpisodeTitle != "Dulcinea" || taggedEpisode.Year != 2015 {
+		t.Errorf("episode row = %+v", taggedEpisode)
+	}
+	if !taggedEpisode.MatchesTargetTags || taggedEpisode.EligibilityStatus != "eligible" {
+		t.Errorf("tagged episode gate = %v/%q", taggedEpisode.MatchesTargetTags, taggedEpisode.EligibilityStatus)
+	}
+
+	untagged := rows["episode|43"]
+	if untagged.MatchesTargetTags || untagged.EligibilityStatus != "waiting_for_tags" {
+		t.Errorf("untagged episode gate = %v/%q", untagged.MatchesTargetTags, untagged.EligibilityStatus)
+	}
+
+	fileless := rows["episode|44"]
+	if fileless.TargetFilePath != "" || fileless.EligibilityStatus != "missing_target" {
+		t.Errorf("fileless episode = %+v", fileless)
+	}
+
+	// arr_instances rows exist, are enabled, carry an encrypted key and record
+	// the pass.
+	for kind, id := range map[string]int64{"radarr": rows["movie|7"].InstanceID, "sonarr": rows["episode|42"].InstanceID} {
+		var (
+			baseURL   string
+			enc       []byte
+			enabled   bool
+			lastSync  *string
+			last4     string
+			instances int
+		)
+		if err := r.store.DB.QueryRow(
+			`SELECT base_url, api_key_enc, enabled, last_sync_at, api_key_last4
+			 FROM arr_instances WHERE id = ?`, id).
+			Scan(&baseURL, &enc, &enabled, &lastSync, &last4); err != nil {
+			t.Fatalf("read %s instance: %v", kind, err)
+		}
+		if baseURL == "" || len(enc) == 0 || !enabled {
+			t.Errorf("%s instance row = %q enc=%d enabled=%v", kind, baseURL, len(enc), enabled)
+		}
+		if last4 == "" || lastSync == nil || *lastSync == "" {
+			t.Errorf("%s instance last4/last_sync = %q/%v", kind, last4, lastSync)
+		}
+		if err := r.store.DB.QueryRow(`SELECT COUNT(*) FROM arr_instances WHERE type = ?`, kind).Scan(&instances); err != nil {
+			t.Fatalf("count %s instances: %v", kind, err)
+		}
+		if instances != 1 {
+			t.Errorf("%s instance rows = %d, want 1", kind, instances)
+		}
+	}
+
+	// A second pass is a no-op: everything is unchanged and no id moves.
+	ids := cacheIDs(t, r.store)
+	stats, err = p.Sync(context.Background())
+	if err != nil {
+		t.Fatalf("second Sync: %v", err)
+	}
+	if stats.Unchanged != 5 || stats.Inserted != 0 || stats.Updated != 0 || stats.Deleted != 0 {
+		t.Fatalf("second pass stats = %+v, want 5 unchanged", stats)
+	}
+	for key, id := range cacheIDs(t, r.store) {
+		if ids[key] != id {
+			t.Errorf("row %s id = %d, want %d (stable ids)", key, id, ids[key])
+		}
+	}
+}
+
+// TestSyncSkipsDisabledInstancesAndMissingKeys documents the enable gate: a
+// disabled connection is never contacted, and an enabled instance without a
+// stored key fails alone instead of aborting the pass.
+func TestSyncSkipsDisabledInstancesAndMissingKeys(t *testing.T) {
+	r := newRig(t)
+	// Enabled connection whose secret is deliberately absent.
+	raw, err := json.Marshal(settings.ArrConnections{Instances: []settings.ArrConnection{
+		{Kind: "radarr", BaseURL: "http://radarr.invalid", Enabled: false},
+		{Kind: "sonarr", BaseURL: sonarrServer(t).URL, Enabled: true},
+	}})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := r.settings.Set(context.Background(), settings.KeyArrConnections, raw); err != nil {
+		t.Fatalf("set connections: %v", err)
+	}
+
+	stats, err := r.newPoller(time.Minute).Sync(context.Background())
+	if err == nil {
+		t.Fatal("Sync succeeded with a missing API key")
+	}
+	if !errors.Is(err, ErrMissingAPIKey) {
+		t.Fatalf("error = %v, want ErrMissingAPIKey", err)
+	}
+	if stats.Instances != 1 || stats.Failed != 1 {
+		t.Fatalf("stats = %+v, want 1 instance / 1 failure", stats)
+	}
+	var count int
+	if err := r.store.DB.QueryRow(`SELECT COUNT(*) FROM arr_instances`).Scan(&count); err != nil {
+		t.Fatalf("count instances: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("arr_instances rows = %d, want 0 (disabled instance must not be created)", count)
+	}
+}
+
+// panickingStore fails the cache write with a panic, like a driver bug would.
+type panickingStore struct {
+	LibraryStore
+	mu       sync.Mutex
+	attempts int
+}
+
+func (p *panickingStore) ArrInstanceByKind(ctx context.Context, kind string) (store.ArrInstanceSyncRow, bool, error) {
+	return store.ArrInstanceSyncRow{ID: 1, Kind: kind, BaseURL: "http://x", Enabled: true}, true, nil
+}
+
+func (p *panickingStore) SaveArrInstance(ctx context.Context, row store.ArrInstanceSyncRow) (int64, error) {
+	return row.ID, nil
+}
+
+func (p *panickingStore) TouchArrInstanceSync(ctx context.Context, id int64) error { return nil }
+
+func (p *panickingStore) SyncLibraryCache(ctx context.Context, instanceID int64, items []store.LibraryCacheItem) (store.LibrarySyncStats, error) {
+	p.mu.Lock()
+	p.attempts++
+	p.mu.Unlock()
+	panic("cache write exploded")
+}
+
+// TestLoopSurvivesPanic proves the background loop keeps polling after a panic
+// in one pass instead of dying silently.
+func TestLoopSurvivesPanic(t *testing.T) {
+	r := newRig(t)
+	radarr := radarrServer(t)
+	r.configure(settings.ArrConnection{Kind: "radarr", BaseURL: radarr.URL, Enabled: true})
+	r.key("radarr", radarr.APIKey())
+
+	fake := &panickingStore{}
+	p, err := New(Deps{
+		Store:    fake,
+		Settings: r.settings,
+		Secrets:  r.secrets,
+		Interval: 10 * time.Millisecond,
+		Timeout:  time.Second,
+		Logf:     t.Logf,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p.Start(ctx)
+	defer p.Stop()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		fake.mu.Lock()
+		attempts := fake.attempts
+		fake.mu.Unlock()
+		if attempts >= 2 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("poller made %d attempts, want at least 2 (loop must survive a panic)", fake.attempts)
+}
+
+// TestNewDefaultsInterval pins the settled 300 s cadence.
+func TestNewDefaultsInterval(t *testing.T) {
+	r := newRig(t)
+	p, err := New(Deps{Store: r.store, Settings: r.settings, Secrets: r.secrets})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if p.Interval() != DefaultInterval {
+		t.Errorf("Interval() = %v, want %v", p.Interval(), DefaultInterval)
+	}
+	if DefaultInterval != 300*time.Second {
+		t.Errorf("DefaultInterval = %v, want 300s", DefaultInterval)
+	}
+}
+
+func TestNewRejectsMissingDeps(t *testing.T) {
+	if _, err := New(Deps{}); err == nil {
+		t.Fatal("New accepted empty Deps")
+	}
+}
+
+// readCache loads every cache row keyed by "media|externalID".
+func readCache(t *testing.T, st *store.Store) map[string]cacheRow {
+	t.Helper()
+	rows, err := st.DB.Query(
+		`SELECT id, arr_instance_id, media_type, external_item_id, COALESCE(series_id,0),
+		        COALESCE(tmdb_id,0), COALESCE(tvdb_id,0), title, COALESCE(original_language_iso2,''),
+		        COALESCE(year,0), season_number, episode_number, COALESCE(episode_title,''),
+		        COALESCE(media_folder_path,''), COALESCE(target_file_path,''),
+		        matches_target_tags, eligibility_status
+		 FROM arr_library_cache`)
+	if err != nil {
+		t.Fatalf("query cache: %v", err)
+	}
+	defer rows.Close()
+
+	out := map[string]cacheRow{}
+	for rows.Next() {
+		var (
+			row     cacheRow
+			season  *int64
+			episode *int64
+			media   string
+			ext     int64
+		)
+		if err := rows.Scan(&row.ID, &row.InstanceID, &media, &ext, &row.SeriesID,
+			&row.TMDBID, &row.TVDBID, &row.Title, &row.OriginalLanguageISO2, &row.Year,
+			&season, &episode, &row.EpisodeTitle, &row.MediaFolderPath, &row.TargetFilePath,
+			&row.MatchesTargetTags, &row.EligibilityStatus); err != nil {
+			t.Fatalf("scan cache row: %v", err)
+		}
+		if season != nil {
+			v := int(*season)
+			row.SeasonNumber = &v
+		}
+		if episode != nil {
+			v := int(*episode)
+			row.EpisodeNumber = &v
+		}
+		row.MediaType = media
+		row.ExternalItemID = ext
+		out[fmt.Sprintf("%s|%d", media, ext)] = row
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate cache: %v", err)
+	}
+	return out
+}
+
+type cacheRow struct {
+	ID                   int64
+	InstanceID           int64
+	MediaType            string
+	ExternalItemID       int64
+	SeriesID             int64
+	TMDBID               int64
+	TVDBID               int64
+	Title                string
+	OriginalLanguageISO2 string
+	Year                 int
+	SeasonNumber         *int
+	EpisodeNumber        *int
+	EpisodeTitle         string
+	MediaFolderPath      string
+	TargetFilePath       string
+	MatchesTargetTags    bool
+	EligibilityStatus    string
+}
+
+func cacheIDs(t *testing.T, st *store.Store) map[string]int64 {
+	t.Helper()
+	rows := readCache(t, st)
+	out := make(map[string]int64, len(rows))
+	for key, row := range rows {
+		out[key] = row.ID
+	}
+	return out
+}
+
+// TestSyncUpdatesChangedRowAndDeletesVanished drives the diff through the
+// poller with a swappable client source: the same instance id must be reused
+// for an updated item, and a vanished item must be deleted.
+func TestSyncUpdatesChangedRowAndDeletesVanished(t *testing.T) {
+	r := newRig(t)
+	r.configure(settings.ArrConnection{Kind: "radarr", BaseURL: "http://radarr.invalid", Enabled: true})
+	if err := r.secrets.Set("arr.radarr.api_key", "key"); err != nil {
+		t.Fatalf("set secret: %v", err)
+	}
+
+	src := &fakeRadarr{movies: []arr.Movie{{
+		ID: 7, Title: "Shrek", Year: 2001, HasFile: true,
+		OriginalLanguage: arr.Language{ID: 1, Name: "English"},
+		MovieFile:        &arr.MediaFile{Path: "/media/movies/Shrek/Shrek [ArcA310].mkv"},
+	}}}
+	p, err := New(Deps{
+		Store:     r.store,
+		Settings:  r.settings,
+		Secrets:   r.secrets,
+		Interval:  time.Minute,
+		NewRadarr: func(baseURL, apiKey string) (RadarrSource, error) { return src, nil },
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	stats, err := p.Sync(context.Background())
+	if err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if stats.Inserted != 1 {
+		t.Fatalf("inserted = %d, want 1", stats.Inserted)
+	}
+	before := readCache(t, r.store)["movie|7"]
+
+	// The instance renamed the movie and re-imported an untagged file.
+	src.movies = []arr.Movie{{
+		ID: 7, Title: "Shrek 2", Year: 2004, HasFile: true,
+		OriginalLanguage: arr.Language{ID: 2, Name: "Polish"},
+		MovieFile:        &arr.MediaFile{Path: "/media/movies/Shrek 2/Shrek 2.mkv"},
+	}}
+	stats, err = p.Sync(context.Background())
+	if err != nil {
+		t.Fatalf("Sync (changed): %v", err)
+	}
+	if stats.Updated != 1 || stats.Inserted != 0 || stats.Deleted != 0 {
+		t.Fatalf("changed stats = %+v", stats)
+	}
+	after := readCache(t, r.store)["movie|7"]
+	if after.ID != before.ID {
+		t.Errorf("row id = %d, want %d (update in place)", after.ID, before.ID)
+	}
+	if after.Title != "Shrek 2" || after.Year != 2004 || after.OriginalLanguageISO2 != "pl" ||
+		after.EligibilityStatus != "waiting_for_tags" || after.MatchesTargetTags {
+		t.Errorf("updated row = %+v", after)
+	}
+
+	// The movie vanishes from arr: the row goes away.
+	src.movies = nil
+	stats, err = p.Sync(context.Background())
+	if err != nil {
+		t.Fatalf("Sync (vanished): %v", err)
+	}
+	if stats.Deleted != 1 {
+		t.Fatalf("vanished stats = %+v, want 1 deleted", stats)
+	}
+	if _, ok := readCache(t, r.store)["movie|7"]; ok {
+		t.Error("vanished movie row still cached")
+	}
+}
+
+type fakeRadarr struct {
+	movies []arr.Movie
+}
+
+func (f *fakeRadarr) Movies(context.Context) ([]arr.Movie, error) {
+	return f.movies, nil
+}

@@ -27,6 +27,7 @@ import (
 
 	"github.com/Subject412/dubarr/backend/internal/api"
 	"github.com/Subject412/dubarr/backend/internal/arrrescan"
+	"github.com/Subject412/dubarr/backend/internal/arrsync"
 	"github.com/Subject412/dubarr/backend/internal/auth"
 	"github.com/Subject412/dubarr/backend/internal/extract"
 	"github.com/Subject412/dubarr/backend/internal/gate"
@@ -172,6 +173,7 @@ type server struct {
 	scanner  *watch.Scanner
 	extract  *extract.Worker
 	sync     *syncworker.Worker
+	library  *arrsync.Poller
 	mux      *http.ServeMux
 	http     *http.Server
 
@@ -181,6 +183,8 @@ type server struct {
 	extractCancel context.CancelFunc
 	// syncCancel stops the Execute→mux→rescan worker; nil when disabled.
 	syncCancel context.CancelFunc
+	// libraryCancel stops the arr library poller; nil when disabled.
+	libraryCancel context.CancelFunc
 
 	closeOnce sync.Once
 	closeErr  error
@@ -335,6 +339,27 @@ func newServerWithSecrets(cfg Config, secOpts secrets.Options) (*server, error) 
 		syncCancel = nil
 	}
 
+	// M6-1: poll Radarr/Sonarr and refresh arr_library_cache so the manual
+	// search bridge and approvals always see the current library. Disabled
+	// (no instances, or a non-positive interval) rather than fatal.
+	libraryCtx, libraryCancel := context.WithCancel(context.Background())
+	libraryPoller, libraryErr := wireArrSync(libraryCtx, arrSyncWiring{
+		Settings: settingsStore,
+		Store:    st,
+		Secrets:  sec,
+		Logf:     log.Printf,
+	})
+	if libraryErr != nil {
+		log.Printf("dubarr: arr library sync disabled: %v", libraryErr)
+		libraryCancel()
+		libraryCancel = nil
+	} else if libraryPoller != nil {
+		libraryPoller.Start(libraryCtx)
+	} else {
+		libraryCancel()
+		libraryCancel = nil
+	}
+
 	s := &server{
 		cfg:           cfg,
 		store:         st,
@@ -343,9 +368,11 @@ func newServerWithSecrets(cfg Config, secOpts secrets.Options) (*server, error) 
 		scanner:       watchScanner,
 		extract:       extractWorker,
 		sync:          syncWorker,
+		library:       libraryPoller,
 		scannerCancel: scanCancel,
 		extractCancel: extractCancel,
 		syncCancel:    syncCancel,
+		libraryCancel: libraryCancel,
 		mux:           mux,
 	}
 	s.http = &http.Server{
@@ -566,6 +593,116 @@ func wireSyncWorker(ctx context.Context, deps syncWiring) (*syncworker.Worker, e
 	return worker, nil
 }
 
+// arrSyncWiring is the collaborator set for the M6-1 library poller.
+type arrSyncWiring struct {
+	Settings *settings.Store
+	Store    *store.Store
+	// Secrets reads arr.<kind>.api_key and re-encrypts it for arr_instances.
+	Secrets arrsync.SecretStore
+	// Interval overrides settings arr.options.poll_interval_sec. 0 reads the
+	// setting; a negative value disables the poller (test seam, like the other
+	// workers' Interval field).
+	Interval time.Duration
+	// Logf reports why the poller stays disabled. Nil means log.Printf.
+	Logf func(format string, args ...any)
+}
+
+// wireArrSync builds the M6-1 poller over the enabled arr.connections.
+//
+// It returns (nil, nil) — the documented "disabled" case — when no connection is
+// enabled or the interval is not positive, so a fresh install serves the wizard
+// and a deliberately disabled sync never starts a goroutine. The pass refreshes
+// arr_library_cache; the manual search bridge and approvals read that table.
+func wireArrSync(ctx context.Context, deps arrSyncWiring) (*arrsync.Poller, error) {
+	logf := deps.Logf
+	if logf == nil {
+		logf = log.Printf
+	}
+	if deps.Settings == nil || deps.Store == nil {
+		return nil, errors.New("arr library sync needs the settings store and the database store")
+	}
+	if deps.Secrets == nil {
+		return nil, errors.New("arr library sync needs the secret store for arr API keys")
+	}
+
+	conns, err := loadArrConnections(ctx, deps.Settings)
+	if err != nil {
+		return nil, err
+	}
+	enabled := 0
+	for _, conn := range conns.Instances {
+		if conn.Enabled && strings.TrimSpace(conn.BaseURL) != "" {
+			enabled++
+		}
+	}
+	if enabled == 0 {
+		logf("dubarr: arr library sync disabled: no enabled arr instances")
+		return nil, nil
+	}
+
+	interval := deps.Interval
+	if interval == 0 {
+		interval, err = loadArrSyncInterval(ctx, deps.Settings)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if interval <= 0 {
+		logf("dubarr: arr library sync disabled: arr.options.poll_interval_sec is not positive")
+		return nil, nil
+	}
+
+	poller, err := arrsync.New(arrsync.Deps{
+		Store:    deps.Store,
+		Settings: deps.Settings,
+		Secrets:  deps.Secrets,
+		Interval: interval,
+		Logf:     logf,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("arr library sync: %w", err)
+	}
+	return poller, nil
+}
+
+// loadArrConnections reads the seeded arr.connections section. A missing row
+// means no instance is configured yet.
+func loadArrConnections(ctx context.Context, st *settings.Store) (settings.ArrConnections, error) {
+	raw, ok, err := st.Get(ctx, settings.KeyArrConnections)
+	if err != nil {
+		return settings.ArrConnections{}, fmt.Errorf("read arr.connections: %w", err)
+	}
+	if !ok {
+		return settings.ArrConnections{}, nil
+	}
+	var conns settings.ArrConnections
+	if err := json.Unmarshal(raw, &conns); err != nil {
+		return settings.ArrConnections{}, fmt.Errorf("decode arr.connections: %w", err)
+	}
+	return conns, nil
+}
+
+// loadArrSyncInterval reads arr.options.poll_interval_sec, defaulting to the
+// settled 300 s cadence when the section is missing. A non-positive stored value
+// is returned as-is so the caller can treat it as "disabled".
+func loadArrSyncInterval(ctx context.Context, st *settings.Store) (time.Duration, error) {
+	raw, ok, err := st.Get(ctx, settings.KeyArrOptions)
+	if err != nil {
+		return 0, fmt.Errorf("read arr.options: %w", err)
+	}
+	if !ok {
+		return arrsync.DefaultInterval, nil
+	}
+	var opts settings.ArrOptions
+	if err := json.Unmarshal(raw, &opts); err != nil {
+		return 0, fmt.Errorf("decode arr.options: %w", err)
+	}
+	if opts.PollIntervalSec <= 0 {
+		return 0, nil
+	}
+	return time.Duration(opts.PollIntervalSec) * time.Second, nil
+}
+
 // newVaultHook adapts vault.Writer to extract.VaultHook: one Write per staged
 // track, all sharing a Donor Group UUID so sibling tracks stay linked.
 func newVaultHook(writer *vault.Writer) extract.VaultHook {
@@ -730,6 +867,12 @@ func (s *server) Close() error {
 		}
 		if s.sync != nil {
 			s.sync.Stop()
+		}
+		if s.libraryCancel != nil {
+			s.libraryCancel()
+		}
+		if s.library != nil {
+			s.library.Stop()
 		}
 		if s.store != nil {
 			s.closeErr = s.store.Close()

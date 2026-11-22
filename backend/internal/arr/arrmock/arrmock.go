@@ -35,28 +35,30 @@ type Language struct {
 
 // Movie is a Radarr /api/v3/movie element.
 type Movie struct {
-	ID               int      `json:"id"`
-	Title            string   `json:"title"`
-	Year             int      `json:"year"`
-	TmdbID           int      `json:"tmdbId"`
-	Path             string   `json:"path"`
-	FolderName       string   `json:"folderName"`
-	QualityProfileID int      `json:"qualityProfileId"`
-	Monitored        bool     `json:"monitored"`
-	HasFile          bool     `json:"hasFile"`
-	OriginalLanguage Language `json:"originalLanguage"`
+	ID               int        `json:"id"`
+	Title            string     `json:"title"`
+	Year             int        `json:"year"`
+	TmdbID           int        `json:"tmdbId"`
+	Path             string     `json:"path"`
+	FolderName       string     `json:"folderName"`
+	QualityProfileID int        `json:"qualityProfileId"`
+	Monitored        bool       `json:"monitored"`
+	HasFile          bool       `json:"hasFile"`
+	OriginalLanguage Language   `json:"originalLanguage"`
+	MovieFile        *MovieFile `json:"movieFile,omitempty"`
 }
 
 // Series is a Sonarr /api/v3/series element.
 type Series struct {
-	ID               int    `json:"id"`
-	Title            string `json:"title"`
-	Year             int    `json:"year"`
-	TvdbID           int    `json:"tvdbId"`
-	Path             string `json:"path"`
-	FolderName       string `json:"folderName"`
-	QualityProfileID int    `json:"qualityProfileId"`
-	Monitored        bool   `json:"monitored"`
+	ID               int      `json:"id"`
+	Title            string   `json:"title"`
+	Year             int      `json:"year"`
+	TvdbID           int      `json:"tvdbId"`
+	Path             string   `json:"path"`
+	FolderName       string   `json:"folderName"`
+	QualityProfileID int      `json:"qualityProfileId"`
+	Monitored        bool     `json:"monitored"`
+	OriginalLanguage Language `json:"originalLanguage"`
 }
 
 // QualityProfile is an /api/v3/qualityprofile element.
@@ -78,6 +80,7 @@ type RootFolder struct {
 type Fixtures struct {
 	Movies          []Movie
 	Series          []Series
+	Episodes        []Episode
 	QualityProfiles []QualityProfile
 	RootFolders     []RootFolder
 }
@@ -165,6 +168,7 @@ func New(kind Kind, apiKey string, fx Fixtures) *Server {
 		mux.HandleFunc("/api/v3/series", s.handle(func(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusOK, nonNil(fx.Series))
 		}))
+		mux.HandleFunc("/api/v3/episode", s.serveEpisodes(fx.Episodes))
 	}
 
 	s.Server = httptest.NewServer(mux)

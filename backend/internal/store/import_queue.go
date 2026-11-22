@@ -20,6 +20,12 @@ var (
 	// ErrImportExtractionState reports an extraction result recorded for a row
 	// that is no longer extracting (already finished or never approved).
 	ErrImportExtractionState = errors.New("store: import candidate is not extracting")
+	// ErrLibraryCacheNotFound reports a manual library match naming an
+	// arr_library_cache row that does not exist.
+	ErrLibraryCacheNotFound = errors.New("store: library cache target not found")
+	// ErrImportCandidateMatchMismatch reports an approve that supplies a
+	// library id different from the one already matched on the row.
+	ErrImportCandidateMatchMismatch = errors.New("store: import candidate is matched to a different library target")
 )
 
 // RecordImportCandidate inserts a newly discovered donor file into the
@@ -179,42 +185,52 @@ func (s *Store) ImportCandidateGate(ctx context.Context, sourcePath string) (Imp
 // ErrImportCandidateNotFound and a row that already left pending_approval
 // reports ErrImportCandidateState, so approve cannot pair against a stale row.
 func (s *Store) ImportCandidateTarget(ctx context.Context, id int64) (string, error) {
+	target, _, err := s.ImportCandidateMatchTarget(ctx, id)
+	return target, err
+}
+
+// ImportCandidateMatchTarget is ImportCandidateTarget plus the candidate's
+// matched_library_cache_id (0 when the row has no matched arr library row).
+// Approve needs both: the path to pair the donor with and the identity the
+// extraction→vault hand-off requires.
+func (s *Store) ImportCandidateMatchTarget(ctx context.Context, id int64) (string, int64, error) {
 	var (
 		status      string
 		raw         sql.NullString
 		cacheTarget sql.NullString
+		cacheID     sql.NullInt64
 	)
 	err := s.DB.QueryRowContext(ctx, `
-		SELECT iq.status, iq.parsed_raw_json, alc.target_file_path
+		SELECT iq.status, iq.parsed_raw_json, alc.target_file_path, iq.matched_library_cache_id
 		FROM import_queue iq
 		LEFT JOIN arr_library_cache alc ON alc.id = iq.matched_library_cache_id
-		WHERE iq.id = ?`, id).Scan(&status, &raw, &cacheTarget)
+		WHERE iq.id = ?`, id).Scan(&status, &raw, &cacheTarget, &cacheID)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", ErrImportCandidateNotFound
+		return "", 0, ErrImportCandidateNotFound
 	}
 	if err != nil {
-		return "", fmt.Errorf("store: read import candidate %d target: %w", id, err)
+		return "", 0, fmt.Errorf("store: read import candidate %d target: %w", id, err)
 	}
 	if status != "pending_approval" {
-		return "", ErrImportCandidateState
+		return "", 0, ErrImportCandidateState
 	}
 	target := cacheTarget.String
 	if payload := strings.TrimSpace(raw.String); raw.Valid && payload != "" && payload != "null" {
 		var doc map[string]json.RawMessage
 		if err := json.Unmarshal([]byte(payload), &doc); err != nil {
-			return "", fmt.Errorf("store: import candidate %d: parsed_raw_json is not a JSON object: %w", id, err)
+			return "", 0, fmt.Errorf("store: import candidate %d: parsed_raw_json is not a JSON object: %w", id, err)
 		}
 		if blob, ok := doc[gateJSONKey]; ok {
 			var gate ImportGateStatus
 			if err := json.Unmarshal(blob, &gate); err != nil {
-				return "", fmt.Errorf("store: decode import candidate %d gate: %w", id, err)
+				return "", 0, fmt.Errorf("store: decode import candidate %d gate: %w", id, err)
 			}
 			if gate.TargetPath != "" {
 				target = gate.TargetPath
 			}
 		}
 	}
-	return target, nil
+	return target, cacheID.Int64, nil
 }
 
 // SetImportCandidateDonor persists the donor selection and moves the candidate
@@ -226,8 +242,24 @@ func (s *Store) ImportCandidateTarget(ctx context.Context, id int64) (string, er
 // candidate file. The conditional status guard means a racing approve/reject
 // cannot attach a donor to a row that already left pending_approval.
 func (s *Store) SetImportCandidateDonor(ctx context.Context, id int64, donorPath string) error {
+	return s.SetImportCandidateApproval(ctx, id, donorPath, 0)
+}
+
+// SetImportCandidateApproval is SetImportCandidateDonor plus an optional manual
+// library match: when libraryCacheID is positive it is validated against
+// arr_library_cache and persisted into import_queue.matched_library_cache_id in
+// the same transaction as the donor and the status transition, so the
+// extraction→vault hand-off always sees a media identity.
+//
+// A supplied id that contradicts a match already on the row is
+// ErrImportCandidateMatchMismatch; an unknown id is ErrLibraryCacheNotFound.
+// Both leave the row pending_approval.
+func (s *Store) SetImportCandidateApproval(ctx context.Context, id int64, donorPath string, libraryCacheID int64) error {
 	if strings.TrimSpace(donorPath) == "" {
 		return fmt.Errorf("store: import candidate %d: donor path is empty", id)
+	}
+	if libraryCacheID < 0 {
+		return fmt.Errorf("store: import candidate %d: library cache id must be positive", id)
 	}
 	donorRaw, err := json.Marshal(donorPath)
 	if err != nil {
@@ -240,14 +272,39 @@ func (s *Store) SetImportCandidateDonor(ctx context.Context, id int64, donorPath
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op once committed
 
-	var raw sql.NullString
+	var (
+		raw       sql.NullString
+		currentID sql.NullInt64
+		status    string
+	)
 	err = tx.QueryRowContext(ctx,
-		`SELECT parsed_raw_json FROM import_queue WHERE id = ?`, id).Scan(&raw)
+		`SELECT parsed_raw_json, matched_library_cache_id, status FROM import_queue WHERE id = ?`,
+		id).Scan(&raw, &currentID, &status)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrImportCandidateNotFound
 	}
 	if err != nil {
 		return fmt.Errorf("store: read import candidate %d: %w", id, err)
+	}
+	if status != "pending_approval" {
+		return ErrImportCandidateState
+	}
+
+	var match any
+	if libraryCacheID > 0 {
+		var exists int
+		err = tx.QueryRowContext(ctx,
+			`SELECT 1 FROM arr_library_cache WHERE id = ?`, libraryCacheID).Scan(&exists)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrLibraryCacheNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("store: read library cache %d: %w", libraryCacheID, err)
+		}
+		if currentID.Valid && currentID.Int64 != libraryCacheID {
+			return ErrImportCandidateMatchMismatch
+		}
+		match = libraryCacheID
 	}
 
 	doc := map[string]json.RawMessage{}
@@ -266,8 +323,10 @@ func (s *Store) SetImportCandidateDonor(ctx context.Context, id int64, donorPath
 	}
 
 	res, err := tx.ExecContext(ctx,
-		`UPDATE import_queue SET parsed_raw_json = ?, status = 'extracting', updated_at = CURRENT_TIMESTAMP
-		 WHERE id = ? AND status = 'pending_approval'`, string(encoded), id)
+		`UPDATE import_queue
+		 SET parsed_raw_json = ?, matched_library_cache_id = COALESCE(?, matched_library_cache_id),
+		     status = 'extracting', updated_at = CURRENT_TIMESTAMP
+		 WHERE id = ? AND status = 'pending_approval'`, string(encoded), match, id)
 	if err != nil {
 		return fmt.Errorf("store: record import candidate %d donor: %w", id, err)
 	}
@@ -276,8 +335,8 @@ func (s *Store) SetImportCandidateDonor(ctx context.Context, id int64, donorPath
 		return fmt.Errorf("store: record import candidate %d donor rows: %w", id, err)
 	}
 	if n != 1 {
-		var status string
-		qerr := tx.QueryRowContext(ctx, `SELECT status FROM import_queue WHERE id = ?`, id).Scan(&status)
+		var current string
+		qerr := tx.QueryRowContext(ctx, `SELECT status FROM import_queue WHERE id = ?`, id).Scan(&current)
 		if errors.Is(qerr, sql.ErrNoRows) {
 			return ErrImportCandidateNotFound
 		}
@@ -315,6 +374,11 @@ type ImportCandidateSummary struct {
 	// DonorPath is the donor persisted at approval time (empty for rows that
 	// never stored a selection).
 	DonorPath string
+	// Matched reports whether the row is linked to an arr_library_cache row;
+	// LibraryTitle is that row's title. An unmatched row needs a manual match
+	// before approve can hand media identity to extraction.
+	Matched      bool
+	LibraryTitle string
 }
 
 // ListPendingImportCandidates returns every donor awaiting approval, newest
@@ -326,7 +390,7 @@ type ImportCandidateSummary struct {
 func (s *Store) ListPendingImportCandidates(ctx context.Context) ([]ImportCandidateSummary, error) {
 	rows, err := s.DB.QueryContext(ctx, `
 		SELECT iq.id, iq.source_file_path, iq.filename, iq.file_size, iq.status,
-		       iq.parsed_raw_json,
+		       iq.parsed_raw_json, iq.matched_library_cache_id,
 		       alc.title, alc.media_type, alc.year, alc.season_number, alc.episode_number,
 		       alc.target_file_path, alc.original_language_iso2,
 		       alc.audio_languages_json, alc.eligibility_status
@@ -344,6 +408,7 @@ func (s *Store) ListPendingImportCandidates(ctx context.Context) ([]ImportCandid
 		var (
 			c                  ImportCandidateSummary
 			raw                sql.NullString
+			matchedID          sql.NullInt64
 			title, mediaType   sql.NullString
 			year               sql.NullInt64
 			season, episode    sql.NullInt64
@@ -351,10 +416,12 @@ func (s *Store) ListPendingImportCandidates(ctx context.Context) ([]ImportCandid
 			audioLangs, eligib sql.NullString
 		)
 		if err := rows.Scan(&c.ID, &c.SourceFilePath, &c.Filename, &c.FileSize, &c.Status,
-			&raw, &title, &mediaType, &year, &season, &episode,
+			&raw, &matchedID, &title, &mediaType, &year, &season, &episode,
 			&target, &origLang, &audioLangs, &eligib); err != nil {
 			return nil, fmt.Errorf("store: scan pending import candidate: %w", err)
 		}
+		c.Matched = matchedID.Valid
+		c.LibraryTitle = title.String
 		c.Title = title.String
 		c.MediaType = mediaType.String
 		c.Year = int(year.Int64)

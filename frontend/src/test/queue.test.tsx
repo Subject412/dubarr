@@ -18,6 +18,8 @@ const items = [
     original_language: 'en',
     audio_languages: ['en', 'pl'],
     eligibility: 'eligible',
+    matched: true,
+    library_title: 'Minions and Monsters',
     matched_tags: ['[ArcA310]'],
     missing_tags: [],
     donor_candidates: [
@@ -42,9 +44,39 @@ const items = [
     original_language: 'en',
     audio_languages: ['en'],
     eligibility: 'waiting_for_tags',
+    matched: true,
+    library_title: 'Shrek',
     matched_tags: [],
     missing_tags: ['[ArcA310]'],
     donor_candidates: [],
+  },
+  {
+    id: 3,
+    source_file_path: '/watch/Kraina.Lodu.2013.PL.mkv',
+    filename: 'Kraina.Lodu.2013.PL.mkv',
+    file_size: 256,
+    status: 'pending_approval',
+    title: '',
+    media_type: '',
+    target_path: '',
+    original_language: '',
+    audio_languages: [],
+    eligibility: 'missing_target',
+    matched: false,
+    library_title: '',
+    matched_tags: [],
+    missing_tags: [],
+    donor_candidates: [],
+  },
+]
+
+const libraryResults = [
+  {
+    id: 7,
+    title: 'Kraina Lodu',
+    year: 2013,
+    media_type: 'movie',
+    original_language_iso2: 'en',
   },
 ]
 
@@ -56,6 +88,12 @@ function queueFetch() {
     }
     if (url.includes('/api/queue/1/approve')) {
       return jsonResponse({ id: 1, status: 'extracting' })
+    }
+    if (url.includes('/api/imports/search-library')) {
+      return jsonResponse({ items: libraryResults })
+    }
+    if (url.includes('/api/queue/3/approve')) {
+      return jsonResponse({ id: 3, status: 'extracting' })
     }
     if (url.includes('/api/queue/2/reject')) {
       return jsonResponse({ id: 2, status: 'ignored' })
@@ -113,6 +151,36 @@ describe('approval queue page', () => {
         ([url, init]) => String(url).includes('/api/queue/2/reject') && isMethod(init, 'POST'),
       )
       expect(call).toBeTruthy()
+    })
+  })
+
+  it('matches an unmatched item against the arr library and approves with it', async () => {
+    const fetchMock = queueFetch()
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    renderWithProviders(<QueuePage />, { route: '/queue' })
+
+    const card = await screen.findByTestId('queue-item-3')
+    const approveButton = within(card).getByRole('button', { name: /approve/i })
+    expect(approveButton).toBeDisabled()
+
+    await user.type(within(card).getByPlaceholderText(/search the arr library/i), 'kraina')
+    const option = await within(card).findByRole(
+      'button',
+      { name: /Kraina Lodu \(2013\)/i },
+      { timeout: 2000 },
+    )
+    await user.click(option)
+
+    expect(within(card).getByText(/Matched to Kraina Lodu \(2013\)/)).toBeInTheDocument()
+    await user.click(within(card).getByRole('button', { name: /approve/i }))
+
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find(
+        ([url, init]) => String(url).includes('/api/queue/3/approve') && isMethod(init, 'POST'),
+      )
+      expect(call).toBeTruthy()
+      expect(JSON.parse(String(call?.[1]?.body))).toEqual({ library_cache_id: 7 })
     })
   })
 

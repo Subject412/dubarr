@@ -144,10 +144,27 @@ export type QueueItem = {
   matched_tags: string[]
   missing_tags: string[]
   donor_candidates: QueueDonorCandidate[]
+  /** Whether the row carries an arr library identity; when false the operator must match it manually. */
+  matched: boolean
+  library_title: string
 }
 
 export type QueueResponse = {
   items: QueueItem[]
+}
+
+export type LibrarySearchItem = {
+  id: number
+  title: string
+  year: number
+  media_type: 'movie' | 'episode'
+  season_number?: number
+  episode_number?: number
+  original_language_iso2: string
+}
+
+export type LibrarySearchResponse = {
+  items: LibrarySearchItem[]
 }
 
 export type QueueTransition = {
@@ -249,9 +266,15 @@ export const api = {
     request<BrowseResponse>(`/api/system/browse?path=${encodeURIComponent(path)}`),
   health: () => request<Health>('/api/health'),
   queue: () => request<QueueResponse>('/api/queue'),
+  searchLibrary: (q: string) =>
+    request<LibrarySearchResponse>(`/api/imports/search-library?q=${encodeURIComponent(q)}`),
   vault: () => request<VaultResponse>('/api/vault'),
-  approveQueueItem: (id: number) =>
-    request<QueueTransition>(`/api/queue/${id}/approve`, { method: 'POST' }),
+  approveQueueItem: (id: number, libraryCacheId?: number) =>
+    request<QueueTransition>(`/api/queue/${id}/approve`, {
+      method: 'POST',
+      body:
+        libraryCacheId == null ? undefined : JSON.stringify({ library_cache_id: libraryCacheId }),
+    }),
   rejectQueueItem: (id: number) =>
     request<QueueTransition>(`/api/queue/${id}/reject`, { method: 'POST' }),
 }

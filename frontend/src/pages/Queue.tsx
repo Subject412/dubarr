@@ -1,10 +1,13 @@
-import type { QueueEligibility, QueueItem } from '../lib/api'
+import { useState } from 'react'
+import type { LibrarySearchItem, QueueEligibility, QueueItem } from '../lib/api'
 import {
   useApproveQueueItem,
+  useDebouncedValue,
+  useLibrarySearch,
   useQueue,
   useRejectQueueItem,
 } from '../lib/hooks'
-import { Alert, Badge, Button, Card, PageHeader, Spinner } from '../components/ui'
+import { Alert, Badge, Button, Card, Input, PageHeader, Spinner } from '../components/ui'
 
 const eligibilityView: Record<
   QueueEligibility,
@@ -38,6 +41,63 @@ function episodeLabel(item: QueueItem): string | null {
   return `S${pad(item.season_number)}E${pad(item.episode_number)}`
 }
 
+function libraryLabel(entry: LibrarySearchItem): string {
+  const title = entry.year ? `${entry.title} (${entry.year})` : entry.title
+  if (entry.season_number == null || entry.episode_number == null) return title
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${title} S${pad(entry.season_number)}E${pad(entry.episode_number)}`
+}
+
+/** Inline typeahead over the arr-synced library for the manual match fallback. */
+function LibrarySearchBox({
+  onSelect,
+}: {
+  onSelect: (entry: LibrarySearchItem) => void
+}) {
+  const [query, setQuery] = useState('')
+  const debounced = useDebouncedValue(query, 300)
+  const search = useLibrarySearch(debounced)
+  const tooShort = debounced.trim().length < 2
+
+  return (
+    <div className="mt-2">
+      <Input
+        value={query}
+        onChange={(event) => setQuery(event.target.value)}
+        placeholder="Search the arr library…"
+        aria-label="Search the arr library"
+        autoComplete="off"
+      />
+      {search.isFetching && <p className="mt-1 text-xs text-zinc-500">Searching…</p>}
+      {search.error && (
+        <p className="mt-1 text-xs text-red-400">Library search failed: {search.error.message}</p>
+      )}
+      {!tooShort && !search.isFetching && search.data && search.data.items.length === 0 && (
+        <p className="mt-1 text-xs text-zinc-500">No library matches.</p>
+      )}
+      {!tooShort && search.data && search.data.items.length > 0 && (
+        <ul className="mt-2 max-h-48 space-y-1 overflow-y-auto">
+          {search.data.items.map((entry) => (
+            <li key={entry.id}>
+              <button
+                type="button"
+                onClick={() => onSelect(entry)}
+                className="flex w-full items-center justify-between gap-2 rounded-md border border-ink-700 bg-ink-950/60 px-3 py-1.5 text-left text-sm text-zinc-200 hover:border-accent-500 hover:bg-ink-800"
+              >
+                <span className="truncate">{libraryLabel(entry)}</span>
+                <span className="shrink-0 text-xs text-zinc-500">
+                  {entry.media_type}
+                  {entry.original_language_iso2 ? ` · ${entry.original_language_iso2}` : ''}
+                </span>
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  )
+}
+
 function DonorLine({ item }: { item: QueueItem }) {
   if (item.donor_candidates.length === 0) {
     return (
@@ -69,7 +129,7 @@ function QueueCard({
   rejecting,
 }: {
   item: QueueItem
-  onApprove: (id: number) => void
+  onApprove: (id: number, libraryCacheId?: number) => void
   onReject: (id: number) => void
   approving: boolean
   rejecting: boolean
@@ -77,6 +137,8 @@ function QueueCard({
   const view = eligibilityView[item.eligibility] ?? eligibilityView.missing_target
   const episode = episodeLabel(item)
   const busy = approving || rejecting
+  const [manualMatch, setManualMatch] = useState<LibrarySearchItem | null>(null)
+  const needsMatch = !item.matched && manualMatch === null
 
   return (
     <div data-testid={`queue-item-${item.id}`}>
@@ -103,6 +165,25 @@ function QueueCard({
           <dd className="mt-1 truncate font-mono text-xs text-zinc-300" title={item.target_path}>
             {item.target_path || 'No matched target file'}
           </dd>
+          {!item.matched && (
+            <div className="mt-3 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3">
+              <p className="text-xs font-medium text-amber-300/90">
+                No arr library match — identify this release to approve it.
+              </p>
+              {manualMatch ? (
+                <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-sm text-zinc-200">
+                    Matched to {libraryLabel(manualMatch)}
+                  </span>
+                  <Button variant="ghost" size="sm" onClick={() => setManualMatch(null)}>
+                    Change
+                  </Button>
+                </div>
+              ) : (
+                <LibrarySearchBox onSelect={setManualMatch} />
+              )}
+            </div>
+          )}
         </div>
         <div>
           <dt className="text-[11px] uppercase tracking-wider text-zinc-500">Audio languages</dt>
@@ -146,8 +227,9 @@ function QueueCard({
         <Button
           variant="primary"
           size="sm"
-          disabled={busy}
-          onClick={() => onApprove(item.id)}
+          disabled={busy || needsMatch}
+          title={needsMatch ? 'Match this release to an arr library item first' : undefined}
+          onClick={() => onApprove(item.id, manualMatch?.id)}
         >
           {approving ? 'Approving…' : 'Approve'}
         </Button>
@@ -204,9 +286,9 @@ export function QueuePage() {
           <QueueCard
             key={item.id}
             item={item}
-            onApprove={(id) => approve.mutate(id)}
+            onApprove={(id, libraryCacheId) => approve.mutate({ id, libraryCacheId })}
             onReject={(id) => reject.mutate(id)}
-            approving={approve.isPending && approve.variables === item.id}
+            approving={approve.isPending && approve.variables?.id === item.id}
             rejecting={reject.isPending && reject.variables === item.id}
           />
         ))}

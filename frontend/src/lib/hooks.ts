@@ -5,11 +5,13 @@ import {
   type UseMutationResult,
   type UseQueryResult,
 } from '@tanstack/react-query'
+import { useEffect, useState } from 'react'
 import {
   api,
   type AuthStatus,
   type BrowseResponse,
   type Health,
+  type LibrarySearchResponse,
   type QueueResponse,
   type QueueTransition,
   type SettingsEnvelope,
@@ -25,6 +27,7 @@ export const queryKeys = {
   queue: ['queue'] as const,
   vault: ['vault'] as const,
   browse: (path: string) => ['browse', path] as const,
+  librarySearch: (q: string) => ['library', 'search', q] as const,
 }
 
 /** Public first-run probe; drives the route gate. */
@@ -78,10 +81,20 @@ export function useVault(): UseQueryResult<VaultResponse> {
   })
 }
 
-export function useApproveQueueItem(): UseMutationResult<QueueTransition, Error, number> {
+export type ApproveQueueVariables = {
+  id: number
+  /** Manual arr library match for a queue row the automatic parse could not identify. */
+  libraryCacheId?: number
+}
+
+export function useApproveQueueItem(): UseMutationResult<
+  QueueTransition,
+  Error,
+  ApproveQueueVariables
+> {
   const client = useQueryClient()
   return useMutation({
-    mutationFn: (id) => api.approveQueueItem(id),
+    mutationFn: ({ id, libraryCacheId }) => api.approveQueueItem(id, libraryCacheId),
     onSuccess: () => {
       void client.invalidateQueries({ queryKey: queryKeys.queue })
     },
@@ -95,6 +108,27 @@ export function useRejectQueueItem(): UseMutationResult<QueueTransition, Error, 
     onSuccess: () => {
       void client.invalidateQueries({ queryKey: queryKeys.queue })
     },
+  })
+}
+
+/** Debounces a fast-changing value (search input) before it drives a query. */
+export function useDebouncedValue<T>(value: T, delayMs = 300): T {
+  const [debounced, setDebounced] = useState(value)
+  useEffect(() => {
+    const timer = setTimeout(() => setDebounced(value), delayMs)
+    return () => clearTimeout(timer)
+  }, [value, delayMs])
+  return debounced
+}
+
+/** Manual library lookup; only runs once the debounced query has 2+ chars. */
+export function useLibrarySearch(q: string): UseQueryResult<LibrarySearchResponse> {
+  const query = q.trim()
+  return useQuery({
+    queryKey: queryKeys.librarySearch(query),
+    queryFn: () => api.searchLibrary(query),
+    enabled: query.length >= 2,
+    staleTime: 10_000,
   })
 }
 

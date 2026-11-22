@@ -11,6 +11,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"os"
 	"path"
@@ -47,6 +48,7 @@ type Service struct {
 // RegisterRoutes mounts:
 //
 //	GET  /api/queue                 pending_approval candidates
+//	GET  /api/imports/search-library  manual arr_library_cache search
 //	POST /api/queue/{id}/approve    pending_approval -> extracting
 //	POST /api/queue/{id}/reject     pending_approval -> ignored
 func RegisterRoutes(mux *http.ServeMux, deps Dependencies) *Service {
@@ -64,6 +66,7 @@ func RegisterRoutes(mux *http.ServeMux, deps Dependencies) *Service {
 		return svc.requireAdmin(h)
 	}
 	mux.Handle("GET /api/queue", admin(svc.handleList))
+	mux.Handle("GET /api/imports/search-library", admin(svc.handleSearchLibrary))
 	mux.Handle("POST /api/queue/{id}/approve", admin(svc.handleApprove))
 	mux.Handle("POST /api/queue/{id}/reject", admin(svc.handleReject))
 	return svc
@@ -97,6 +100,10 @@ type QueueItem struct {
 	MatchedTags      []string         `json:"matched_tags"`
 	MissingTags      []string         `json:"missing_tags"`
 	DonorCandidates  []DonorCandidate `json:"donor_candidates"`
+	// Matched reports whether the row carries an arr library identity; when
+	// false the UI must ask the operator to pick one via search-library.
+	Matched      bool   `json:"matched"`
+	LibraryTitle string `json:"library_title"`
 }
 
 type listResponse struct {
@@ -139,6 +146,8 @@ func (s *Service) handleList(w http.ResponseWriter, r *http.Request) {
 			MatchedTags:      row.Gate.MatchedTags,
 			MissingTags:      row.Gate.MissingTags,
 			DonorCandidates:  pairDonors(row.TargetPath, patterns),
+			Matched:          row.Matched,
+			LibraryTitle:     row.LibraryTitle,
 		}
 		// Post-approval rows leave the list, but when a donor was persisted
 		// (e.g. re-listing before extraction) the card must agree with it.
@@ -158,6 +167,43 @@ func (s *Service) handleList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, listResponse{Items: items})
 }
 
+// handleSearchLibrary serves the manual-match lookup: a case-insensitive title
+// substring search over the arr-synced library cache (IDEA.md §4), used when
+// the automatic /api/v3/parse match failed (e.g. localized release names).
+func (s *Service) handleSearchLibrary(w http.ResponseWriter, r *http.Request) {
+	if s.store == nil || s.store.DB == nil {
+		writeError(w, http.StatusServiceUnavailable, "queue store is not configured")
+		return
+	}
+	items, err := s.store.ListLibrarySearch(r.Context(), r.URL.Query().Get("q"))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not search the library")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+// approveRequest is the optional approve body. An empty or absent body keeps
+// the arr-matched behaviour; library_cache_id supplies a manual match for a
+// queue row the automatic parse could not identify.
+type approveRequest struct {
+	LibraryCacheID int64 `json:"library_cache_id"`
+}
+
+// decodeApproveBody tolerates an absent/empty body and rejects malformed JSON
+// so a bad request never looks like "no manual match".
+func decodeApproveBody(r *http.Request) (approveRequest, error) {
+	var req approveRequest
+	if r.Body == nil {
+		return req, nil
+	}
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if errors.Is(err, io.EOF) {
+		return req, nil
+	}
+	return req, err
+}
+
 func (s *Service) handleApprove(w http.ResponseWriter, r *http.Request) {
 	if s.store == nil || s.store.DB == nil {
 		writeError(w, http.StatusServiceUnavailable, "queue store is not configured")
@@ -168,24 +214,51 @@ func (s *Service) handleApprove(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid queue id")
 		return
 	}
+	req, err := decodeApproveBody(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.LibraryCacheID < 0 {
+		writeError(w, http.StatusBadRequest, "invalid library_cache_id")
+		return
+	}
 
 	// Resolve the donor exactly as the approval card does, then persist it with
 	// the status transition so the extractor never has to re-pair (and never
 	// mistakes the candidate file for the donor).
-	target, err := s.store.ImportCandidateTarget(r.Context(), id)
+	target, currentMatch, err := s.store.ImportCandidateMatchTarget(r.Context(), id)
 	if err != nil {
-		switch {
-		case errors.Is(err, store.ErrImportCandidateNotFound):
-			writeError(w, http.StatusNotFound, "queue item not found")
-		case errors.Is(err, store.ErrImportCandidateState):
-			writeError(w, http.StatusConflict, "queue item is no longer pending approval")
-		default:
-			writeError(w, http.StatusInternalServerError, "could not read the queue item")
-		}
+		writeQueueMutationError(w, err, "could not read the queue item")
 		return
 	}
+
+	// Extraction→vault needs a media identity. A row without one may be
+	// matched manually here; otherwise approve must not proceed.
+	if currentMatch == 0 && req.LibraryCacheID == 0 {
+		writeError(w, http.StatusConflict, "no matched library target")
+		return
+	}
+	if req.LibraryCacheID != 0 {
+		if currentMatch != 0 && currentMatch != req.LibraryCacheID {
+			writeError(w, http.StatusConflict, "library target does not match the queue item's matched library")
+			return
+		}
+		cacheTarget, ok, err := s.store.LibraryCacheTarget(r.Context(), req.LibraryCacheID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "could not read the library target")
+			return
+		}
+		if !ok {
+			writeError(w, http.StatusNotFound, "library target not found")
+			return
+		}
+		if strings.TrimSpace(target) == "" {
+			target = cacheTarget
+		}
+	}
 	if strings.TrimSpace(target) == "" {
-		writeError(w, http.StatusConflict, "no matched library target to pair a donor with")
+		writeError(w, http.StatusConflict, "matched library target has no target file to pair a donor with")
 		return
 	}
 	donors := pairDonors(target, s.donorPatterns(r.Context()))
@@ -193,18 +266,26 @@ func (s *Service) handleApprove(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "no donor paired: no sibling file matches the donor patterns")
 		return
 	}
-	if err := s.store.SetImportCandidateDonor(r.Context(), id, donors[0].Path); err != nil {
-		switch {
-		case errors.Is(err, store.ErrImportCandidateNotFound):
-			writeError(w, http.StatusNotFound, "queue item not found")
-		case errors.Is(err, store.ErrImportCandidateState):
-			writeError(w, http.StatusConflict, "queue item is no longer pending approval")
-		default:
-			writeError(w, http.StatusInternalServerError, "could not update the queue item")
-		}
+	if err := s.store.SetImportCandidateApproval(r.Context(), id, donors[0].Path, req.LibraryCacheID); err != nil {
+		writeQueueMutationError(w, err, "could not update the queue item")
 		return
 	}
 	writeJSON(w, http.StatusOK, transitionResponse{ID: id, Status: "extracting"})
+}
+
+// writeQueueMutationError maps store sentinels shared by approve and the status
+// transitions onto HTTP statuses.
+func writeQueueMutationError(w http.ResponseWriter, err error, message string) {
+	switch {
+	case errors.Is(err, store.ErrImportCandidateNotFound), errors.Is(err, store.ErrLibraryCacheNotFound):
+		writeError(w, http.StatusNotFound, "queue item not found")
+	case errors.Is(err, store.ErrImportCandidateState):
+		writeError(w, http.StatusConflict, "queue item is no longer pending approval")
+	case errors.Is(err, store.ErrImportCandidateMatchMismatch):
+		writeError(w, http.StatusConflict, "library target does not match the queue item's matched library")
+	default:
+		writeError(w, http.StatusInternalServerError, message)
+	}
 }
 
 func (s *Service) handleReject(w http.ResponseWriter, r *http.Request) {

@@ -257,6 +257,49 @@ func TestScanInvokesCandidateHook(t *testing.T) {
 	}
 }
 
+// TestScanSurvivesPanickingHook is the regression for the M2-wiring review
+// finding: an unrecovered panic in the CandidateHook unwound Scan and killed
+// the scan loop goroutine for good. A panicking hook must behave like any
+// other per-file hook error — the pass completes, both files are recorded, and
+// the panic is reported in Result.Errors.
+func TestScanSurvivesPanickingHook(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "first.mkv"))
+	writeFile(t, filepath.Join(root, "second.mkv"))
+
+	st := newFakeStore()
+	sc, err := New(st, []string{root}, time.Second)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	sc.SetCandidateHook(func(context.Context, string, string, int64) error {
+		panic("gate exploded")
+	})
+
+	res, err := sc.Scan(context.Background())
+	if err == nil {
+		t.Fatal("Scan: expected the hook panic to surface as an error")
+	}
+	if len(st.paths()) != 2 {
+		t.Errorf("recorded %d candidates, want both files: %v", len(st.paths()), st.paths())
+	}
+	if res.Seen != 2 || res.Added != 2 {
+		t.Errorf("Seen/Added = %d/%d, want 2/2 (scan must complete)", res.Seen, res.Added)
+	}
+	if len(res.Errors) != 2 {
+		t.Fatalf("Errors = %d, want one per file: %v", len(res.Errors), res.Errors)
+	}
+	found := false
+	for _, e := range res.Errors {
+		if strings.Contains(e.Error(), "watch: candidate hook panic: gate exploded") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("Errors = %v, want a %q entry", res.Errors, "watch: candidate hook panic: gate exploded")
+	}
+}
+
 func TestScanDebouncesOverlappingRuns(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "movie.mkv"))

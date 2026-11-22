@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -62,7 +63,8 @@ type CandidateStore interface {
 //
 // The hook runs after the row is committed, so a hook failure never drops the
 // candidate; the error is collected in Result.Errors and returned aggregated
-// from Scan, exactly like a per-file record error.
+// from Scan, exactly like a per-file record error. A panic is recovered and
+// treated the same way, so a bad hook cannot kill the scan loop.
 type CandidateHook func(ctx context.Context, sourcePath, filename string, size int64) error
 
 // Result summarises one scan pass.
@@ -156,14 +158,21 @@ func (s *Scanner) SetCandidateHook(fn CandidateHook) {
 	s.mu.Unlock()
 }
 
-// invokeHook runs the configured post-record callback, if any.
-func (s *Scanner) invokeHook(ctx context.Context, sourcePath, filename string, size int64) error {
+// invokeHook runs the configured post-record callback, if any. A panic in the
+// hook is recovered and returned as an error: the hook runs in the scan loop
+// goroutine, so letting it unwind would kill the loop permanently.
+func (s *Scanner) invokeHook(ctx context.Context, sourcePath, filename string, size int64) (err error) {
 	s.mu.Lock()
 	hook := s.hook
 	s.mu.Unlock()
 	if hook == nil {
 		return nil
 	}
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("watch: candidate hook panic: %v", r)
+		}
+	}()
 	return hook(ctx, sourcePath, filename, size)
 }
 
@@ -309,8 +318,13 @@ func (s *Scanner) run(ctx context.Context) {
 	defer ticker.Stop()
 
 	for {
-		// Errors are surfaced through Result; the loop keeps running.
-		_, _ = s.Scan(ctx)
+		// Hook and record failures are non-fatal: Scan collects them in
+		// Result.Errors and the loop keeps running, so log each one instead
+		// of dropping the detail on the floor.
+		res, _ := s.Scan(ctx)
+		for _, err := range res.Errors {
+			log.Printf("WARN watch: scan error: %v", err)
+		}
 		select {
 		case <-ctx.Done():
 			return

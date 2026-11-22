@@ -301,6 +301,9 @@ type scannerWiring struct {
 // incoming donor media; media_roots are the target libraries and are not
 // scanned for donors. With no watch_dir configured it returns (nil, nil) after
 // logging once, so a fresh install can serve the setup wizard.
+//
+// watch_dir, tag_filter and scan_interval are read once at boot; changing them
+// in the UI at runtime requires a restart to take effect.
 func wireScanner(ctx context.Context, deps scannerWiring) (*watch.Scanner, error) {
 	logf := deps.Logf
 	if logf == nil {

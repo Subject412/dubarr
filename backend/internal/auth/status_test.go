@@ -57,8 +57,41 @@ func TestStatusShape(t *testing.T) {
 	}
 }
 
-// TestStatusKeyringIsNilSafe covers deployments without a keyring backend and
-// unauthenticated callers carrying no session.
+// TestStatusReportsKeySource keeps the pinned-source state additive: the marker
+// is exposed read-only and the per-boot re-pin flag is reported when supplied.
+func TestStatusReportsKeySource(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer st.Close()
+	if _, err := st.DB.Exec(
+		`INSERT INTO settings (key, value) VALUES ('secrets.key_source', 'keyfile')`,
+	); err != nil {
+		t.Fatalf("seed marker: %v", err)
+	}
+
+	code, body := statusBody(t, Dependencies{
+		DB:               st.DB,
+		KeySourceChanged: func() bool { return true },
+	})
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	if got := body["keySource"]; got != "keyfile" {
+		t.Errorf("keySource = %v, want keyfile", got)
+	}
+	if got := body["keySourceChanged"]; got != true {
+		t.Errorf("keySourceChanged = %v, want true", got)
+	}
+
+	// Existing contract fields survive unchanged.
+	for _, key := range []string{"initialized", "authenticated", "keyring_available"} {
+		if _, ok := body[key]; !ok {
+			t.Errorf("status is missing %q: %v", key, body)
+		}
+	}
+}
 func TestStatusKeyringIsNilSafe(t *testing.T) {
 	st, err := store.Open(t.TempDir())
 	if err != nil {

@@ -30,6 +30,9 @@ type Dependencies struct {
 	// /api/auth/status can tell the SPA whether to offer "remember in keyring"
 	// style flows. Optional: nil means "not available".
 	KeyringAvailable func() bool
+	// KeySourceChanged reports whether this boot re-pinned an empty secrets
+	// collection to a different master-key source. Optional: nil means false.
+	KeySourceChanged func() bool
 }
 
 // User is the authenticated principal exposed in API responses and in the
@@ -47,6 +50,8 @@ type Service struct {
 	ttl time.Duration
 	// keyringAvailable is nil unless the composition root supplies it.
 	keyringAvailable func() bool
+	// keySourceChanged is nil unless the composition root supplies it.
+	keySourceChanged func() bool
 
 	mu  sync.RWMutex
 	key []byte
@@ -58,7 +63,7 @@ func New(deps Dependencies) *Service {
 	if ttl <= 0 {
 		ttl = defaultSessionTTL
 	}
-	return &Service{db: deps.DB, ttl: ttl, keyringAvailable: deps.KeyringAvailable}
+	return &Service{db: deps.DB, ttl: ttl, keyringAvailable: deps.KeyringAvailable, keySourceChanged: deps.KeySourceChanged}
 }
 
 // RegisterRoutes mounts every auth endpoint on mux and returns the service so

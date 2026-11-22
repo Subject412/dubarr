@@ -139,3 +139,65 @@ func resolveFromKeyring(opts Options) ([]byte, error) {
 	}
 	return key, nil
 }
+
+// resolveRecorded returns the key from exactly the recorded source. It never
+// generates key material and never falls back: a recorded keyring that is
+// locked, absent, or missing its entry is a hard error.
+func resolveRecorded(opts Options, recorded Source) ([]byte, error) {
+	switch recorded {
+	case SourceExplicitKeyfile:
+		if opts.KeyfilePath == "" {
+			return nil, fmt.Errorf("secrets: recorded source %q has no configured keyfile", recorded)
+		}
+		return readKeyfile(opts.KeyfilePath)
+
+	case SourcePassphrase:
+		if opts.Passphrase == "" {
+			return nil, fmt.Errorf("secrets: recorded source %q has no configured passphrase", recorded)
+		}
+		salt, err := readSalt(filepath.Join(opts.DataDir, PassphraseSaltFile))
+		if err != nil {
+			return nil, fmt.Errorf("secrets: read passphrase salt: %w", err)
+		}
+		return DerivePassphraseKey(opts.Passphrase, salt), nil
+
+	case SourceKeyring:
+		if opts.Keyring == nil {
+			return nil, errors.New("secrets: recorded keyring is not configured")
+		}
+		if !opts.Keyring.Available() {
+			return nil, errors.New("secrets: recorded keyring is unavailable")
+		}
+		encoded, err := opts.Keyring.Get(opts.serviceName(), opts.keyringUser())
+		if err != nil {
+			return nil, fmt.Errorf("secrets: read recorded keyring: %w", err)
+		}
+		return decodeKey(encoded)
+
+	case SourceKeyfile:
+		key, err := readKeyfile(filepath.Join(opts.DataDir, MasterKeyFile))
+		if err != nil {
+			return nil, fmt.Errorf("secrets: read recorded keyfile: %w", err)
+		}
+		return key, nil
+
+	default:
+		return nil, fmt.Errorf("secrets: unknown recorded key source %q", recorded)
+	}
+}
+
+// candidateSource predicts the source the current options would resolve,
+// mirroring ResolveMasterKey's order without touching storage or generating a
+// key. It is used only for the operator-facing mismatch message.
+func candidateSource(opts Options) Source {
+	switch {
+	case opts.KeyfilePath != "":
+		return SourceExplicitKeyfile
+	case opts.Passphrase != "":
+		return SourcePassphrase
+	case opts.Keyring != nil && opts.Keyring.Available():
+		return SourceKeyring
+	default:
+		return SourceKeyfile
+	}
+}

@@ -100,8 +100,51 @@ func writeUsage(w io.Writer) {
 	fs := newFlagSet(&cfg)
 	fs.SetOutput(w)
 	fmt.Fprintln(w, "Usage: dubarr [flags]")
+	fmt.Fprintln(w, "       dubarr rekey --data-dir DIR --keyfile PATH")
 	fmt.Fprintln(w)
 	fs.PrintDefaults()
+}
+
+// runRekey implements the one-shot rekey subcommand: it re-encrypts every
+// secret under the supplied keyfile and pins the keyfile source.
+func runRekey(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("dubarr rekey", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	dataDir := fs.String("data-dir", "./data", "appliance data directory")
+	keyfile := fs.String("keyfile", "", "path to the new master keyfile")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			fmt.Fprintln(stdout, "Usage: dubarr rekey --data-dir DIR --keyfile PATH")
+			return 0
+		}
+		fmt.Fprintf(stderr, "dubarr: %v\n", err)
+		return 2
+	}
+	if fs.NArg() > 0 {
+		fmt.Fprintf(stderr, "dubarr: unexpected positional arguments: %v\n", fs.Args())
+		return 2
+	}
+	if *dataDir == "" || *keyfile == "" {
+		fmt.Fprintln(stderr, "dubarr: rekey requires --data-dir and --keyfile")
+		return 2
+	}
+
+	st, err := store.Open(*dataDir)
+	if err != nil {
+		fmt.Fprintf(stderr, "dubarr: open store: %v\n", err)
+		return 1
+	}
+	defer func() {
+		if cerr := st.Close(); cerr != nil {
+			fmt.Fprintf(stderr, "dubarr: close: %v\n", cerr)
+		}
+	}()
+	if err := secrets.Rekey(st, secrets.DefaultOptions(*dataDir), *keyfile); err != nil {
+		fmt.Fprintf(stderr, "dubarr: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "dubarr: rekey complete: data-dir=%s\n", *dataDir)
+	return 0
 }
 
 // server owns the opened stores and the HTTP server. It is the composition
@@ -159,6 +202,7 @@ func newServerWithSecrets(cfg Config, secOpts secrets.Options) (*server, error) 
 		DB:               st.DB,
 		SessionTTL:       sessionTTL,
 		KeyringAvailable: sec.KeyringAvailable,
+		KeySourceChanged: sec.KeySourceChanged,
 	})
 
 	api.RegisterRoutes(mux, api.Dependencies{
@@ -323,6 +367,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 // runContext executes the command until ctx is cancelled. It returns the exit
 // code so tests can drive the whole lifecycle without sending signals.
 func runContext(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	if len(args) > 0 && args[0] == "rekey" {
+		return runRekey(args[1:], stdout, stderr)
+	}
 	cfg, err := parseFlags(args)
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {

@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Subject412/dubarr/backend/internal/secrets"
 )
 
 const (
@@ -77,20 +79,37 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if s.keyringAvailable != nil {
 		keyring = s.keyringAvailable()
 	}
+	// The pinned source comes from the settings marker; a failure to read it
+	// leaves the field empty rather than breaking the public status probe.
+	var keySource string
+	if err := s.db.QueryRowContext(r.Context(),
+		`SELECT value FROM settings WHERE key = ?`, secrets.KeySourceSetting,
+	).Scan(&keySource); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		keySource = ""
+	}
+	changed := false
+	if s.keySourceChanged != nil {
+		changed = s.keySourceChanged()
+	}
 	writeJSON(w, http.StatusOK, statusResponse{
 		Initialized:      users > 0,
 		Authenticated:    authErr == nil,
 		KeyringAvailable: keyring,
+		KeySource:        keySource,
+		KeySourceChanged: changed,
 	})
 }
 
 // statusResponse is the public /api/auth/status contract (IDEA.md): whether the
-// first-run admin exists, whether this caller is signed in, and whether an OS
-// keyring backend is usable. It carries no user identity or secret material.
+// first-run admin exists, whether this caller is signed in, whether an OS
+// keyring backend is usable, and which master-key source is pinned. It carries
+// no user identity or secret material.
 type statusResponse struct {
-	Initialized      bool `json:"initialized"`
-	Authenticated    bool `json:"authenticated"`
-	KeyringAvailable bool `json:"keyring_available"`
+	Initialized      bool   `json:"initialized"`
+	Authenticated    bool   `json:"authenticated"`
+	KeyringAvailable bool   `json:"keyring_available"`
+	KeySource        string `json:"keySource"`
+	KeySourceChanged bool   `json:"keySourceChanged"`
 }
 
 // handleSetup creates the first administrator exactly once. Any existing user

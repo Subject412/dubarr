@@ -9,6 +9,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/Subject412/dubarr/backend/internal/secrets"
+	"github.com/Subject412/dubarr/backend/internal/store"
 )
 
 func TestParseFlagsDefaults(t *testing.T) {
@@ -84,6 +87,50 @@ func TestRunHelpPrintsUsageAndExitsZero(t *testing.T) {
 	}
 	if stderr.Len() != 0 {
 		t.Errorf("run(--help) wrote to stderr: %q", stderr.String())
+	}
+}
+
+// TestRunRekeySubcommand exercises the CLI entry point end to end: a fresh
+// keyfile is generated, installed and pinned, and the old secret survives.
+func TestRunRekeySubcommand(t *testing.T) {
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	svc, err := secrets.Open(st, secrets.Options{DataDir: dataDir})
+	if err != nil {
+		t.Fatalf("secrets.Open: %v", err)
+	}
+	if err := svc.Set("api.key", "rekey-me"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	newKeyfile := filepath.Join(t.TempDir(), "rekey.key")
+	var stdout, stderr bytes.Buffer
+	code := runContext(context.Background(),
+		[]string{"rekey", "--data-dir", dataDir, "--keyfile", newKeyfile}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("rekey exit = %d (stderr: %q)", code, stderr.String())
+	}
+	if _, err := os.Stat(newKeyfile); err != nil {
+		t.Fatalf("rekey did not create the new keyfile: %v", err)
+	}
+
+	st2, err := store.Open(dataDir)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer st2.Close()
+	svc2, err := secrets.Open(st2, secrets.Options{DataDir: dataDir})
+	if err != nil {
+		t.Fatalf("Open after rekey: %v", err)
+	}
+	if got, err := svc2.Get("api.key"); err != nil || got != "rekey-me" {
+		t.Fatalf("Get after rekey = %q, %v", got, err)
 	}
 }
 

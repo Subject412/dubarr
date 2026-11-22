@@ -19,11 +19,15 @@ type Service struct {
 	// keyring is retained only so KeyringAvailable can answer /api/auth/status
 	// and the health payload without re-probing the platform.
 	keyring KeyringBackend
+	// keySourceChanged is true when this boot auto re-pinned an empty
+	// collection to a different source; /api/auth/status surfaces it.
+	keySourceChanged bool
 }
 
-// Open resolves the master key for st.DataDir (see Options for the resolution
-// order) and returns a ready Service. This touches the keyring and keyfile but
-// performs no SQL writes, so it is safe to call before the HTTP server starts.
+// Open resolves the master key for st.DataDir under the pinned-source state
+// machine (ADR-0008) and returns a ready Service. On first boot it writes the
+// marker and sentinel in one transaction; on later boots it resolves only from
+// the recorded source and refuses a mismatch when user secrets exist.
 func Open(st *store.Store, opts Options) (*Service, error) {
 	if st == nil || st.DB == nil {
 		return nil, errors.New("secrets: store handle is required")
@@ -31,16 +35,59 @@ func Open(st *store.Store, opts Options) (*Service, error) {
 	if opts.DataDir == "" {
 		opts.DataDir = st.DataDir()
 	}
-	key, source, err := ResolveMasterKey(opts)
+
+	recorded, err := readKeySource(st.DB)
 	if err != nil {
 		return nil, err
 	}
-	return NewWithKey(st.DB, key, opts.Keyring, source)
+	userSecrets, err := countUserSecrets(st.DB)
+	if err != nil {
+		return nil, err
+	}
+
+	if recorded == "" {
+		if userSecrets > 0 {
+			// M1 upgrade: adopt whichever existing source authenticates.
+			key, source, err := migratePinning(st.DB, opts)
+			if err != nil {
+				return nil, err
+			}
+			return NewWithKey(st.DB, key, opts.Keyring, source)
+		}
+		// First boot: generation is allowed exactly here.
+		key, source, err := ResolveMasterKey(opts)
+		if err != nil {
+			return nil, err
+		}
+		if err := pinKeySource(st.DB, source, key); err != nil {
+			return nil, err
+		}
+		return NewWithKey(st.DB, key, opts.Keyring, source)
+	}
+
+	key, resolveErr := resolveRecorded(opts, recorded)
+	if resolveErr != nil {
+		if userSecrets == 0 {
+			return repinEmpty(st.DB, opts, recorded)
+		}
+		return nil, &SourceMismatchError{
+			Recorded: recorded,
+			Now:      candidateSource(opts),
+			Secrets:  userSecrets,
+		}
+	}
+
+	// The source matched; the sentinel must also authenticate. A wiped keyring
+	// or corrupt check row is fatal, never a silent re-initialisation.
+	if err := verifyKeyCheck(st.DB, key); err != nil {
+		return nil, fmt.Errorf("%w (recorded source %q)", err, recorded)
+	}
+	return NewWithKey(st.DB, key, opts.Keyring, recorded)
 }
 
-// NewWithKey builds a Service from an already-resolved key. It exists for tests
-// and for callers that manage the key themselves (e.g. a future unlock screen);
-// production code path is Open.
+// NewWithKey builds a Service from an already-resolved key. It bypasses the
+// pinned-source state machine by design (tests, embedders, an explicit unlock
+// flow); production startup goes through Open.
 func NewWithKey(db *sql.DB, key []byte, keyring KeyringBackend, source Source) (*Service, error) {
 	if db == nil {
 		return nil, errors.New("secrets: database handle is required")
@@ -58,6 +105,12 @@ func (s *Service) KeySource() Source {
 		return ""
 	}
 	return s.source
+}
+
+// KeySourceChanged reports whether this boot auto re-pinned an empty secrets
+// collection to a different master-key source. It is false on normal boots.
+func (s *Service) KeySourceChanged() bool {
+	return s != nil && s.keySourceChanged
 }
 
 // KeyringAvailable reports whether an OS keyring is usable right now, so

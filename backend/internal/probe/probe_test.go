@@ -393,6 +393,23 @@ func TestProbeZeroAudioTracksIsEmptySlice(t *testing.T) {
 	if !strings.Contains(string(raw), `"audio_tracks":[]`) {
 		t.Fatalf("JSON = %s, want audio_tracks:[]", raw)
 	}
+
+	// The cache-hit path must preserve the empty-slice contract too; a clone
+	// built with append(nil, ...) would turn a zero-length slice into nil.
+	cached, err := p.Probe(context.Background(), path)
+	if err != nil {
+		t.Fatalf("cached Probe: %v", err)
+	}
+	if cached.Tracks == nil {
+		t.Fatal("cached Tracks is nil, want an empty slice")
+	}
+	cachedRaw, err := json.Marshal(cached)
+	if err != nil {
+		t.Fatalf("cached Marshal: %v", err)
+	}
+	if !strings.Contains(string(cachedRaw), `"audio_tracks":[]`) {
+		t.Fatalf("cached JSON = %s, want audio_tracks:[]", cachedRaw)
+	}
 }
 
 func TestProbeReturnsCopyOfCachedResult(t *testing.T) {

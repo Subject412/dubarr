@@ -371,6 +371,7 @@ func (p *Prober) cachePut(key cacheKey, info *MediaInfo) {
 
 func cloneInfo(in *MediaInfo) *MediaInfo {
 	out := *in
-	out.Tracks = append([]AudioTrack(nil), in.Tracks...)
+	out.Tracks = make([]AudioTrack, len(in.Tracks))
+	copy(out.Tracks, in.Tracks)
 	return &out
 }

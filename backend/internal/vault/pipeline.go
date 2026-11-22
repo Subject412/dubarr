@@ -174,6 +174,18 @@ func (w *Writer) Write(ctx context.Context, req Request) (*Entry, error) {
 		media.FolderPath = vaultDir
 	}
 
+	// Write-once: refuse an existing destination before copying anything, so a
+	// refused overwrite reports ErrCollision rather than surfacing a copy error
+	// (ENOSPC, EACCES) and never wastes a full copy of the staged file. The
+	// mutex closes the check/rename race inside this process; see the package
+	// comment for the cross-process TOCTOU note.
+	w.mu.Lock()
+	err = checkDestinationFree(finalPath)
+	w.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+
 	digest, size, tempPath, err := w.copyToTemp(staged, vaultDir, info.Size())
 	if err != nil {
 		return nil, err
@@ -187,16 +199,12 @@ func (w *Writer) Write(ctx context.Context, req Request) (*Entry, error) {
 		}
 	}()
 
-	// Write-once: refuse an existing destination instead of renaming over it.
-	// The mutex closes the check/rename race inside this process; see the
-	// package comment for the cross-process TOCTOU note.
+	// Belt-and-braces: re-check under the same mutex immediately before the
+	// rename, in case the destination appeared since the check above.
 	w.mu.Lock()
-	if _, err := os.Lstat(finalPath); err == nil {
+	if err := checkDestinationFree(finalPath); err != nil {
 		w.mu.Unlock()
-		return nil, fmt.Errorf("%w: %s: %w", ErrCollision, finalPath, fs.ErrExist)
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		w.mu.Unlock()
-		return nil, fmt.Errorf("vault: check destination %s: %w", finalPath, err)
+		return nil, err
 	}
 	if err := w.renameFile(tempPath, finalPath); err != nil {
 		w.mu.Unlock()
@@ -270,6 +278,18 @@ func (w *Writer) Write(ctx context.Context, req Request) (*Entry, error) {
 	}
 	_ = os.Remove(filepath.Dir(staged))
 	return entry, nil
+}
+
+// checkDestinationFree enforces write-once: it returns ErrCollision (matching
+// fs.ErrExist) when finalPath already exists. Callers hold w.mu so the check
+// and the rename that follows it are atomic within this process.
+func checkDestinationFree(finalPath string) error {
+	if _, err := os.Lstat(finalPath); err == nil {
+		return fmt.Errorf("%w: %s: %w", ErrCollision, finalPath, fs.ErrExist)
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("vault: check destination %s: %w", finalPath, err)
+	}
+	return nil
 }
 
 // copyToTemp streams src into a hidden temp file inside vaultDir, hashing the

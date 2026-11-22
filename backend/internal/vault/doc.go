@@ -7,25 +7,30 @@
 //
 //  1. canonicalize and validate the staged file (regular file, confined to the
 //     extraction root);
-//  2. stream its bytes into a temp file inside the vault directory while
+//  2. refuse an existing destination with ErrCollision before copying anything
+//     (write-once, so a refused overwrite costs no copy);
+//  3. stream its bytes into a temp file inside the vault directory while
 //     computing SHA-256 of exactly the bytes being archived, then fsync it;
-//  3. atomically rename the temp file to <base>.<iso2>.mka (ISO 639-1 suffix,
-//     per GLOSSARY "Target Language" and IDEA.md §3.3);
-//  4. fsync the vault directory so the rename is durable;
-//  5. chmod the published file 0444 (ADR-0002 immutability);
-//  6. record the track in audio_tracks (and its vault_media parent);
-//  7. remove the staged file and, when empty, its import directory.
+//  4. atomically rename the temp file to <base>.<iso2>.mka (ISO 639-1 suffix,
+//     per GLOSSARY "Target Language" and IDEA.md §3.3), re-checking that the
+//     destination is still absent under the writer's mutex;
+//  5. fsync the vault directory so the rename is durable;
+//  6. chmod the published file 0444 (ADR-0002 immutability);
+//  7. record the track in audio_tracks (and its vault_media parent);
+//  8. remove the staged file and, when empty, its import directory.
 //
 // # Write-once
 //
 // An existing destination is never overwritten: the pipeline refuses with
 // ErrCollision (which also matches fs.ErrExist) before creating any temp file.
-// The check and the rename run under the writer's mutex, so a single process
-// cannot race itself. The extraction worker is serialized (concurrency 1), so
-// vault writes are serialized too; a second process writing the same vault is
-// outside the M3-2 scope and remains a documented TOCTOU window. The rename
-// itself is a plain os.Rename because no portable RENAME_NOREPLACE primitive
-// exists in the standard library and the repository targets Windows as well.
+// The destination is checked once before the copy and again, under the
+// writer's mutex, immediately before the rename as belt-and-braces, so a single
+// process cannot race itself. The extraction worker is serialized (concurrency
+// 1), so vault writes are serialized too; a second process writing the same
+// vault is outside the M3-2 scope and remains a documented TOCTOU window. The
+// rename itself is a plain os.Rename because no portable RENAME_NOREPLACE
+// primitive exists in the standard library and the repository targets Windows
+// as well.
 //
 // # Directory permissions
 //

@@ -214,13 +214,18 @@ func TestWriteRefusesOverwrite(t *testing.T) {
 	h := newHarness(t)
 	original := []byte("original vault payload")
 	staged1 := h.stage(1, "donor.pl.1.mka", original)
-	first, err := h.writer.Write(h.ctx, baseRequest(staged1))
-	if err != nil {
+	if _, err := h.writer.Write(h.ctx, baseRequest(staged1)); err != nil {
 		t.Fatalf("first Write: %v", err)
 	}
 
 	replacement := []byte("this must never replace the archive")
 	staged2 := h.stage(2, "donor2.pl.1.mka", replacement)
+	// A copy that started would fail on this unreadable source (root ignores the
+	// mode bits, but then the copy simply succeeds): the collision must be
+	// reported before any temp file is created.
+	if err := os.Chmod(staged2, 0o000); err != nil {
+		t.Fatalf("make replacement unreadable: %v", err)
+	}
 	entry, err := h.writer.Write(h.ctx, baseRequest(staged2))
 	if entry != nil {
 		t.Errorf("second Write entry = %+v, want nil", entry)
@@ -232,7 +237,8 @@ func TestWriteRefusesOverwrite(t *testing.T) {
 		t.Errorf("collision error does not match fs.ErrExist: %v", err)
 	}
 
-	got, err := os.ReadFile(first.Path)
+	wantPath := filepath.Join(h.vault, "Spirited Away (2001).pl.mka")
+	got, err := os.ReadFile(wantPath)
 	if err != nil {
 		t.Fatalf("read vault file: %v", err)
 	}

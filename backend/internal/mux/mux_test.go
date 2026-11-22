@@ -14,6 +14,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/Subject412/dubarr/backend/internal/analyze"
@@ -109,6 +110,35 @@ func sha256File(t *testing.T, path string) string {
 		t.Fatalf("hash %s: %v", path, err)
 	}
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// videoStreamHash hashes the compressed video packets only (no container
+// metadata), so it proves the video bitstream survived the mux untouched.
+func videoStreamHash(t *testing.T, path string) string {
+	t.Helper()
+	out, err := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error",
+		"-i", path, "-map", "0:v", "-c", "copy", "-f", "hash", "-hash", "md5", "-").Output()
+	if err != nil {
+		t.Fatalf("hash video stream of %s: %v", path, err)
+	}
+	got := strings.TrimSpace(string(out))
+	const emptyMD5 = "MD5=d41d8cd98f00b204e9800998ecf8427e"
+	if !strings.HasPrefix(got, "MD5=") || got == emptyMD5 {
+		t.Fatalf("video stream hash of %s is empty: %q", path, got)
+	}
+	return got
+}
+
+// noTempsLeft fails when any *.dubarr*.tmp scratch file survived beside target.
+func noTempsLeft(t *testing.T, target string) {
+	t.Helper()
+	matches, err := filepath.Glob(target + ".*.tmp")
+	if err != nil {
+		t.Fatalf("glob temps: %v", err)
+	}
+	if len(matches) > 0 {
+		t.Errorf("leftover temp files: %v", matches)
+	}
 }
 
 // snapshot records every regular file under dir with its hash.
@@ -286,6 +316,7 @@ func TestMuxPublishesAtomicallyWithBackup(t *testing.T) {
 		t.Fatalf("stat target: %v", err)
 	}
 	beforeProbe := probeFile(t, h.target)
+	beforeVideo := videoStreamHash(t, h.target)
 
 	res, err := New(Dependencies{}).Mux(context.Background(), h.job())
 	if err != nil {
@@ -301,6 +332,7 @@ func TestMuxPublishesAtomicallyWithBackup(t *testing.T) {
 	if _, err := os.Stat(h.target + ".dubarr.tmp"); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("temp file still present: %v", err)
 	}
+	noTempsLeft(t, h.target)
 
 	// The original bytes survive verbatim in the sidecar backup.
 	if got := sha256File(t, h.target+".bak"); got != beforeTargetHash {
@@ -327,11 +359,15 @@ func TestMuxPublishesAtomicallyWithBackup(t *testing.T) {
 		t.Error("target inode unchanged, want atomic replacement")
 	}
 
-	// Video stream is copied byte-for-byte: codec/size/frame count/bitrate and
-	// duration are untouched.
+	// Video stream is copied byte-for-byte: the compressed bitstream hash is
+	// identical before and after (ffprobe reports N/A nb_frames/bit_rate for
+	// these tiny fixtures, so a probe comparison alone is nearly vacuous).
 	afterProbe := probeFile(t, h.target)
 	if want, got := videoOnly(beforeProbe), videoOnly(afterProbe); !reflect.DeepEqual(got, want) {
 		t.Errorf("video stream changed:\n got %+v\nwant %+v", got, want)
+	}
+	if got, want := videoStreamHash(t, h.target), beforeVideo; got != want {
+		t.Errorf("video stream hash = %s, want %s (video was re-encoded)", got, want)
 	}
 
 	// Exactly one audio track was appended, tagged with the vault track's ISO2
@@ -496,8 +532,156 @@ func TestMkvmergeFailureLeavesOriginalUntouched(t *testing.T) {
 	if _, err := os.Stat(h.target + ".dubarr.tmp"); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("temp not cleaned up: %v", err)
 	}
+	noTempsLeft(t, h.target)
 	if _, err := os.Stat(h.target + ".bak"); !errors.Is(err, os.ErrNotExist) {
 		t.Error(".bak created despite failed mux")
+	}
+}
+
+func TestStagedAudioOutsideJobDirAborts(t *testing.T) {
+	h := newHarness(t)
+	hash := sha256File(t, h.target)
+	// A perfectly valid .mka, but staged outside {WORK_DIR}/jobs/{id}/.
+	outside := copyFixture(t, fixtureAudio, h.dir, "vault-track.mka")
+
+	job := h.job()
+	job.AudioPath = outside
+	if _, err := New(Dependencies{}).Mux(context.Background(), job); !errors.Is(err, ErrInvalidJob) {
+		t.Fatalf("Mux error = %v, want ErrInvalidJob", err)
+	}
+	if got := sha256File(t, h.target); got != hash {
+		t.Error("target modified for out-of-jobDir audio")
+	}
+	if _, err := os.Stat(h.target + ".bak"); !errors.Is(err, os.ErrNotExist) {
+		t.Error(".bak created despite invalid audio path")
+	}
+	noTempsLeft(t, h.target)
+}
+
+func TestTargetMustBeAnExistingRegularFile(t *testing.T) {
+	h := newHarness(t)
+	dirTarget := filepath.Join(h.dir, "Folder (2021) [TDARR].mkv")
+	if err := os.Mkdir(dirTarget, 0o755); err != nil {
+		t.Fatalf("mkdir target: %v", err)
+	}
+	cases := map[string]string{
+		"missing":     filepath.Join(h.dir, "Nope (2021) [TDARR].mkv"),
+		"non-regular": dirTarget,
+	}
+	for name, path := range cases {
+		t.Run(name, func(t *testing.T) {
+			job := h.job()
+			job.TargetPath = path
+			if _, err := New(Dependencies{}).Mux(context.Background(), job); !errors.Is(err, ErrTargetMissing) {
+				t.Fatalf("Mux error = %v, want ErrTargetMissing", err)
+			}
+			if _, err := os.Stat(filepath.Join(h.work, "jobs", "42", "target.mkv")); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("work copy written for unusable target: %v", err)
+			}
+		})
+	}
+}
+
+func TestBasicJobShapeValidation(t *testing.T) {
+	h := newHarness(t)
+	hash := sha256File(t, h.target)
+	cases := []struct {
+		name   string
+		mutate func(*Job)
+		want   error
+	}{
+		{"no work dir", func(j *Job) { j.WorkDir = "  " }, ErrNoWorkDir},
+		{"no job id", func(j *Job) { j.ID = 0 }, ErrInvalidJob},
+		{"no target path", func(j *Job) { j.TargetPath = "" }, ErrInvalidJob},
+		{"no audio path", func(j *Job) { j.AudioPath = "" }, ErrInvalidJob},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			job := h.job()
+			tc.mutate(&job)
+			if _, err := New(Dependencies{}).Mux(context.Background(), job); !errors.Is(err, tc.want) {
+				t.Fatalf("Mux error = %v, want %v", err, tc.want)
+			}
+			if got := sha256File(t, h.target); got != hash {
+				t.Error("target modified on invalid job")
+			}
+		})
+	}
+}
+
+// TestPostMuxProbeFailureAborts covers ADR-0004: the muxed temp is probed
+// before the rename, so a broken probe or a missing track leaves the original
+// untouched and no .bak behind.
+func TestPostMuxProbeFailureAborts(t *testing.T) {
+	cases := map[string]string{
+		"probe error":     "not json at all",
+		"no audio tracks": `{"streams":[{"codec_type":"video"}]}`,
+	}
+	for name, probeOut := range cases {
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t)
+			hash := sha256File(t, h.target)
+			run := func(ctx context.Context, bin string, args ...string) ([]byte, error) {
+				if filepath.Base(bin) == "ffprobe" {
+					// The Copy-on-Work baseline (basename target.mkv) must
+					// succeed; only the post-mux temp probe fails.
+					if len(args) > 0 && filepath.Base(args[len(args)-1]) == "target.mkv" {
+						return []byte(`{"streams":[{"codec_type":"video"},{"codec_type":"audio"}]}`), nil
+					}
+					return []byte(probeOut), nil
+				}
+				return execRun(ctx, bin, args...)
+			}
+			_, err := New(Dependencies{Run: run}).Mux(context.Background(), h.job())
+			if !errors.Is(err, ErrPublish) {
+				t.Fatalf("Mux error = %v, want ErrPublish", err)
+			}
+			if got := sha256File(t, h.target); got != hash {
+				t.Error("target modified after failed validation")
+			}
+			if _, err := os.Stat(h.target + ".bak"); !errors.Is(err, os.ErrNotExist) {
+				t.Error(".bak created despite failed validation")
+			}
+			noTempsLeft(t, h.target)
+		})
+	}
+}
+
+// TestConcurrentMuxesUseDistinctTemps runs two publishes on one target: each
+// job must own its temp file, so neither can delete the other's output.
+func TestConcurrentMuxesUseDistinctTemps(t *testing.T) {
+	h := newHarness(t)
+	second := *h
+	second.id = 43
+	secondJobDir := filepath.Join(h.work, "jobs", "43")
+	if err := os.MkdirAll(secondJobDir, 0o755); err != nil {
+		t.Fatalf("mkdir second job: %v", err)
+	}
+	second.audio = copyFixture(t, fixtureAudio, secondJobDir, "synced.pl.mka")
+
+	jobs := []Job{h.job(), second.job()}
+	errs := make([]error, len(jobs))
+	var wg sync.WaitGroup
+	for i := range jobs {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, errs[i] = New(Dependencies{}).Mux(context.Background(), jobs[i])
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent Mux %d: %v", i, err)
+		}
+	}
+	noTempsLeft(t, h.target)
+	doc := probeFile(t, h.target)
+	if got := len(audioStreams(doc)); got != 2 {
+		t.Errorf("audio tracks = %d, want 2 (one per concurrent job)", got)
+	}
+	if _, err := os.Stat(h.target + ".bak"); err != nil {
+		t.Errorf("concurrent mux left no .bak: %v", err)
 	}
 }
 

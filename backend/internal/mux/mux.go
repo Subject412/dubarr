@@ -3,6 +3,9 @@ package mux
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -91,6 +94,8 @@ type Result struct {
 type Dependencies struct {
 	// MKVMergePath pins the binary; empty resolves mkvmerge on PATH.
 	MKVMergePath string
+	// FfprobePath pins the validation binary; empty resolves ffprobe on PATH.
+	FfprobePath string
 	// LookPath overrides binary discovery (tests).
 	LookPath func(string) (string, error)
 	// Run executes the tool and returns combined output; nil uses
@@ -103,15 +108,17 @@ type Dependencies struct {
 // Muxer performs tag-gated, atomic muxing.
 type Muxer struct {
 	mkvmergePath string
+	ffprobePath  string
 	lookPath     func(string) (string, error)
 	run          func(ctx context.Context, name string, args ...string) ([]byte, error)
 	timeout      time.Duration
 }
 
-// New builds a Muxer. A missing mkvmerge is reported from Mux, not here.
+// New builds a Muxer. A missing tool is reported from Mux, not here.
 func New(deps Dependencies) *Muxer {
 	m := &Muxer{
 		mkvmergePath: deps.MKVMergePath,
+		ffprobePath:  deps.FfprobePath,
 		lookPath:     deps.LookPath,
 		run:          deps.Run,
 		timeout:      deps.Timeout,
@@ -133,10 +140,11 @@ func New(deps Dependencies) *Muxer {
 // Order is deliberate: verdict, ambiguity and the Tdarr Gate are all resolved
 // read-only before the first write, so an abort leaves the target directory and
 // the Work Area untouched. The target is then copied into
-// {WORK_DIR}/jobs/{id}/, mkvmerge writes <target>.dubarr.tmp beside the target
-// (same filesystem), the original is copied to <target>.bak, and only then is
-// the temp renamed over the original. Any failure removes the temp and leaves
-// the original bytes in place; staging cleanup belongs to the caller.
+// {WORK_DIR}/jobs/{id}/, mkvmerge writes a uniquely named hidden temp beside
+// the target (same filesystem), ffprobe validates the result, the original is
+// copied to <target>.bak, and only then is the temp renamed over the original.
+// Any failure removes only the temp this call created and leaves the original
+// bytes in place; staging cleanup belongs to the caller.
 func (m *Muxer) Mux(ctx context.Context, job Job) (Result, error) {
 	target, _, jobDir, lang, err := job.normalize()
 	if err != nil {
@@ -195,10 +203,27 @@ func (m *Muxer) Mux(ctx context.Context, job Job) (Result, error) {
 			return Result{}, fmt.Errorf("%w: mkvmerge not found on PATH: %v", ErrTool, err)
 		}
 	}
-	temp := target + ".dubarr.tmp"
-	if err := os.Remove(temp); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return Result{}, fmt.Errorf("%w: stale temp: %v", ErrPublish, err)
+	probeBin := m.ffprobePath
+	if probeBin == "" {
+		if probeBin, err = m.lookPath("ffprobe"); err != nil {
+			return Result{}, fmt.Errorf("%w: ffprobe not found on PATH: %v", ErrTool, err)
+		}
 	}
+	// Baseline for the pre-rename validation: the Copy-on-Work bytes carry the
+	// target's own audio tracks.
+	beforeAudio, err := m.probeAudioCount(ctx, probeBin, workCopy)
+	if err != nil {
+		return Result{}, fmt.Errorf("%w: pre-mux probe of %s: %v", ErrTool, filepath.Base(workCopy), err)
+	}
+
+	// The temp name is unique per job and reserved with O_EXCL, so two
+	// concurrent Mux calls on one target never share (or delete) each other's
+	// work. Only the file this call created is removed on failure.
+	temp, tempOut, err := createTempBeside(target, "dubarr", 0o644)
+	if err != nil {
+		return Result{}, err
+	}
+	_ = tempOut.Close()
 	published := false
 	defer func() {
 		if !published {
@@ -226,6 +251,12 @@ func (m *Muxer) Mux(ctx context.Context, job Job) (Result, error) {
 	}
 	if fi, err := os.Stat(temp); err != nil || fi.Size() == 0 {
 		return Result{}, fmt.Errorf("%w: mkvmerge produced no output", ErrTool)
+	}
+
+	// ADR-0004: validate the muxed file before it replaces the original.
+	// A probe failure or a missing track aborts with the original intact.
+	if err := m.validatePublished(ctx, probeBin, temp, beforeAudio); err != nil {
+		return Result{}, err
 	}
 
 	bak := target + ".bak"
@@ -360,6 +391,76 @@ func resolveAudio(audioPath, jobDir string) (string, error) {
 	return audio, nil
 }
 
+// createTempBeside reserves a unique hidden temp path in the target's own
+// directory, so the later rename stays on one filesystem. The name is random
+// and created O_EXCL: concurrent Mux calls on the same target can neither
+// collide with nor remove each other's work (vault/pipeline.go createTemp).
+// The returned file is owned by the caller and is removed by it on failure.
+func createTempBeside(target, tag string, perm os.FileMode) (string, *os.File, error) {
+	dir, base := filepath.Dir(target), filepath.Base(target)
+	for attempt := 0; attempt < 4; attempt++ {
+		var raw [8]byte
+		if _, err := rand.Read(raw[:]); err != nil {
+			return "", nil, fmt.Errorf("%w: random temp name: %v", ErrPublish, err)
+		}
+		path := filepath.Join(dir, base+"."+tag+"-"+hex.EncodeToString(raw[:])+".tmp")
+		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
+		if errors.Is(err, os.ErrExist) {
+			continue
+		}
+		if err != nil {
+			return "", nil, fmt.Errorf("%w: create temp in %s: %v", ErrPublish, dir, err)
+		}
+		return path, f, nil
+	}
+	return "", nil, fmt.Errorf("%w: create temp in %s: no unique name after retries", ErrPublish, dir)
+}
+
+// probeAudioCount runs ffprobe and counts audio streams. Any non-zero exit is
+// a failure: unlike mkvmerge there is no warning exit worth accepting here.
+func (m *Muxer) probeAudioCount(ctx context.Context, bin, path string) (int, error) {
+	ctx, cancel := context.WithTimeout(ctx, m.timeout)
+	defer cancel()
+	out, err := m.run(ctx, bin, "-v", "error",
+		"-show_entries", "stream=codec_type", "-of", "json", path)
+	if err != nil {
+		if ctx.Err() != nil {
+			return 0, fmt.Errorf("timed out after %s", m.timeout)
+		}
+		return 0, fmt.Errorf("%v: %s", err, tail(out))
+	}
+	var doc struct {
+		Streams []struct {
+			CodecType string `json:"codec_type"`
+		} `json:"streams"`
+	}
+	if err := json.Unmarshal(out, &doc); err != nil {
+		return 0, fmt.Errorf("decode ffprobe output: %v", err)
+	}
+	count := 0
+	for _, s := range doc.Streams {
+		if s.CodecType == "audio" {
+			count++
+		}
+	}
+	return count, nil
+}
+
+// validatePublished re-probes the muxed temp before the atomic rename
+// (ADR-0004): ffprobe must succeed and exactly one audio track must have been
+// appended. A failure returns ErrPublish and leaves the original untouched.
+func (m *Muxer) validatePublished(ctx context.Context, bin, path string, beforeAudio int) error {
+	got, err := m.probeAudioCount(ctx, bin, path)
+	if err != nil {
+		return fmt.Errorf("%w: post-mux probe of %s: %v", ErrPublish, filepath.Base(path), err)
+	}
+	if want := beforeAudio + 1; got != want {
+		return fmt.Errorf("%w: post-mux probe of %s found %d audio tracks, want %d",
+			ErrPublish, filepath.Base(path), got, want)
+	}
+	return nil
+}
+
 // DefaultTrackTitle is the fallback Matroska track name: the ISO-2 language
 // plus the dub marker, rendered like the vault badge "PL DUB" (IDEA.md:506).
 // A configured mux.options.track_title_in_mkv (default "Polski Dubbing")
@@ -375,10 +476,16 @@ func yesNo(v bool) string {
 	return "no"
 }
 
-// writeBackup copies the original to <name>.bk through a same-directory temp,
-// preserving its permission bits (0644-ish for library files).
+// writeBackup copies the original to <name>.bak through a uniquely named
+// same-directory temp, preserving its permission bits (0644-ish for library
+// files). The .bak itself is intentionally overwritten: it is the previous
+// good copy, not a per-run artifact.
 func writeBackup(src, dst string, perm os.FileMode) error {
-	tmp := dst + ".tmp"
+	tmp, f, err := createTempBeside(dst, "bak", perm)
+	if err != nil {
+		return err
+	}
+	_ = f.Close()
 	if err := copyFile(src, tmp, perm); err != nil {
 		_ = os.Remove(tmp)
 		return err

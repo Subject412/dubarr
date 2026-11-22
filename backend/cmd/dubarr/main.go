@@ -208,6 +208,7 @@ func newServerWithSecrets(cfg Config, secOpts secrets.Options) (*server, error) 
 	api.RegisterRoutes(mux, api.Dependencies{
 		DB:           st.DB,
 		Settings:     settingsStore,
+		Secrets:      sec,
 		RequireAdmin: authSvc.RequireAdmin,
 	})
 

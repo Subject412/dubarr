@@ -12,6 +12,7 @@
 //	mux.options        keep .bak, track title written into Matroska
 //	watch.options      watch-folder scan cadence and stability window
 //	arr.options        Radarr/Sonarr polling cadence
+//	arr.connections    Radarr/Sonarr instances (API keys live in internal/secrets)
 //
 // mux/watch/arr sections are an extension of the IDEA.md key list: the spec
 // only names the first five, but the settled defaults for keep_bak, the track
@@ -29,6 +30,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -48,11 +50,13 @@ const (
 	KeyMuxOptions      = "mux.options"
 	KeyWatchOptions    = "watch.options"
 	KeyArrOptions      = "arr.options"
+	KeyArrConnections  = "arr.connections"
 )
 
 var knownKeys = []string{
 	KeyStoragePaths, KeyLanguagesPolicy, KeyTargetTagFilter, KeySyncDefaults,
 	KeySecurityOptions, KeyMuxOptions, KeyWatchOptions, KeyArrOptions,
+	KeyArrConnections,
 }
 
 // KnownKeys returns the writable section keys in stable order.
@@ -122,6 +126,21 @@ type ArrOptions struct {
 	ManualSync      bool `json:"manual_sync"`
 }
 
+// ArrConnection is one Radarr or Sonarr instance. The API key is deliberately
+// absent: it lives in the encrypted secrets store and only a masked suffix is
+// derived when the API lists connections.
+type ArrConnection struct {
+	// Kind is "radarr" or "sonarr"; it is also the identity of the instance.
+	Kind    string `json:"kind"`
+	BaseURL string `json:"base_url"`
+	Enabled bool   `json:"enabled"`
+}
+
+// ArrConnections is the arr.connections section: at most one instance per kind.
+type ArrConnections struct {
+	Instances []ArrConnection `json:"instances"`
+}
+
 // Store reads and writes settings sections on the shared database handle.
 type Store struct {
 	db *sql.DB
@@ -185,6 +204,9 @@ func Defaults(dataDir string) map[string]any {
 		KeyArrOptions: ArrOptions{
 			PollIntervalSec: 300,
 			ManualSync:      true,
+		},
+		KeyArrConnections: ArrConnections{
+			Instances: []ArrConnection{},
 		},
 	}
 }
@@ -474,6 +496,13 @@ func normalize(key string, raw json.RawMessage) (string, error) {
 			err = errors.New("poll_interval_sec must be 30..86400")
 		}
 		v = p
+	case KeyArrConnections:
+		var p ArrConnections
+		err = strict(raw, &p)
+		if err == nil {
+			err = validateArrConnections(&p)
+		}
+		v = p
 	}
 	if err != nil {
 		return "", fmt.Errorf("%w: %s: %v", ErrInvalidValue, key, err)
@@ -544,6 +573,33 @@ func validateTagFilter(p *TargetTagFilter) error {
 	}
 	if p.EnforceTagFilter && len(p.RequiredFilenameTags) == 0 {
 		return errors.New("enforce_tag_filter requires at least one required_filename_tag")
+	}
+	return nil
+}
+
+func validateArrConnections(p *ArrConnections) error {
+	if p.Instances == nil {
+		p.Instances = []ArrConnection{}
+	}
+	seen := make(map[string]bool, len(p.Instances))
+	for i := range p.Instances {
+		inst := &p.Instances[i]
+		inst.Kind = strings.ToLower(strings.TrimSpace(inst.Kind))
+		switch inst.Kind {
+		case "radarr", "sonarr":
+		default:
+			return fmt.Errorf("instance %d: kind must be radarr or sonarr", i)
+		}
+		if seen[inst.Kind] {
+			return fmt.Errorf("instance %d: duplicate kind %q", i, inst.Kind)
+		}
+		seen[inst.Kind] = true
+		inst.BaseURL = strings.TrimSpace(inst.BaseURL)
+		u, err := url.Parse(inst.BaseURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("instance %d: base_url must be an absolute http(s) URL", i)
+		}
+		inst.BaseURL = strings.TrimRight(inst.BaseURL, "/")
 	}
 	return nil
 }

@@ -12,6 +12,7 @@ import (
 	"errors"
 	"net/http"
 
+	"github.com/Subject412/dubarr/backend/internal/secrets"
 	"github.com/Subject412/dubarr/backend/internal/settings"
 )
 
@@ -21,6 +22,9 @@ type Dependencies struct {
 	DB *sql.DB
 	// Settings is the settings store, normally shared with the rest of the app.
 	Settings *settings.Store
+	// Secrets is the encrypted secret store used for arr API keys. When nil the
+	// arr connection routes answer 503 rather than storing keys unencrypted.
+	Secrets *secrets.Service
 	// RequireAdmin wraps admin-only handlers. When nil every route answers 503
 	// rather than silently running unauthenticated.
 	RequireAdmin func(http.Handler) http.Handler
@@ -29,6 +33,7 @@ type Dependencies struct {
 // Service holds the resolved dependencies for the registered handlers.
 type Service struct {
 	store        *settings.Store
+	secrets      *secrets.Service
 	requireAdmin func(http.Handler) http.Handler
 }
 
@@ -38,12 +43,16 @@ type Service struct {
 //	PUT  /api/settings         validate + persist a partial update
 //	GET  /api/settings/export  sanitized configuration export
 //	GET  /api/system/browse    canonicalized directory listing
+//	GET  /api/settings/arr                     list arr connections (masked keys)
+//	PUT  /api/settings/arr/{kind}              upsert one connection
+//	DELETE /api/settings/arr/{kind}            remove one connection
+//	POST /api/settings/arr/{kind}/test         ping the saved connection
 func RegisterRoutes(mux *http.ServeMux, deps Dependencies) *Service {
 	store := deps.Settings
 	if store == nil && deps.DB != nil {
 		store = settings.New(deps.DB)
 	}
-	svc := &Service{store: store, requireAdmin: deps.RequireAdmin}
+	svc := &Service{store: store, secrets: deps.Secrets, requireAdmin: deps.RequireAdmin}
 
 	admin := func(h http.HandlerFunc) http.Handler {
 		if svc.requireAdmin == nil {
@@ -58,6 +67,10 @@ func RegisterRoutes(mux *http.ServeMux, deps Dependencies) *Service {
 	mux.Handle("PUT /api/settings", admin(svc.handlePutSettings))
 	mux.Handle("GET /api/settings/export", admin(svc.handleExportSettings))
 	mux.Handle("GET /api/system/browse", admin(svc.handleBrowse))
+	mux.Handle("GET /api/settings/arr", admin(svc.handleListArr))
+	mux.Handle("PUT /api/settings/arr/{kind}", admin(svc.handleUpsertArr))
+	mux.Handle("DELETE /api/settings/arr/{kind}", admin(svc.handleDeleteArr))
+	mux.Handle("POST /api/settings/arr/{kind}/test", admin(svc.handleTestArr))
 	return svc
 }
 

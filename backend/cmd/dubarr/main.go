@@ -26,15 +26,18 @@ import (
 	"time"
 
 	"github.com/Subject412/dubarr/backend/internal/api"
+	"github.com/Subject412/dubarr/backend/internal/arrrescan"
 	"github.com/Subject412/dubarr/backend/internal/auth"
 	"github.com/Subject412/dubarr/backend/internal/extract"
 	"github.com/Subject412/dubarr/backend/internal/gate"
 	"github.com/Subject412/dubarr/backend/internal/health"
+	"github.com/Subject412/dubarr/backend/internal/mux"
 	"github.com/Subject412/dubarr/backend/internal/queue"
 	"github.com/Subject412/dubarr/backend/internal/secrets"
 	"github.com/Subject412/dubarr/backend/internal/settings"
 	"github.com/Subject412/dubarr/backend/internal/store"
 	"github.com/Subject412/dubarr/backend/internal/syncjob"
+	"github.com/Subject412/dubarr/backend/internal/syncworker"
 	"github.com/Subject412/dubarr/backend/internal/vault"
 	"github.com/Subject412/dubarr/backend/internal/vaultapi"
 	"github.com/Subject412/dubarr/backend/internal/watch"
@@ -168,6 +171,7 @@ type server struct {
 	settings *settings.Store
 	scanner  *watch.Scanner
 	extract  *extract.Worker
+	sync     *syncworker.Worker
 	mux      *http.ServeMux
 	http     *http.Server
 
@@ -175,6 +179,8 @@ type server struct {
 	scannerCancel context.CancelFunc
 	// extractCancel stops the approval-to-vault worker; nil when disabled.
 	extractCancel context.CancelFunc
+	// syncCancel stops the Execute→mux→rescan worker; nil when disabled.
+	syncCancel context.CancelFunc
 
 	closeOnce sync.Once
 	closeErr  error
@@ -308,6 +314,27 @@ func newServerWithSecrets(cfg Config, secOpts secrets.Options) (*server, error) 
 		extractCancel = nil
 	}
 
+	// M5-3: queued sync job → Execute → mux → arr rescan. Disabled (rows stay
+	// queued) when the storage or sync configuration is not complete yet; a
+	// broken chain must not take the HTTP API down.
+	syncCtx, syncCancel := context.WithCancel(context.Background())
+	syncWorker, syncErr := wireSyncWorker(syncCtx, syncWiring{
+		Settings: settingsStore,
+		Store:    st,
+		Secrets:  sec,
+		Logf:     log.Printf,
+	})
+	if syncErr != nil {
+		log.Printf("dubarr: sync worker disabled: %v", syncErr)
+		syncCancel()
+		syncCancel = nil
+	} else if syncWorker != nil {
+		syncWorker.Start(syncCtx)
+	} else {
+		syncCancel()
+		syncCancel = nil
+	}
+
 	s := &server{
 		cfg:           cfg,
 		store:         st,
@@ -315,8 +342,10 @@ func newServerWithSecrets(cfg Config, secOpts secrets.Options) (*server, error) 
 		settings:      settingsStore,
 		scanner:       watchScanner,
 		extract:       extractWorker,
+		sync:          syncWorker,
 		scannerCancel: scanCancel,
 		extractCancel: extractCancel,
+		syncCancel:    syncCancel,
 		mux:           mux,
 	}
 	s.http = &http.Server{
@@ -451,6 +480,88 @@ func wireExtractWorker(ctx context.Context, deps extractWiring) (*extract.Worker
 	})
 	if err != nil {
 		return nil, fmt.Errorf("extraction worker: %w", err)
+	}
+	return worker, nil
+}
+
+// syncWiring is the collaborator set for the M5-3 sync job worker.
+type syncWiring struct {
+	Settings *settings.Store
+	Store    *store.Store
+	// Secrets decrypts arr_instances.api_key_enc for the M5-4 rescan.
+	Secrets arrrescan.Decrypter
+	// Interval overrides the idle cadence; 0 keeps syncworker.DefaultInterval.
+	Interval time.Duration
+	// Logf reports why the worker stays disabled. Nil means log.Printf.
+	Logf func(format string, args ...any)
+}
+
+// wireSyncWorker builds the M5-3 chain: queued sync jobs are analysed by the
+// M4-6 Execute seam, muxed by M5-1 and rescanned by M5-4.
+//
+// vault_dir, work_dir and sync.defaults are required. With any of them missing
+// it returns (nil, nil) after logging once, leaving jobs queued rather than
+// failing them against incomplete storage. The analysis settings and gate rule
+// are re-read per job by the worker.
+func wireSyncWorker(ctx context.Context, deps syncWiring) (*syncworker.Worker, error) {
+	logf := deps.Logf
+	if logf == nil {
+		logf = log.Printf
+	}
+	if deps.Settings == nil || deps.Store == nil {
+		return nil, errors.New("sync worker needs the settings store and the database store")
+	}
+	if deps.Secrets == nil {
+		return nil, errors.New("sync worker needs the secret decrypter for arr rescans")
+	}
+
+	paths, err := loadStoragePaths(ctx, deps.Settings)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(paths.VaultDir) == "" {
+		logf("dubarr: sync worker disabled: storage.paths.vault_dir is not configured")
+		return nil, nil
+	}
+	if strings.TrimSpace(paths.WorkDir) == "" {
+		logf("dubarr: sync worker disabled: storage.paths.work_dir is not configured")
+		return nil, nil
+	}
+	if _, ok, err := deps.Settings.Get(ctx, settings.KeySyncDefaults); err != nil {
+		return nil, fmt.Errorf("read sync.defaults: %w", err)
+	} else if !ok {
+		logf("dubarr: sync worker disabled: sync.defaults is not configured")
+		return nil, nil
+	}
+
+	// Execute lives behind the same service the HTTP API registers, but the
+	// worker only needs the method: mount it on a throwaway mux.
+	executor := syncjob.RegisterRoutes(http.NewServeMux(), syncjob.Dependencies{
+		DB:       deps.Store.DB,
+		Settings: deps.Settings,
+		WorkDir:  paths.WorkDir,
+	})
+
+	rescanner, err := arrrescan.New(arrrescan.Deps{
+		DB:      deps.Store.DB,
+		Secrets: deps.Secrets,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("arr rescanner: %w", err)
+	}
+
+	worker, err := syncworker.New(syncworker.Dependencies{
+		Store:     deps.Store,
+		Settings:  deps.Settings,
+		Executor:  executor,
+		Muxer:     mux.New(mux.Dependencies{}),
+		Rescanner: rescanner,
+		WorkDir:   paths.WorkDir,
+		Interval:  deps.Interval,
+		Logf:      logf,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("sync worker: %w", err)
 	}
 	return worker, nil
 }
@@ -613,6 +724,12 @@ func (s *server) Close() error {
 		}
 		if s.extract != nil {
 			s.extract.Stop()
+		}
+		if s.syncCancel != nil {
+			s.syncCancel()
+		}
+		if s.sync != nil {
+			s.sync.Stop()
 		}
 		if s.store != nil {
 			s.closeErr = s.store.Close()

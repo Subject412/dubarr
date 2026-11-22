@@ -1,0 +1,404 @@
+package syncworker
+
+import (
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/Subject412/dubarr/backend/internal/analyze"
+	"github.com/Subject412/dubarr/backend/internal/arrrescan"
+	"github.com/Subject412/dubarr/backend/internal/mux"
+	"github.com/Subject412/dubarr/backend/internal/settings"
+	"github.com/Subject412/dubarr/backend/internal/store"
+)
+
+type fakeExecutor struct {
+	report analyze.Report
+	err    error
+	panic  any
+	calls  []int64
+}
+
+func (f *fakeExecutor) Execute(_ context.Context, id int64) (analyze.Report, error) {
+	f.calls = append(f.calls, id)
+	if f.panic != nil {
+		panic(f.panic)
+	}
+	return f.report, f.err
+}
+
+type fakeMuxer struct {
+	result mux.Result
+	err    error
+	jobs   []mux.Job
+}
+
+func (f *fakeMuxer) Mux(_ context.Context, job mux.Job) (mux.Result, error) {
+	f.jobs = append(f.jobs, job)
+	return f.result, f.err
+}
+
+type fakeRescanner struct {
+	err  error
+	rows []arrrescan.LibraryCacheRow
+}
+
+func (f *fakeRescanner) RescanAfterMux(_ context.Context, row arrrescan.LibraryCacheRow) error {
+	f.rows = append(f.rows, row)
+	return f.err
+}
+
+type rig struct {
+	store    *store.Store
+	settings *settings.Store
+	workDir  string
+	target   string
+	libID    int64
+	trackID  int64
+}
+
+func newRig(t *testing.T) *rig {
+	t.Helper()
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "data"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	ss := settings.New(st.DB)
+	if err := ss.Seed(context.Background(), filepath.Join(dir, "data")); err != nil {
+		t.Fatalf("seed settings: %v", err)
+	}
+	work := filepath.Join(dir, "work")
+	if err := os.MkdirAll(work, 0o700); err != nil {
+		t.Fatalf("mkdir work: %v", err)
+	}
+	raw, err := json.Marshal(settings.StoragePaths{WorkDir: work, VaultDir: filepath.Join(dir, "vault")})
+	if err != nil {
+		t.Fatalf("marshal storage: %v", err)
+	}
+	if err := ss.Set(context.Background(), settings.KeyStoragePaths, raw); err != nil {
+		t.Fatalf("set storage: %v", err)
+	}
+
+	media := filepath.Join(dir, "library")
+	if err := os.MkdirAll(media, 0o700); err != nil {
+		t.Fatalf("mkdir library: %v", err)
+	}
+	target := filepath.Join(media, "Movie (2020) [ArcA310].mkv")
+	if err := os.WriteFile(target, []byte("target"), 0o600); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	trackPath := filepath.Join(media, "track.pl.mka")
+	if err := os.WriteFile(trackPath, []byte("mka"), 0o600); err != nil {
+		t.Fatalf("write track: %v", err)
+	}
+
+	mediaID, err := st.EnsureVaultMedia(context.Background(), store.VaultMediaRecord{
+		MediaType: "movie", Title: "Movie", Year: 2020, FolderPath: media,
+	})
+	if err != nil {
+		t.Fatalf("EnsureVaultMedia: %v", err)
+	}
+	trackID := insertTrack(t, st.DB, mediaID, trackPath)
+
+	res, err := st.DB.Exec(`INSERT INTO arr_instances (name, type, base_url, api_key_enc, api_key_last4)
+		VALUES ('test', 'radarr', 'http://localhost', X'00', '0000')`)
+	if err != nil {
+		t.Fatalf("insert arr instance: %v", err)
+	}
+	instanceID, _ := res.LastInsertId()
+	res, err = st.DB.Exec(`INSERT INTO arr_library_cache
+		(arr_instance_id, media_type, external_item_id, title, original_language_iso2,
+		 target_file_path, eligibility_status, matches_target_tags, audio_languages_json)
+		VALUES (?, 'movie', 7, 'Movie', 'eng', ?, 'eligible', 1, '["eng"]')`,
+		instanceID, target)
+	if err != nil {
+		t.Fatalf("insert library: %v", err)
+	}
+	libID, _ := res.LastInsertId()
+
+	return &rig{store: st, settings: ss, workDir: work, target: target, libID: libID, trackID: trackID}
+}
+
+func insertTrack(t *testing.T, db *sql.DB, mediaID int64, path string) int64 {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read track: %v", err)
+	}
+	sum := sha256.Sum256(data)
+	res, err := db.Exec(`INSERT INTO audio_tracks
+		(vault_media_id, group_uuid, lang_iso2, lang_iso3, variant, file_path, sha256,
+		 codec, channels, channel_count)
+		VALUES (?, 'group-1', 'pl', 'pol', 'dubbing', ?, ?, 'pcm_s16le', '2.0', 2)`,
+		mediaID, path, hex.EncodeToString(sum[:]))
+	if err != nil {
+		t.Fatalf("insert track: %v", err)
+	}
+	id, _ := res.LastInsertId()
+	return id
+}
+
+func (r *rig) newJob(t *testing.T) int64 {
+	t.Helper()
+	rec, err := r.store.CreateSyncJob(context.Background(), store.SyncJobCreate{
+		VaultTrackID:         r.trackID,
+		TargetLibraryCacheID: r.libID,
+		TargetVideoPath:      r.target,
+		TargetLangISO2:       "pl",
+	})
+	if err != nil {
+		t.Fatalf("CreateSyncJob: %v", err)
+	}
+	return rec.ID
+}
+
+// stage makes the per-job directory look like a successful Execute left it.
+func (r *rig) stage(t *testing.T, jobID int64) string {
+	t.Helper()
+	dir := filepath.Join(r.workDir, "jobs", strconv.FormatInt(jobID, 10))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir staging: %v", err)
+	}
+	path := filepath.Join(dir, fmt.Sprintf("target-%d-track.pl.mka", r.trackID))
+	if err := os.WriteFile(path, []byte("mka"), 0o600); err != nil {
+		t.Fatalf("write staged audio: %v", err)
+	}
+	return path
+}
+
+func newWorker(t *testing.T, r *rig, ex Executor, mx Muxer, rs Rescanner) *Worker {
+	t.Helper()
+	w, err := New(Dependencies{
+		Store:     r.store,
+		Settings:  r.settings,
+		Executor:  ex,
+		Muxer:     mx,
+		Rescanner: rs,
+		WorkDir:   r.workDir,
+		Interval:  time.Millisecond,
+		Logf:      t.Logf,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return w
+}
+
+func stableReport() analyze.Report {
+	return analyze.Report{
+		Verdict:        analyze.VerdictOK,
+		Classification: analyze.ClassificationStable,
+		SyncMethod:     "same_lang_reference",
+		OffsetsMS:      []float64{1200, 1210},
+	}
+}
+
+func TestProcessOnceRunsExecuteMuxRescanChain(t *testing.T) {
+	r := newRig(t)
+	jobID := r.newJob(t)
+	audio := r.stage(t, jobID)
+
+	ex := &fakeExecutor{report: stableReport()}
+	mx := &fakeMuxer{}
+	rs := &fakeRescanner{}
+	w := newWorker(t, r, ex, mx, rs)
+
+	processed, err := w.ProcessOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessOnce: %v", err)
+	}
+	if !processed {
+		t.Fatal("ProcessOnce processed = false, want true")
+	}
+	if len(ex.calls) != 1 || ex.calls[0] != jobID {
+		t.Fatalf("Execute calls = %v, want [%d]", ex.calls, jobID)
+	}
+	if len(mx.jobs) != 1 {
+		t.Fatalf("Mux calls = %d, want 1", len(mx.jobs))
+	}
+	got := mx.jobs[0]
+	if got.ID != jobID || got.WorkDir != r.workDir || got.TargetPath != r.target {
+		t.Fatalf("mux job identity = %+v", got)
+	}
+	if got.TargetLangISO2 != "pl" {
+		t.Fatalf("mux language = %q, want pl", got.TargetLangISO2)
+	}
+	if got.AudioPath != audio {
+		t.Fatalf("mux audio = %q, want %q", got.AudioPath, audio)
+	}
+	if got.SyncOffsetMS != 1205 {
+		t.Fatalf("mux offset = %d, want median 1205", got.SyncOffsetMS)
+	}
+	if got.Report.Verdict != analyze.VerdictOK {
+		t.Fatalf("mux report verdict = %q, want ok", got.Report.Verdict)
+	}
+	if len(rs.rows) != 1 || rs.rows[0].ExternalItemID != 7 || rs.rows[0].MediaType != "movie" {
+		t.Fatalf("rescan rows = %+v", rs.rows)
+	}
+
+	rec, _, err := r.store.SyncJobByID(context.Background(), jobID)
+	if err != nil {
+		t.Fatalf("SyncJobByID: %v", err)
+	}
+	if rec.Status != "completed" {
+		t.Fatalf("status = %q, want completed", rec.Status)
+	}
+	if _, err := os.Stat(filepath.Dir(audio)); err != nil {
+		t.Fatalf("staging should be kept on success: %v", err)
+	}
+}
+
+func TestProcessOnceFailsUnmuxableVerdictWithoutMux(t *testing.T) {
+	r := newRig(t)
+	jobID := r.newJob(t)
+	audio := r.stage(t, jobID)
+
+	report := stableReport()
+	report.Verdict = analyze.VerdictDrifting
+	report.Classification = analyze.ClassificationDrifting
+	mx := &fakeMuxer{}
+	w := newWorker(t, r, &fakeExecutor{report: report}, mx, &fakeRescanner{})
+
+	processed, err := w.ProcessOnce(context.Background())
+	if err != nil || !processed {
+		t.Fatalf("ProcessOnce = %v/%v, want true/nil", processed, err)
+	}
+	if len(mx.jobs) != 0 {
+		t.Fatalf("Mux called %d times for a drifting verdict, want 0", len(mx.jobs))
+	}
+	rec, _, _ := r.store.SyncJobByID(context.Background(), jobID)
+	if rec.Status != "failed" || !strings.Contains(rec.ErrorMessage, "drifting") {
+		t.Fatalf("status/message = %q/%q, want failed mentioning drifting", rec.Status, rec.ErrorMessage)
+	}
+	if _, err := os.Stat(filepath.Dir(audio)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("staging should be cleaned on failure, stat err = %v", err)
+	}
+}
+
+func TestProcessOnceMuxFailureFailsJobAndCleansStaging(t *testing.T) {
+	r := newRig(t)
+	jobID := r.newJob(t)
+	audio := r.stage(t, jobID)
+	w := newWorker(t, r, &fakeExecutor{report: stableReport()},
+		&fakeMuxer{err: errors.New("mux: mkvmerge failed\nsecond line")}, &fakeRescanner{})
+
+	processed, err := w.ProcessOnce(context.Background())
+	if err != nil || !processed {
+		t.Fatalf("ProcessOnce = %v/%v, want true/nil", processed, err)
+	}
+	rec, _, _ := r.store.SyncJobByID(context.Background(), jobID)
+	if rec.Status != "failed" || rec.ErrorMessage != "mux: mkvmerge failed" {
+		t.Fatalf("status/message = %q/%q, want failed/first line", rec.Status, rec.ErrorMessage)
+	}
+	if _, err := os.Stat(filepath.Dir(audio)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("staging should be cleaned on failure, stat err = %v", err)
+	}
+}
+
+func TestProcessOncePanicIsRecordedAsJobFailure(t *testing.T) {
+	r := newRig(t)
+	jobID := r.newJob(t)
+	audio := r.stage(t, jobID)
+	w := newWorker(t, r, &fakeExecutor{panic: "boom"}, &fakeMuxer{}, &fakeRescanner{})
+
+	processed, err := w.ProcessOnce(context.Background())
+	if err != nil || !processed {
+		t.Fatalf("ProcessOnce = %v/%v, want true/nil", processed, err)
+	}
+	rec, _, _ := r.store.SyncJobByID(context.Background(), jobID)
+	if rec.Status != "failed" || !strings.Contains(rec.ErrorMessage, "panic") {
+		t.Fatalf("status/message = %q/%q, want failed mentioning panic", rec.Status, rec.ErrorMessage)
+	}
+	if _, err := os.Stat(filepath.Dir(audio)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("staging should be cleaned after a panic, stat err = %v", err)
+	}
+}
+
+func TestMuxableVerdict(t *testing.T) {
+	for _, verdict := range []string{analyze.VerdictOK, analyze.ClassificationStable} {
+		if !muxableVerdict(verdict) {
+			t.Errorf("muxableVerdict(%q) = false, want true", verdict)
+		}
+	}
+	for _, verdict := range []string{analyze.VerdictDrifting, analyze.VerdictUnreliable, analyze.VerdictOutOfRange, ""} {
+		if muxableVerdict(verdict) {
+			t.Errorf("muxableVerdict(%q) = true, want false", verdict)
+		}
+	}
+}
+
+func TestProcessOnceExecuteErrorMarksFailed(t *testing.T) {
+	r := newRig(t)
+	jobID := r.newJob(t)
+	w := newWorker(t, r, &fakeExecutor{err: errors.New("engine missing\nstack")}, &fakeMuxer{}, &fakeRescanner{})
+
+	if processed, err := w.ProcessOnce(context.Background()); err != nil || !processed {
+		t.Fatalf("ProcessOnce = %v/%v, want true/nil", processed, err)
+	}
+	rec, _, _ := r.store.SyncJobByID(context.Background(), jobID)
+	if rec.Status != "failed" || rec.ErrorMessage != "engine missing" {
+		t.Fatalf("status/message = %q/%q", rec.Status, rec.ErrorMessage)
+	}
+}
+
+// M5-4 contract: an arr rescan is best-effort and must not undo a good mux.
+func TestProcessOnceRescanFailureKeepsJobDone(t *testing.T) {
+	r := newRig(t)
+	jobID := r.newJob(t)
+	r.stage(t, jobID)
+	w := newWorker(t, r, &fakeExecutor{report: stableReport()},
+		&fakeMuxer{}, &fakeRescanner{err: errors.New("arrrescan: connection refused")})
+
+	if processed, err := w.ProcessOnce(context.Background()); err != nil || !processed {
+		t.Fatalf("ProcessOnce = %v/%v, want true/nil", processed, err)
+	}
+	rec, _, _ := r.store.SyncJobByID(context.Background(), jobID)
+	if rec.Status != "completed" {
+		t.Fatalf("status = %q, want completed despite rescan failure", rec.Status)
+	}
+}
+
+func TestNewRejectsIncompleteDependencies(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "data"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	ok := Dependencies{
+		Store: st, Executor: &fakeExecutor{}, Muxer: &fakeMuxer{},
+		Rescanner: &fakeRescanner{}, WorkDir: "/tmp/work",
+	}
+	cases := []struct {
+		name string
+		mut  func(*Dependencies)
+		want error
+	}{
+		{"no work dir", func(d *Dependencies) { d.WorkDir = " " }, ErrNoWorkDir},
+		{"no store", func(d *Dependencies) { d.Store = nil }, ErrNoStore},
+		{"no executor", func(d *Dependencies) { d.Executor = nil }, ErrNoExecutor},
+		{"no muxer", func(d *Dependencies) { d.Muxer = nil }, ErrNoMuxer},
+		{"no rescanner", func(d *Dependencies) { d.Rescanner = nil }, ErrNoRescanner},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := ok
+			tc.mut(&d)
+			if _, err := New(d); !errors.Is(err, tc.want) {
+				t.Fatalf("New err = %v, want %v", err, tc.want)
+			}
+		})
+	}
+}

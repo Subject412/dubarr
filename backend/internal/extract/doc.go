@@ -26,7 +26,9 @@
 // Output goes to {WORK_DIR}/extract/{import_id}/ (IDEA.md §3.3), never into
 // the Vault. WORK_DIR is storage.paths.work_dir; when unset it falls back to
 // DATA_DIR/work. On any failure the job directory is wiped; on success it is
-// left in place for M3-2.
+// left in place for the vault pipeline unless a VaultHook is configured, in
+// which case the hook owns the staged files and the row only completes when it
+// returns nil.
 //
 // # Track selection and validation
 //

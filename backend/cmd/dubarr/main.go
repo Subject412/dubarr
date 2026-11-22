@@ -4,6 +4,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -17,6 +19,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -24,12 +27,14 @@ import (
 
 	"github.com/Subject412/dubarr/backend/internal/api"
 	"github.com/Subject412/dubarr/backend/internal/auth"
+	"github.com/Subject412/dubarr/backend/internal/extract"
 	"github.com/Subject412/dubarr/backend/internal/gate"
 	"github.com/Subject412/dubarr/backend/internal/health"
 	"github.com/Subject412/dubarr/backend/internal/queue"
 	"github.com/Subject412/dubarr/backend/internal/secrets"
 	"github.com/Subject412/dubarr/backend/internal/settings"
 	"github.com/Subject412/dubarr/backend/internal/store"
+	"github.com/Subject412/dubarr/backend/internal/vault"
 	"github.com/Subject412/dubarr/backend/internal/vaultapi"
 	"github.com/Subject412/dubarr/backend/internal/watch"
 	"github.com/Subject412/dubarr/backend/web"
@@ -161,11 +166,14 @@ type server struct {
 	secrets  *secrets.Service
 	settings *settings.Store
 	scanner  *watch.Scanner
+	extract  *extract.Worker
 	mux      *http.ServeMux
 	http     *http.Server
 
 	// scannerCancel stops the watch loop; nil when no scanner was started.
 	scannerCancel context.CancelFunc
+	// extractCancel stops the approval-to-vault worker; nil when disabled.
+	extractCancel context.CancelFunc
 
 	closeOnce sync.Once
 	closeErr  error
@@ -271,13 +279,37 @@ func newServerWithSecrets(cfg Config, secOpts secrets.Options) (*server, error) 
 		watchScanner.Start(scanCtx)
 	}
 
+	// M3-4: approval → extraction → vault. The worker consumes rows the user
+	// approved (status extracting) and hands each validated staging output to
+	// the vault writer. A broken storage/vault configuration must not take the
+	// HTTP API down; approvals then stay queued until the next boot.
+	extractCtx, extractCancel := context.WithCancel(context.Background())
+	extractWorker, extractErr := wireExtractWorker(extractCtx, extractWiring{
+		Settings: settingsStore,
+		Store:    st,
+		DataDir:  cfg.DataDir,
+		Logf:     log.Printf,
+	})
+	if extractErr != nil {
+		log.Printf("dubarr: extraction worker disabled: %v", extractErr)
+		extractCancel()
+		extractCancel = nil
+	} else if extractWorker != nil {
+		extractWorker.Start(extractCtx)
+	} else {
+		extractCancel()
+		extractCancel = nil
+	}
+
 	s := &server{
 		cfg:           cfg,
 		store:         st,
 		secrets:       sec,
 		settings:      settingsStore,
 		scanner:       watchScanner,
+		extract:       extractWorker,
 		scannerCancel: scanCancel,
+		extractCancel: extractCancel,
 		mux:           mux,
 	}
 	s.http = &http.Server{
@@ -356,6 +388,145 @@ func wireScanner(ctx context.Context, deps scannerWiring) (*watch.Scanner, error
 	return scanner, nil
 }
 
+// extractWiring is the collaborator set for the approval-to-vault worker.
+type extractWiring struct {
+	Settings *settings.Store
+	Store    *store.Store
+	DataDir  string
+	// Interval overrides the idle cadence; 0 keeps extract.DefaultInterval.
+	Interval time.Duration
+	// Logf reports why the worker stays disabled. Nil means log.Printf.
+	Logf func(format string, args ...any)
+}
+
+// wireExtractWorker builds the M3-4 pipeline: the M3-1 extraction worker over
+// approved queue rows, with a vault hook that publishes every validated
+// staging output through the M3-2 writer.
+//
+// The vault directory is required. With none configured it returns (nil, nil)
+// after logging once, leaving approved rows queued rather than failing them
+// against a missing vault. storage.paths and languages.policy are read per job
+// by the worker; the vault writer re-reads storage.paths per write.
+func wireExtractWorker(ctx context.Context, deps extractWiring) (*extract.Worker, error) {
+	logf := deps.Logf
+	if logf == nil {
+		logf = log.Printf
+	}
+	if deps.Settings == nil || deps.Store == nil {
+		return nil, errors.New("extraction worker needs the settings store and the database store")
+	}
+
+	paths, err := loadStoragePaths(ctx, deps.Settings)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(paths.VaultDir) == "" {
+		logf("dubarr: extraction worker disabled: storage.paths.vault_dir is not configured")
+		return nil, nil
+	}
+
+	writer, err := vault.New(vault.Dependencies{
+		Store:    deps.Store,
+		Settings: deps.Settings,
+		DataDir:  deps.DataDir,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("vault writer: %w", err)
+	}
+
+	worker, err := extract.New(extract.Dependencies{
+		Store:     deps.Store,
+		Settings:  deps.Settings,
+		DataDir:   deps.DataDir,
+		Interval:  deps.Interval,
+		VaultHook: newVaultHook(writer),
+		Logf:      logf,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("extraction worker: %w", err)
+	}
+	return worker, nil
+}
+
+// newVaultHook adapts vault.Writer to extract.VaultHook: one Write per staged
+// track, all sharing a Donor Group UUID so sibling tracks stay linked.
+func newVaultHook(writer *vault.Writer) extract.VaultHook {
+	return func(ctx context.Context, job store.ImportExtractionJob, tracks []extract.StagedTrack) error {
+		media, baseName, err := vaultMediaFor(job)
+		if err != nil {
+			return err
+		}
+		groupUUID, err := newDonorGroupUUID()
+		if err != nil {
+			return err
+		}
+		for _, track := range tracks {
+			if _, err := writer.Write(ctx, vault.Request{
+				StagedPath:        track.Path,
+				BaseName:          baseName,
+				Language:          track.Language,
+				Media:             media,
+				SeasonNumber:      job.SeasonNumber,
+				EpisodeNumber:     job.EpisodeNumber,
+				GroupUUID:         groupUUID,
+				Variant:           track.Variant,
+				Codec:             track.Codec,
+				Channels:          track.Channels,
+				ChannelCount:      track.ChannelCount,
+				BitrateBPS:        track.BitrateBPS,
+				SampleRate:        track.SampleRate,
+				DurationMS:        track.Duration.Milliseconds(),
+				SourceReleaseName: job.Filename,
+			}); err != nil {
+				return fmt.Errorf("archive %s: %w", filepath.Base(track.Path), err)
+			}
+		}
+		return nil
+	}
+}
+
+// vaultMediaFor derives the vault catalogue row and archive stem from the
+// queue row's matched arr target. An unmatched donor cannot be catalogued and
+// fails the row with a reason rather than archiving anonymously.
+func vaultMediaFor(job store.ImportExtractionJob) (store.VaultMediaRecord, string, error) {
+	title := strings.TrimSpace(job.Title)
+	if title == "" {
+		return store.VaultMediaRecord{}, "", fmt.Errorf("queue row %d has no matched library target", job.ID)
+	}
+	var mediaType string
+	switch job.MediaType {
+	case "movie":
+		mediaType = "movie"
+	case "episode":
+		mediaType = "series"
+	default:
+		return store.VaultMediaRecord{}, "", fmt.Errorf("queue row %d has unsupported media type %q", job.ID, job.MediaType)
+	}
+	baseName := title
+	if job.Year > 0 {
+		baseName = fmt.Sprintf("%s (%d)", title, job.Year)
+	}
+	media := store.VaultMediaRecord{
+		MediaType:            mediaType,
+		Title:                title,
+		Year:                 job.Year,
+		TMDBID:               job.TMDBID,
+		TVDBID:               job.TVDBID,
+		OriginalLanguageISO2: job.OriginalLanguage,
+	}
+	return media, baseName, nil
+}
+
+// newDonorGroupUUID returns a random hex id linking the tracks archived from
+// one donor (GLOSSARY "Donor Group").
+func newDonorGroupUUID() (string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", fmt.Errorf("generate donor group uuid: %w", err)
+	}
+	return hex.EncodeToString(raw[:]), nil
+}
+
 // loadStoragePaths reads the seeded storage.paths section. A missing row means
 // the wizard has not run yet and yields the zero value (no watch dir).
 func loadStoragePaths(ctx context.Context, st *settings.Store) (settings.StoragePaths, error) {
@@ -429,6 +600,12 @@ func (s *server) Close() error {
 		}
 		if s.scanner != nil {
 			s.scanner.Stop()
+		}
+		if s.extractCancel != nil {
+			s.extractCancel()
+		}
+		if s.extract != nil {
+			s.extract.Stop()
 		}
 		if s.store != nil {
 			s.closeErr = s.store.Close()

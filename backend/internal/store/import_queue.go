@@ -308,6 +308,10 @@ func (s *Store) TransitionImportCandidate(ctx context.Context, id int64, to stri
 // donor file to extract from and the arr original language used to build the
 // export policy. SelectedExportsJSON is the persisted approval choice (empty
 // in M2; the worker falls back to the export policy when it is empty).
+//
+// Match metadata is joined from arr_library_cache so the vault hand-off can
+// name and catalogue the published track; those fields are empty/zero when the
+// candidate is unmatched.
 type ImportExtractionJob struct {
 	ID               int64
 	SourceFilePath   string
@@ -315,6 +319,15 @@ type ImportExtractionJob struct {
 	FileSize         int64
 	SelectedExports  string
 	OriginalLanguage string
+	// Match metadata from arr_library_cache (media_type is "movie" or
+	// "episode"; empty when the donor has no matched target).
+	Title         string
+	MediaType     string
+	Year          int
+	TMDBID        int64
+	TVDBID        int64
+	SeasonNumber  *int
+	EpisodeNumber *int
 }
 
 // NextImportExtraction returns the oldest row awaiting extraction, or ok=false
@@ -322,18 +335,22 @@ type ImportExtractionJob struct {
 // time (concurrency 1), so a single-row read is enough.
 func (s *Store) NextImportExtraction(ctx context.Context) (ImportExtractionJob, bool, error) {
 	var (
-		job  ImportExtractionJob
-		orig sql.NullString
+		job                               ImportExtractionJob
+		orig, title, mediaType            sql.NullString
+		year, tmdb, tvdb, season, episode sql.NullInt64
 	)
 	err := s.DB.QueryRowContext(ctx, `
 		SELECT iq.id, iq.source_file_path, iq.filename, iq.file_size,
-		       iq.selected_exports_json, alc.original_language_iso2
+		       iq.selected_exports_json, alc.original_language_iso2,
+		       alc.title, alc.media_type, alc.year, alc.tmdb_id, alc.tvdb_id,
+		       alc.season_number, alc.episode_number
 		FROM import_queue iq
 		LEFT JOIN arr_library_cache alc ON alc.id = iq.matched_library_cache_id
 		WHERE iq.status = 'extracting'
 		ORDER BY iq.created_at, iq.id
 		LIMIT 1`).Scan(&job.ID, &job.SourceFilePath, &job.Filename, &job.FileSize,
-		&job.SelectedExports, &orig)
+		&job.SelectedExports, &orig, &title, &mediaType, &year, &tmdb, &tvdb,
+		&season, &episode)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ImportExtractionJob{}, false, nil
 	}
@@ -341,6 +358,19 @@ func (s *Store) NextImportExtraction(ctx context.Context) (ImportExtractionJob, 
 		return ImportExtractionJob{}, false, fmt.Errorf("store: next import extraction: %w", err)
 	}
 	job.OriginalLanguage = orig.String
+	job.Title = title.String
+	job.MediaType = mediaType.String
+	job.Year = int(year.Int64)
+	job.TMDBID = tmdb.Int64
+	job.TVDBID = tvdb.Int64
+	if season.Valid {
+		v := int(season.Int64)
+		job.SeasonNumber = &v
+	}
+	if episode.Valid {
+		v := int(episode.Int64)
+		job.EpisodeNumber = &v
+	}
 	return job, true, nil
 }
 

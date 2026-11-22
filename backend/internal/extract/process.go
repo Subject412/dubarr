@@ -112,8 +112,59 @@ func (w *Worker) processJob(ctx context.Context, job store.ImportExtractionJob) 
 			return err
 		}
 	}
+
+	// Hand the validated staging output to the vault pipeline (M3-4). The hook
+	// owns the staged files on success; on failure the deferred cleanup below
+	// wipes the job directory, matching the extraction failure contract.
+	if w.vaultHook != nil {
+		staged := make([]StagedTrack, 0, len(outputs))
+		for i, out := range outputs {
+			info, err := w.prober.Probe(ctx, out)
+			if err != nil {
+				return fmt.Errorf("extract: probe staged output %s: %w", out, err)
+			}
+			got := info.Tracks[0]
+			staged = append(staged, StagedTrack{
+				Path:         out,
+				Language:     trackLanguage(tracks[i]),
+				Codec:        got.Codec,
+				Channels:     channelLayout(got),
+				ChannelCount: got.Channels,
+				Duration:     info.Duration,
+			})
+		}
+		if err := w.vaultHook(ctx, job, staged); err != nil {
+			return fmt.Errorf("extract: vault: %w", err)
+		}
+	}
 	ok = true
 	return nil
+}
+
+// trackLanguage is the token the vault uses to name the archived file: the
+// normalized ISO 639-1 code when the donor tag resolved, else the ISO 639-2/B
+// form (the vault rejects "und", which the export policy never selects).
+func trackLanguage(track probe.AudioTrack) string {
+	if track.LanguageISO1 != "" {
+		return track.LanguageISO1
+	}
+	return track.LanguageISO2B
+}
+
+// channelLayout is the human-readable layout stored with the vault entry,
+// normalizing ffprobe's mono/stereo names to the "1.0"/"2.0" form.
+func channelLayout(track probe.AudioTrack) string {
+	switch track.ChannelLayout {
+	case "mono":
+		return "1.0"
+	case "stereo":
+		return "2.0"
+	case "":
+		if track.Channels > 0 {
+			return fmt.Sprintf("%d.0", track.Channels)
+		}
+	}
+	return track.ChannelLayout
 }
 
 // selectTracks applies the settled export policy to the donor's probed audio

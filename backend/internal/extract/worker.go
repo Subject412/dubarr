@@ -46,6 +46,28 @@ type SettingsReader interface {
 	Get(ctx context.Context, key string) (json.RawMessage, bool, error)
 }
 
+// StagedTrack is one validated extraction output handed to the vault hook.
+// Language is the donor track's language token (ISO 639-1 when known), and
+// Codec/Channels describe the staged file that was just re-probed.
+type StagedTrack struct {
+	Path         string
+	Language     string
+	Variant      string
+	Codec        string
+	Channels     string
+	ChannelCount int
+	BitrateBPS   int
+	SampleRate   int
+	Duration     time.Duration
+}
+
+// VaultHook archives a successful extraction. It is called after every staged
+// track validated, with the queue job and its staging outputs; the worker then
+// marks the row completed when it returns nil. A non-nil error fails the row
+// with the hook's reason and wipes the staging directory. The hook owns the
+// staged files: on success it must remove them (the vault writer does).
+type VaultHook func(ctx context.Context, job store.ImportExtractionJob, tracks []StagedTrack) error
+
 // Dependencies configures a Worker.
 type Dependencies struct {
 	// Store persists queue transitions. Required.
@@ -65,6 +87,9 @@ type Dependencies struct {
 	// Interval is the idle cadence; 0 selects DefaultInterval, negative is an
 	// error.
 	Interval time.Duration
+	// VaultHook archives a successful extraction (M3-4). Optional: nil leaves
+	// the validated output staged under WORK_DIR for a later consumer.
+	VaultHook VaultHook
 	// Logf receives worker diagnostics. Nil uses the standard logger.
 	Logf func(format string, args ...any)
 }
@@ -79,6 +104,7 @@ type Worker struct {
 	mkvmerge   string
 	mkvextract string
 	interval   time.Duration
+	vaultHook  VaultHook
 	logf       func(string, ...any)
 
 	// run executes mkvtoolnix commands; overridable for unit tests.
@@ -121,6 +147,7 @@ func New(deps Dependencies) (*Worker, error) {
 		mkvmerge:   deps.MKVMergePath,
 		mkvextract: deps.MKVExtractPath,
 		interval:   interval,
+		vaultHook:  deps.VaultHook,
 		logf:       logf,
 		run:        execRun,
 	}, nil

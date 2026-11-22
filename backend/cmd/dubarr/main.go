@@ -4,11 +4,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -22,11 +24,13 @@ import (
 
 	"github.com/Subject412/dubarr/backend/internal/api"
 	"github.com/Subject412/dubarr/backend/internal/auth"
+	"github.com/Subject412/dubarr/backend/internal/gate"
 	"github.com/Subject412/dubarr/backend/internal/health"
 	"github.com/Subject412/dubarr/backend/internal/queue"
 	"github.com/Subject412/dubarr/backend/internal/secrets"
 	"github.com/Subject412/dubarr/backend/internal/settings"
 	"github.com/Subject412/dubarr/backend/internal/store"
+	"github.com/Subject412/dubarr/backend/internal/watch"
 	"github.com/Subject412/dubarr/backend/web"
 )
 
@@ -155,8 +159,12 @@ type server struct {
 	store    *store.Store
 	secrets  *secrets.Service
 	settings *settings.Store
+	scanner  *watch.Scanner
 	mux      *http.ServeMux
 	http     *http.Server
+
+	// scannerCancel stops the watch loop; nil when no scanner was started.
+	scannerCancel context.CancelFunc
 
 	closeOnce sync.Once
 	closeErr  error
@@ -242,12 +250,29 @@ func newServerWithSecrets(cfg Config, secOpts secrets.Options) (*server, error) 
 	}
 	mux.Handle("/", spa)
 
+	scanCtx, scanCancel := context.WithCancel(context.Background())
+	watchScanner, scanErr := wireScanner(scanCtx, scannerWiring{
+		Settings: settingsStore,
+		Store:    st,
+		Logf:     log.Printf,
+	})
+	if scanErr != nil {
+		// A broken watch path must not take the HTTP API down: the operator
+		// can still fix storage.paths in the UI and restart.
+		log.Printf("dubarr: watch scanner disabled: %v", scanErr)
+		scanCancel()
+	} else if watchScanner != nil {
+		watchScanner.Start(scanCtx)
+	}
+
 	s := &server{
-		cfg:      cfg,
-		store:    st,
-		secrets:  sec,
-		settings: settingsStore,
-		mux:      mux,
+		cfg:           cfg,
+		store:         st,
+		secrets:       sec,
+		settings:      settingsStore,
+		scanner:       watchScanner,
+		scannerCancel: scanCancel,
+		mux:           mux,
 	}
 	s.http = &http.Server{
 		Addr:              cfg.Listen,
@@ -258,12 +283,144 @@ func newServerWithSecrets(cfg Config, secOpts secrets.Options) (*server, error) 
 	return s, nil
 }
 
+// scannerWiring is the collaborator set the composition root needs to build
+// the watch scanner. It is a struct rather than positional arguments so tests
+// can substitute a logging sink without touching the production path.
+type scannerWiring struct {
+	Settings *settings.Store
+	Store    *store.Store
+	// Logf reports why the scanner stays disabled. Nil means log.Printf.
+	Logf func(format string, args ...any)
+}
+
+// wireScanner builds the M2 ingest pipeline: watch scanner over the configured
+// watch folder, with a post-record hook that classifies each new candidate via
+// the Tdarr Gate and persists the verdict for GET /api/queue.
+//
+// The scanner watches storage.paths.watch_dir (IDEA.md §3.3), the dropzone for
+// incoming donor media; media_roots are the target libraries and are not
+// scanned for donors. With no watch_dir configured it returns (nil, nil) after
+// logging once, so a fresh install can serve the setup wizard.
+func wireScanner(ctx context.Context, deps scannerWiring) (*watch.Scanner, error) {
+	logf := deps.Logf
+	if logf == nil {
+		logf = log.Printf
+	}
+	if deps.Settings == nil || deps.Store == nil {
+		return nil, errors.New("watch scanner needs the settings store and the database store")
+	}
+
+	paths, err := loadStoragePaths(ctx, deps.Settings)
+	if err != nil {
+		return nil, err
+	}
+	watchDir := strings.TrimSpace(paths.WatchDir)
+	if watchDir == "" {
+		logf("dubarr: watch scanner disabled: storage.paths.watch_dir is not configured")
+		return nil, nil
+	}
+
+	rule, err := loadGateRule(ctx, deps.Settings)
+	if err != nil {
+		return nil, err
+	}
+	interval, err := loadWatchInterval(ctx, deps.Settings)
+	if err != nil {
+		return nil, err
+	}
+
+	scanner, err := watch.New(deps.Store, []string{watchDir}, interval)
+	if err != nil {
+		return nil, fmt.Errorf("watch scanner: %w", err)
+	}
+
+	gateSvc := gate.NewService(rule, deps.Store)
+	scanner.SetCandidateHook(func(ctx context.Context, sourcePath, _ string, _ int64) error {
+		// M2 has no arr target resolution on the watch path yet, so the
+		// dropped file is classified by its own filename — exactly what
+		// ADR-0005 makes authoritative for eligibility.
+		if _, err := gateSvc.ClassifyCandidate(ctx, sourcePath, sourcePath); err != nil {
+			return fmt.Errorf("gate classify %s: %w", sourcePath, err)
+		}
+		return nil
+	})
+	return scanner, nil
+}
+
+// loadStoragePaths reads the seeded storage.paths section. A missing row means
+// the wizard has not run yet and yields the zero value (no watch dir).
+func loadStoragePaths(ctx context.Context, st *settings.Store) (settings.StoragePaths, error) {
+	raw, ok, err := st.Get(ctx, settings.KeyStoragePaths)
+	if err != nil {
+		return settings.StoragePaths{}, fmt.Errorf("read storage.paths: %w", err)
+	}
+	if !ok {
+		return settings.StoragePaths{}, nil
+	}
+	var paths settings.StoragePaths
+	if err := json.Unmarshal(raw, &paths); err != nil {
+		return settings.StoragePaths{}, fmt.Errorf("decode storage.paths: %w", err)
+	}
+	return paths, nil
+}
+
+// loadGateRule converts target.tag_filter into the gate rule, falling back to
+// the seeded default when the section is missing or unreadable.
+func loadGateRule(ctx context.Context, st *settings.Store) (gate.Rule, error) {
+	raw, ok, err := st.Get(ctx, settings.KeyTargetTagFilter)
+	if err != nil {
+		return gate.Rule{}, fmt.Errorf("read target.tag_filter: %w", err)
+	}
+	if !ok {
+		return gate.RuleFromTagFilter(defaultTagFilter()), nil
+	}
+	var tf settings.TargetTagFilter
+	if err := json.Unmarshal(raw, &tf); err != nil {
+		return gate.Rule{}, fmt.Errorf("decode target.tag_filter: %w", err)
+	}
+	return gate.RuleFromTagFilter(tf), nil
+}
+
+// defaultTagFilter is the seeded target.tag_filter, used when the row is
+// absent (fresh DATA_DIR before Seed, e.g. a hand-built test store).
+func defaultTagFilter() settings.TargetTagFilter {
+	tf, _ := settings.Defaults("")[settings.KeyTargetTagFilter].(settings.TargetTagFilter)
+	return tf
+}
+
+// loadWatchInterval reads watch.options.scan_interval_sec, defaulting to the
+// settled 10 s cadence when the section is missing or not positive.
+func loadWatchInterval(ctx context.Context, st *settings.Store) (time.Duration, error) {
+	raw, ok, err := st.Get(ctx, settings.KeyWatchOptions)
+	if err != nil {
+		return 0, fmt.Errorf("read watch.options: %w", err)
+	}
+	if !ok {
+		return watch.DefaultInterval, nil
+	}
+	var opts settings.WatchOptions
+	if err := json.Unmarshal(raw, &opts); err != nil {
+		return 0, fmt.Errorf("decode watch.options: %w", err)
+	}
+	if opts.ScanIntervalSec <= 0 {
+		return watch.DefaultInterval, nil
+	}
+	return time.Duration(opts.ScanIntervalSec) * time.Second, nil
+}
+
 // Handler exposes the wired mux (used by tests and embed checks).
 func (s *server) Handler() http.Handler { return s.mux }
 
-// Close releases the database handle. It is safe to call more than once.
+// Close stops the watch loop and releases the database handle. It is safe to
+// call more than once.
 func (s *server) Close() error {
 	s.closeOnce.Do(func() {
+		if s.scannerCancel != nil {
+			s.scannerCancel()
+		}
+		if s.scanner != nil {
+			s.scanner.Stop()
+		}
 		if s.store != nil {
 			s.closeErr = s.store.Close()
 		}

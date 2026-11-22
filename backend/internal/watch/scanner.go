@@ -56,6 +56,15 @@ type CandidateStore interface {
 	RecordImportCandidate(ctx context.Context, sourcePath, filename string, size int64) (created bool, err error)
 }
 
+// CandidateHook is invoked once for every newly recorded candidate. It lets
+// the composition root classify the file (Tdarr Gate) without making the
+// scanner depend on the gate or the store's gate columns.
+//
+// The hook runs after the row is committed, so a hook failure never drops the
+// candidate; the error is collected in Result.Errors and returned aggregated
+// from Scan, exactly like a per-file record error.
+type CandidateHook func(ctx context.Context, sourcePath, filename string, size int64) error
+
 // Result summarises one scan pass.
 type Result struct {
 	// Seen is the number of media files that passed extension/root checks.
@@ -72,6 +81,8 @@ type Scanner struct {
 	store    CandidateStore
 	roots    []string
 	interval time.Duration
+	// hook is the optional post-record callback, guarded by mu.
+	hook CandidateHook
 
 	// running is the debounce latch: Scan holds it for its whole duration.
 	running sync.Mutex
@@ -135,6 +146,26 @@ func New(store CandidateStore, roots []string, interval time.Duration) (*Scanner
 
 // Interval reports the effective scan cadence.
 func (s *Scanner) Interval() time.Duration { return s.interval }
+
+// SetCandidateHook installs fn as the post-record callback. Passing nil clears
+// it. Set it before Start; a hook installed later takes effect on the next
+// recorded candidate. Existing behaviour without a hook is unchanged.
+func (s *Scanner) SetCandidateHook(fn CandidateHook) {
+	s.mu.Lock()
+	s.hook = fn
+	s.mu.Unlock()
+}
+
+// invokeHook runs the configured post-record callback, if any.
+func (s *Scanner) invokeHook(ctx context.Context, sourcePath, filename string, size int64) error {
+	s.mu.Lock()
+	hook := s.hook
+	s.mu.Unlock()
+	if hook == nil {
+		return nil
+	}
+	return hook(ctx, sourcePath, filename, size)
+}
 
 // Roots reports the canonicalized media roots.
 func (s *Scanner) Roots() []string { return append([]string(nil), s.roots...) }
@@ -220,6 +251,9 @@ func (s *Scanner) scanRoot(ctx context.Context, root string, res *Result) error 
 		}
 		if created {
 			res.Added++
+			if err := s.invokeHook(ctx, resolved, info.Name(), info.Size()); err != nil {
+				res.Errors = append(res.Errors, fmt.Errorf("watch: post-record hook for %q: %w", resolved, err))
+			}
 		}
 		return nil
 	})

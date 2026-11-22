@@ -203,6 +203,60 @@ func TestNewDefaultsIntervalToTenSeconds(t *testing.T) {
 	}
 }
 
+// TestScanInvokesCandidateHook checks the additive post-record callback: it
+// fires once per newly recorded candidate, not on rescans, and a hook error is
+// aggregated without dropping the candidate.
+func TestScanInvokesCandidateHook(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "tagged [ArcA310].mkv"))
+
+	st := newFakeStore()
+	sc, err := New(st, []string{root}, time.Second)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	var calls int
+	var got string
+	sc.SetCandidateHook(func(_ context.Context, sourcePath, _ string, _ int64) error {
+		calls++
+		got = sourcePath
+		return nil
+	})
+
+	res, err := sc.Scan(context.Background())
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if res.Added != 1 || calls != 1 {
+		t.Errorf("Added = %d, hook calls = %d, want 1 and 1", res.Added, calls)
+	}
+	if !strings.HasSuffix(got, "tagged [ArcA310].mkv") {
+		t.Errorf("hook sourcePath = %q, want the recorded candidate", got)
+	}
+
+	// A rescan records nothing new, so the hook must not run again.
+	if _, err := sc.Scan(context.Background()); err != nil {
+		t.Fatalf("second Scan: %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("hook calls after rescan = %d, want 1", calls)
+	}
+
+	// A failing hook is surfaced as a per-file error but the row stays.
+	writeFile(t, filepath.Join(root, "broken.mkv"))
+	sc.SetCandidateHook(func(context.Context, string, string, int64) error {
+		return errors.New("gate is sad")
+	})
+	res, err = sc.Scan(context.Background())
+	if err == nil || len(res.Errors) != 1 {
+		t.Errorf("Scan after hook failure: err=%v errors=%v, want one aggregated error", err, res.Errors)
+	}
+	if res.Added != 1 || len(st.paths()) != 2 {
+		t.Errorf("candidate dropped by hook failure: Added=%d stored=%v", res.Added, st.paths())
+	}
+}
+
 func TestScanDebouncesOverlappingRuns(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "movie.mkv"))

@@ -23,6 +23,7 @@ import (
 	"github.com/Subject412/dubarr/backend/internal/api"
 	"github.com/Subject412/dubarr/backend/internal/auth"
 	"github.com/Subject412/dubarr/backend/internal/health"
+	"github.com/Subject412/dubarr/backend/internal/queue"
 	"github.com/Subject412/dubarr/backend/internal/secrets"
 	"github.com/Subject412/dubarr/backend/internal/settings"
 	"github.com/Subject412/dubarr/backend/internal/store"
@@ -209,6 +210,12 @@ func newServerWithSecrets(cfg Config, secOpts secrets.Options) (*server, error) 
 		DB:           st.DB,
 		Settings:     settingsStore,
 		Secrets:      sec,
+		RequireAdmin: authSvc.RequireAdmin,
+	})
+
+	queue.RegisterRoutes(mux, queue.Dependencies{
+		DB:           st.DB,
+		Settings:     settingsStore,
 		RequireAdmin: authSvc.RequireAdmin,
 	})
 

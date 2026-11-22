@@ -7,6 +7,7 @@ import { UNAUTHORIZED_EVENT, type AuthStatus } from './lib/api'
 import { queryKeys, useAuthStatus } from './lib/hooks'
 import { LoginPage } from './pages/Login'
 import { PlaceholderPage } from './pages/Placeholder'
+import { QueuePage } from './pages/Queue'
 import { SettingsPage } from './pages/Settings'
 import { SetupPage } from './pages/Setup'
 import { SystemPage } from './pages/System'
@@ -75,6 +76,10 @@ function App() {
                 description="Browse titles, inspect tracks and start a sync job."
               />
             }
+          />
+          <Route
+            path="/queue"
+            element={<QueuePage />}
           />
           <Route
             path="/sync"

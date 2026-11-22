@@ -10,6 +10,8 @@ import {
   type AuthStatus,
   type BrowseResponse,
   type Health,
+  type QueueResponse,
+  type QueueTransition,
   type SettingsEnvelope,
   type User,
 } from './api'
@@ -19,6 +21,7 @@ export const queryKeys = {
   me: ['auth', 'me'] as const,
   settings: ['settings'] as const,
   health: ['health'] as const,
+  queue: ['queue'] as const,
   browse: (path: string) => ['browse', path] as const,
 }
 
@@ -54,6 +57,34 @@ export function useHealth(): UseQueryResult<Health> {
     queryKey: queryKeys.health,
     queryFn: api.health,
     staleTime: 10_000,
+  })
+}
+
+export function useQueue(): UseQueryResult<QueueResponse> {
+  return useQuery({
+    queryKey: queryKeys.queue,
+    queryFn: api.queue,
+    staleTime: 5_000,
+  })
+}
+
+export function useApproveQueueItem(): UseMutationResult<QueueTransition, Error, number> {
+  const client = useQueryClient()
+  return useMutation({
+    mutationFn: (id) => api.approveQueueItem(id),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: queryKeys.queue })
+    },
+  })
+}
+
+export function useRejectQueueItem(): UseMutationResult<QueueTransition, Error, number> {
+  const client = useQueryClient()
+  return useMutation({
+    mutationFn: (id) => api.rejectQueueItem(id),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: queryKeys.queue })
+    },
   })
 }
 

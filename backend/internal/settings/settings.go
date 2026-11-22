@@ -51,12 +51,13 @@ const (
 	KeyWatchOptions    = "watch.options"
 	KeyArrOptions      = "arr.options"
 	KeyArrConnections  = "arr.connections"
+	KeyImportsOptions  = "imports.options"
 )
 
 var knownKeys = []string{
 	KeyStoragePaths, KeyLanguagesPolicy, KeyTargetTagFilter, KeySyncDefaults,
 	KeySecurityOptions, KeyMuxOptions, KeyWatchOptions, KeyArrOptions,
-	KeyArrConnections,
+	KeyArrConnections, KeyImportsOptions,
 }
 
 // KnownKeys returns the writable section keys in stable order.
@@ -124,6 +125,13 @@ type WatchOptions struct {
 type ArrOptions struct {
 	PollIntervalSec int  `json:"poll_interval_sec"`
 	ManualSync      bool `json:"manual_sync"`
+}
+
+// ImportsOptions configure approval-queue donor pairing. DonorPatterns are
+// matched case-insensitively against sibling filenames; a pattern without '*'
+// is a substring match, with '*' it is a glob (e.g. "PL.DUB", "*LEKTOR.PL*").
+type ImportsOptions struct {
+	DonorPatterns []string `json:"donor_patterns"`
 }
 
 // ArrConnection is one Radarr or Sonarr instance. The API key is deliberately
@@ -207,6 +215,9 @@ func Defaults(dataDir string) map[string]any {
 		},
 		KeyArrConnections: ArrConnections{
 			Instances: []ArrConnection{},
+		},
+		KeyImportsOptions: ImportsOptions{
+			DonorPatterns: []string{"PL.DUB"},
 		},
 	}
 }
@@ -503,6 +514,13 @@ func normalize(key string, raw json.RawMessage) (string, error) {
 			err = validateArrConnections(&p)
 		}
 		v = p
+	case KeyImportsOptions:
+		var p ImportsOptions
+		err = strict(raw, &p)
+		if err == nil {
+			err = validateImports(&p)
+		}
+		v = p
 	}
 	if err != nil {
 		return "", fmt.Errorf("%w: %s: %v", ErrInvalidValue, key, err)
@@ -600,6 +618,18 @@ func validateArrConnections(p *ArrConnections) error {
 			return fmt.Errorf("instance %d: base_url must be an absolute http(s) URL", i)
 		}
 		inst.BaseURL = strings.TrimRight(inst.BaseURL, "/")
+	}
+	return nil
+}
+
+func validateImports(p *ImportsOptions) error {
+	if p.DonorPatterns == nil {
+		p.DonorPatterns = []string{}
+	}
+	for _, pattern := range p.DonorPatterns {
+		if strings.TrimSpace(pattern) == "" {
+			return errors.New("donor_patterns entries must not be empty")
+		}
 	}
 	return nil
 }

@@ -117,6 +117,44 @@ export type SettingsExport = {
   settings: Record<string, unknown>
 }
 
+export type QueueEligibility = 'eligible' | 'waiting_for_tags' | 'missing_target'
+
+export type QueueDonorCandidate = {
+  filename: string
+  path: string
+  file_size: number
+  selected: boolean
+}
+
+export type QueueItem = {
+  id: number
+  source_file_path: string
+  filename: string
+  file_size: number
+  status: string
+  title: string
+  year?: number
+  media_type?: string
+  season_number?: number
+  episode_number?: number
+  target_path: string
+  original_language?: string
+  audio_languages: string[]
+  eligibility: QueueEligibility
+  matched_tags: string[]
+  missing_tags: string[]
+  donor_candidates: QueueDonorCandidate[]
+}
+
+export type QueueResponse = {
+  items: QueueItem[]
+}
+
+export type QueueTransition = {
+  id: number
+  status: string
+}
+
 export class ApiError extends Error {
   readonly status: number
 
@@ -187,4 +225,9 @@ export const api = {
   browse: (path: string) =>
     request<BrowseResponse>(`/api/system/browse?path=${encodeURIComponent(path)}`),
   health: () => request<Health>('/api/health'),
+  queue: () => request<QueueResponse>('/api/queue'),
+  approveQueueItem: (id: number) =>
+    request<QueueTransition>(`/api/queue/${id}/approve`, { method: 'POST' }),
+  rejectQueueItem: (id: number) =>
+    request<QueueTransition>(`/api/queue/${id}/reject`, { method: 'POST' }),
 }

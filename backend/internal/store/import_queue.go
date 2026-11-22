@@ -10,6 +10,15 @@ import (
 	"time"
 )
 
+// Errors reported by the approval-queue transitions.
+var (
+	// ErrImportCandidateNotFound reports an unknown import_queue id.
+	ErrImportCandidateNotFound = errors.New("store: import candidate not found")
+	// ErrImportCandidateState reports a transition requested from a status
+	// other than pending_approval.
+	ErrImportCandidateState = errors.New("store: import candidate is not pending approval")
+)
+
 // RecordImportCandidate inserts a newly discovered donor file into the
 // approval queue (IDEA.md §4 table 5) and reports whether the row was created.
 //
@@ -130,4 +139,139 @@ func (s *Store) ImportCandidateGate(ctx context.Context, sourcePath string) (Imp
 		return ImportGateStatus{}, false, fmt.Errorf("store: decode import candidate gate: %w", err)
 	}
 	return status, true, nil
+}
+
+// ImportCandidateSummary is one pending approval-queue row joined with the
+// matched arr library target and the stored gate verdict. String fields are
+// empty when the candidate has no match or classification yet.
+type ImportCandidateSummary struct {
+	ID               int64
+	SourceFilePath   string
+	Filename         string
+	FileSize         int64
+	Status           string
+	Title            string
+	MediaType        string
+	Year             int
+	SeasonNumber     *int
+	EpisodeNumber    *int
+	TargetPath       string
+	OriginalLanguage string
+	AudioLanguages   string
+	Eligibility      string
+	Gate             ImportGateStatus
+	HasGate          bool
+}
+
+// ListPendingImportCandidates returns every donor awaiting approval, newest
+// queue id last, with the matched target and gate verdict attached.
+//
+// The gate verdict lives in parsed_raw_json (see SetImportCandidateGate); when a
+// candidate was never classified, Eligibility falls back to the arr library
+// row's eligibility_status, and finally to "missing_target".
+func (s *Store) ListPendingImportCandidates(ctx context.Context) ([]ImportCandidateSummary, error) {
+	rows, err := s.DB.QueryContext(ctx, `
+		SELECT iq.id, iq.source_file_path, iq.filename, iq.file_size, iq.status,
+		       iq.parsed_raw_json,
+		       alc.title, alc.media_type, alc.year, alc.season_number, alc.episode_number,
+		       alc.target_file_path, alc.original_language_iso2,
+		       alc.audio_languages_json, alc.eligibility_status
+		FROM import_queue iq
+		LEFT JOIN arr_library_cache alc ON alc.id = iq.matched_library_cache_id
+		WHERE iq.status = 'pending_approval'
+		ORDER BY iq.created_at, iq.id`)
+	if err != nil {
+		return nil, fmt.Errorf("store: list pending import candidates: %w", err)
+	}
+	defer rows.Close()
+
+	out := []ImportCandidateSummary{}
+	for rows.Next() {
+		var (
+			c                  ImportCandidateSummary
+			raw                sql.NullString
+			title, mediaType   sql.NullString
+			year               sql.NullInt64
+			season, episode    sql.NullInt64
+			target, origLang   sql.NullString
+			audioLangs, eligib sql.NullString
+		)
+		if err := rows.Scan(&c.ID, &c.SourceFilePath, &c.Filename, &c.FileSize, &c.Status,
+			&raw, &title, &mediaType, &year, &season, &episode,
+			&target, &origLang, &audioLangs, &eligib); err != nil {
+			return nil, fmt.Errorf("store: scan pending import candidate: %w", err)
+		}
+		c.Title = title.String
+		c.MediaType = mediaType.String
+		c.Year = int(year.Int64)
+		if season.Valid {
+			v := int(season.Int64)
+			c.SeasonNumber = &v
+		}
+		if episode.Valid {
+			v := int(episode.Int64)
+			c.EpisodeNumber = &v
+		}
+		c.TargetPath = target.String
+		c.OriginalLanguage = origLang.String
+		c.AudioLanguages = audioLangs.String
+		c.Eligibility = eligib.String
+		if raw.Valid && strings.TrimSpace(raw.String) != "" {
+			var doc map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(raw.String), &doc); err != nil {
+				return nil, fmt.Errorf("store: import candidate %d: parsed_raw_json is not an object: %w", c.ID, err)
+			}
+			if blob, ok := doc[gateJSONKey]; ok {
+				if err := json.Unmarshal(blob, &c.Gate); err != nil {
+					return nil, fmt.Errorf("store: decode import candidate %d gate: %w", c.ID, err)
+				}
+				c.HasGate = true
+				if c.Gate.TargetPath != "" {
+					c.TargetPath = c.Gate.TargetPath
+				}
+				if c.Gate.Status != "" {
+					c.Eligibility = c.Gate.Status
+				}
+			}
+		}
+		if c.Eligibility == "" {
+			c.Eligibility = "missing_target"
+		}
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate pending import candidates: %w", err)
+	}
+	return out, nil
+}
+
+// TransitionImportCandidate moves a pending_approval candidate to status to.
+//
+// M2 has no extraction worker: approve marks the row extracting (M3 consumes
+// that state) and reject marks it ignored. Any other source status is a
+// conflict, so a double click cannot silently overwrite a completed row.
+func (s *Store) TransitionImportCandidate(ctx context.Context, id int64, to string) error {
+	res, err := s.DB.ExecContext(ctx,
+		`UPDATE import_queue SET status = ?, updated_at = CURRENT_TIMESTAMP
+		 WHERE id = ? AND status = 'pending_approval'`, to, id)
+	if err != nil {
+		return fmt.Errorf("store: transition import candidate %d: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: transition import candidate %d rows: %w", id, err)
+	}
+	if n == 1 {
+		return nil
+	}
+
+	var current string
+	err = s.DB.QueryRowContext(ctx, `SELECT status FROM import_queue WHERE id = ?`, id).Scan(&current)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrImportCandidateNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("store: read import candidate %d: %w", id, err)
+	}
+	return ErrImportCandidateState
 }

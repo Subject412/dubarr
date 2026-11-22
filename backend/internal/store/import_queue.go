@@ -17,6 +17,9 @@ var (
 	// ErrImportCandidateState reports a transition requested from a status
 	// other than pending_approval.
 	ErrImportCandidateState = errors.New("store: import candidate is not pending approval")
+	// ErrImportExtractionState reports an extraction result recorded for a row
+	// that is no longer extracting (already finished or never approved).
+	ErrImportExtractionState = errors.New("store: import candidate is not extracting")
 )
 
 // RecordImportCandidate inserts a newly discovered donor file into the
@@ -299,4 +302,102 @@ func (s *Store) TransitionImportCandidate(ctx context.Context, id int64, to stri
 		return fmt.Errorf("store: read import candidate %d: %w", id, err)
 	}
 	return ErrImportCandidateState
+}
+
+// ImportExtractionJob is the extraction worker's view of an approved row: the
+// donor file to extract from and the arr original language used to build the
+// export policy. SelectedExportsJSON is the persisted approval choice (empty
+// in M2; the worker falls back to the export policy when it is empty).
+type ImportExtractionJob struct {
+	ID               int64
+	SourceFilePath   string
+	Filename         string
+	FileSize         int64
+	SelectedExports  string
+	OriginalLanguage string
+}
+
+// NextImportExtraction returns the oldest row awaiting extraction, or ok=false
+// when no row is in the extracting state. The worker consumes rows one at a
+// time (concurrency 1), so a single-row read is enough.
+func (s *Store) NextImportExtraction(ctx context.Context) (ImportExtractionJob, bool, error) {
+	var (
+		job  ImportExtractionJob
+		orig sql.NullString
+	)
+	err := s.DB.QueryRowContext(ctx, `
+		SELECT iq.id, iq.source_file_path, iq.filename, iq.file_size,
+		       iq.selected_exports_json, alc.original_language_iso2
+		FROM import_queue iq
+		LEFT JOIN arr_library_cache alc ON alc.id = iq.matched_library_cache_id
+		WHERE iq.status = 'extracting'
+		ORDER BY iq.created_at, iq.id
+		LIMIT 1`).Scan(&job.ID, &job.SourceFilePath, &job.Filename, &job.FileSize,
+		&job.SelectedExports, &orig)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ImportExtractionJob{}, false, nil
+	}
+	if err != nil {
+		return ImportExtractionJob{}, false, fmt.Errorf("store: next import extraction: %w", err)
+	}
+	job.OriginalLanguage = orig.String
+	return job, true, nil
+}
+
+// ClaimImportExtraction atomically claims an extracting row for this worker.
+//
+// M3-1 is additive and migration-free, and import_queue's status CHECK only
+// permits the M1 status vocabulary, so no separate 'processing' state can be
+// introduced. The claim is therefore a conditional touch of the extracting row:
+// the UPDATE only succeeds while the status is still 'extracting', which gives
+// one writer exclusive ownership for the lifetime of the claim. A crash leaves
+// the row extracting, and the next boot re-processes it after reaping its
+// staging directory — the desired crash-safe behaviour for concurrency 1.
+func (s *Store) ClaimImportExtraction(ctx context.Context, id int64) (bool, error) {
+	res, err := s.DB.ExecContext(ctx,
+		`UPDATE import_queue SET status = 'extracting', updated_at = CURRENT_TIMESTAMP
+		 WHERE id = ? AND status = 'extracting'`, id)
+	if err != nil {
+		return false, fmt.Errorf("store: claim import extraction %d: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("store: claim import extraction %d rows: %w", id, err)
+	}
+	return n == 1, nil
+}
+
+// FinishImportExtraction records the extraction outcome for an extracting row.
+//
+// status is 'completed' when the validated output is staged in WORK_DIR for
+// M3-2 (the status CHECK has no 'extracted' member and M3-1 adds no migration,
+// so 'completed' carries "extracted, awaiting vault" until M3-2 advances it)
+// and 'failed' when the row is dead-lettered with errorMessage. Recording a
+// result for a row that is no longer extracting is a state conflict.
+func (s *Store) FinishImportExtraction(ctx context.Context, id int64, status, errorMessage string) error {
+	if status != "completed" && status != "failed" {
+		return fmt.Errorf("store: finish import extraction %d: unsupported status %q", id, status)
+	}
+	res, err := s.DB.ExecContext(ctx,
+		`UPDATE import_queue SET status = ?, error_message = ?, updated_at = CURRENT_TIMESTAMP
+		 WHERE id = ? AND status = 'extracting'`, status, errorMessage, id)
+	if err != nil {
+		return fmt.Errorf("store: finish import extraction %d: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: finish import extraction %d rows: %w", id, err)
+	}
+	if n == 1 {
+		return nil
+	}
+	var current string
+	err = s.DB.QueryRowContext(ctx, `SELECT status FROM import_queue WHERE id = ?`, id).Scan(&current)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrImportCandidateNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("store: read import candidate %d: %w", id, err)
+	}
+	return fmt.Errorf("%w (status %q)", ErrImportExtractionState, current)
 }

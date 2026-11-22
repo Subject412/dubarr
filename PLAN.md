@@ -79,4 +79,12 @@ Full acceptance pass: container zero-env build+start, wizard creates admin + per
 - M3-3 — Vault UI: vault page listing entries (name, size, sha256, source target/donor, created); no delete-by-default (`.bak`-style opt-in clean is settled for M4+); read-only.
 - M3-4 — Approve→Vault integration: approve action triggers extraction→vault pipeline end-to-end; queue status advances to vaulted (or failed with reason); acceptance run: Shrek-like fixture produces valid .pl.mka + sha256, zero staging leftovers on success AND failure paths.
 - M4: Rust dubarr-sync + Copy-on-Work + Reference Language Resolver + checkpoints + drift regression. Acceptance: cargo/go tests 100%; Vault byte-identical (RO-mount); accurate same-lang & lowpass reports.
+
+### M4 tasks (drafted at gate, 2026-11-22)
+- M4-1 — Rust `dubarr-sync` CLI core (sync-engine/): read WAV PCM slices (hound), compute offset_ms = t_target − t_donor via cross-correlation (rustfft), stdio/JSON output contract; golden tests with synthetic WAVs (known offsets); clap CLI.
+- M4-2 — Go↔Rust bridge: Go invokes the `dubarr-sync` binary (PATH, health-reported), passes job JSON on stdin, parses result; typed errors; timeout; version handshake; absent-binary ⇒ typed error (matches /api/health dubarr-sync:false).
+- M4-3 — Copy-on-Work: jobs copy vault `.mka` + target audio into WORK_DIR (SHA-256 verify against vault manifest), never touch VAULT_DIR (settled: vault write-once + copy-on-work + SHA-256); cleanup on completion/failure.
+- M4-4 — Reference Language Resolver: per IDEA.md priority (same_lang_reference original-language pair first, then policy languages); pure functions + tests over track metadata (probe types).
+- M4-5 — Checkpoints + drift: multi-point offset analysis at sync.defaults.checkpoint_positions_pct with checkpoint_window_sec; drift report (per-point offsets, monotonic sanity, max drift); lowpass/same-lang report accuracy tests.
+- M4-6 — Sync job API + status: POST /api/sync/jobs (target_track_id, target_library_cache_id, force_ignore_tag_filter gated by settled allow_force_tag_override=OFF), job status polling, results persisted.
 - M5: Sync Studio + tag-gated atomic mux + arr Rescan. Acceptance: Shrek end-to-end; Minions fails loudly if ambiguous; zero vault/video modification, zero untagged mux, zero secret leaks.

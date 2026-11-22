@@ -5,6 +5,7 @@ import { Badge, Button } from './ui'
 
 const navItems = [
   { to: '/queue', label: 'Approval Queue', icon: '✓', hint: 'M2' },
+  { to: '/vault', label: 'Audio Vault', icon: '♫', hint: 'M3' },
   { to: '/library', label: 'Library', icon: '▤', hint: 'M2' },
   { to: '/sync', label: 'Sync Studio', icon: '◉', hint: 'M5' },
   { to: '/settings', label: 'Settings', icon: '⚙' },

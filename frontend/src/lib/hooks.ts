@@ -14,6 +14,7 @@ import {
   type QueueTransition,
   type SettingsEnvelope,
   type User,
+  type VaultResponse,
 } from './api'
 
 export const queryKeys = {
@@ -22,6 +23,7 @@ export const queryKeys = {
   settings: ['settings'] as const,
   health: ['health'] as const,
   queue: ['queue'] as const,
+  vault: ['vault'] as const,
   browse: (path: string) => ['browse', path] as const,
 }
 
@@ -65,6 +67,14 @@ export function useQueue(): UseQueryResult<QueueResponse> {
     queryKey: queryKeys.queue,
     queryFn: api.queue,
     staleTime: 5_000,
+  })
+}
+
+export function useVault(): UseQueryResult<VaultResponse> {
+  return useQuery({
+    queryKey: queryKeys.vault,
+    queryFn: api.vault,
+    staleTime: 10_000,
   })
 }
 

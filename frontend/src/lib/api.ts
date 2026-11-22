@@ -155,6 +155,29 @@ export type QueueTransition = {
   status: string
 }
 
+export type VaultItem = {
+  id: number
+  title: string
+  media_type: 'movie' | 'series'
+  season_number: number | null
+  episode_number: number | null
+  filename: string
+  file_size: number
+  sha256: string
+  language: string
+  language_iso3?: string
+  variant: string
+  codec: string
+  channels: string
+  channel_count: number
+  source_release_name: string
+  created_at: string
+}
+
+export type VaultResponse = {
+  items: VaultItem[]
+}
+
 export class ApiError extends Error {
   readonly status: number
 
@@ -226,6 +249,7 @@ export const api = {
     request<BrowseResponse>(`/api/system/browse?path=${encodeURIComponent(path)}`),
   health: () => request<Health>('/api/health'),
   queue: () => request<QueueResponse>('/api/queue'),
+  vault: () => request<VaultResponse>('/api/vault'),
   approveQueueItem: (id: number) =>
     request<QueueTransition>(`/api/queue/${id}/approve`, { method: 'POST' }),
   rejectQueueItem: (id: number) =>

@@ -11,6 +11,7 @@ import { QueuePage } from './pages/Queue'
 import { SettingsPage } from './pages/Settings'
 import { SetupPage } from './pages/Setup'
 import { SystemPage } from './pages/System'
+import { VaultPage } from './pages/Vault'
 
 /**
  * Route gate: /api/auth/status decides whether the appliance needs first-run
@@ -81,6 +82,7 @@ function App() {
             path="/queue"
             element={<QueuePage />}
           />
+          <Route path="/vault" element={<VaultPage />} />
           <Route
             path="/sync"
             element={

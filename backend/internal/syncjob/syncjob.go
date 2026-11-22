@@ -205,13 +205,14 @@ func (s *Service) handleCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 // eligibilityError enforces the Tdarr Gate verdict. Force (already checked
-// against settings by the caller) bypasses it.
+// against settings by the caller) bypasses the gate only: a target with no
+// file path is not eligible under any setting.
 func eligibilityError(lib store.LibraryCacheJobTarget, force bool) error {
-	if force {
-		return nil
-	}
 	if strings.TrimSpace(lib.TargetFilePath) == "" {
 		return errors.New("target file is missing")
+	}
+	if force {
+		return nil
 	}
 	status := strings.TrimSpace(lib.EligibilityStatus)
 	if status == "" {
@@ -500,6 +501,9 @@ func trackAudioTrack(rec store.VaultTrackRecord, index int) probe.AudioTrack {
 		Language:      rec.LangISO2,
 		LanguageISO1:  rec.LangISO2,
 		LanguageISO2B: rec.LangISO3,
+		Disposition: probe.Disposition{
+			Comment: strings.EqualFold(strings.TrimSpace(rec.Variant), "commentary"),
+		},
 	}
 }
 

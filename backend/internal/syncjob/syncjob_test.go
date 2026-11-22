@@ -19,6 +19,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Subject412/dubarr/backend/internal/probe"
+	"github.com/Subject412/dubarr/backend/internal/reflang"
 	"github.com/Subject412/dubarr/backend/internal/settings"
 	"github.com/Subject412/dubarr/backend/internal/store"
 	"github.com/Subject412/dubarr/backend/internal/sync"
@@ -203,6 +205,45 @@ func TestCreateJobEligibilityGate(t *testing.T) {
 	}
 	if rec := postJob(t, f.mux, body); rec.Code != http.StatusCreated {
 		t.Fatalf("force on create = %d %s, want 201", rec.Code, rec.Body)
+	}
+
+	// Force overrides the tag filter only: a missing target file must still
+	// be rejected as a conflict instead of reaching the store and 500ing.
+	missing := insertLibrary(t, f.db.DB, "", "eligible", "eng")
+	body = fmt.Sprintf(`{"vault_track_id":%d,"target_library_cache_id":%d,"force_ignore_tag_filter":true}`, trackID, missing)
+	rec = postJob(t, f.mux, body)
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "target file is missing") {
+		t.Fatalf("force on missing target = %d %s, want 409 target file is missing", rec.Code, rec.Body)
+	}
+}
+
+// TestTrackAudioTrackCommentaryNeverSelected guards the vault -> probe mapping:
+// a commentary variant must carry Disposition.Comment so reflang never picks it
+// as a reference donor, even when it is the highest-quality sibling.
+func TestTrackAudioTrackCommentaryNeverSelected(t *testing.T) {
+	job := store.VaultTrackRecord{ID: 1, LangISO2: "pl", ChannelCount: 2, Variant: "dubbing"}
+	commentary := store.VaultTrackRecord{ID: 2, LangISO2: "en", ChannelCount: 6, Variant: " Commentary "}
+	dub := store.VaultTrackRecord{ID: 3, LangISO2: "en", ChannelCount: 2, Variant: "dubbing"}
+
+	if got := trackAudioTrack(commentary, 0); !got.Disposition.Comment {
+		t.Fatalf("commentary variant mapped to Disposition.Comment = false, want true")
+	}
+	if got := trackAudioTrack(dub, 0); got.Disposition.Comment {
+		t.Fatalf("dubbing variant mapped to Disposition.Comment = true, want false")
+	}
+
+	vaultTracks := []probe.AudioTrack{
+		trackAudioTrack(job, 0),
+		trackAudioTrack(commentary, 1),
+		trackAudioTrack(dub, 2),
+	}
+	targetTracks := []probe.AudioTrack{{Index: 1, Channels: 2, Language: "eng", LanguageISO1: "en"}}
+	resolved := reflang.Resolve(targetTracks, vaultTracks, reflang.Languages{Targets: []string{"pl"}}, "")
+	if len(resolved.Pairs) != 1 {
+		t.Fatalf("pairs = %d (%s), want 1 en reference", len(resolved.Pairs), resolved.Reason)
+	}
+	if got := resolved.Pairs[0].Vault.Index; got != 2 {
+		t.Fatalf("donor vault index = %d, want 2 (dubbing sibling); commentary sibling selected", got)
 	}
 }
 

@@ -352,7 +352,12 @@ func (w *Worker) processJob(ctx context.Context, id int64) error {
 		w.logf("syncworker: job %d rescan: %v", id, err)
 	}
 
-	return w.store.FinishSyncJobAnalysis(ctx, id, statusCompleted, string(report.SyncMethod), offset, report, "")
+	// The mux already published, so the terminal status write must outlive a
+	// shutdown cancellation: a SIGTERM during the up-to-30s rescan window would
+	// otherwise fail this write and leave ProcessOnce marking a published job
+	// failed. Only this last write is detached; the rescan above stays
+	// cancellable and best-effort.
+	return w.store.FinishSyncJobAnalysis(context.WithoutCancel(ctx), id, statusCompleted, string(report.SyncMethod), offset, report, "")
 }
 
 // muxableVerdict accepts exactly the two verdicts M5-1 may publish. The

@@ -41,10 +41,16 @@ type fakeMuxer struct {
 	result mux.Result
 	err    error
 	jobs   []mux.Job
+	// after runs once the publish returns, simulating a seam that observes a
+	// shutdown cancellation between mux and the terminal status write.
+	after func()
 }
 
 func (f *fakeMuxer) Mux(_ context.Context, job mux.Job) (mux.Result, error) {
 	f.jobs = append(f.jobs, job)
+	if f.after != nil {
+		f.after()
+	}
 	return f.result, f.err
 }
 
@@ -367,6 +373,40 @@ func TestProcessOnceRescanFailureKeepsJobDone(t *testing.T) {
 	rec, _, _ := r.store.SyncJobByID(context.Background(), jobID)
 	if rec.Status != "completed" {
 		t.Fatalf("status = %q, want completed despite rescan failure", rec.Status)
+	}
+}
+
+// A shutdown cancellation observed right after the mux returns must not turn an
+// already-published job into a failure: the terminal status write is detached
+// from the drain context, and staging is kept.
+func TestProcessOncePublishedJobSurvivesShutdownCancellation(t *testing.T) {
+	r := newRig(t)
+	jobID := r.newJob(t)
+	audio := r.stage(t, jobID)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// Cancel as soon as the publish returns, mimicking a SIGTERM that lands in
+	// the rescan window before the terminal write.
+	mx := &fakeMuxer{after: cancel}
+	w := newWorker(t, r, &fakeExecutor{report: stableReport()}, mx, &fakeRescanner{})
+
+	processed, err := w.ProcessOnce(ctx)
+	if err != nil || !processed {
+		t.Fatalf("ProcessOnce = %v/%v, want true/nil", processed, err)
+	}
+	if len(mx.jobs) != 1 {
+		t.Fatalf("Mux calls = %d, want 1", len(mx.jobs))
+	}
+	rec, _, err := r.store.SyncJobByID(context.Background(), jobID)
+	if err != nil {
+		t.Fatalf("SyncJobByID: %v", err)
+	}
+	if rec.Status != "completed" {
+		t.Fatalf("status = %q, want completed after a published mux", rec.Status)
+	}
+	if _, err := os.Stat(filepath.Dir(audio)); err != nil {
+		t.Fatalf("staging should be kept after a published job: %v", err)
 	}
 }
 

@@ -186,6 +186,34 @@ func TestTempLeftoversCatchesSeededScratch(t *testing.T) {
 	}
 }
 
+// TestStaleTempBesideTargetIsFlagged pins the production cleanup contract: a
+// Mux call removes only the temp it created (mux.go:219-235), never a stale
+// scratch file left beside the target by an earlier crash. The verification
+// helper must nevertheless report that file under its real
+// "<target>.dubarr-<hex>.tmp" name, so a leak is visible rather than silently
+// passing.
+func TestStaleTempBesideTargetIsFlagged(t *testing.T) {
+	h := newHarness(t)
+	stale := h.target + ".dubarr-0123456789abcdef.tmp"
+	if err := os.WriteFile(stale, []byte("stale"), 0o644); err != nil {
+		t.Fatalf("seed stale temp: %v", err)
+	}
+
+	// A failing mux still creates and removes its own temp, leaving the
+	// seeded one untouched.
+	if _, err := New(Dependencies{MKVMergePath: "/bin/false"}).Mux(context.Background(), h.job()); !errors.Is(err, ErrTool) {
+		t.Fatalf("Mux error = %v, want ErrTool", err)
+	}
+
+	got, err := tempLeftovers(h.target)
+	if err != nil {
+		t.Fatalf("tempLeftovers: %v", err)
+	}
+	if len(got) != 1 || got[0] != stale {
+		t.Fatalf("tempLeftovers = %v, want the seeded stale temp [%s]", got, stale)
+	}
+}
+
 // snapshot records every regular file under dir with its hash.
 func snapshot(t *testing.T, dir string) map[string]string {
 	t.Helper()
@@ -374,10 +402,11 @@ func TestMuxPublishesAtomicallyWithBackup(t *testing.T) {
 	if res.OutputPath != h.target {
 		t.Errorf("OutputPath = %q, want %q", res.OutputPath, h.target)
 	}
-	if _, err := os.Stat(h.target + ".dubarr.tmp"); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("temp file still present: %v", err)
+	if leftovers, err := tempLeftovers(h.target); err != nil {
+		t.Fatalf("list temps: %v", err)
+	} else if len(leftovers) > 0 {
+		t.Errorf("temp files still present beside target: %v", leftovers)
 	}
-	noTempsLeft(t, h.target)
 
 	// The original bytes survive verbatim in the sidecar backup.
 	if got := sha256File(t, h.target+".bak"); got != beforeTargetHash {
@@ -574,8 +603,10 @@ func TestMkvmergeFailureLeavesOriginalUntouched(t *testing.T) {
 	if got := sha256File(t, h.target); got != hash {
 		t.Error("target modified on mkvmerge failure")
 	}
-	if _, err := os.Stat(h.target + ".dubarr.tmp"); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("temp not cleaned up: %v", err)
+	if leftovers, err := tempLeftovers(h.target); err != nil {
+		t.Fatalf("list temps: %v", err)
+	} else if len(leftovers) > 0 {
+		t.Errorf("temp not cleaned up: %v", leftovers)
 	}
 	noTempsLeft(t, h.target)
 	if _, err := os.Stat(h.target + ".bak"); !errors.Is(err, os.ErrNotExist) {

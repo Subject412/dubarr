@@ -1,0 +1,5 @@
+# Pinned master-key source; no silent keyring↔keyfile switching
+
+The master key's source is pinned per data-dir: on first resolution the app records `secrets.key_source` plus a sentinel `secrets.__key_check` row (AES-GCM seal of a fixed plaintext under the master key). On every later boot the key is resolved only from the recorded source — a locked/absent keyring never silently falls back to a keyfile, and a present keyring never silently displaces one; a source mismatch (or a failed check-decrypt, e.g. wiped keyring) with a non-empty secrets collection refuses startup with a typed `ErrKeySourceMismatch` and an operator hint, while an empty collection re-pins automatically with a WARN. A one-shot `dubarr rekey --keyfile PATH` bootstrap flag decrypts and re-encrypts all rows atomically under a newly resolved source; it is a flag, not an env var, so ADR-0003's zero-env rule stands (this ADR records the exception). This prevents the pre-existing failure where the keyring's availability flipping between boots left stored secrets undecryptable with no error.
+
+Status: accepted

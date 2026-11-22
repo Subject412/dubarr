@@ -95,6 +95,11 @@ export type ArrOptions = {
   manual_sync: boolean
 }
 
+/** Sibling filenames that mark a dropped file as a donor dub. */
+export type ImportsOptions = {
+  donor_patterns: string[]
+}
+
 export type DubarrSettings = {
   'storage.paths': StoragePaths
   'languages.policy': LanguagesPolicy
@@ -104,6 +109,7 @@ export type DubarrSettings = {
   'mux.options': MuxOptions
   'watch.options': WatchOptions
   'arr.options': ArrOptions
+  'imports.options': ImportsOptions
 }
 
 export type SettingsKey = keyof DubarrSettings

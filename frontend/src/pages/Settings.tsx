@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import type {
   ArrOptions,
+  ImportsOptions,
   LanguagesPolicy,
   MuxOptions,
   SecurityOptions,
@@ -35,6 +36,7 @@ function Section<T extends object>({
   sectionKey,
   value,
   save,
+  onSaved,
   children,
 }: {
   title: string
@@ -42,6 +44,8 @@ function Section<T extends object>({
   sectionKey: SettingsKey
   value: T
   save: (key: SettingsKey, value: T) => Promise<unknown>
+  /** Runs after a successful save with the saved and pre-save values. */
+  onSaved?: (saved: T, previous: T) => void
   children: (draft: T, update: (patch: Partial<T>) => void) => ReactNode
 }) {
   const [draft, setDraft] = useState<T>(value)
@@ -73,6 +77,7 @@ function Section<T extends object>({
       await save(sectionKey, draft)
       setDirty(false)
       setStatus('saved')
+      onSaved?.(draft, value)
     } catch (err) {
       setStatus('error')
       setError(err instanceof Error ? err.message : 'could not save section')
@@ -134,6 +139,9 @@ export function SettingsPage() {
   const saveSettings = useSaveSettings()
   const [exportError, setExportError] = useState('')
   const [exporting, setExporting] = useState(false)
+  const [watchRestartNotice, setWatchRestartNotice] = useState(false)
+
+  const flagWatchRestart = () => setWatchRestartNotice(true)
 
   const data = settings.data?.settings
 
@@ -176,6 +184,19 @@ export function SettingsPage() {
       {settings.isLoading && <Spinner label="Loading settings" />}
       {settings.error && <Alert>Could not load settings: {settings.error.message}</Alert>}
       {exportError && <Alert>{exportError}</Alert>}
+      {watchRestartNotice && (
+        <Alert tone="warning">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <span>
+              Restart required to apply watch changes. The watch folder, scan interval and tag
+              filter are read at startup.
+            </span>
+            <Button size="sm" variant="ghost" onClick={() => setWatchRestartNotice(false)}>
+              Dismiss
+            </Button>
+          </div>
+        </Alert>
+      )}
 
       {data && (
         <div className="space-y-5">
@@ -185,6 +206,9 @@ export function SettingsPage() {
             sectionKey="storage.paths"
             value={(data['storage.paths'] as StoragePaths) ?? DEFAULTS['storage.paths']}
             save={save}
+            onSaved={(saved, previous) => {
+              if (saved.watch_dir !== previous.watch_dir) flagWatchRestart()
+            }}
           >
             {(draft, update) => (
               <>
@@ -272,6 +296,9 @@ export function SettingsPage() {
             sectionKey="target.tag_filter"
             value={(data['target.tag_filter'] as TargetTagFilter) ?? DEFAULTS['target.tag_filter']}
             save={save}
+            onSaved={(saved, previous) => {
+              if (JSON.stringify(saved) !== JSON.stringify(previous)) flagWatchRestart()
+            }}
           >
             {(draft, update) => (
               <>
@@ -428,6 +455,9 @@ export function SettingsPage() {
             sectionKey="watch.options"
             value={(data['watch.options'] as WatchOptions) ?? DEFAULTS['watch.options']}
             save={save}
+            onSaved={(saved, previous) => {
+              if (saved.scan_interval_sec !== previous.scan_interval_sec) flagWatchRestart()
+            }}
           >
             {(draft, update) => (
               <div className="grid gap-4 md:grid-cols-2">
@@ -443,6 +473,24 @@ export function SettingsPage() {
                   onChange={(stability_check_interval_sec) => update({ stability_check_interval_sec })}
                 />
               </div>
+            )}
+          </Section>
+
+          <Section<ImportsOptions>
+            title="Donor patterns"
+            description="Sibling filenames that mark a dropped file as a donor dub. Matching is case-insensitive; a pattern without * is a substring match, with * a glob."
+            sectionKey="imports.options"
+            value={(data['imports.options'] as ImportsOptions) ?? DEFAULTS['imports.options']}
+            save={save}
+          >
+            {(draft, update) => (
+              <StringListEditor
+                label="Donor patterns"
+                inputLabel="Add donor pattern"
+                values={draft.donor_patterns ?? []}
+                onChange={(donor_patterns) => update({ donor_patterns })}
+                placeholder="PL.DUB"
+              />
             )}
           </Section>
 

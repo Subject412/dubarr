@@ -222,7 +222,6 @@ func TestSliceWindow(t *testing.T) {
 	}
 }
 
-
 func TestAnalyzeDrifting(t *testing.T) {
 	eng := &scriptedEngine{offsets: []float64{500, 500, 500, 2000, 2000, 2000}}
 	rep, err := Analyze(context.Background(), eng, DefaultConfig(), request(t.TempDir()))
@@ -247,6 +246,93 @@ func TestAnalyzeOutOfRange(t *testing.T) {
 	}
 	if rep.Verdict != VerdictOutOfRange || rep.Classification != ClassificationOutOfRange {
 		t.Fatalf("verdict/classification = %q/%q, want out_of_range", rep.Verdict, rep.Classification)
+	}
+}
+
+// TestAnalyzeVerdictPrecedence drives the aggregation seam through the
+// precedence matrix out_of_range > unreliable > drifting > ok.
+func TestAnalyzeVerdictPrecedence(t *testing.T) {
+	const hi = 0.9
+	stable := []float64{1200, 1210, 1195, 1205, 1198, 1202}
+	drifting := []float64{500, 500, 500, 2000, 2000, 2000}
+	beyond := []float64{200000, 200100, 199900, 200050, 200000, 200010}
+
+	cases := []struct {
+		name           string
+		offsets        []float64
+		qualities      []float64
+		wantVerdict    string
+		wantClass      string
+		wantMaxDriftMS float64
+	}{
+		{
+			name:        "ok",
+			offsets:     stable,
+			qualities:   []float64{hi, hi, hi, hi, hi, hi},
+			wantVerdict: VerdictOK, wantClass: ClassificationStable,
+			wantMaxDriftMS: 15,
+		},
+		{
+			name:        "drifting",
+			offsets:     drifting,
+			qualities:   []float64{hi, hi, hi, hi, hi, hi},
+			wantVerdict: VerdictDrifting, wantClass: ClassificationDrifting,
+			wantMaxDriftMS: 1500,
+		},
+		{
+			name:        "single weak checkpoint is unreliable",
+			offsets:     stable,
+			qualities:   []float64{hi, hi, 0.2, hi, hi, hi},
+			wantVerdict: VerdictUnreliable, wantClass: ClassificationUnreliable,
+			wantMaxDriftMS: 15,
+		},
+		{
+			name:        "unreliable outranks drifting",
+			offsets:     drifting,
+			qualities:   []float64{hi, hi, 0.1, hi, hi, hi},
+			wantVerdict: VerdictUnreliable, wantClass: ClassificationUnreliable,
+			wantMaxDriftMS: 1500,
+		},
+		{
+			name:        "out_of_range outranks unreliable",
+			offsets:     beyond,
+			qualities:   []float64{0.05, 0.05, 0.05, 0.05, 0.05, 0.05},
+			wantVerdict: VerdictOutOfRange, wantClass: ClassificationOutOfRange,
+			wantMaxDriftMS: 200,
+		},
+		{
+			name:        "quality at threshold is trusted",
+			offsets:     stable,
+			qualities:   []float64{hi, hi, LowQualityThreshold, hi, hi, hi},
+			wantVerdict: VerdictOK, wantClass: ClassificationStable,
+			wantMaxDriftMS: 15,
+		},
+		{
+			name:        "quality just below threshold is unreliable",
+			offsets:     stable,
+			qualities:   []float64{hi, hi, math.Nextafter(LowQualityThreshold, 0), hi, hi, hi},
+			wantVerdict: VerdictUnreliable, wantClass: ClassificationUnreliable,
+			wantMaxDriftMS: 15,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			eng := &scriptedEngine{offsets: tc.offsets, qualities: tc.qualities}
+			rep, err := Analyze(context.Background(), eng, DefaultConfig(), request(t.TempDir()))
+			if err != nil {
+				t.Fatalf("Analyze: %v", err)
+			}
+			if rep.Verdict != tc.wantVerdict || rep.Classification != tc.wantClass {
+				t.Fatalf("verdict/classification = %q/%q, want %q/%q",
+					rep.Verdict, rep.Classification, tc.wantVerdict, tc.wantClass)
+			}
+			if math.Abs(rep.MaxDriftMS-tc.wantMaxDriftMS) > 1e-9 {
+				t.Fatalf("max_drift_ms = %v, want %v", rep.MaxDriftMS, tc.wantMaxDriftMS)
+			}
+			if len(rep.Qualities) != len(tc.qualities) {
+				t.Fatalf("qualities length = %d, want %d", len(rep.Qualities), len(tc.qualities))
+			}
+		})
 	}
 }
 
@@ -534,7 +620,7 @@ func TestIntegrationOffsetWithinSearchWindow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Analyze: %v", err)
 	}
-	want := float64(DefaultMaxOffsetSec+CheckWindowMarginSec) // 190 s slice
+	want := float64(DefaultMaxOffsetSec + CheckWindowMarginSec) // 190 s slice
 	for i, job := range eng.calls {
 		if job.SliceLenSec != want {
 			t.Fatalf("checkpoint %d slice_len = %v, want %v", i, job.SliceLenSec, want)
@@ -553,4 +639,3 @@ func TestIntegrationOffsetWithinSearchWindow(t *testing.T) {
 		t.Fatalf("verdict/classification = %q/%q (offsets %v), want ok/stable", rep.Verdict, rep.Classification, rep.OffsetsMS)
 	}
 }
-

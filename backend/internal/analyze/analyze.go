@@ -12,6 +12,11 @@
 //     a larger spread means speed drift or a mid-movie edit.
 //   - Does any point exceed sync.defaults.max_offset_sec? Then the verdict is
 //     [VerdictOutOfRange] and M5 must fail loudly instead of muxing.
+//   - Is any point's correlation weak enough to distrust? A checkpoint whose
+//     correlation_quality falls below [LowQualityThreshold] makes the verdict
+//     [VerdictUnreliable]: offsets beyond the searchable window surface as
+//     boundary peaks with degraded quality, so a weak peak usually means the
+//     reported offset is not a real match.
 //   - Was the reference pair resolved as same_lang_reference or
 //     lowpass_fallback? This comes from internal/reflang and travels in the
 //     report so the accuracy of a low-pass match is visible downstream.
@@ -55,10 +60,20 @@ var DefaultCheckpointPositionsPct = []int{10, 25, 40, 55, 70, 85}
 // specified, so the spec's 40 ms is used verbatim.
 const StableSpreadThresholdMS = 40.0
 
+// LowQualityThreshold is the correlation_quality floor below which a
+// checkpoint is not trusted. IDEA.md specifies no threshold for
+// correlation_quality, so 0.25 is an implementation choice: peaks that weak
+// are barely distinguishable from noise. Offsets beyond the searchable window
+// surface as boundary peaks with degraded quality, so a low-quality
+// checkpoint is usually a non-match rather than a real offset and yields
+// [VerdictUnreliable].
+const LowQualityThreshold = 0.25
+
 // Verdicts reported to the sync job status and consumed by M5.
 const (
 	VerdictOK         = "ok"
 	VerdictDrifting   = "drifting"
+	VerdictUnreliable = "unreliable"
 	VerdictOutOfRange = "out_of_range"
 )
 
@@ -67,6 +82,7 @@ const (
 const (
 	ClassificationStable     = "stable"
 	ClassificationDrifting   = "drifting"
+	ClassificationUnreliable = "unreliable"
 	ClassificationOutOfRange = "out_of_range"
 )
 
@@ -225,7 +241,7 @@ func Analyze(ctx context.Context, engine Engine, cfg Config, req Request) (Repor
 		report.Qualities = append(report.Qualities, result.CorrelationQuality)
 	}
 
-	verdict, classification, drift := classify(report.OffsetsMS, float64(cfg.MaxOffsetSec)*1000)
+	verdict, classification, drift := classify(report.OffsetsMS, report.Qualities, float64(cfg.MaxOffsetSec)*1000)
 	report.Verdict = verdict
 	report.Classification = classification
 	report.MaxDriftMS = drift
@@ -259,8 +275,10 @@ func sliceWindow(duration float64, pct int, window float64) (start, length float
 
 // classify implements the monotonic sanity check: a constant shift has a small
 // spread across checkpoints, drift has a large one, and any point beyond the
-// acceptance bound fails loudly.
-func classify(offsets []float64, maxOffsetMS float64) (verdict, classification string, maxDrift float64) {
+// acceptance bound fails loudly. A checkpoint too weak to trust (quality below
+// [LowQualityThreshold]) outranks drift but not an out-of-range offset, giving
+// the precedence out_of_range > unreliable > drifting > ok.
+func classify(offsets, qualities []float64, maxOffsetMS float64) (verdict, classification string, maxDrift float64) {
 	if len(offsets) == 0 {
 		return VerdictOutOfRange, ClassificationOutOfRange, 0
 	}
@@ -277,6 +295,11 @@ func classify(offsets []float64, maxOffsetMS float64) (verdict, classification s
 	for _, off := range offsets {
 		if math.Abs(off) > maxOffsetMS {
 			return VerdictOutOfRange, ClassificationOutOfRange, maxDrift
+		}
+	}
+	for _, q := range qualities {
+		if q < LowQualityThreshold {
+			return VerdictUnreliable, ClassificationUnreliable, maxDrift
 		}
 	}
 	if maxDrift >= StableSpreadThresholdMS {

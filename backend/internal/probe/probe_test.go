@@ -2,6 +2,7 @@ package probe
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
@@ -354,6 +355,43 @@ func TestProbeCommandShape(t *testing.T) {
 		if !strings.Contains(call, want) {
 			t.Errorf("ffprobe call %q lacks %q", call, want)
 		}
+	}
+}
+
+// TestProbeZeroAudioTracksIsEmptySlice keeps the JSON contract stable: a file
+// with no audio stream must emit audio_tracks: [] and never null.
+func TestProbeZeroAudioTracksIsEmptySlice(t *testing.T) {
+	const videoOnly = `{
+	  "streams": [
+	    {"index":0,"codec_name":"h264","codec_type":"video","channels":0}
+	  ],
+	  "format":{"format_name":"matroska,webm","duration":"10.000000"}
+	}`
+	p := New(Dependencies{Run: func(context.Context, string, ...string) ([]byte, error) {
+		return []byte(videoOnly), nil
+	}})
+	path := filepath.Join(t.TempDir(), "silent.mkv")
+	if err := os.WriteFile(path, []byte("media"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := p.Probe(context.Background(), path)
+	if err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+	if info.Tracks == nil {
+		t.Fatal("Tracks is nil for a zero-audio file, want an empty slice")
+	}
+	if len(info.Tracks) != 0 {
+		t.Fatalf("got %d tracks, want 0: %+v", len(info.Tracks), info.Tracks)
+	}
+
+	raw, err := json.Marshal(info)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if !strings.Contains(string(raw), `"audio_tracks":[]`) {
+		t.Fatalf("JSON = %s, want audio_tracks:[]", raw)
 	}
 }
 

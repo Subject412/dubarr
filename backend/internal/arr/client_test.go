@@ -283,6 +283,46 @@ func TestClientErrorModel(t *testing.T) {
 	})
 }
 
+// TestPingRejectsCrossPointedInstance proves a client aimed at the wrong *arr
+// application fails the connection test instead of reporting a healthy ping.
+func TestPingRejectsCrossPointedInstance(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("radarr client against sonarr", func(t *testing.T) {
+		srv := arrmock.New(arrmock.Sonarr, "", sonarrFixtures())
+		defer srv.Close()
+
+		c, err := arr.NewRadarrClient(srv.URL, srv.APIKey(), time.Second)
+		if err != nil {
+			t.Fatalf("NewRadarrClient: %v", err)
+		}
+		err = c.Ping(ctx)
+		if !errors.Is(err, arr.ErrKindMismatch) {
+			t.Fatalf("Ping error = %v, want ErrKindMismatch", err)
+		}
+		var mismatch *arr.KindMismatchError
+		if !errors.As(err, &mismatch) {
+			t.Fatalf("error %v is not a *KindMismatchError", err)
+		}
+		if mismatch.Expected != arr.KindRadarr || mismatch.Got != "Sonarr" {
+			t.Fatalf("mismatch = %+v", mismatch)
+		}
+	})
+
+	t.Run("sonarr client against radarr", func(t *testing.T) {
+		srv := arrmock.New(arrmock.Radarr, "", radarrFixtures())
+		defer srv.Close()
+
+		c, err := arr.NewSonarrClient(srv.URL, srv.APIKey(), time.Second)
+		if err != nil {
+			t.Fatalf("NewSonarrClient: %v", err)
+		}
+		if err := c.Ping(ctx); !errors.Is(err, arr.ErrKindMismatch) {
+			t.Fatalf("Ping error = %v, want ErrKindMismatch", err)
+		}
+	})
+}
+
 func TestConstructorsRejectInvalidBaseURL(t *testing.T) {
 	tests := []struct {
 		name string

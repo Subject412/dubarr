@@ -109,10 +109,16 @@ func New(kind Kind, apiKey string, fx Fixtures) *Server {
 	}
 	s := &Server{apiKey: apiKey}
 
+	// Real instances report the product name in canonical casing.
+	appName := "Radarr"
+	if kind == Sonarr {
+		appName = "Sonarr"
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v3/system/status", s.handle(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
-			"appName": string(kind),
+			"appName": appName,
 			"version": "5.0.0",
 		})
 	}))

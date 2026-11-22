@@ -317,6 +317,20 @@ func Rekey(st *store.Store, opts Options, keyfilePath string) error {
 		plain []byte
 	}
 	var rows []row
+	// Decrypted secret material must not outlive this call: overwrite every
+	// plaintext buffer on both the success and the failure path.
+	defer func() {
+		plaintexts := make([][]byte, len(rows))
+		for i := range rows {
+			plaintexts[i] = rows[i].plain
+		}
+		if rekeyScrubHook != nil && len(plaintexts) > 0 {
+			rekeyScrubHook(plaintexts)
+		}
+		for _, plain := range plaintexts {
+			zeroBytes(plain)
+		}
+	}()
 	if count > 0 {
 		oldCipher, err := NewCipher(oldKey)
 		if err != nil {
@@ -427,6 +441,17 @@ func Rekey(st *store.Store, opts Options, keyfilePath string) error {
 	}
 	return nil
 }
+
+// zeroBytes overwrites b with zeroes.
+func zeroBytes(b []byte) {
+	for i := range b {
+		b[i] = 0
+	}
+}
+
+// rekeyScrubHook, when set (tests only), observes the plaintext buffers Rekey
+// is about to zeroize so a test can assert they do not survive the call.
+var rekeyScrubHook func(plaintexts [][]byte)
 
 // readFileMaybe returns the file content and whether it existed.
 func readFileMaybe(path string) ([]byte, bool, error) {

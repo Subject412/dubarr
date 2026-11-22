@@ -618,6 +618,86 @@ func TestRekeyInstallsExplicitKeyfile(t *testing.T) {
 	}
 }
 
+// assertZeroed fails when any captured plaintext buffer still carries
+// non-zero bytes, i.e. Rekey let decrypted secret material outlive its call.
+func assertZeroed(t *testing.T, buffers [][]byte) {
+	t.Helper()
+	if len(buffers) == 0 {
+		t.Fatal("rekey scrub hook saw no plaintext buffers")
+	}
+	for i, buf := range buffers {
+		for j, b := range buf {
+			if b != 0 {
+				t.Fatalf("plaintext buffer %d byte %d survives Rekey: %d buffers captured", i, j, len(buffers))
+			}
+		}
+	}
+}
+
+// TestRekeyZeroizesPlaintexts proves every decrypted row buffer is overwritten
+// before Rekey returns, on the success and the failure path alike.
+func TestRekeyZeroizesPlaintexts(t *testing.T) {
+	seedRekeyable := func(t *testing.T) (string, string) {
+		t.Helper()
+		dir := t.TempDir()
+		st := bootStore(t, dir)
+		svc, err := Open(st, Options{DataDir: dir})
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		for k, v := range map[string]string{"a": "alpha", "b": "beta"} {
+			if err := svc.Set(k, v); err != nil {
+				t.Fatalf("Set %q: %v", k, err)
+			}
+		}
+		if err := st.Close(); err != nil {
+			t.Fatalf("close store: %v", err)
+		}
+		newPath := filepath.Join(t.TempDir(), "new-master.key")
+		writeKeyfile(t, newPath, secondKey(t))
+		return dir, newPath
+	}
+
+	capture := func(t *testing.T) *[][]byte {
+		t.Helper()
+		var captured [][]byte
+		orig := rekeyScrubHook
+		rekeyScrubHook = func(plaintexts [][]byte) {
+			captured = append(captured, plaintexts...)
+		}
+		t.Cleanup(func() { rekeyScrubHook = orig })
+		return &captured
+	}
+
+	t.Run("success", func(t *testing.T) {
+		dir, newPath := seedRekeyable(t)
+		captured := capture(t)
+
+		st := bootStore(t, dir)
+		defer st.Close()
+		if err := Rekey(st, Options{DataDir: dir}, newPath); err != nil {
+			t.Fatalf("Rekey: %v", err)
+		}
+		assertZeroed(t, *captured)
+	})
+
+	t.Run("failure", func(t *testing.T) {
+		dir, newPath := seedRekeyable(t)
+		captured := capture(t)
+
+		origInstall := installKeyfileNow
+		installKeyfileNow = func(string, []byte) error { return errors.New("injected install failure") }
+		t.Cleanup(func() { installKeyfileNow = origInstall })
+
+		st := bootStore(t, dir)
+		defer st.Close()
+		if err := Rekey(st, Options{DataDir: dir}, newPath); err == nil {
+			t.Fatal("Rekey succeeded although installing the keyfile failed")
+		}
+		assertZeroed(t, *captured)
+	})
+}
+
 // TestCorruptKeySourceMarkerIsFatal: an unrecognised marker is never treated as
 // a source and never silently re-pinned, even with an empty collection.
 func TestCorruptKeySourceMarkerIsFatal(t *testing.T) {

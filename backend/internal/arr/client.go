@@ -3,6 +3,7 @@ package arr
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -13,6 +14,10 @@ import (
 // DefaultTimeout bounds every request when a constructor is given a
 // non-positive timeout.
 const DefaultTimeout = 30 * time.Second
+
+// ErrKindMismatch means the instance reported an appName the client does not
+// serve, for example a Radarr client configured with a Sonarr URL.
+var ErrKindMismatch = errors.New("arr: instance app kind mismatch")
 
 // Client is the read surface Dubarr needs from any *arr instance
 // (ADR-0007). Credentials are supplied per client; this package stores none.
@@ -107,13 +112,36 @@ func newCore(kind Kind, baseURL, apiKey string, timeout time.Duration) (core, er
 // Kind implements Client.
 func (c *core) Kind() Kind { return c.kind }
 
-// Ping implements Client.
+// KindMismatchError reports a client pointed at the wrong *arr application:
+// the instance answered with an appName the client does not serve. It carries
+// only kind names, never credentials.
+type KindMismatchError struct {
+	Expected Kind
+	Got      string
+}
+
+// Error implements error.
+func (e *KindMismatchError) Error() string {
+	return fmt.Sprintf("%s: expected %q, got %q", ErrKindMismatch, e.Expected, e.Got)
+}
+
+// Is lets errors.Is(err, ErrKindMismatch) match.
+func (e *KindMismatchError) Is(target error) bool { return target == ErrKindMismatch }
+
+// Ping implements Client. It validates the instance's appName so a Radarr
+// client pointed at Sonarr (or vice versa) fails instead of pinging OK.
 func (c *core) Ping(ctx context.Context) error {
 	var status struct {
 		AppName string `json:"appName"`
 		Version string `json:"version"`
 	}
-	return c.get(ctx, "/api/v3/system/status", &status)
+	if err := c.get(ctx, "/api/v3/system/status", &status); err != nil {
+		return err
+	}
+	if !strings.EqualFold(status.AppName, string(c.kind)) {
+		return &KindMismatchError{Expected: c.kind, Got: status.AppName}
+	}
+	return nil
 }
 
 // QualityProfiles implements Client.

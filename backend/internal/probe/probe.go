@@ -278,6 +278,7 @@ func parseFFprobe(path string, raw []byte) (*MediaInfo, error) {
 	info := &MediaInfo{
 		Path:   path,
 		Format: doc.Format.FormatName,
+		Tracks: []AudioTrack{},
 	}
 	if d, err := strconv.ParseFloat(doc.Format.Duration, 64); err == nil && d > 0 {
 		info.Duration = time.Duration(math.Round(d * float64(time.Second)))

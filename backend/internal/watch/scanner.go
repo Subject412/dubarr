@@ -77,11 +77,15 @@ type Scanner struct {
 	running sync.Mutex
 	busy    bool
 
-	// Lifecycle state, created by Start and released by Stop/Wait.
-	startOnce sync.Once
-	stopOnce  sync.Once
-	cancel    context.CancelFunc
-	wg        sync.WaitGroup
+	// Lifecycle state, guarded by mu. started records that the loop goroutine
+	// was launched; stopped makes Stop permanent (Start after Stop is a no-op).
+	// wg.Add happens under mu so a concurrent Stop's cancel+Wait never sees a
+	// zero counter that is about to be incremented.
+	mu      sync.Mutex
+	started bool
+	stopped bool
+	cancel  context.CancelFunc
+	wg      sync.WaitGroup
 }
 
 // New builds a Scanner for the given roots. interval <= 0 selects
@@ -246,17 +250,24 @@ func isMediaFile(name string) bool {
 
 // Start launches the scan loop in a goroutine and returns immediately. The
 // first scan runs at once, then one per interval. The loop stops when ctx is
-// cancelled or Stop is called. Start is idempotent.
+// cancelled or Stop is called. Start is idempotent and a no-op once Stop has
+// been called or after the first Start (one loop per Scanner).
 func (s *Scanner) Start(ctx context.Context) {
-	s.startOnce.Do(func() {
-		ctx, cancel := context.WithCancel(ctx)
-		s.cancel = cancel
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
-			s.run(ctx)
-		}()
-	})
+	s.mu.Lock()
+	if s.started || s.stopped {
+		s.mu.Unlock()
+		return
+	}
+	s.started = true
+	ctx, cancel := context.WithCancel(ctx)
+	s.cancel = cancel
+	s.wg.Add(1)
+	s.mu.Unlock()
+
+	go func() {
+		defer s.wg.Done()
+		s.run(ctx)
+	}()
 }
 
 func (s *Scanner) run(ctx context.Context) {
@@ -275,13 +286,18 @@ func (s *Scanner) run(ctx context.Context) {
 }
 
 // Stop cancels the scan loop and waits for it to exit. Safe to call more than
-// once and without Start.
+// once and without Start: stopping before Start is remembered (a later Start is
+// a no-op), and a second Stop still waits for the loop to finish. Stop never
+// returns while the goroutine is still running.
 func (s *Scanner) Stop() {
-	s.stopOnce.Do(func() {
-		if s.cancel != nil {
-			s.cancel()
-		}
-	})
+	s.mu.Lock()
+	s.stopped = true
+	cancel := s.cancel
+	s.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
 	s.Wait()
 }
 

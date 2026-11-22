@@ -307,3 +307,71 @@ func TestStopIsIdempotent(t *testing.T) {
 	sc.Stop()
 	sc.Wait()
 }
+
+// TestScannerStopBeforeStartDoesNotDisarm checks the lifecycle regression:
+// Stop before Start must be safe and must not consume the stop state, so a
+// later Start (a no-op, since stopped is sticky) and Stop still terminate.
+func TestScannerStopBeforeStartDoesNotDisarm(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "dropped.mkv"))
+	st := newFakeStore()
+
+	sc, err := New(st, []string{root}, 5*time.Millisecond)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	sc.Stop() // safe: nothing started yet
+
+	sc.Start(context.Background())
+	time.Sleep(10 * time.Millisecond)
+	if got := st.paths(); len(got) != 0 {
+		t.Errorf("Start after Stop launched a scan loop, recorded %v", got)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		sc.Stop()
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop after Start did not terminate: later Stop was disarmed")
+	}
+}
+
+// TestScannerConcurrentStartStop exercises concurrent Start/Stop calls under
+// -race: no data race, no deadlock, every Stop returns.
+func TestScannerConcurrentStartStop(t *testing.T) {
+	for i := 0; i < 25; i++ {
+		sc, err := New(newFakeStore(), []string{t.TempDir()}, time.Millisecond)
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			sc.Start(context.Background())
+		}()
+		go func() {
+			defer wg.Done()
+			sc.Stop()
+		}()
+
+		finished := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(finished)
+		}()
+		select {
+		case <-finished:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("iteration %d: concurrent Start/Stop did not terminate", i)
+		}
+		// A Stop after the dust settles must also return.
+		sc.Stop()
+	}
+}

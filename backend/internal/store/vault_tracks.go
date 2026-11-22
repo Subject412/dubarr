@@ -26,6 +26,9 @@ type VaultMediaRecord struct {
 // audio_tracks). SeasonNumber/EpisodeNumber are nil for movies. LangISO2 is the
 // filename suffix language, LangISO3 the ISO 639-2/B code when known.
 type VaultTrackRecord struct {
+	// ID is the audio_tracks primary key (0 when the caller constructed a
+	// record for insertion; populated by reads).
+	ID                int64
 	VaultMediaID      int64
 	SeasonNumber      *int
 	EpisodeNumber     *int
@@ -197,14 +200,14 @@ func (s *Store) VaultTrackByID(ctx context.Context, id int64) (VaultTrackRecord,
 		season, episode sql.NullInt64
 	)
 	err := s.DB.QueryRowContext(ctx, `
-		SELECT vault_media_id, season_number, episode_number, group_uuid,
+		SELECT id, vault_media_id, season_number, episode_number, group_uuid,
 		       lang_iso2, COALESCE(lang_iso3, ''), variant, is_original_lang,
 		       file_path, sha256, codec, channels, channel_count,
 		       COALESCE(bitrate_bps, 0), COALESCE(sample_rate, 0),
 		       COALESCE(source_fps, 0), COALESCE(duration_ms, 0),
 		       COALESCE(source_release_name, ''), COALESCE(notes, '')
 		FROM audio_tracks WHERE id = ?`, id).
-		Scan(&rec.VaultMediaID, &season, &episode, &rec.GroupUUID,
+		Scan(&rec.ID, &rec.VaultMediaID, &season, &episode, &rec.GroupUUID,
 			&rec.LangISO2, &rec.LangISO3, &rec.Variant, &rec.IsOriginalLang,
 			&rec.FilePath, &rec.SHA256, &rec.Codec, &rec.Channels, &rec.ChannelCount,
 			&rec.BitrateBPS, &rec.SampleRate, &rec.SourceFPS, &rec.DurationMS,

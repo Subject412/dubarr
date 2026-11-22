@@ -2,9 +2,10 @@
 // dubbing-sync job (IDEA.md §5.2, PLAN.md M4-5).
 //
 // It slices both staged WAV sources at the configured checkpoint positions
-// (sync.defaults.checkpoint_positions_pct), correlates each 150 s window
-// through the M4-2 sync bridge, and aggregates a [Report]. The report answers
-// three questions the mux stage (M5) needs:
+// (sync.defaults.checkpoint_positions_pct), correlates each window through the
+// M4-2 sync bridge, and aggregates a [Report]. Each slice is widened past
+// checkpoint_window_sec to cover max_offset_sec (see [Analyze]). The report
+// answers three questions the mux stage (M5) needs:
 //
 //   - What is the offset at each point, and how consistent is it? A constant
 //     shift keeps the spread across checkpoints below 40 ms (IDEA.md:385);
@@ -33,8 +34,15 @@ import (
 const (
 	// DefaultCheckpointWindowSec is the settled 150 s analysis window.
 	DefaultCheckpointWindowSec = 150
-	// DefaultMaxOffsetSec is the settled ±180 s search/acceptance bound.
+	// DefaultMaxOffsetSec is the settled ±180 s search/acceptance bound
+	// (IDEA.md §5.1 --max-offset-sec is the engine search window).
 	DefaultMaxOffsetSec = 180
+	// CheckWindowMarginSec widens the analysed slice beyond max_offset_sec so
+	// the engine can actually reach the bound: the engine caps |lag| at the
+	// slice length and only scores lags that keep at least 1/20 of the slice
+	// overlapping, so a slice equal to max_offset_sec + 10 s still scores a
+	// peak at the full bound (10 s of overlap vs the 9.5 s minimum).
+	CheckWindowMarginSec = 10
 )
 
 // DefaultCheckpointPositionsPct is the settled 6-point sampling of the
@@ -143,10 +151,13 @@ type Report struct {
 // Analyze resolves the reference strategy, runs one correlation per checkpoint
 // sequentially, and aggregates the drift report.
 //
-// The engine searches the full slice (WindowSec = slice length), which for the
-// settled 150 s window is tighter than the ±180 s acceptance bound; MaxOffsetSec
-// is therefore the acceptance threshold, not an engine tuning knob. Any offset
-// beyond it produces [VerdictOutOfRange].
+// Each checkpoint window is centred on the settled pct position, but its
+// length is searchWindowSec: the larger of checkpoint_window_sec and
+// max_offset_sec + CheckWindowMarginSec (190 s with the settled defaults).
+// The engine's search is bounded by the slice length, so a slice that stopped
+// at the 150 s checkpoint window could never report an offset near the ±180 s
+// bound and [VerdictOutOfRange] would be unreachable. WindowSec is set to the
+// actual slice length, so the engine searches the whole analysed slice.
 func Analyze(ctx context.Context, engine Engine, cfg Config, req Request) (Report, error) {
 	if engine == nil {
 		return Report{}, fmt.Errorf("analyze: nil engine")
@@ -180,7 +191,7 @@ func Analyze(ctx context.Context, engine Engine, cfg Config, req Request) (Repor
 		return Report{}, fmt.Errorf("analyze: invalid duration %v", duration)
 	}
 
-	window := float64(cfg.CheckpointWindowSec)
+	window := searchWindowSec(cfg)
 	report := Report{
 		SyncMethod:  method,
 		Reason:      resolved.Pairs[0].Reason,
@@ -219,6 +230,13 @@ func Analyze(ctx context.Context, engine Engine, cfg Config, req Request) (Repor
 	report.Classification = classification
 	report.MaxDriftMS = drift
 	return report, nil
+}
+
+// searchWindowSec is the analysed slice length. It is at least the settled
+// checkpoint window, but widened to max_offset_sec + CheckWindowMarginSec so
+// the engine's lag search reaches the full offset bound (IDEA.md §5.1).
+func searchWindowSec(cfg Config) float64 {
+	return math.Max(float64(cfg.CheckpointWindowSec), float64(cfg.MaxOffsetSec+CheckWindowMarginSec))
 }
 
 // sliceWindow places the checkpoint window at pct of duration, centred on the

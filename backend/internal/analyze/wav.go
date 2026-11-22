@@ -7,6 +7,12 @@ import (
 	"os"
 )
 
+// maxFmtChunkSize bounds the fmt payload we are willing to read. The canonical
+// PCM fmt chunk is 16 bytes and WAVE_FORMAT_EXTENSIBLE adds 24; anything past
+// this is malformed and trusting the file-controlled uint32 would allow a
+// multi-gigabyte allocation.
+const maxFmtChunkSize = 64 << 10
+
 // wavDuration reads the playable duration from a RIFF/WAVE header without
 // decoding samples. The engine accepts any PCM/float WAV; data size over byte
 // rate is exact for constant-bitrate PCM, which is all the sync stage stages.
@@ -40,12 +46,23 @@ func wavDuration(path string) (float64, error) {
 		size := binary.LittleEndian.Uint32(chunk[4:8])
 		switch id {
 		case "fmt ":
-			body := make([]byte, size)
-			if _, err := io.ReadFull(f, body); err != nil {
+			if size < 16 {
+				return 0, fmt.Errorf("fmt chunk too short (%d bytes)", size)
+			}
+			if size > maxFmtChunkSize {
+				return 0, fmt.Errorf("fmt chunk too large (%d bytes, limit %d)", size, maxFmtChunkSize)
+			}
+			// Only the 16 fixed bytes are needed; skip the rest of the payload
+			// (plus RIFF's pad byte when the payload is odd) so the next chunk
+			// header is read at the right offset.
+			var body [16]byte
+			if _, err := io.ReadFull(f, body[:]); err != nil {
 				return 0, fmt.Errorf("read fmt chunk: %w", err)
 			}
-			if len(body) < 16 {
-				return 0, fmt.Errorf("fmt chunk too short (%d bytes)", len(body))
+			if rest := int64(size) - 16 + int64(size%2); rest > 0 {
+				if _, err := f.Seek(rest, io.SeekCurrent); err != nil {
+					return 0, fmt.Errorf("skip fmt chunk payload: %w", err)
+				}
 			}
 			byteRate = binary.LittleEndian.Uint32(body[8:12])
 			haveFmt = true

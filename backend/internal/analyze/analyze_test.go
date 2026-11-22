@@ -160,22 +160,68 @@ func TestAnalyzeStable(t *testing.T) {
 	if len(rep.OffsetsMS) != 6 || len(rep.Qualities) != 6 || len(rep.Checkpoints) != 6 {
 		t.Fatalf("report lengths = %d/%d/%d, want 6", len(rep.OffsetsMS), len(rep.Qualities), len(rep.Checkpoints))
 	}
-	// slice_start = pct*duration - window/2, clamped into the file.
+	// slice_start = pct*duration - window/2, clamped into the file. The
+	// analysed slice is widened to max_offset_sec + margin (190 s).
+	const sliceLen = 190.0
 	wantFirst := 0.0
 	if got := rep.Checkpoints[0].SliceStartSec; math.Abs(got-wantFirst) > 1e-9 {
 		t.Fatalf("first slice_start = %v, want %v", got, wantFirst)
 	}
-	want55 := 0.55*600 - 75
+	want55 := 0.55*600 - sliceLen/2
 	if got := rep.Checkpoints[3].SliceStartSec; math.Abs(got-want55) > 1e-9 {
 		t.Fatalf("55%% slice_start = %v, want %v", got, want55)
 	}
 	if len(eng.calls) != 6 {
 		t.Fatalf("engine calls = %d, want 6", len(eng.calls))
 	}
-	if got, want := eng.calls[0].SliceLenSec, 150.0; got != want {
+	if got, want := eng.calls[0].SliceLenSec, sliceLen; got != want {
 		t.Fatalf("slice_len = %v, want %v", got, want)
 	}
+	// The engine search window must cover the full max_offset_sec bound, not
+	// just the 150 s checkpoint window (IDEA.md §5.1).
+	if eng.calls[0].WindowSec == nil {
+		t.Fatal("window_sec = nil, want the analysed slice length")
+	}
+	if got, want := *eng.calls[0].WindowSec, sliceLen; got != want {
+		t.Fatalf("window_sec = %v, want %v", got, want)
+	}
+	if got, want := *eng.calls[0].WindowSec, float64(DefaultMaxOffsetSec); got < want {
+		t.Fatalf("window_sec = %v, want >= max_offset_sec %v", got, want)
+	}
 }
+
+func TestSliceWindow(t *testing.T) {
+	cases := []struct {
+		name     string
+		duration float64
+		pct      int
+		window   float64
+		start    float64
+		length   float64
+	}{
+		{"head clamp", 600, 10, 190, 0, 190},
+		{"centred", 600, 55, 190, 235, 190},
+		{"tail clamp", 600, 85, 190, 410, 190},
+		{"file shorter than window", 100, 50, 190, 0, 100},
+		{"file shorter at head", 120, 10, 190, 0, 120},
+		{"file equals window", 190, 50, 190, 0, 190},
+		{"file just short of window", 189, 99, 190, 0, 189},
+		{"window below file", 600, 1, 150, 0, 150},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			start, length := sliceWindow(tc.duration, tc.pct, tc.window)
+			if math.Abs(start-tc.start) > 1e-9 || math.Abs(length-tc.length) > 1e-9 {
+				t.Fatalf("sliceWindow(%v, %d, %v) = (%v, %v), want (%v, %v)",
+					tc.duration, tc.pct, tc.window, start, length, tc.start, tc.length)
+			}
+			if start < 0 || length <= 0 || start+length > tc.duration+1e-9 {
+				t.Fatalf("window (%v, %v) escapes [0, %v]", start, length, tc.duration)
+			}
+		})
+	}
+}
+
 
 func TestAnalyzeDrifting(t *testing.T) {
 	eng := &scriptedEngine{offsets: []float64{500, 500, 500, 2000, 2000, 2000}}
@@ -323,6 +369,12 @@ func piecewiseDonor(target []float32, leadA, leadB, split int) []float32 {
 // writeWAV writes mono float32 PCM in a RIFF/WAVE container.
 func writeWAV(t *testing.T, path string, samples []float32) {
 	t.Helper()
+	writeWAVRate(t, path, samples, sampleRate)
+}
+
+// writeWAVRate is writeWAV with an explicit sample rate.
+func writeWAVRate(t *testing.T, path string, samples []float32, rate uint32) {
+	t.Helper()
 	f, err := os.Create(path)
 	if err != nil {
 		t.Fatalf("create %s: %v", path, err)
@@ -339,8 +391,8 @@ func writeWAV(t *testing.T, path string, samples []float32) {
 	binary.LittleEndian.PutUint32(h[16:20], 16)
 	binary.LittleEndian.PutUint16(h[20:22], 3) // IEEE float
 	binary.LittleEndian.PutUint16(h[22:24], 1) // mono
-	binary.LittleEndian.PutUint32(h[24:28], sampleRate)
-	binary.LittleEndian.PutUint32(h[28:32], sampleRate*4)
+	binary.LittleEndian.PutUint32(h[24:28], rate)
+	binary.LittleEndian.PutUint32(h[28:32], rate*4)
 	binary.LittleEndian.PutUint16(h[32:34], 4)
 	binary.LittleEndian.PutUint16(h[34:36], 32)
 	copy(h[36:40], "data")
@@ -395,12 +447,13 @@ func TestIntegrationConstantOffset(t *testing.T) {
 func TestIntegrationPiecewiseDrift(t *testing.T) {
 	eng := requireEngine(t)
 	dir := t.TempDir()
-	const dur = 1200
+	const dur = 1500
 	n := dur * sampleRate
 	target := noiseSignal(n, 13)
-	// Checkpoint windows: 45-195, 225-375, 405-555, 585-735, ...
-	// Split at 570s leaves every window entirely on one side.
-	donor := piecewiseDonor(target, 500, 2000, 570*sampleRate)
+	// 190 s windows centred on 10/25/40/55/70/85 %: 55-245, 280-470, 505-695,
+	// 730-920, 955-1145, 1180-1370. A split at 712 s leaves every window
+	// entirely on one side.
+	donor := piecewiseDonor(target, 500, 2000, 712*sampleRate)
 	writeWAV(t, filepath.Join(dir, "target.wav"), target)
 	writeWAV(t, filepath.Join(dir, "donor.wav"), donor)
 
@@ -444,3 +497,60 @@ func TestIntegrationOutOfRange(t *testing.T) {
 		t.Fatalf("verdict = %q (offsets %v), want out_of_range", rep.Verdict, rep.OffsetsMS)
 	}
 }
+
+// recordingEngine wraps the real engine and keeps the jobs it was handed, so
+// integration tests can assert the window the analysis asked for.
+type recordingEngine struct {
+	inner Engine
+	calls []sync.Job
+}
+
+func (r *recordingEngine) Run(ctx context.Context, job sync.Job) (sync.Result, error) {
+	r.calls = append(r.calls, job)
+	return r.inner.Run(ctx, job)
+}
+
+// TestIntegrationOffsetWithinSearchWindow places the donor 165 s ahead: beyond
+// the 150 s checkpoint window but inside the 180 s max_offset_sec bound. The
+// engine can only report it because the analysed slice is widened to
+// max_offset_sec + margin; with a 150 s slice the lag cap hides it.
+func TestIntegrationOffsetWithinSearchWindow(t *testing.T) {
+	eng := &recordingEngine{inner: requireEngine(t)}
+	dir := t.TempDir()
+	const (
+		rate   = 8000
+		dur    = 600
+		leadMS = 165000
+	)
+	target := noiseSignal(dur*rate, 19)
+	writeWAVRate(t, filepath.Join(dir, "target.wav"), target, rate)
+	writeWAVRate(t, filepath.Join(dir, "donor.wav"), shiftedDonor(target, leadMS*rate/1000), rate)
+
+	req := request(dir)
+	req.DurationSec = dur
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	rep, err := Analyze(ctx, eng, DefaultConfig(), req)
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+	want := float64(DefaultMaxOffsetSec+CheckWindowMarginSec) // 190 s slice
+	for i, job := range eng.calls {
+		if job.SliceLenSec != want {
+			t.Fatalf("checkpoint %d slice_len = %v, want %v", i, job.SliceLenSec, want)
+		}
+		if job.WindowSec == nil || *job.WindowSec != want {
+			t.Fatalf("checkpoint %d window_sec = %v, want %v", i, job.WindowSec, want)
+		}
+	}
+	for i, off := range rep.OffsetsMS {
+		if math.Abs(off-leadMS) > 50 {
+			t.Fatalf("checkpoint %d offset = %v, want ~%v", i, off, leadMS)
+		}
+	}
+	// 165 s is inside the settled 180 s acceptance bound.
+	if rep.Verdict != VerdictOK || rep.Classification != ClassificationStable {
+		t.Fatalf("verdict/classification = %q/%q (offsets %v), want ok/stable", rep.Verdict, rep.Classification, rep.OffsetsMS)
+	}
+}
+

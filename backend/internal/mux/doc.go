@@ -1,6 +1,28 @@
-// Package mux holds mkvmerge muxing and the Tdarr export gate.
+// Package mux publishes a synchronized audio track into a Tdarr-tagged target
+// MKV without transcoding it (PLAN.md M5-1, ADR-0004).
 //
-// It is a placeholder created by the M1 scaffolding task: only this package
-// comment exists. Feature code and its RegisterRoutes entrypoint arrive in a
-// later task.
+// [Muxer.Mux] is the pipeline behind the future POST /api/sync/jobs/{id}/mux:
+//
+//  1. Refuse a sync report whose verdict is not ok|stable. Drifting,
+//     unreliable and out_of_range jobs never reach mkvmerge.
+//  2. Loud-fail an ambiguous pairing before any write: when the target
+//     filename resolves to several queued vault tracks, or the report's
+//     language does not map to exactly one of them, the call returns
+//     [ErrAmbiguous] and leaves every directory byte-identical.
+//  3. Re-check the Tdarr Gate against the base filename unless the caller
+//     forces an override (ADR-0005); ineligible targets return [ErrIneligible].
+//  4. Copy the target into {WORK_DIR}/jobs/{id}/ (Copy-on-Work, ADR-0002) and
+//     let mkvmerge read only that copy plus the staged .mka. The target itself
+//     is opened read-only.
+//  5. Append the .mka with `--language 0:<iso2> --track-name 0:<title>
+//     --sync 0:<offset>` (IDEA.md:397-403). The target's video and existing
+//     audio are copied as-is, never transcoded.
+//  6. Publish atomically: mkvmerge writes <target>.mkv.dubarr.tmp in the
+//     target's directory (same filesystem), the original is copied to
+//     <target>.mkv.bak, then the temp is renamed over the original. The .bak
+//     is the settled default; cleaning it is an opt-in later step.
+//
+// Any failure removes the temp and leaves the original untouched. WORK_DIR
+// staging is the caller's to clean up, and VAULT_DIR is never opened for
+// writing.
 package mux

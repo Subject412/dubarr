@@ -1,0 +1,186 @@
+import { act, screen, waitFor } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import { describe, expect, it, vi } from 'vitest'
+import { SETTINGS_HELP } from '../lib/settings-help'
+import { SettingsPage } from '../pages/Settings'
+import { isMethod, jsonResponse, renderWithProviders } from '../test/helpers'
+
+const SETTINGS = {
+  'storage.paths': {
+    watch_dir: '/watch',
+    vault_dir: '/vault',
+    work_dir: '/work',
+    media_roots: [],
+  },
+  'languages.policy': {
+    target_import_languages: ['pl'],
+    extra_reference_languages: ['en'],
+    original_language_from_arr: true,
+    exclude_commentary: true,
+    export_mode: 'rule_based',
+  },
+  'target.tag_filter': {
+    required_filename_tags: ['[ArcA310]'],
+    tag_match_mode: 'ANY',
+    tag_case_sensitive: false,
+    excluded_filename_tags: [],
+    enforce_tag_filter: true,
+  },
+  'sync.defaults': {
+    max_offset_sec: 180,
+    checkpoint_positions_pct: [10, 25],
+    checkpoint_window_sec: 150,
+    preview_positions_pct: [10],
+    preview_window_sec: 60,
+  },
+  'security.options': {
+    vault_read_only: true,
+    allow_force_tag_override: false,
+    require_av1_warning: true,
+    require_av1_strict: false,
+  },
+  'mux.options': { keep_bak: true, track_title_in_mkv: 'Polski Dubbing' },
+  'watch.options': { scan_interval_sec: 10, stability_check_interval_sec: 4 },
+  'arr.options': { poll_interval_sec: 300, manual_sync: true },
+  'imports.options': { donor_patterns: ['PL.DUB'] },
+}
+
+function mockFetch(): ReturnType<typeof vi.fn> {
+  const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input)
+    if (url.includes('/api/settings') && isMethod(init, 'PUT')) {
+      return jsonResponse({ settings: SETTINGS })
+    }
+    if (url.includes('/api/settings')) {
+      return jsonResponse({ settings: SETTINGS })
+    }
+    return jsonResponse({ error: 'unexpected' }, 404)
+  })
+  vi.stubGlobal('fetch', fetchMock)
+  return fetchMock
+}
+
+async function renderSettings() {
+  mockFetch()
+  renderWithProviders(<SettingsPage />, { route: '/settings' })
+  expect(await screen.findByRole('heading', { name: 'Storage paths' })).toBeInTheDocument()
+}
+
+const helpCount = Object.values(SETTINGS_HELP).reduce(
+  (total, fields) => total + Object.keys(fields).length,
+  0,
+)
+
+describe('info tooltip (issue #3)', () => {
+  it('renders one help button per settings help entry across every field kind', async () => {
+    await renderSettings()
+
+    expect(screen.getAllByRole('button', { name: /^About / })).toHaveLength(helpCount)
+
+    // Every control kind wires help, not just text inputs.
+    expect(screen.getByLabelText('Vault folder')).toHaveAttribute('aria-describedby')
+    expect(screen.getByLabelText('Export mode')).toHaveAttribute('aria-describedby')
+    expect(screen.getByRole('switch', { name: 'Keep .bak backup' })).toHaveAttribute(
+      'aria-describedby',
+    )
+    expect(screen.getByLabelText('Add target language')).toHaveAttribute('aria-describedby')
+    expect(screen.getByLabelText('Checkpoint positions (%)')).toHaveAttribute('aria-describedby')
+  })
+
+  it('opens on hover with role=tooltip and closes when the pointer leaves', async () => {
+    const user = userEvent.setup()
+    await renderSettings()
+
+    const trigger = screen.getByRole('button', { name: 'About Vault folder' })
+    expect(screen.queryByRole('tooltip')).not.toBeInTheDocument()
+
+    await user.hover(trigger)
+    const tooltip = await screen.findByRole('tooltip')
+    expect(tooltip).toHaveTextContent(/write-once/i)
+    expect(screen.getByLabelText('Vault folder')).toHaveAttribute('aria-describedby', tooltip.id)
+
+    await user.unhover(trigger)
+    expect(screen.queryByRole('tooltip')).not.toBeInTheDocument()
+  })
+
+  it('opens on keyboard focus and closes on blur and Escape', async () => {
+    const user = userEvent.setup()
+    await renderSettings()
+
+    const trigger = screen.getByRole('button', { name: 'About Keep .bak backup' })
+
+    act(() => trigger.focus())
+    expect(await screen.findByRole('tooltip')).toBeInTheDocument()
+
+    await user.keyboard('{Escape}')
+    expect(screen.queryByRole('tooltip')).not.toBeInTheDocument()
+
+    act(() => trigger.blur())
+    expect(screen.queryByRole('tooltip')).not.toBeInTheDocument()
+
+    act(() => trigger.focus())
+    expect(await screen.findByRole('tooltip')).toBeInTheDocument()
+    act(() => trigger.blur())
+    expect(screen.queryByRole('tooltip')).not.toBeInTheDocument()
+  })
+
+  it('positions the popover out of flow above the control so it covers nothing', async () => {
+    const user = userEvent.setup()
+    await renderSettings()
+
+    const trigger = screen.getByRole('button', { name: 'About Vault folder' })
+    const control = screen.getByLabelText('Vault folder')
+    const box = {
+      top: 300,
+      bottom: 316,
+      left: 100,
+      right: 116,
+      width: 16,
+      height: 16,
+      x: 100,
+      y: 300,
+      toJSON: () => ({}),
+    } as DOMRect
+    vi.spyOn(trigger, 'getBoundingClientRect').mockReturnValue(box)
+
+    await user.hover(trigger)
+    const tooltip = await screen.findByRole('tooltip')
+
+    expect(getComputedStyle(tooltip).position).toBe('fixed')
+    // Above the trigger: no overlap with the control being configured.
+    expect(Number.parseInt(tooltip.style.top, 10)).toBeLessThan(box.top)
+    expect(control).toBeInTheDocument()
+  })
+
+  it('never puts help text into the settings payload', async () => {
+    const user = userEvent.setup()
+    const fetchMock = await renderSettingsAndReturnMock()
+
+    await user.click(screen.getByLabelText('Save Languages policy'))
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([, init]) => isMethod(init, 'PUT'))).toBe(true)
+    })
+
+    const put = fetchMock.mock.calls.find(([, init]) => isMethod(init, 'PUT'))
+    const body = String(put?.[1]?.body)
+    expect(body).toContain('languages.policy')
+    expect(body).not.toContain(SETTINGS_HELP['languages.policy'].export_mode)
+    expect(body).not.toContain(SETTINGS_HELP['languages.policy'].target_import_languages)
+  })
+})
+
+async function renderSettingsAndReturnMock() {
+  const fetchMock = mockFetch()
+  renderWithProviders(<SettingsPage />, { route: '/settings' })
+  expect(await screen.findByRole('heading', { name: 'Storage paths' })).toBeInTheDocument()
+  return fetchMock
+}
+
+describe('settings help module', () => {
+  it('documents every settings field exactly once', () => {
+    expect(SETTINGS_HELP['storage.paths'].watch_dir).toMatch(/Watch Folder/i)
+    expect(SETTINGS_HELP['security.options'].vault_read_only).toMatch(/write-once/i)
+    expect(SETTINGS_HELP['mux.options'].keep_bak).toMatch(/backup/i)
+    expect(SETTINGS_HELP['sync.defaults'].max_offset_sec).toMatch(/offset/i)
+  })
+})

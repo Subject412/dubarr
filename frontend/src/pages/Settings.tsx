@@ -15,6 +15,7 @@ import type {
 import { api } from '../lib/api'
 import { DEFAULT_SETTINGS as DEFAULTS } from '../lib/defaults'
 import { useSaveSettings, useSettings } from '../lib/hooks'
+import { settingsHelp } from '../lib/settings-help'
 import {
   isSettingsSectionKey,
   SETTINGS_SECTIONS,
@@ -123,14 +124,16 @@ function NumberField({
   value,
   onChange,
   hint,
+  help,
 }: {
   label: string
   value: number
   onChange: (next: number) => void
   hint?: string
+  help?: string
 }) {
   return (
-    <Field label={label} hint={hint} htmlFor={undefined}>
+    <Field label={label} hint={hint} help={help} htmlFor={undefined}>
       <Input
         type="number"
         aria-label={label}
@@ -278,16 +281,19 @@ export function SettingsPage() {
                 <div className="grid gap-4 md:grid-cols-2">
                   <PathField
                     label="Watch folder"
+                    help={settingsHelp('storage.paths', 'watch_dir')}
                     value={draft.watch_dir}
                     onChange={(watch_dir) => update({ watch_dir })}
                   />
                   <PathField
                     label="Vault folder"
+                    help={settingsHelp('storage.paths', 'vault_dir')}
                     value={draft.vault_dir}
                     onChange={(vault_dir) => update({ vault_dir })}
                   />
                   <PathField
                     label="Work folder"
+                    help={settingsHelp('storage.paths', 'work_dir')}
                     value={draft.work_dir}
                     onChange={(work_dir) => update({ work_dir })}
                   />
@@ -296,7 +302,7 @@ export function SettingsPage() {
                   label="Media roots"
                   values={draft.media_roots ?? []}
                   onChange={(media_roots) => update({ media_roots })}
-                  hint="Libraries Dubarr is allowed to read from."
+                  help={settingsHelp('storage.paths', 'media_roots')}
                 />
               </>
             )}
@@ -315,6 +321,7 @@ export function SettingsPage() {
                   values={draft.target_import_languages ?? []}
                   onChange={(target_import_languages) => update({ target_import_languages })}
                   placeholder="pl"
+                  help={settingsHelp('languages.policy', 'target_import_languages')}
                 />
                 <StringListEditor
                   label="Extra reference languages"
@@ -322,8 +329,13 @@ export function SettingsPage() {
                   values={draft.extra_reference_languages ?? []}
                   onChange={(extra_reference_languages) => update({ extra_reference_languages })}
                   placeholder="en"
+                  help={settingsHelp('languages.policy', 'extra_reference_languages')}
                 />
-                <Field label="Export mode" htmlFor="export-mode">
+                <Field
+                  label="Export mode"
+                  htmlFor="export-mode"
+                  help={settingsHelp('languages.policy', 'export_mode')}
+                >
                   <Select
                     id="export-mode"
                     value={draft.export_mode}
@@ -337,13 +349,13 @@ export function SettingsPage() {
                 </Field>
                 <Toggle
                   label="Original language from *arr"
-                  description="Use Radarr/Sonarr metadata to identify the original track."
+                  help={settingsHelp('languages.policy', 'original_language_from_arr')}
                   checked={draft.original_language_from_arr}
                   onChange={(original_language_from_arr) => update({ original_language_from_arr })}
                 />
                 <Toggle
                   label="Exclude commentary tracks"
-                  description="Commentary audio never becomes the reference or target track."
+                  help={settingsHelp('languages.policy', 'exclude_commentary')}
                   checked={draft.exclude_commentary}
                   onChange={(exclude_commentary) => update({ exclude_commentary })}
                 />
@@ -367,15 +379,21 @@ export function SettingsPage() {
                   values={draft.required_filename_tags ?? []}
                   onChange={(required_filename_tags) => update({ required_filename_tags })}
                   placeholder="[ArcA310]"
+                  help={settingsHelp('target.tag_filter', 'required_filename_tags')}
                 />
                 <StringListEditor
                   label="Excluded filename tags"
                   inputLabel="Add excluded tag"
                   values={draft.excluded_filename_tags ?? []}
                   onChange={(excluded_filename_tags) => update({ excluded_filename_tags })}
+                  help={settingsHelp('target.tag_filter', 'excluded_filename_tags')}
                 />
                 <div className="grid gap-4 md:grid-cols-2">
-                  <Field label="Tag match mode" htmlFor="tag-match-mode">
+                  <Field
+                    label="Tag match mode"
+                    htmlFor="tag-match-mode"
+                    help={settingsHelp('target.tag_filter', 'tag_match_mode')}
+                  >
                     <Select
                       id="tag-match-mode"
                       value={draft.tag_match_mode}
@@ -393,12 +411,13 @@ export function SettingsPage() {
                   <div className="space-y-1">
                     <Toggle
                       label="Case sensitive"
+                      help={settingsHelp('target.tag_filter', 'tag_case_sensitive')}
                       checked={draft.tag_case_sensitive}
                       onChange={(tag_case_sensitive) => update({ tag_case_sensitive })}
                     />
                     <Toggle
                       label="Enforce tag filter"
-                      description="Reject targets without a required tag."
+                      help={settingsHelp('target.tag_filter', 'enforce_tag_filter')}
                       checked={draft.enforce_tag_filter}
                       onChange={(enforce_tag_filter) => update({ enforce_tag_filter })}
                     />
@@ -417,23 +436,25 @@ export function SettingsPage() {
               <>
                 <Toggle
                   label="Vault read-only"
-                  description="Mounted vault is never modified by Dubarr."
+                  help={settingsHelp('security.options', 'vault_read_only')}
                   checked={draft.vault_read_only}
                   onChange={(vault_read_only) => update({ vault_read_only })}
                 />
                 <Toggle
                   label="Allow force tag override"
-                  description="Operators may bypass the destination tag gate per item."
+                  help={settingsHelp('security.options', 'allow_force_tag_override')}
                   checked={draft.allow_force_tag_override}
                   onChange={(allow_force_tag_override) => update({ allow_force_tag_override })}
                 />
                 <Toggle
                   label="Require AV1 warning acknowledgement"
+                  help={settingsHelp('security.options', 'require_av1_warning')}
                   checked={draft.require_av1_warning}
                   onChange={(require_av1_warning) => update({ require_av1_warning })}
                 />
                 <Toggle
                   label="Require AV1 strict mode"
+                  help={settingsHelp('security.options', 'require_av1_strict')}
                   checked={draft.require_av1_strict}
                   onChange={(require_av1_strict) => update({ require_av1_strict })}
                 />
@@ -453,27 +474,32 @@ export function SettingsPage() {
                     label="Max offset (s)"
                     value={draft.max_offset_sec}
                     onChange={(max_offset_sec) => update({ max_offset_sec })}
+                    help={settingsHelp('sync.defaults', 'max_offset_sec')}
                   />
                   <NumberField
                     label="Checkpoint window (s)"
                     value={draft.checkpoint_window_sec}
                     onChange={(checkpoint_window_sec) => update({ checkpoint_window_sec })}
+                    help={settingsHelp('sync.defaults', 'checkpoint_window_sec')}
                   />
                   <NumberField
                     label="Preview window (s)"
                     value={draft.preview_window_sec}
                     onChange={(preview_window_sec) => update({ preview_window_sec })}
+                    help={settingsHelp('sync.defaults', 'preview_window_sec')}
                   />
                 </div>
                 <ListEditor
                   label="Checkpoint positions (%)"
                   values={draft.checkpoint_positions_pct ?? []}
                   onChange={(checkpoint_positions_pct) => update({ checkpoint_positions_pct })}
+                  help={settingsHelp('sync.defaults', 'checkpoint_positions_pct')}
                 />
                 <ListEditor
                   label="Preview positions (%)"
                   values={draft.preview_positions_pct ?? []}
                   onChange={(preview_positions_pct) => update({ preview_positions_pct })}
+                  help={settingsHelp('sync.defaults', 'preview_positions_pct')}
                 />
               </>
             )}
@@ -488,10 +514,15 @@ export function SettingsPage() {
               <>
                 <Toggle
                   label="Keep .bak backup"
+                  help={settingsHelp('mux.options', 'keep_bak')}
                   checked={draft.keep_bak}
                   onChange={(keep_bak) => update({ keep_bak })}
                 />
-                <Field label="Track title written into Matroska" htmlFor="track-title">
+                <Field
+                  label="Track title written into Matroska"
+                  htmlFor="track-title"
+                  help={settingsHelp('mux.options', 'track_title_in_mkv')}
+                >
                   <Input
                     id="track-title"
                     value={draft.track_title_in_mkv}
@@ -516,12 +547,14 @@ export function SettingsPage() {
                   label="Scan interval (s)"
                   value={draft.scan_interval_sec}
                   onChange={(scan_interval_sec) => update({ scan_interval_sec })}
+                  help={settingsHelp('watch.options', 'scan_interval_sec')}
                 />
                 <NumberField
                   label="Stability check interval (s)"
                   hint="Minimum 4 seconds per IDEA.md §3.5."
                   value={draft.stability_check_interval_sec}
                   onChange={(stability_check_interval_sec) => update({ stability_check_interval_sec })}
+                  help={settingsHelp('watch.options', 'stability_check_interval_sec')}
                 />
               </div>
             )}
@@ -539,6 +572,7 @@ export function SettingsPage() {
                 values={draft.donor_patterns ?? []}
                 onChange={(donor_patterns) => update({ donor_patterns })}
                 placeholder="PL.DUB"
+                help={settingsHelp('imports.options', 'donor_patterns')}
               />
             )}
           </Section>
@@ -554,9 +588,11 @@ export function SettingsPage() {
                   label="Poll interval (s)"
                   value={draft.poll_interval_sec}
                   onChange={(poll_interval_sec) => update({ poll_interval_sec })}
+                  help={settingsHelp('arr.options', 'poll_interval_sec')}
                 />
                 <Toggle
                   label="Manual sync enabled"
+                  help={settingsHelp('arr.options', 'manual_sync')}
                   checked={draft.manual_sync}
                   onChange={(manual_sync) => update({ manual_sync })}
                 />

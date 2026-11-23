@@ -131,7 +131,7 @@ func (s *Service) browseRoots(r *http.Request) ([]string, error) {
 	if err := json.Unmarshal(raw, &paths); err != nil {
 		return nil, err
 	}
-	candidates := append([]string{paths.WatchDir, paths.VaultDir, paths.WorkDir}, paths.MediaRoots...)
+	candidates := append([]string{paths.WatchDir, paths.VaultDir, paths.WorkDir, paths.OutputDir}, paths.MediaRoots...)
 	roots := make([]string, 0, len(candidates))
 	seen := map[string]struct{}{}
 	for _, candidate := range candidates {

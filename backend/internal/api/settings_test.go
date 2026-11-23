@@ -488,3 +488,44 @@ func TestListDirRejectsSymlinkSwap(t *testing.T) {
 		t.Fatalf("listDir on a real root: %v", err)
 	}
 }
+
+// TestMuxOutputDirIsBrowsableAndGuarded: the Settings path picker browses
+// through /api/system/browse, so storage.paths.output_dir must be a browse root
+// (ADR-0011); a folder inside the vault is rejected at save time (ADR-0002).
+func TestMuxOutputDirIsBrowsableAndGuarded(t *testing.T) {
+	h := newHarness(t)
+	h.setupAdmin()
+
+	outDir := filepath.Join(t.TempDir(), "deliver")
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	put := func(paths map[string]any) (int, []byte) {
+		return h.do(http.MethodPut, "/api/settings", map[string]any{
+			"settings": map[string]any{settings.KeyStoragePaths: paths},
+		})
+	}
+	code, body := put(map[string]any{
+		"watch_dir": "", "vault_dir": "", "work_dir": filepath.Join(h.dataDir, "work"),
+		"output_dir": outDir, "media_roots": []string{},
+	})
+	if code != http.StatusOK {
+		t.Fatalf("configure output_dir = %d: %s", code, body)
+	}
+	code, body = h.do(http.MethodGet, "/api/system/browse?path="+outDir, nil)
+	if code != http.StatusOK {
+		t.Fatalf("browse output_dir = %d: %s", code, body)
+	}
+
+	vault := filepath.Join(t.TempDir(), "vault")
+	if err := os.MkdirAll(filepath.Join(vault, "inside"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	code, body = put(map[string]any{
+		"watch_dir": "", "vault_dir": vault, "work_dir": filepath.Join(h.dataDir, "work"),
+		"output_dir": filepath.Join(vault, "inside"), "media_roots": []string{},
+	})
+	if code != http.StatusBadRequest {
+		t.Fatalf("output_dir inside the vault = %d: %s, want 400", code, body)
+	}
+}

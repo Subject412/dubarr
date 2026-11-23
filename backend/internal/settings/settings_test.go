@@ -427,3 +427,90 @@ func TestLanguagesPolicyExplicitFalseSurvivesRoundTrip(t *testing.T) {
 		t.Error("explicit prefer_original_language=false read back as true")
 	}
 }
+
+// TestStorageOutputDirValidation pins the settings-API side of the
+// storage.paths.output_dir guard (ADR-0011): absolute only, and never the vault
+// or a directory inside it (ADR-0002). The mux worker repeats the check on the
+// EvalSymlinks-resolved paths.
+func TestStorageOutputDirValidation(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	if err := s.Seed(ctx, t.TempDir()); err != nil {
+		t.Fatalf("Seed: %v", err)
+	}
+	cases := []struct {
+		name    string
+		dir     string
+		wantErr bool
+	}{
+		{name: "sibling root", dir: "/outputs", wantErr: false},
+		{name: "empty", dir: "", wantErr: false},
+		{name: "relative", dir: "outputs", wantErr: true},
+		{name: "vault itself", dir: "/vault", wantErr: true},
+		{name: "inside vault", dir: "/vault/mux", wantErr: true},
+		{name: "vault with trailing slash", dir: "/vault/", wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := json.Marshal(StoragePaths{
+				WatchDir: "/watch", VaultDir: "/vault", WorkDir: "/work",
+				OutputDir: tc.dir, MediaRoots: []string{},
+			})
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			err = s.Set(ctx, KeyStoragePaths, raw)
+			if tc.wantErr && err == nil {
+				t.Fatalf("Set accepted output_dir %q", tc.dir)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("Set(%q): %v", tc.dir, err)
+			}
+		})
+	}
+}
+
+// TestMuxOutputMode covers the mode default and validation: legacy rows are
+// served as "replace", both real modes round-trip and anything else is a 400.
+func TestMuxOutputMode(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	if err := s.Seed(ctx, t.TempDir()); err != nil {
+		t.Fatalf("Seed: %v", err)
+	}
+	if got := decode[MuxOptions](t, mustGet(t, s, ctx, KeyMuxOptions)); got.OutputMode != MuxOutputReplace {
+		t.Fatalf("seeded output_mode = %q, want %q", got.OutputMode, MuxOutputReplace)
+	}
+
+	for _, mode := range []string{MuxOutputReplace, MuxOutputSeparate} {
+		raw := json.RawMessage(`{"keep_bak":true,"track_title_in_mkv":"Polski Dubbing","output_mode":"` + mode + `"}`)
+		if err := s.Set(ctx, KeyMuxOptions, raw); err != nil {
+			t.Fatalf("Set(%s): %v", mode, err)
+		}
+		if got := decode[MuxOptions](t, mustGet(t, s, ctx, KeyMuxOptions)); got.OutputMode != mode {
+			t.Errorf("stored output_mode = %q, want %q", got.OutputMode, mode)
+		}
+	}
+
+	bad := json.RawMessage(`{"keep_bak":true,"track_title_in_mkv":"Polski Dubbing","output_mode":"elsewhere"}`)
+	if err := s.Set(ctx, KeyMuxOptions, bad); err == nil {
+		t.Fatal("Set accepted an unknown output_mode")
+	}
+
+	// A row written before the field existed must read back as replace, both
+	// from All (serveable) and from a direct decode.
+	legacy := `{"keep_bak":true,"track_title_in_mkv":"Polski Dubbing"}`
+	if _, err := s.db.ExecContext(ctx, `UPDATE settings SET value = ? WHERE key = ?`, legacy, KeyMuxOptions); err != nil {
+		t.Fatalf("write legacy row: %v", err)
+	}
+	if got := decode[MuxOptions](t, mustGet(t, s, ctx, KeyMuxOptions)); got.OutputMode != MuxOutputReplace {
+		t.Errorf("legacy output_mode = %q, want %q", got.OutputMode, MuxOutputReplace)
+	}
+	all, err := s.All(ctx)
+	if err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	if got := decode[MuxOptions](t, all[KeyMuxOptions]); got.OutputMode != MuxOutputReplace {
+		t.Errorf("served legacy output_mode = %q, want %q", got.OutputMode, MuxOutputReplace)
+	}
+}

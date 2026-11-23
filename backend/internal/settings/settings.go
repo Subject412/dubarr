@@ -4,7 +4,7 @@
 // Layout follows IDEA.md §4: one row per settings section, the row value being
 // the JSON object for that section. Section keys:
 //
-//	storage.paths      watch_dir, vault_dir, work_dir, media_roots
+//	storage.paths      watch_dir, vault_dir, work_dir, output_dir, media_roots
 //	languages.policy   target/reference languages, commentary exclusion, export mode
 //	target.tag_filter  Tdarr destination filename gate (ADR-0005)
 //	sync.defaults      max offset, checkpoint/preview sampling positions
@@ -68,9 +68,14 @@ func KnownKeys() []string { return append([]string(nil), knownKeys...) }
 // StoragePaths are the five logical storage areas (IDEA.md §3.3). Empty values
 // mean "not configured yet" and are filled by the setup wizard.
 type StoragePaths struct {
-	WatchDir   string   `json:"watch_dir"`
-	VaultDir   string   `json:"vault_dir"`
-	WorkDir    string   `json:"work_dir"`
+	WatchDir string `json:"watch_dir"`
+	VaultDir string `json:"vault_dir"`
+	WorkDir  string `json:"work_dir"`
+	// OutputDir is the target-independent destination root for
+	// mux.options.output_mode=separate. It is a root in its own right (the
+	// muxer canonicalizes it again with EvalSymlinks) and must never overlap
+	// the Audio Vault (ADR-0002).
+	OutputDir  string   `json:"output_dir"`
 	MediaRoots []string `json:"media_roots"`
 }
 
@@ -137,10 +142,42 @@ type SecurityOptions struct {
 	RequireAV1Strict      bool `json:"require_av1_strict"`
 }
 
+// Mux output destination modes (ADR-0011).
+const (
+	MuxOutputReplace  = "replace"
+	MuxOutputSeparate = "separate"
+)
+
 // MuxOptions control atomic muxing side effects.
 type MuxOptions struct {
 	KeepBak         bool   `json:"keep_bak"`
 	TrackTitleInMKV string `json:"track_title_in_mkv"`
+	// OutputMode is "replace" (atomically replace the Target, current
+	// behaviour) or "separate" (write <basename>.dubarr.mkv into
+	// storage.paths.output_dir and leave the Target untouched, ADR-0011).
+	OutputMode string `json:"output_mode"`
+}
+
+// UnmarshalJSON makes an absent output_mode mean "replace". Legacy rows written
+// before the key existed must keep the current in-place behaviour; plain
+// decoding would read them as an empty mode and fail validation.
+func (m *MuxOptions) UnmarshalJSON(data []byte) error {
+	type plain MuxOptions
+	aux := struct {
+		*plain
+		OutputMode *string `json:"output_mode"`
+	}{plain: (*plain)(m)}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&aux); err != nil {
+		return err
+	}
+	if aux.OutputMode == nil {
+		m.OutputMode = MuxOutputReplace
+	} else {
+		m.OutputMode = *aux.OutputMode
+	}
+	return nil
 }
 
 // WatchOptions configure donor-folder scanning. StabilityCheckIntervalSec is
@@ -234,6 +271,7 @@ func Defaults(dataDir string) map[string]any {
 		KeyMuxOptions: MuxOptions{
 			KeepBak:         true,
 			TrackTitleInMKV: "Polski Dubbing",
+			OutputMode:      MuxOutputReplace,
 		},
 		KeyWatchOptions: WatchOptions{
 			ScanIntervalSec:           10,
@@ -295,23 +333,36 @@ func (s *Store) Get(ctx context.Context, key string) (json.RawMessage, bool, err
 }
 
 // serveable applies load-time defaults to a stored section before it reaches a
-// caller. It exists for languages.policy: a legacy row predates
-// prefer_original_language, and the UI/API/export all decode the served JSON
-// directly, so absence has to be materialized as the agreed default here too.
+// caller. It exists for languages.policy and mux.options: legacy rows predate
+// prefer_original_language / output_mode, and the UI/API/export all decode the
+// served JSON directly, so absence has to be materialized as the agreed default
+// here too.
 func serveable(key, value string) json.RawMessage {
 	raw := json.RawMessage(value)
-	if key != KeyLanguagesPolicy {
+	switch key {
+	case KeyLanguagesPolicy:
+		var p LanguagesPolicy
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return raw // a malformed legacy row keeps its raw bytes
+		}
+		blob, err := json.Marshal(p)
+		if err != nil {
+			return raw
+		}
+		return blob
+	case KeyMuxOptions:
+		var p MuxOptions
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return raw
+		}
+		blob, err := json.Marshal(p)
+		if err != nil {
+			return raw
+		}
+		return blob
+	default:
 		return raw
 	}
-	var p LanguagesPolicy
-	if err := json.Unmarshal(raw, &p); err != nil {
-		return raw // a malformed legacy row keeps its raw bytes
-	}
-	blob, err := json.Marshal(p)
-	if err != nil {
-		return raw
-	}
-	return blob
 }
 
 // All returns every readable section, already stripped of non-section rows.
@@ -539,6 +590,9 @@ func normalize(key string, raw json.RawMessage) (string, error) {
 		if err == nil && strings.TrimSpace(p.TrackTitleInMKV) == "" {
 			err = errors.New("track_title_in_mkv is required")
 		}
+		if err == nil {
+			err = validateMuxOptions(&p)
+		}
 		v = p
 	case KeyWatchOptions:
 		var p WatchOptions
@@ -598,12 +652,44 @@ func validateStorage(p *StoragePaths) error {
 	if p.MediaRoots == nil {
 		p.MediaRoots = []string{}
 	}
-	for _, path := range append([]string{p.WatchDir, p.VaultDir, p.WorkDir}, p.MediaRoots...) {
+	for _, path := range append([]string{p.WatchDir, p.VaultDir, p.WorkDir, p.OutputDir}, p.MediaRoots...) {
 		if path != "" && !filepath.IsAbs(path) {
 			return fmt.Errorf("path %q must be absolute", path)
 		}
 	}
+	// ADR-0002: nothing is ever written into the Audio Vault. The mux worker
+	// repeats this check on the EvalSymlinks-resolved paths; here a lexical
+	// comparison catches the obvious misconfiguration at save time.
+	if p.OutputDir != "" && p.VaultDir != "" {
+		if pathWithin(filepath.Clean(p.VaultDir), filepath.Clean(p.OutputDir)) {
+			return errors.New("output_dir must not be the vault folder or inside it")
+		}
+	}
 	return nil
+}
+
+// pathWithin reports whether target is root or below it. Both paths must
+// already be cleaned (and, where they exist, EvalSymlinks-resolved).
+func pathWithin(root, target string) bool {
+	rel, err := filepath.Rel(root, target)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
+}
+
+func validateMuxOptions(p *MuxOptions) error {
+	// An absent or empty mode keeps the historical in-place behaviour; a
+	// caller that sends only keep_bak must not be rejected.
+	if p.OutputMode == "" {
+		p.OutputMode = MuxOutputReplace
+	}
+	switch p.OutputMode {
+	case MuxOutputReplace, MuxOutputSeparate:
+		return nil
+	default:
+		return fmt.Errorf(`output_mode must be %q or %q`, MuxOutputReplace, MuxOutputSeparate)
+	}
 }
 
 func validateLanguages(p *LanguagesPolicy) error {

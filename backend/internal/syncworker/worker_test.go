@@ -490,3 +490,169 @@ func TestNewRejectsIncompleteDependencies(t *testing.T) {
 		})
 	}
 }
+
+func setStoragePaths(t *testing.T, s *settings.Store, paths settings.StoragePaths) {
+	t.Helper()
+	raw, err := json.Marshal(paths)
+	if err != nil {
+		t.Fatalf("marshal storage.paths: %v", err)
+	}
+	if err := s.Set(context.Background(), settings.KeyStoragePaths, raw); err != nil {
+		t.Fatalf("set storage.paths: %v", err)
+	}
+}
+
+func setMuxOptions(t *testing.T, s *settings.Store, opts settings.MuxOptions) {
+	t.Helper()
+	raw, err := json.Marshal(opts)
+	if err != nil {
+		t.Fatalf("marshal mux.options: %v", err)
+	}
+	if err := s.Set(context.Background(), settings.KeyMuxOptions, raw); err != nil {
+		t.Fatalf("set mux.options: %v", err)
+	}
+}
+
+// TestProcessOnceSeparateModeSkipsRescanAndRecordsOutputPath covers ADR-0011:
+// the worker resolves storage.paths.output_dir, passes it to the muxer, skips
+// the arr rescan (the library file is untouched) and stores the final path on
+// the job so GET /api/sync/jobs can show it.
+func TestProcessOnceSeparateModeSkipsRescanAndRecordsOutputPath(t *testing.T) {
+	r := newRig(t)
+	outDir := filepath.Join(t.TempDir(), "output")
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		t.Fatalf("mkdir output: %v", err)
+	}
+	resolvedOut, err := filepath.EvalSymlinks(outDir)
+	if err != nil {
+		t.Fatalf("resolve output: %v", err)
+	}
+	vaultDir := filepath.Join(filepath.Dir(outDir), "vault")
+	if err := os.MkdirAll(vaultDir, 0o755); err != nil {
+		t.Fatalf("mkdir vault: %v", err)
+	}
+	setStoragePaths(t, r.settings, settings.StoragePaths{
+		WorkDir: r.workDir, VaultDir: vaultDir, OutputDir: outDir,
+	})
+	setMuxOptions(t, r.settings, settings.MuxOptions{
+		KeepBak: true, TrackTitleInMKV: "Polski Dubbing", OutputMode: settings.MuxOutputSeparate,
+	})
+
+	jobID := r.newJob(t)
+	r.stage(t, jobID)
+	dest := filepath.Join(resolvedOut, "Movie (2020) [ArcA310].dubarr.mkv")
+	mx := &fakeMuxer{result: mux.Result{OutputPath: dest}}
+	rs := &fakeRescanner{}
+	w := newWorker(t, r, &fakeExecutor{report: stableReport()}, mx, rs)
+
+	if processed, err := w.ProcessOnce(context.Background()); err != nil || !processed {
+		t.Fatalf("ProcessOnce = %v/%v, want true/nil", processed, err)
+	}
+	if len(mx.jobs) != 1 {
+		t.Fatalf("Mux calls = %d, want 1", len(mx.jobs))
+	}
+	if got := mx.jobs[0].OutputMode; got != settings.MuxOutputSeparate {
+		t.Errorf("mux output mode = %q, want separate", got)
+	}
+	if got := mx.jobs[0].OutputDir; got != resolvedOut {
+		t.Errorf("mux output dir = %q, want %q", got, resolvedOut)
+	}
+	if len(rs.rows) != 0 {
+		t.Errorf("rescan ran in separate mode: %+v", rs.rows)
+	}
+	rec, ok, err := r.store.SyncJobByID(context.Background(), jobID)
+	if err != nil || !ok {
+		t.Fatalf("SyncJobByID = %v/%v", ok, err)
+	}
+	if rec.Status != "completed" {
+		t.Errorf("status = %q, want completed", rec.Status)
+	}
+	if rec.OutputPath != dest {
+		t.Errorf("output_path = %q, want %q", rec.OutputPath, dest)
+	}
+}
+
+// TestProcessOnceSeparateModeRejectsVaultOutputDir is the worker-side ADR-0002
+// guard: a settings row edited straight in SQLite cannot make the muxer write
+// into the Audio Vault.
+func TestProcessOnceSeparateModeRejectsVaultOutputDir(t *testing.T) {
+	r := newRig(t)
+	setStoragePaths(t, r.settings, settings.StoragePaths{
+		WorkDir: r.workDir, VaultDir: filepath.Join(t.TempDir(), "vault"), OutputDir: "",
+	})
+	// Bypass settings.Set so the worker's own guard is what rejects the row,
+	// mimicking a settings row edited directly in SQLite.
+	vaultDir := filepath.Join(t.TempDir(), "vault2")
+	outDir := filepath.Join(vaultDir, "deliver")
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	raw, err := json.Marshal(settings.StoragePaths{
+		WorkDir: r.workDir, VaultDir: vaultDir, OutputDir: outDir,
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if _, err := r.store.DB.Exec(
+		`UPDATE settings SET value = ? WHERE key = ?`, string(raw), settings.KeyStoragePaths,
+	); err != nil {
+		t.Fatalf("write storage.paths row: %v", err)
+	}
+	setMuxOptions(t, r.settings, settings.MuxOptions{
+		KeepBak: true, TrackTitleInMKV: "Polski Dubbing", OutputMode: settings.MuxOutputSeparate,
+	})
+
+	jobID := r.newJob(t)
+	r.stage(t, jobID)
+	mx := &fakeMuxer{}
+	w := newWorker(t, r, &fakeExecutor{report: stableReport()}, mx, &fakeRescanner{})
+
+	if processed, err := w.ProcessOnce(context.Background()); err != nil || !processed {
+		t.Fatalf("ProcessOnce = %v/%v, want true/nil", processed, err)
+	}
+	if len(mx.jobs) != 0 {
+		t.Fatalf("Mux ran with an output dir inside the vault: %+v", mx.jobs)
+	}
+	rec, _, _ := r.store.SyncJobByID(context.Background(), jobID)
+	if rec.Status != "failed" || !strings.Contains(rec.ErrorMessage, "vault") {
+		t.Errorf("status/message = %q/%q, want failed mentioning vault", rec.Status, rec.ErrorMessage)
+	}
+}
+
+// TestProcessOnceSeparateModeRequiresExistingOutputDir fails before mux when
+// the configured directory is missing or unset.
+func TestProcessOnceSeparateModeRequiresExistingOutputDir(t *testing.T) {
+	cases := []struct {
+		name string
+		dir  string
+	}{
+		{name: "missing directory", dir: "/definitely/not/here"},
+		{name: "unset output dir", dir: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRig(t)
+			setStoragePaths(t, r.settings, settings.StoragePaths{
+				WorkDir: r.workDir, VaultDir: filepath.Join(t.TempDir(), "vault"), OutputDir: tc.dir,
+			})
+			setMuxOptions(t, r.settings, settings.MuxOptions{
+				KeepBak: true, TrackTitleInMKV: "Polski Dubbing", OutputMode: settings.MuxOutputSeparate,
+			})
+			jobID := r.newJob(t)
+			r.stage(t, jobID)
+			mx := &fakeMuxer{}
+			w := newWorker(t, r, &fakeExecutor{report: stableReport()}, mx, &fakeRescanner{})
+
+			if processed, err := w.ProcessOnce(context.Background()); err != nil || !processed {
+				t.Fatalf("ProcessOnce = %v/%v, want true/nil", processed, err)
+			}
+			if len(mx.jobs) != 0 {
+				t.Fatalf("Mux ran without a usable output dir: %+v", mx.jobs)
+			}
+			rec, _, _ := r.store.SyncJobByID(context.Background(), jobID)
+			if rec.Status != "failed" {
+				t.Errorf("status = %q, want failed", rec.Status)
+			}
+		})
+	}
+}

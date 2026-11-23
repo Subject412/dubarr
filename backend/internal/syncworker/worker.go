@@ -329,7 +329,11 @@ func (w *Worker) processJob(ctx context.Context, id int64) error {
 	}
 
 	opts, optsOK := w.muxOptions(ctx)
-	_, err = w.muxer.Mux(ctx, mux.Job{
+	mode, outputDir, err := w.outputDestination(ctx, opts)
+	if err != nil {
+		return err
+	}
+	res, err := w.muxer.Mux(ctx, mux.Job{
 		ID:             id,
 		WorkDir:        w.workDir,
 		TargetPath:     targetPath,
@@ -338,6 +342,8 @@ func (w *Worker) processJob(ctx context.Context, id int64) error {
 		SyncOffsetMS:   offset,
 		TrackTitle:     w.trackTitle(opts),
 		KeepBak:        keepBak(opts, optsOK),
+		OutputMode:     mode,
+		OutputDir:      outputDir,
 		Gate:           rule,
 		Force:          w.forceOverride(ctx),
 		Report:         report,
@@ -347,11 +353,22 @@ func (w *Worker) processJob(ctx context.Context, id int64) error {
 		return err
 	}
 
-	// M5-4: rescan is best-effort and never undoes a published mux.
-	if row, err := w.rescanRow(ctx, rec.TargetLibraryCacheID); err != nil {
-		w.logf("syncworker: job %d rescan skipped: %v", id, err)
-	} else if err := w.rescanner.RescanAfterMux(ctx, row); err != nil {
-		w.logf("syncworker: job %d rescan: %v", id, err)
+	// ADR-0011: record where the file landed so the API/UI can show it. This
+	// write must outlive a shutdown cancellation (the mux already published);
+	// a failure is logged and never undoes the publish.
+	if err := w.store.SetSyncJobOutputPath(context.WithoutCancel(ctx), id, res.OutputPath); err != nil {
+		w.logf("syncworker: job %d output path: %v", id, err)
+	}
+
+	// M5-4: rescan is best-effort and never undoes a published mux. Separate
+	// mode leaves the library Target untouched, so there is nothing for the
+	// arr to rescan (ADR-0011).
+	if mode != settings.MuxOutputSeparate {
+		if row, err := w.rescanRow(ctx, rec.TargetLibraryCacheID); err != nil {
+			w.logf("syncworker: job %d rescan skipped: %v", id, err)
+		} else if err := w.rescanner.RescanAfterMux(ctx, row); err != nil {
+			w.logf("syncworker: job %d rescan: %v", id, err)
+		}
 	}
 
 	// The mux already published, so the terminal status write must outlive a
@@ -540,6 +557,88 @@ func keepBak(opts settings.MuxOptions, ok bool) *bool {
 		return &discard
 	}
 	return nil
+}
+
+// outputDestination resolves mux.options.output_mode and re-validates
+// storage.paths.output_dir in the worker (ADR-0011). The settings API already
+// checks the shape, but a row can be edited directly in SQLite, and the
+// EvalSymlinks-resolved vault guard is only meaningful here.
+//
+// replace mode returns the empty output dir; Mux then publishes in place.
+func (w *Worker) outputDestination(ctx context.Context, opts settings.MuxOptions) (string, string, error) {
+	mode := strings.TrimSpace(opts.OutputMode)
+	if mode == "" {
+		mode = settings.MuxOutputReplace
+	}
+	if mode != settings.MuxOutputSeparate {
+		// An unknown mode is rejected by the muxer itself.
+		return mode, "", nil
+	}
+	if w.settings == nil {
+		return "", "", fmt.Errorf("%w: storage.paths is unavailable", mux.ErrOutputDir)
+	}
+	raw, ok, err := w.settings.Get(ctx, settings.KeyStoragePaths)
+	if err != nil {
+		return "", "", fmt.Errorf("syncworker: read storage.paths: %w", err)
+	}
+	if !ok {
+		return "", "", fmt.Errorf("%w: storage.paths is not configured", mux.ErrOutputDir)
+	}
+	var paths settings.StoragePaths
+	if err := json.Unmarshal(raw, &paths); err != nil {
+		return "", "", fmt.Errorf("%w: decode storage.paths: %v", mux.ErrOutputDir, err)
+	}
+	if strings.TrimSpace(paths.OutputDir) == "" {
+		return "", "", fmt.Errorf("%w: separate output mode requires storage.paths.output_dir", mux.ErrOutputDir)
+	}
+	resolved, err := resolveOutputRoot(paths.OutputDir)
+	if err != nil {
+		return "", "", err
+	}
+	// ADR-0002: never write into the Audio Vault. Compare canonical paths when
+	// the vault exists, and fall back to the cleaned lexical paths otherwise.
+	if strings.TrimSpace(paths.VaultDir) != "" {
+		vault := filepath.Clean(paths.VaultDir)
+		if abs, err := filepath.Abs(vault); err == nil {
+			vault = abs
+		}
+		if canonical, err := filepath.EvalSymlinks(vault); err == nil {
+			vault = canonical
+		}
+		if withinDir(vault, resolved) {
+			return "", "", fmt.Errorf("%w: %s is the vault folder or inside it", mux.ErrOutputDir, resolved)
+		}
+	}
+	return settings.MuxOutputSeparate, resolved, nil
+}
+
+// resolveOutputRoot canonicalizes and checks the separate-mode destination root.
+func resolveOutputRoot(dir string) (string, error) {
+	abs, err := filepath.Abs(strings.TrimSpace(dir))
+	if err != nil {
+		return "", fmt.Errorf("%w: %s: %v", mux.ErrOutputDir, dir, err)
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", fmt.Errorf("%w: %s: %v", mux.ErrOutputDir, dir, err)
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return "", fmt.Errorf("%w: %s: %v", mux.ErrOutputDir, dir, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("%w: %s is not a directory", mux.ErrOutputDir, resolved)
+	}
+	return resolved, nil
+}
+
+// withinDir reports whether target is root or below it.
+func withinDir(root, target string) bool {
+	rel, err := filepath.Rel(root, target)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
 }
 
 // cleanup removes {WORK_DIR}/jobs/{id}/ after a failure. Cleanup errors are

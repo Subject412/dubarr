@@ -1,0 +1,82 @@
+import type { SettingsKey } from './api'
+
+/**
+ * Single source of truth for the settings categories. The Settings page renders
+ * its cards from this list and the AppShell submenu is built from it, so the
+ * navigation cannot drift from the rendered sections.
+ */
+export type SettingsSection = {
+  key: SettingsKey
+  title: string
+  description: string
+}
+
+export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
+  {
+    key: 'storage.paths',
+    title: 'Storage paths',
+    description: 'Watch folder, vault, working area and media roots (absolute paths).',
+  },
+  {
+    key: 'languages.policy',
+    title: 'Languages policy',
+    description: 'Which dubbing tracks are imported and which reference tracks are kept.',
+  },
+  {
+    key: 'target.tag_filter',
+    title: 'Target tag filter',
+    description: 'Tdarr destination filename gate (ADR-0005).',
+  },
+  {
+    key: 'security.options',
+    title: 'Security options',
+    description: 'Safety switches around the vault and AV1 hand-off.',
+  },
+  {
+    key: 'sync.defaults',
+    title: 'Sync defaults',
+    description: 'Automatic offset search bounds and sampling windows.',
+  },
+  {
+    key: 'mux.options',
+    title: 'Mux options',
+    description: 'Atomic muxing side effects.',
+  },
+  {
+    key: 'watch.options',
+    title: 'Watch options',
+    description: 'Donor-folder scanning cadence and stability window.',
+  },
+  {
+    key: 'imports.options',
+    title: 'Donor patterns',
+    description:
+      'Sibling filenames that mark a dropped file as a donor dub. Matching is case-insensitive; a pattern without * is a substring match, with * a glob.',
+  },
+  {
+    key: 'arr.options',
+    title: '*arr options',
+    description: 'Radarr/Sonarr polling.',
+  },
+]
+
+/** Stable DOM id for a section card, derived from its settings key. */
+export function settingsSectionId(key: SettingsKey): string {
+  return `settings-${key.replace(/\./g, '-')}`
+}
+
+export function settingsSection(key: SettingsKey): SettingsSection {
+  const section = SETTINGS_SECTIONS.find((candidate) => candidate.key === key)
+  if (!section) throw new Error(`unknown settings section: ${key}`)
+  return section
+}
+
+export function isSettingsSectionKey(value: string | null): value is SettingsKey {
+  return Boolean(value) && SETTINGS_SECTIONS.some((section) => section.key === value)
+}
+
+/** Reverse of {@link settingsSectionId}: maps a rendered card id back to its key. */
+export function settingsSectionKeyFromId(id: string): SettingsKey | null {
+  const section = SETTINGS_SECTIONS.find((candidate) => settingsSectionId(candidate.key) === id)
+  return section ? section.key : null
+}

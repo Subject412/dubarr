@@ -95,12 +95,14 @@ export function Field({
 }
 
 export function Card({
+  id,
   title,
   description,
   actions,
   children,
   className,
 }: {
+  id?: string
   title?: ReactNode
   description?: ReactNode
   actions?: ReactNode
@@ -108,7 +110,10 @@ export function Card({
   className?: string
 }) {
   return (
-    <section className={cn('rounded-xl border border-ink-800 bg-ink-900 shadow-sm', className)}>
+    <section
+      id={id}
+      className={cn('scroll-mt-6 rounded-xl border border-ink-800 bg-ink-900 shadow-sm', className)}
+    >
       {(title || actions) && (
         <header className="flex flex-wrap items-start justify-between gap-3 border-b border-ink-800 px-5 py-4">
           <div>

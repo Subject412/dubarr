@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import type {
   ArrOptions,
   ImportsOptions,
@@ -14,6 +15,13 @@ import type {
 import { api } from '../lib/api'
 import { DEFAULT_SETTINGS as DEFAULTS } from '../lib/defaults'
 import { useSaveSettings, useSettings } from '../lib/hooks'
+import {
+  isSettingsSectionKey,
+  SETTINGS_SECTIONS,
+  settingsSection,
+  settingsSectionId,
+  settingsSectionKeyFromId,
+} from '../lib/settings-sections'
 import { PathField, PathListEditor } from '../components/PathPicker'
 import { ThemeSelector } from '../components/ThemeSelector'
 import {
@@ -32,16 +40,12 @@ import {
 } from '../components/ui'
 
 function Section<T extends object>({
-  title,
-  description,
   sectionKey,
   value,
   save,
   onSaved,
   children,
 }: {
-  title: string
-  description: string
   sectionKey: SettingsKey
   value: T
   save: (key: SettingsKey, value: T) => Promise<unknown>
@@ -50,6 +54,7 @@ function Section<T extends object>({
   children: (draft: T, update: (patch: Partial<T>) => void) => ReactNode
 }) {
   const [draft, setDraft] = useState<T>(value)
+  const { title, description } = settingsSection(sectionKey)
   const [status, setStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
   const [error, setError] = useState('')
   const [dirty, setDirty] = useState(false)
@@ -87,6 +92,7 @@ function Section<T extends object>({
 
   return (
     <Card
+      id={settingsSectionId(sectionKey)}
       title={title}
       description={description}
       actions={
@@ -145,6 +151,60 @@ export function SettingsPage() {
   const flagWatchRestart = () => setWatchRestartNotice(true)
 
   const data = settings.data?.settings
+
+  // Category navigation lives in the URL (`/settings?section=<key>`) so the
+  // location is shareable and browser back/forward keeps working. Cards are
+  // only scrolled, never remounted, so unsaved drafts survive a switch.
+  const [searchParams, setSearchParams] = useSearchParams()
+  const sectionParam = searchParams.get('section')
+  const activeSection = isSettingsSectionKey(sectionParam) ? sectionParam : null
+  const activeSectionRef = useRef<SettingsKey | null>(activeSection)
+  // URL writes made by the observer itself must not scroll the page again.
+  const scrollFromObserver = useRef<SettingsKey | null>(null)
+  // Programmatic scrolling fires observer entries; ignore them briefly so the
+  // explicit selection is not immediately overwritten.
+  const ignoreObserverUntil = useRef(0)
+  const sectionsReady = Boolean(data)
+
+  useEffect(() => {
+    if (!activeSection) return
+    activeSectionRef.current = activeSection
+    if (scrollFromObserver.current === activeSection) {
+      scrollFromObserver.current = null
+      return
+    }
+    const target = document.getElementById(settingsSectionId(activeSection))
+    if (!target) return
+    ignoreObserverUntil.current = Date.now() + 700
+    target.scrollIntoView?.({ block: 'start' })
+  }, [activeSection, sectionsReady])
+
+  // Scrolling manually through the page keeps the submenu highlight and the
+  // URL in step, without adding history entries.
+  useEffect(() => {
+    if (!sectionsReady || typeof IntersectionObserver === 'undefined') return
+    const nodes = SETTINGS_SECTIONS.map((section) =>
+      document.getElementById(settingsSectionId(section.key)),
+    ).filter((node): node is HTMLElement => Boolean(node))
+    if (nodes.length === 0) return
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (Date.now() < ignoreObserverUntil.current) return
+        const topmost = entries
+          .filter((entry) => entry.isIntersecting)
+          .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top)[0]
+        const key = topmost ? settingsSectionKeyFromId(topmost.target.id) : null
+        if (!key || key === activeSectionRef.current) return
+        activeSectionRef.current = key
+        scrollFromObserver.current = key
+        setSearchParams({ section: key }, { replace: true })
+      },
+      { root: document.querySelector('main'), rootMargin: '0px 0px -60% 0px' },
+    )
+    nodes.forEach((node) => observer.observe(node))
+    return () => observer.disconnect()
+  }, [sectionsReady, setSearchParams])
 
   const save = (key: SettingsKey, value: object) => saveSettings.mutateAsync({ [key]: value })
 
@@ -206,8 +266,6 @@ export function SettingsPage() {
       {data && (
         <div className="space-y-5">
           <Section<StoragePaths>
-            title="Storage paths"
-            description="Watch folder, vault, working area and media roots (absolute paths)."
             sectionKey="storage.paths"
             value={(data['storage.paths'] as StoragePaths) ?? DEFAULTS['storage.paths']}
             save={save}
@@ -245,8 +303,6 @@ export function SettingsPage() {
           </Section>
 
           <Section<LanguagesPolicy>
-            title="Languages policy"
-            description="Which dubbing tracks are imported and which reference tracks are kept."
             sectionKey="languages.policy"
             value={(data['languages.policy'] as LanguagesPolicy) ?? DEFAULTS['languages.policy']}
             save={save}
@@ -296,8 +352,6 @@ export function SettingsPage() {
           </Section>
 
           <Section<TargetTagFilter>
-            title="Target tag filter"
-            description="Tdarr destination filename gate (ADR-0005)."
             sectionKey="target.tag_filter"
             value={(data['target.tag_filter'] as TargetTagFilter) ?? DEFAULTS['target.tag_filter']}
             save={save}
@@ -355,8 +409,6 @@ export function SettingsPage() {
           </Section>
 
           <Section<SecurityOptions>
-            title="Security options"
-            description="Safety switches around the vault and AV1 hand-off."
             sectionKey="security.options"
             value={(data['security.options'] as SecurityOptions) ?? DEFAULTS['security.options']}
             save={save}
@@ -390,8 +442,6 @@ export function SettingsPage() {
           </Section>
 
           <Section<SyncDefaults>
-            title="Sync defaults"
-            description="Automatic offset search bounds and sampling windows."
             sectionKey="sync.defaults"
             value={(data['sync.defaults'] as SyncDefaults) ?? DEFAULTS['sync.defaults']}
             save={save}
@@ -430,8 +480,6 @@ export function SettingsPage() {
           </Section>
 
           <Section<MuxOptions>
-            title="Mux options"
-            description="Atomic muxing side effects."
             sectionKey="mux.options"
             value={(data['mux.options'] as MuxOptions) ?? DEFAULTS['mux.options']}
             save={save}
@@ -455,8 +503,6 @@ export function SettingsPage() {
           </Section>
 
           <Section<WatchOptions>
-            title="Watch options"
-            description="Donor-folder scanning cadence and stability window."
             sectionKey="watch.options"
             value={(data['watch.options'] as WatchOptions) ?? DEFAULTS['watch.options']}
             save={save}
@@ -482,8 +528,6 @@ export function SettingsPage() {
           </Section>
 
           <Section<ImportsOptions>
-            title="Donor patterns"
-            description="Sibling filenames that mark a dropped file as a donor dub. Matching is case-insensitive; a pattern without * is a substring match, with * a glob."
             sectionKey="imports.options"
             value={(data['imports.options'] as ImportsOptions) ?? DEFAULTS['imports.options']}
             save={save}
@@ -500,8 +544,6 @@ export function SettingsPage() {
           </Section>
 
           <Section<ArrOptions>
-            title="*arr options"
-            description="Radarr/Sonarr polling."
             sectionKey="arr.options"
             value={(data['arr.options'] as ArrOptions) ?? DEFAULTS['arr.options']}
             save={save}

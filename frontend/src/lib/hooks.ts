@@ -20,6 +20,9 @@ import {
   type CreateSyncJobBody,
   type Health,
   type LibrarySearchResponse,
+  type LogLevel,
+  type LogsQuery,
+  type LogsResponse,
   type QueueResponse,
   type QueueTransition,
   type SettingsEnvelope,
@@ -42,6 +45,8 @@ export const queryKeys = {
   librarySearch: (q: string) => ['library', 'search', q] as const,
   tokens: ['auth', 'tokens'] as const,
   arrConnections: ['settings', 'arr'] as const,
+  logs: (query: LogsQuery = {}) => ['logs', query] as const,
+  logLevel: ['logs', 'level'] as const,
 }
 
 /** Public first-run probe; drives the route gate. */
@@ -312,6 +317,39 @@ export function useChangePassword(): UseMutationResult<
 > {
   return useMutation({
     mutationFn: ({ currentPassword, newPassword }) => api.changePassword(currentPassword, newPassword),
+  })
+}
+
+/**
+ * Ring-buffer entries for the Logs page. Polls while `live` is true so the
+ * tail follows the appliance without an SSE endpoint.
+ */
+export function useLogs(query: LogsQuery = {}, live = true): UseQueryResult<LogsResponse> {
+  return useQuery({
+    queryKey: queryKeys.logs(query),
+    queryFn: () => api.logs(query),
+    retry: false,
+    refetchInterval: live ? 2_000 : false,
+  })
+}
+
+/** Runtime minimum severity reported by GET /api/logs/level. */
+export function useLogLevel(): UseQueryResult<{ level: LogLevel }> {
+  return useQuery({
+    queryKey: queryKeys.logLevel,
+    queryFn: api.logLevel,
+    retry: false,
+  })
+}
+
+export function useSetLogLevel(): UseMutationResult<{ level: LogLevel }, Error, LogLevel> {
+  const client = useQueryClient()
+  return useMutation({
+    mutationFn: (level) => api.setLogLevel(level),
+    onSuccess: (data) => {
+      client.setQueryData(queryKeys.logLevel, data)
+      void client.invalidateQueries({ queryKey: ['logs'] })
+    },
   })
 }
 

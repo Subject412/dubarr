@@ -43,6 +43,7 @@ const navItems: NavItem[] = [
     })),
   },
   { to: '/system', label: 'System', icon: '♥' },
+  { to: '/logs', label: 'Logs', icon: '≡', admin: true },
   { to: '/tokens', label: 'API Tokens', icon: '⚿', admin: true },
 ]
 

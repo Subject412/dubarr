@@ -298,6 +298,32 @@ export type ApiTokenCreated = ApiToken & {
   token: string
 }
 
+/** Log severities exposed by GET /api/logs and PUT /api/logs/level. */
+export type LogLevel = 'debug' | 'info' | 'warn' | 'error'
+
+/** One ring-buffer entry. `ts` is an RFC 3339 timestamp. */
+export type LogEntry = {
+  ts: string
+  level: LogLevel
+  component?: string
+  message: string
+  job_id?: string
+  media_id?: string
+}
+
+export type LogsResponse = {
+  entries: LogEntry[]
+  level: LogLevel
+}
+
+export type LogsQuery = {
+  /** Minimum severity; omitted means every entry kept in the ring. */
+  level?: LogLevel
+  component?: string
+  limit?: number
+  since?: string
+}
+
 export class ApiError extends Error {
   readonly status: number
 
@@ -409,4 +435,19 @@ export const api = {
       body: JSON.stringify({ name }),
     }),
   revokeToken: (id: number) => request<void>(`/api/auth/tokens/${id}`, { method: 'DELETE' }),
+  logs: (query: LogsQuery = {}) => {
+    const params = new URLSearchParams()
+    if (query.level) params.set('level', query.level)
+    if (query.component) params.set('component', query.component)
+    if (query.limit != null) params.set('limit', String(query.limit))
+    if (query.since) params.set('since', query.since)
+    const qs = params.toString()
+    return request<LogsResponse>(`/api/logs${qs ? `?${qs}` : ''}`)
+  },
+  logLevel: () => request<{ level: LogLevel }>('/api/logs/level'),
+  setLogLevel: (level: LogLevel) =>
+    request<{ level: LogLevel }>('/api/logs/level', {
+      method: 'PUT',
+      body: JSON.stringify({ level }),
+    }),
 }

@@ -7,6 +7,7 @@ import { UNAUTHORIZED_EVENT, type AuthStatus } from './lib/api'
 import { queryKeys, useAuthStatus, useMe } from './lib/hooks'
 import { ThemeProvider } from './lib/ThemeProvider'
 import { LoginPage } from './pages/Login'
+import { LogsPage } from './pages/Logs'
 import { PlaceholderPage } from './pages/Placeholder'
 import { QueuePage } from './pages/Queue'
 import { SettingsPage } from './pages/Settings'
@@ -115,6 +116,7 @@ function App() {
             <Route path="/system" element={<SystemPage />} />
             <Route element={<AdminRoute />}>
               <Route path="/tokens" element={<TokensPage />} />
+              <Route path="/logs" element={<LogsPage />} />
             </Route>
             <Route path="*" element={<Navigate to="/library" replace />} />
           </Route>

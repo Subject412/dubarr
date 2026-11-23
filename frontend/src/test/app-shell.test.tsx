@@ -19,6 +19,18 @@ function mockAuthenticatedAdmin(): void {
   )
 }
 
+describe('AppShell navigation', () => {
+  it('shows the admin-only Logs tab', async () => {
+    mockAuthenticatedAdmin()
+    renderWithProviders(<App />, { route: '/library' })
+
+    // Wait for /api/auth/me: admin-only items appear only once it resolves.
+    await screen.findByText('Administrator')
+    const links = await screen.findAllByRole('link', { name: /Logs/ })
+    expect(links.some((link) => link.getAttribute('href') === '/logs')).toBe(true)
+  })
+})
+
 describe('AppShell top bar', () => {
   it('labels the admin role by name instead of repeating the username', async () => {
     mockAuthenticatedAdmin()

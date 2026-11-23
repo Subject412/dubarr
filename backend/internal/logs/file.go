@@ -8,16 +8,26 @@ import (
 	"sync"
 )
 
-// The redaction rules run in order: bearer tokens first (so the keyword rule
-// cannot swallow the literal "Bearer"), then key=value pairs, URL query
-// secrets and finally paths to key material. Every match becomes "***".
+// The redaction rules run in order: authorization schemes first (so the
+// keyword rule cannot swallow just the scheme word and leave the credential),
+// then key=value pairs, URL query secrets and finally paths to key material.
+// Every match becomes "***".
 var (
-	// Authorization: Bearer <token>.
-	reBearer = regexp.MustCompile(`(?i)\b(bearer)\s+[A-Za-z0-9._~+/=-]{8,}`)
+	// Authorization: Basic <base64(user:pass)> / Bearer <token>. The scheme
+	// word alone is not a secret, so the credential after it must go too. A
+	// scheme is only treated as such when a >=8-char token follows it.
+	reBearer = regexp.MustCompile(`(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}`)
+	// Authorization[:=] [scheme] <credential>: keeps the header name (and the
+	// scheme, when present) so the line stays readable, drops the credential.
+	// Runs after reBearer so a bare scheme can never survive unredacted.
+	reAuth = regexp.MustCompile(`(?i)\b(authorization)([ 	]*[:=][ 	]*)((?:basic|digest|bearer|negotiate|ntlm|token)[ 	]+)?("[^"]*"|'[^']*'|[^\s,;&]+)`)
 	// key=value / key: value forms (api keys, passwords, tokens, sessions).
-	reKeyValue = regexp.MustCompile(`(?i)\b(x-api-key|api[_-]?key|apikey|password|passwd|secret|token|session|authorization)\b(\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;&]+)`)
+	// There is deliberately no \b anchor: `_` is a word character, so
+	// access_token, secret_key, session_id and client_secret never matched.
+	// The keyword only has to be part of the identifier before the separator.
+	reKeyValue = regexp.MustCompile(`(?i)([A-Za-z0-9_.-]*(?:x-api-key|api[_-]?key|apikey|password|passwd|pwd|pass|secret|token|session|credential)[A-Za-z0-9_.-]*)([ 	]*[:=][ 	]*)(("[^"]*"|'[^']*'|[^\s,;&]+))`)
 	// Secret material in URL query strings.
-	reQuery = regexp.MustCompile(`(?i)([?&](?:apikey|api_key|access_token|token|key)=)[^&\s]+`)
+	reQuery = regexp.MustCompile(`(?i)([?&](?:apikey|api_key|access_token|token|key|password|secret|session|credential)=)[^&\s]+`)
 	// Paths to key material (DATA_DIR/.master.key, .master.salt, keyfiles).
 	reSecretPath = regexp.MustCompile(`(?i)[^\s"']*/[^\s"']*(?:\.master\.key|\.master\.salt|keyfile)[^\s"']*`)
 )
@@ -31,6 +41,10 @@ func Redact(s string) string {
 	s = reBearer.ReplaceAllStringFunc(s, func(match string) string {
 		m := reBearer.FindStringSubmatch(match)
 		return m[1] + " ***"
+	})
+	s = reAuth.ReplaceAllStringFunc(s, func(match string) string {
+		m := reAuth.FindStringSubmatch(match)
+		return m[1] + m[2] + m[3] + "***"
 	})
 	s = reKeyValue.ReplaceAllStringFunc(s, func(match string) string {
 		m := reKeyValue.FindStringSubmatch(match)

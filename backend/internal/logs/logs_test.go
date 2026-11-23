@@ -2,7 +2,10 @@ package logs
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -206,6 +209,92 @@ func TestRedaction(t *testing.T) {
 	}
 	if !strings.Contains(joined, "https://radarr.local/api/v3/movie") {
 		t.Errorf("redaction removed too much: %q", joined)
+	}
+}
+
+// TestStderrRedactsErrorAndAnyAttrs covers finding 1: `error` and slog.Any
+// values arrive as slog.KindAny, which the stderr handler used to print
+// verbatim (main.go logs "error", err on every wiring failure).
+func TestStderrRedactsErrorAndAnyAttrs(t *testing.T) {
+	l, stderr := newTestLogger(t, Options{})
+	log := l.Logger()
+
+	log.Error("radarr probe failed", "error", errors.New("auth failed api_key=supersecret123"))
+	log.Warn("keyfile unreadable", "error", fmt.Errorf("open /config/.master.key: %w", fs.ErrPermission))
+	log.Info("upstream body", "response", slog.Any("response", secretPayload{Body: "access_token=s3cr3t-token"}))
+	log.Info("counters", "n", 3, "ok", false)
+	// With(...) becomes preformatted attrs on the stderr handler, a path
+	// ReplaceAttr does not reach, so redactAttrs must cover it too.
+	log.With("error", errors.New("with_attr api_key=wistleak")).Info("scoped record")
+
+	out := stderr.String()
+	for _, leaked := range []string{"supersecret123", "s3cr3t-token", ".master.key", "wistleak"} {
+		if strings.Contains(out, leaked) {
+			t.Errorf("stderr leaked %q: %q", leaked, out)
+		}
+	}
+	for _, want := range []string{"api_key=***", "access_token=***", "n=3", "ok=false"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("stderr missing %q: %q", want, out)
+		}
+	}
+}
+
+// secretPayload is a non-string slog.Any value (a fmt.Stringer), the shape
+// that reaches the handlers as slog.KindAny.
+type secretPayload struct{ Body string }
+
+func (p secretPayload) String() string { return p.Body }
+
+// TestRedactSensitiveKeys covers finding 2: `_`-compounded keys and encoded
+// Authorization credentials used to slip past the \b-anchored key rules.
+func TestRedactSensitiveKeys(t *testing.T) {
+	cases := []struct{ name, in, leak string }{
+		{"access_token", "GET /api?access_token=leaked1", "leaked1"},
+		{"auth_token", "auth_token=leaked2", "leaked2"},
+		{"secret_key", "secret_key=leaked3", "leaked3"},
+		{"session_id", "session_id=leaked4", "leaked4"},
+		{"db_password", "db_password=leaked5", "leaked5"},
+		{"client_secret", "client_secret: leaked6", "leaked6"},
+		{"pwd", "pwd=leaked7", "leaked7"},
+		{"pass", "pass=leaked8", "leaked8"},
+		{"credential", "credential=leaked9", "leaked9"},
+		{"basic auth", "Authorization: Basic dXNlcjpwYXNzd29yZA==", "dXNlcjpwYXNzd29yZA=="},
+		{"bearer auth", "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.sig", "eyJhbGciOiJIUzI1NiJ9.sig"},
+		{"query password", "https://radarr.local/api?password=leaked10", "leaked10"},
+		{"query session", "https://radarr.local/api?a=1&session=leaked11", "leaked11"},
+	}
+	for _, tc := range cases {
+		got := Redact(tc.in)
+		if strings.Contains(got, tc.leak) {
+			t.Errorf("%s: Redact(%q) = %q, leaked the credential", tc.name, tc.in, got)
+		}
+		if !strings.Contains(got, "***") {
+			t.Errorf("%s: Redact(%q) = %q, want a *** marker", tc.name, tc.in, got)
+		}
+	}
+}
+
+// TestFileSinkRedacts covers the third sink: the rotating file must receive
+// the same redacted message the ring and stderr got.
+func TestFileSinkRedacts(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dubarr.log")
+	l, _ := newTestLogger(t, Options{FilePath: path})
+	l.Logger().Warn("vault unlock failed client_secret=filesecret access_token=filetoken")
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	for _, leaked := range []string{"filesecret", "filetoken"} {
+		if strings.Contains(string(body), leaked) {
+			t.Errorf("file sink leaked %q: %q", leaked, body)
+		}
+	}
+	if !strings.Contains(string(body), "client_secret=***") {
+		t.Errorf("file sink missing the redaction marker: %q", body)
 	}
 }
 

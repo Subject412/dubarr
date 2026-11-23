@@ -102,11 +102,13 @@ func New(opts Options) (*Logger, error) {
 		Level: &level,
 		// Belt and braces: redaction already happens in our handler, but a
 		// record forwarded by another handler still cannot echo a secret.
-		ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
-			if a.Value.Kind() == slog.KindString {
-				a.Value = slog.StringValue(Redact(a.Value.String()))
+		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+			// The built-in time/level/source attrs are formatted by the
+			// handler and carry no free-form text; leave their kinds alone.
+			if len(groups) == 0 && (a.Key == slog.TimeKey || a.Key == slog.LevelKey || a.Key == slog.SourceKey) {
+				return a
 			}
-			return a
+			return redactAttr(a)
 		},
 	})
 	l.logger = slog.New(&handler{base: base, sink: l})
@@ -288,12 +290,33 @@ func redactAttrs(attrs []slog.Attr) []slog.Attr {
 	return out
 }
 
+// redactValue strips credentials from every representation that can carry
+// free-form text: strings, and the slog.KindAny values that `error`,
+// fmt.Stringer and struct attributes become. The stderr handler prints
+// KindAny verbatim, so it must be resolved to text before forwarding.
+// Numeric, boolean, time and duration kinds cannot hold a credential string
+// and keep their type, so int/bool/duration attrs render unchanged.
+func redactValue(v slog.Value) slog.Value {
+	switch v.Kind() {
+	case slog.KindString:
+		return slog.StringValue(Redact(v.String()))
+	case slog.KindAny:
+		if v.Any() == nil {
+			return v
+		}
+		// fmt.Sprint uses Error() for errors and String() for fmt.Stringer,
+		// so one call covers both shapes without type switches.
+		return slog.StringValue(Redact(fmt.Sprint(v.Any())))
+	}
+	return v
+}
+
 func redactAttr(a slog.Attr) slog.Attr {
 	switch a.Value.Kind() {
-	case slog.KindString:
-		a.Value = slog.StringValue(Redact(a.Value.String()))
 	case slog.KindGroup:
 		a.Value = slog.GroupValue(redactAttrs(a.Value.Group())...)
+	default:
+		a.Value = redactValue(a.Value)
 	}
 	return a
 }

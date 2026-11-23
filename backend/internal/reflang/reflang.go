@@ -22,7 +22,8 @@
 //
 // Tracks tagged "und" or with no usable language are never selected as a
 // language reference (settled: und never policy, see gate.SplitExportTracks).
-// Commentary tracks are never references.
+// Commentary tracks (disposition flag or a commentary title, see
+// probe.AudioTrack.IsCommentary) are never references.
 //
 // The package performs no I/O and executes no processes; callers own the
 // actual copying and FFmpeg slicing.
@@ -218,7 +219,7 @@ func normLang(t probe.AudioTrack) string {
 
 // usable reports whether t may act as a language reference at all.
 func usable(t probe.AudioTrack) bool {
-	return !t.Disposition.Comment && normLang(t) != ""
+	return !t.IsCommentary() && normLang(t) != ""
 }
 
 // bestTrack selects the highest-quality non-commentary track in lang.
@@ -272,7 +273,7 @@ func lowpassTarget(targetTracks []probe.AudioTrack, original string) (probe.Audi
 		return t, true
 	}
 	for _, t := range targetTracks {
-		if !t.Disposition.Comment {
+		if !t.IsCommentary() {
 			return t, true
 		}
 	}

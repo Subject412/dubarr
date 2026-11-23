@@ -1,8 +1,6 @@
 package gate
 
 import (
-	"strings"
-
 	"github.com/Subject412/dubarr/backend/internal/langtoken"
 	"github.com/Subject412/dubarr/backend/internal/probe"
 	"github.com/Subject412/dubarr/backend/internal/settings"
@@ -81,7 +79,7 @@ func SplitExportTracks(tracks []probe.AudioTrack, pol ExportPolicy) ExportSplit 
 
 	var split ExportSplit
 	for _, track := range tracks {
-		if track.Disposition.Comment || isCommentaryTitle(track.Title) {
+		if track.IsCommentary() {
 			if !pol.ExcludeCommentary {
 				split.Extras = append(split.Extras, track)
 			}
@@ -105,7 +103,7 @@ func SplitExportTracks(tracks []probe.AudioTrack, pol ExportPolicy) ExportSplit 
 func usableLanguages(tracks []probe.AudioTrack) []string {
 	out := make([]string, 0, len(tracks))
 	for _, track := range tracks {
-		if track.Disposition.Comment || isCommentaryTitle(track.Title) {
+		if track.IsCommentary() {
 			continue
 		}
 		lang := track.LanguageISO1
@@ -129,10 +127,4 @@ func langSet(langs ...string) map[string]bool {
 		}
 	}
 	return set
-}
-
-// isCommentaryTitle heuristically flags commentary tracks whose disposition
-// flag a muxer did not set but whose title says so.
-func isCommentaryTitle(title string) bool {
-	return strings.Contains(strings.ToLower(title), "commentary")
 }

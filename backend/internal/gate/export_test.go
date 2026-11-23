@@ -196,3 +196,35 @@ func indexes(tracks []probe.AudioTrack) []int {
 	}
 	return out
 }
+
+// usableLanguages feeds langtoken.Expand, so "all" must not advertise a
+// title-only commentary language: that is exactly what the resolver excludes.
+func TestUsableLanguagesSkipsTitleOnlyCommentary(t *testing.T) {
+	tracks := []probe.AudioTrack{
+		track(1, "pol", "Polski Dubbing", false),
+		track(2, "eng", "", false),
+		track(3, "jpn", "Director commentary", false),
+	}
+	got := usableLanguages(tracks)
+	want := []string{"pl", "en"}
+	if len(got) != len(want) {
+		t.Fatalf("usableLanguages = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("usableLanguages = %v, want %v", got, want)
+		}
+	}
+
+	split := SplitExportTracks(tracks, ExportPolicy{
+		TargetLanguages:    []string{"pl"},
+		ReferenceLanguages: []string{"all"},
+		ExcludeCommentary:  false,
+	})
+	if len(split.Policy) != 2 || split.Policy[0].Index != 1 || split.Policy[1].Index != 2 {
+		t.Errorf("policy = %v, want tracks 1,2", indexes(split.Policy))
+	}
+	if len(split.Extras) != 1 || split.Extras[0].Index != 3 {
+		t.Errorf("extras = %v, want the commentary track 3 as opt-in", indexes(split.Extras))
+	}
+}

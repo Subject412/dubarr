@@ -96,6 +96,14 @@ type AudioTrack struct {
 	Disposition   Disposition `json:"disposition"`
 }
 
+// IsCommentary reports whether the track is commentary: either the muxer set
+// the disposition flag or the title says so (some muxers drop the flag). Both
+// the reference resolver and the export policy share this predicate so
+// title-only commentary is excluded identically on every path.
+func (t AudioTrack) IsCommentary() bool {
+	return t.Disposition.Comment || strings.Contains(strings.ToLower(t.Title), "commentary")
+}
+
 // MediaInfo is the probe result for one file.
 type MediaInfo struct {
 	Path       string        `json:"path"`

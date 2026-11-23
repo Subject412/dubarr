@@ -462,3 +462,30 @@ func TestReportPredicates(t *testing.T) {
 		t.Error("resolved low-pass pair is not classified lowpass")
 	}
 }
+
+// The "all" token must not turn a title-only commentary track into a
+// reference: export already excludes it, so the resolver must agree.
+func TestResolveAllSkipsTitleOnlyCommentary(t *testing.T) {
+	vault := []probe.AudioTrack{
+		track(1, 2, "eng"),
+		commentaryByTitle(track(2, 6, "jpn"), "Director commentary"),
+	}
+	target := []probe.AudioTrack{
+		track(1, 2, "eng"),
+		commentaryByTitle(track(2, 6, "jpn"), "Director commentary"),
+	}
+	policy := Languages{
+		Targets:    []string{"pl"},
+		References: []string{"all"},
+	}
+	got := Resolve(target, vault, policy, "")
+	want := []string{"en"}
+	if !equal(gotLangs(got), want) {
+		t.Fatalf("pairs = %v, want %v (title-only commentary is never a reference)", gotLangs(got), want)
+	}
+}
+
+func commentaryByTitle(t probe.AudioTrack, title string) probe.AudioTrack {
+	t.Title = title
+	return t
+}

@@ -31,4 +31,14 @@ var (
 	// ErrPublish reports a filesystem failure while copying, backing up or
 	// atomically renaming the muxed output.
 	ErrPublish = errors.New("mux: atomic publish failed")
+	// ErrOutputDir reports an unusable storage.paths.output_dir: missing,
+	// not a directory or not resolvable. Separate mode cannot publish.
+	ErrOutputDir = errors.New("mux: output directory is not usable")
+	// ErrOutputExists reports a separate-mode destination that already exists.
+	// ADR-0011 forbids overwriting or auto-suffixing it.
+	ErrOutputExists = errors.New("mux: separate output already exists")
+	// ErrCrossDevice reports a rename across filesystems. There is
+	// deliberately no copy+delete fallback: it would lose atomicity
+	// (ADR-0011).
+	ErrCrossDevice = errors.New("mux: cannot publish across filesystems")
 )

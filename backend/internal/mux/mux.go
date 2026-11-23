@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Subject412/dubarr/backend/internal/analyze"
@@ -25,6 +26,17 @@ import (
 // DefaultTimeout bounds one mkvmerge remux. Unlike probe/gate this is a bulk
 // operation, so the hang guard is generous rather than a performance budget.
 const DefaultTimeout = 30 * time.Minute
+
+// Mux output destination modes (ADR-0011). The zero value means replace, so a
+// caller that does not know about modes keeps the historical behaviour.
+const (
+	OutputModeReplace  = "replace"
+	OutputModeSeparate = "separate"
+)
+
+// SeparateSuffix is appended to the source Target basename in separate mode:
+// "Movie (2021) [TDARR].mkv" becomes "Movie (2021) [TDARR].dubarr.mkv".
+const SeparateSuffix = ".dubarr.mkv"
 
 // Candidate is one queued vault track that may be muxed into the target. M5-3
 // supplies the queue; Mux only resolves it.
@@ -71,6 +83,14 @@ type Job struct {
 	SetDefault bool
 	// Gate is the target.tag_filter rule re-checked against the base filename.
 	Gate gate.Rule
+	// OutputMode is "" or "replace" (atomic replace of TargetPath) or
+	// "separate" (write <basename>.dubarr.mkv into OutputDir and leave the
+	// Target untouched, ADR-0011).
+	OutputMode string
+	// OutputDir is storage.paths.output_dir, used only in separate mode. It
+	// must already exist; Mux canonicalizes it with EvalSymlinks and confines
+	// the destination to it.
+	OutputDir string
 	// Force bypasses the filename gate only when security.options
 	// allow_force_tag_override is on; the caller owns that switch.
 	Force bool
@@ -127,6 +147,10 @@ type Muxer struct {
 	// remove deletes the sidecar backup when Job.KeepBak is false. Overridable
 	// so tests can exercise the WARN-but-succeed path.
 	remove func(string) error
+	// rename publishes the validated temp. It is os.Rename in production,
+	// same-directory on both sides, and overridable so tests can prove a
+	// cross-device failure aborts instead of falling back to copy+delete.
+	rename func(oldpath, newpath string) error
 	warnf  func(string, ...any)
 }
 
@@ -139,6 +163,7 @@ func New(deps Dependencies) *Muxer {
 		run:          deps.Run,
 		timeout:      deps.Timeout,
 		remove:       os.Remove,
+		rename:       os.Rename,
 		warnf:        deps.Warnf,
 	}
 	if m.warnf == nil {
@@ -162,12 +187,15 @@ func New(deps Dependencies) *Muxer {
 //
 // Order is deliberate: verdict, ambiguity and the Tdarr Gate are all resolved
 // read-only before the first write, so an abort leaves the target directory and
-// the Work Area untouched. The target is then copied into
-// {WORK_DIR}/jobs/{id}/, mkvmerge writes a uniquely named hidden temp beside
-// the target (same filesystem), ffprobe validates the result, the original is
-// copied to <target>.bak, and only then is the temp renamed over the original.
-// Any failure removes only the temp this call created and leaves the original
-// bytes in place; staging cleanup belongs to the caller.
+// the Work Area untouched. The destination (ADR-0011) is resolved next: replace
+// mode publishes over the Target, separate mode publishes
+// <basename>.dubarr.mkv in Job.OutputDir and refuses to overwrite an existing
+// file. The target is then copied into {WORK_DIR}/jobs/{id}/, mkvmerge writes a
+// uniquely named hidden temp in the destination directory (same filesystem),
+// ffprobe validates the result, and only then is the temp renamed into place —
+// after a backup copy of the original in replace mode. Any failure removes only
+// the temp this call created and leaves the original bytes in place; staging
+// cleanup belongs to the caller.
 func (m *Muxer) Mux(ctx context.Context, job Job) (Result, error) {
 	target, _, jobDir, lang, err := job.normalize()
 	if err != nil {
@@ -212,6 +240,14 @@ func (m *Muxer) Mux(ctx context.Context, job Job) (Result, error) {
 		title = DefaultTrackTitle(lang)
 	}
 
+	// Resolve (and in separate mode validate and reserve) the publish
+	// destination before any write, so an unusable destination cannot leave a
+	// work copy or a temp behind.
+	mode, dest, err := resolveDestination(target, job)
+	if err != nil {
+		return Result{}, err
+	}
+
 	if err := os.MkdirAll(jobDir, 0o755); err != nil {
 		return Result{}, fmt.Errorf("%w: create job dir: %v", ErrPublish, err)
 	}
@@ -239,10 +275,11 @@ func (m *Muxer) Mux(ctx context.Context, job Job) (Result, error) {
 		return Result{}, fmt.Errorf("%w: pre-mux probe of %s: %v", ErrTool, filepath.Base(workCopy), err)
 	}
 
-	// The temp name is unique per job and reserved with O_EXCL, so two
-	// concurrent Mux calls on one target never share (or delete) each other's
-	// work. Only the file this call created is removed on failure.
-	temp, tempOut, err := createTempBeside(target, "dubarr", 0o644)
+	// The temp is unique per job and reserved with O_EXCL, so two concurrent
+	// Mux calls never share (or delete) each other's work. It is created in
+	// the destination directory so the later rename stays on one filesystem.
+	// Only the file this call created is removed on failure.
+	temp, tempOut, err := createTempBeside(dest, "dubarr", 0o644)
 	if err != nil {
 		return Result{}, err
 	}
@@ -282,22 +319,27 @@ func (m *Muxer) Mux(ctx context.Context, job Job) (Result, error) {
 		return Result{}, err
 	}
 
-	bak := target + ".bak"
-	if err := writeBackup(target, bak, info.Mode().Perm()); err != nil {
-		return Result{}, fmt.Errorf("%w: backup: %v", ErrPublish, err)
+	bak := ""
+	if mode == OutputModeReplace {
+		bak = target + ".bak"
+		if err := writeBackup(target, bak, info.Mode().Perm()); err != nil {
+			return Result{}, fmt.Errorf("%w: backup: %v", ErrPublish, err)
+		}
 	}
-	// Same directory as the target, so this rename is atomic on one
-	// filesystem. The temp is flushed above; the original is still intact
-	// until this succeeds.
-	if err := os.Rename(temp, target); err != nil {
-		return Result{}, fmt.Errorf("%w: rename output: %v", ErrPublish, err)
+	// Same directory as the destination, so this rename is atomic on one
+	// filesystem. The temp is flushed above; in replace mode the original is
+	// still intact until this succeeds. A cross-device rename is a hard error:
+	// there is no copy+delete fallback (ADR-0011).
+	if err := m.publish(temp, dest); err != nil {
+		return Result{}, err
 	}
 	published = true
 
 	// mux.options.keep_bak=false: the validated, published target is the only
 	// artifact left. The backup is a convenience, so a failed removal is a WARN
-	// and never undoes a successful publish.
-	if job.KeepBak != nil && !*job.KeepBak {
+	// and never undoes a successful publish. Separate mode ignores keep_bak:
+	// nothing was replaced, so there is no backup.
+	if mode == OutputModeReplace && job.KeepBak != nil && !*job.KeepBak {
 		if err := m.remove(bak); err != nil {
 			m.warnf("mux: keep the backup at %s: %v", bak, err)
 		} else {
@@ -306,7 +348,7 @@ func (m *Muxer) Mux(ctx context.Context, job Job) (Result, error) {
 	}
 
 	return Result{
-		OutputPath: target,
+		OutputPath: dest,
 		BackupPath: bak,
 		WorkCopy:   workCopy,
 		AudioPath:  audio,
@@ -314,6 +356,59 @@ func (m *Muxer) Mux(ctx context.Context, job Job) (Result, error) {
 		TrackTitle: title,
 		Command:    append([]string{bin}, args...),
 	}, nil
+}
+
+// publish renames the validated temp into place. EXDEV means the destination
+// and the temp ended up on different filesystems; that is a configuration
+// error to report, never a reason to copy and delete (which would lose the
+// atomic publish guarantee, ADR-0011).
+func (m *Muxer) publish(temp, dest string) error {
+	if err := m.rename(temp, dest); err != nil {
+		if errors.Is(err, syscall.EXDEV) {
+			return fmt.Errorf("%w: %s and %s are on different filesystems: %v", ErrCrossDevice, temp, dest, err)
+		}
+		return fmt.Errorf("%w: rename output: %v", ErrPublish, err)
+	}
+	return nil
+}
+
+// resolveDestination maps Job.OutputMode onto a publish path.
+//
+// replace (the zero value) publishes over the Target. separate canonicalizes
+// Job.OutputDir with EvalSymlinks, requires it to be an existing directory,
+// derives "<basename>.dubarr.mkv" from the Target and fails when that file
+// already exists: no silent overwrite, no auto-suffixing (ADR-0011).
+func resolveDestination(target string, job Job) (mode, dest string, err error) {
+	switch strings.ToLower(strings.TrimSpace(job.OutputMode)) {
+	case "", OutputModeReplace:
+		return OutputModeReplace, target, nil
+	case OutputModeSeparate:
+	default:
+		return "", "", fmt.Errorf("%w: output mode %q", ErrInvalidJob, job.OutputMode)
+	}
+	if strings.TrimSpace(job.OutputDir) == "" {
+		return "", "", fmt.Errorf("%w: separate output mode requires storage.paths.output_dir", ErrInvalidJob)
+	}
+	abs, err := filepath.Abs(job.OutputDir)
+	if err != nil {
+		return "", "", fmt.Errorf("%w: resolve output dir: %v", ErrInvalidJob, err)
+	}
+	dir, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", "", fmt.Errorf("%w: output dir %s: %v", ErrOutputDir, job.OutputDir, err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil || !info.IsDir() {
+		return "", "", fmt.Errorf("%w: %s is not a directory", ErrOutputDir, dir)
+	}
+	base := strings.TrimSuffix(filepath.Base(target), filepath.Ext(target))
+	dest = filepath.Join(dir, base+SeparateSuffix)
+	if _, err := os.Lstat(dest); err == nil {
+		return "", "", fmt.Errorf("%w: %s", ErrOutputExists, dest)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", "", fmt.Errorf("%w: stat %s: %v", ErrPublish, dest, err)
+	}
+	return OutputModeSeparate, dest, nil
 }
 
 // normalize validates the job shape and returns canonical paths. Symlinks are

@@ -10,6 +10,11 @@ import {
   api,
   type ApiTokenCreated,
   type ApiTokensResponse,
+  type ArrConnection,
+  type ArrConnectionKind,
+  type ArrConnectionPayload,
+  type ArrConnectionsResponse,
+  type ArrConnectionTestResult,
   type AuthStatus,
   type BrowseResponse,
   type CreateSyncJobBody,
@@ -36,6 +41,7 @@ export const queryKeys = {
   browse: (path: string) => ['browse', path] as const,
   librarySearch: (q: string) => ['library', 'search', q] as const,
   tokens: ['auth', 'tokens'] as const,
+  arrConnections: ['settings', 'arr'] as const,
 }
 
 /** Public first-run probe; drives the route gate. */
@@ -62,6 +68,58 @@ export function useSettings(enabled = true): UseQueryResult<SettingsEnvelope> {
     queryKey: queryKeys.settings,
     queryFn: api.settings,
     enabled,
+  })
+}
+
+/**
+ * Saved Radarr/Sonarr connections. Never returns plaintext keys: the API only
+ * exposes the masked suffix, and the query is invalidated after every write.
+ */
+export function useArrConnections(enabled = true): UseQueryResult<ArrConnectionsResponse> {
+  return useQuery({
+    queryKey: queryKeys.arrConnections,
+    queryFn: api.arrConnections,
+    enabled,
+    retry: false,
+  })
+}
+
+export function useSaveArrConnection(): UseMutationResult<
+  ArrConnection,
+  Error,
+  { kind: ArrConnectionKind; payload: ArrConnectionPayload }
+> {
+  const client = useQueryClient()
+  return useMutation({
+    mutationFn: ({ kind, payload }) => api.saveArrConnection(kind, payload),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: queryKeys.arrConnections })
+    },
+  })
+}
+
+export function useDeleteArrConnection(): UseMutationResult<void, Error, ArrConnectionKind> {
+  const client = useQueryClient()
+  return useMutation({
+    mutationFn: (kind) => api.deleteArrConnection(kind),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: queryKeys.arrConnections })
+    },
+  })
+}
+
+export function useTestArrConnection(): UseMutationResult<
+  ArrConnectionTestResult,
+  Error,
+  ArrConnectionKind
+> {
+  const client = useQueryClient()
+  return useMutation({
+    mutationFn: (kind) => api.testArrConnection(kind),
+    onSuccess: () => {
+      // A successful ping reflects the saved connection, so refresh the list.
+      void client.invalidateQueries({ queryKey: queryKeys.arrConnections })
+    },
   })
 }
 

@@ -1,4 +1,4 @@
-import type { SettingsKey } from './api'
+import type { SettingsSectionKey } from './settings-sections'
 
 /**
  * Static help copy for the Settings page, keyed by settings section and field.
@@ -6,7 +6,7 @@ import type { SettingsKey } from './api'
  * inline in the form (placeholders, ranges). This module is presentation only —
  * help strings are never part of the settings payload or stored settings.
  */
-export const SETTINGS_HELP: Record<SettingsKey, Record<string, string>> = {
+export const SETTINGS_HELP: Record<SettingsSectionKey, Record<string, string>> = {
   'storage.paths': {
     watch_dir:
       'Watch Folder: the dropzone scanned for new donors. A file is only picked up once its size is stable across two checks.',
@@ -72,6 +72,20 @@ export const SETTINGS_HELP: Record<SettingsKey, Record<string, string>> = {
     donor_patterns:
       'Sibling filenames that mark a dropped file as a donor dub. Without * a pattern is a substring match; with * it is a glob.',
   },
+  'arr.connections': {
+    radarr_base_url:
+      'Root URL of the Radarr instance including the scheme, e.g. http://192.168.1.10:7878. A missing http:// or https:// is rejected, never guessed.',
+    radarr_api_key:
+      'Radarr API key (Settings → General in Radarr). It is stored encrypted server-side; leave the field blank to keep the saved key.',
+    radarr_enabled:
+      'Only enabled connections are used for library sync and original-language lookups.',
+    sonarr_base_url:
+      'Root URL of the Sonarr instance including the scheme, e.g. http://192.168.1.10:8989. A missing http:// or https:// is rejected, never guessed.',
+    sonarr_api_key:
+      'Sonarr API key (Settings → General in Sonarr). It is stored encrypted server-side; leave the field blank to keep the saved key.',
+    sonarr_enabled:
+      'Only enabled connections are used for library sync and original-language lookups.',
+  },
   'arr.options': {
     poll_interval_sec: 'How often the Radarr/Sonarr libraries are refreshed.',
     manual_sync: 'Allow triggering an arr library sync from the UI as well as on the poll timer.',
@@ -79,6 +93,6 @@ export const SETTINGS_HELP: Record<SettingsKey, Record<string, string>> = {
 }
 
 /** Help text for one settings field, or `undefined` when none is authored. */
-export function settingsHelp(section: SettingsKey, field: string): string | undefined {
+export function settingsHelp(section: SettingsSectionKey, field: string): string | undefined {
   return SETTINGS_HELP[section][field]
 }

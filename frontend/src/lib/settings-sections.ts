@@ -1,12 +1,20 @@
 import type { SettingsKey } from './api'
 
 /**
+ * Keys of the cards rendered on the Settings page. `arr.connections` is not a
+ * section of the generic settings envelope: it is backed by the dedicated,
+ * masked arr-connection endpoints, but it still needs a card, a nav entry and
+ * an anchor like every other category.
+ */
+export type SettingsSectionKey = SettingsKey | 'arr.connections'
+
+/**
  * Single source of truth for the settings categories. The Settings page renders
  * its cards from this list and the AppShell submenu is built from it, so the
  * navigation cannot drift from the rendered sections.
  */
 export type SettingsSection = {
-  key: SettingsKey
+  key: SettingsSectionKey
   title: string
   description: string
 }
@@ -54,6 +62,12 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
       'Sibling filenames that mark a dropped file as a donor dub. Matching is case-insensitive; a pattern without * is a substring match, with * a glob.',
   },
   {
+    key: 'arr.connections',
+    title: 'Radarr / Sonarr connections',
+    description:
+      'Saved Radarr and Sonarr instances. API keys are encrypted server-side and only ever shown masked.',
+  },
+  {
     key: 'arr.options',
     title: '*arr options',
     description: 'Radarr/Sonarr polling.',
@@ -61,22 +75,22 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
 ]
 
 /** Stable DOM id for a section card, derived from its settings key. */
-export function settingsSectionId(key: SettingsKey): string {
+export function settingsSectionId(key: SettingsSectionKey): string {
   return `settings-${key.replace(/\./g, '-')}`
 }
 
-export function settingsSection(key: SettingsKey): SettingsSection {
+export function settingsSection(key: SettingsSectionKey): SettingsSection {
   const section = SETTINGS_SECTIONS.find((candidate) => candidate.key === key)
   if (!section) throw new Error(`unknown settings section: ${key}`)
   return section
 }
 
-export function isSettingsSectionKey(value: string | null): value is SettingsKey {
+export function isSettingsSectionKey(value: string | null): value is SettingsSectionKey {
   return Boolean(value) && SETTINGS_SECTIONS.some((section) => section.key === value)
 }
 
 /** Reverse of {@link settingsSectionId}: maps a rendered card id back to its key. */
-export function settingsSectionKeyFromId(id: string): SettingsKey | null {
+export function settingsSectionKeyFromId(id: string): SettingsSectionKey | null {
   const section = SETTINGS_SECTIONS.find((candidate) => settingsSectionId(candidate.key) === id)
   return section ? section.key : null
 }

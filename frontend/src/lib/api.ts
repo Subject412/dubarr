@@ -95,6 +95,36 @@ export type ArrOptions = {
   manual_sync: boolean
 }
 
+/** Supported *arr applications; also the `{kind}` path segment on the API. */
+export type ArrConnectionKind = 'radarr' | 'sonarr'
+
+/**
+ * One saved Radarr/Sonarr connection as returned by GET /api/settings/arr.
+ * `api_key` is always the server mask (e.g. `********abcd`), never plaintext.
+ */
+export type ArrConnection = {
+  kind: ArrConnectionKind
+  base_url: string
+  enabled: boolean
+  api_key: string
+}
+
+export type ArrConnectionsResponse = {
+  instances: ArrConnection[]
+}
+
+/** PUT /api/settings/arr/{kind} body. An omitted `api_key` keeps the stored key. */
+export type ArrConnectionPayload = {
+  base_url: string
+  api_key?: string
+  enabled: boolean
+}
+
+export type ArrConnectionTestResult = {
+  ok: boolean
+  kind: ArrConnectionKind
+}
+
 /** Sibling filenames that mark a dropped file as a donor dub. */
 export type ImportsOptions = {
   donor_patterns: string[]
@@ -340,6 +370,16 @@ export const api = {
       body: JSON.stringify({ settings }),
     }),
   exportSettings: () => request<SettingsExport>('/api/settings/export'),
+  arrConnections: () => request<ArrConnectionsResponse>('/api/settings/arr'),
+  saveArrConnection: (kind: ArrConnectionKind, payload: ArrConnectionPayload) =>
+    request<ArrConnection>(`/api/settings/arr/${kind}`, {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    }),
+  deleteArrConnection: (kind: ArrConnectionKind) =>
+    request<void>(`/api/settings/arr/${kind}`, { method: 'DELETE' }),
+  testArrConnection: (kind: ArrConnectionKind) =>
+    request<ArrConnectionTestResult>(`/api/settings/arr/${kind}/test`, { method: 'POST' }),
   browse: (path: string) =>
     request<BrowseResponse>(`/api/system/browse?path=${encodeURIComponent(path)}`),
   health: () => request<Health>('/api/health'),

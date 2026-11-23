@@ -22,7 +22,9 @@ import {
   settingsSection,
   settingsSectionId,
   settingsSectionKeyFromId,
+  type SettingsSectionKey,
 } from '../lib/settings-sections'
+import { ArrConnectionsSection } from '../components/ArrConnections'
 import { PathField, PathListEditor } from '../components/PathPicker'
 import { ThemeSelector } from '../components/ThemeSelector'
 import {
@@ -161,9 +163,9 @@ export function SettingsPage() {
   const [searchParams, setSearchParams] = useSearchParams()
   const sectionParam = searchParams.get('section')
   const activeSection = isSettingsSectionKey(sectionParam) ? sectionParam : null
-  const activeSectionRef = useRef<SettingsKey | null>(activeSection)
+  const activeSectionRef = useRef<SettingsSectionKey | null>(activeSection)
   // URL writes made by the observer itself must not scroll the page again.
-  const scrollFromObserver = useRef<SettingsKey | null>(null)
+  const scrollFromObserver = useRef<SettingsSectionKey | null>(null)
   // Programmatic scrolling fires observer entries; ignore them briefly so the
   // explicit selection is not immediately overwritten.
   const ignoreObserverUntil = useRef(0)
@@ -576,6 +578,8 @@ export function SettingsPage() {
               />
             )}
           </Section>
+
+          <ArrConnectionsSection />
 
           <Section<ArrOptions>
             sectionKey="arr.options"

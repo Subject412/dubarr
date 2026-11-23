@@ -20,21 +20,37 @@ import (
 
 // DefaultInterval is the settled *arr poll cadence (PLAN.md settled defaults:
 // "arr sync manual + 5-min poll"; settings arr.options.poll_interval_sec = 300).
+// Tags and root folders ride the same pass, so an arr tag edit becomes visible
+// to eligibility within one interval — at most 300 s (ADR-0009).
 const DefaultInterval = 300 * time.Second
 
 // ErrMissingAPIKey reports an enabled instance whose API key is not in the
 // secret store. The pass skips that instance and keeps its cache.
 var ErrMissingAPIKey = errors.New("arrsync: arr instance has no API key")
 
+// tagSource is the /api/v3/tag read both products provide.
+type tagSource interface {
+	Tags(ctx context.Context) ([]arr.Tag, error)
+}
+
+// rootFolderSource is the /api/v3/rootfolder read both products provide.
+type rootFolderSource interface {
+	RootFolders(ctx context.Context) ([]arr.RootFolder, error)
+}
+
 // RadarrSource is the Radarr read surface the poller needs; *arr.RadarrClient
 // satisfies it.
 type RadarrSource interface {
+	tagSource
+	rootFolderSource
 	Movies(ctx context.Context) ([]arr.Movie, error)
 }
 
 // SonarrSource is the Sonarr read surface the poller needs; *arr.SonarrClient
 // satisfies it.
 type SonarrSource interface {
+	tagSource
+	rootFolderSource
 	Series(ctx context.Context) ([]arr.Series, error)
 	Episodes(ctx context.Context, seriesID int) ([]arr.Episode, error)
 }
@@ -279,6 +295,13 @@ func (p *Poller) listItems(ctx context.Context, conn settings.ArrConnection, api
 		if err != nil {
 			return nil, fmt.Errorf("arrsync: %w", err)
 		}
+		// A failed tag/root-folder read fails the instance so the previous
+		// snapshot stays; caching empty metadata would silently change
+		// eligibility once the gate consumes it (ADR-0009).
+		labels, roots, err := p.arrMetadata(ctx, client, conn.Kind)
+		if err != nil {
+			return nil, err
+		}
 		movies, err := client.Movies(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("arrsync: list radarr movies: %w", err)
@@ -290,6 +313,7 @@ func (p *Poller) listItems(ctx context.Context, conn settings.ArrConnection, api
 				target = movie.MovieFile.Path
 			}
 			status, matches := classifyTarget(rule, target)
+			arrIDs, arrLabels := resolveArrTags(movie.Tags, labels)
 			items = append(items, store.LibraryCacheItem{
 				MediaType:            "movie",
 				ExternalItemID:       int64(movie.ID),
@@ -298,6 +322,9 @@ func (p *Poller) listItems(ctx context.Context, conn settings.ArrConnection, api
 				OriginalLanguageISO2: probe.ISO639_1(movie.OriginalLanguage.Name),
 				Year:                 movie.Year,
 				MediaFolderPath:      movie.Path,
+				RootFolderPath:       rootFolderFor(movie.Path, roots),
+				ArrTagIDs:            arrIDs,
+				ArrTagLabels:         arrLabels,
 				TargetFilePath:       target,
 				MatchesTargetTags:    matches,
 				EligibilityStatus:    status,
@@ -308,6 +335,10 @@ func (p *Poller) listItems(ctx context.Context, conn settings.ArrConnection, api
 		client, err := p.sonarr(conn.BaseURL, apiKey)
 		if err != nil {
 			return nil, fmt.Errorf("arrsync: %w", err)
+		}
+		labels, roots, err := p.arrMetadata(ctx, client, conn.Kind)
+		if err != nil {
+			return nil, err
 		}
 		series, err := client.Series(ctx)
 		if err != nil {
@@ -322,6 +353,9 @@ func (p *Poller) listItems(ctx context.Context, conn settings.ArrConnection, api
 				return nil, fmt.Errorf("arrsync: list sonarr episodes for series %d: %w", show.ID, err)
 			}
 			lang := probe.ISO639_1(show.OriginalLanguage.Name)
+			// Sonarr tags live on the series; episodes inherit them.
+			arrIDs, arrLabels := resolveArrTags(show.Tags, labels)
+			root := rootFolderFor(show.Path, roots)
 			for _, episode := range episodes {
 				target := ""
 				if episode.HasFile && episode.EpisodeFile != nil {
@@ -341,6 +375,9 @@ func (p *Poller) listItems(ctx context.Context, conn settings.ArrConnection, api
 					EpisodeNumber:        &number,
 					EpisodeTitle:         episode.Title,
 					MediaFolderPath:      show.Path,
+					RootFolderPath:       root,
+					ArrTagIDs:            arrIDs,
+					ArrTagLabels:         arrLabels,
 					TargetFilePath:       target,
 					MatchesTargetTags:    matches,
 					EligibilityStatus:    status,
@@ -351,6 +388,72 @@ func (p *Poller) listItems(ctx context.Context, conn settings.ArrConnection, api
 	default:
 		return nil, fmt.Errorf("arrsync: unknown arr kind %q", conn.Kind)
 	}
+}
+
+// arrMetadataSource is what one pass needs beyond the library listing.
+type arrMetadataSource interface {
+	tagSource
+	rootFolderSource
+}
+
+// arrMetadata reads the instance's tag list and root folders for one pass. Tags
+// are resolved to labels here, next to the library listing, so a label rename
+// or deletion is reflected by the same sync that refreshes the items.
+func (p *Poller) arrMetadata(ctx context.Context, src arrMetadataSource, kind string) (map[int]string, []arr.RootFolder, error) {
+	tags, err := src.Tags(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("arrsync: list %s tags: %w", kind, err)
+	}
+	roots, err := src.RootFolders(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("arrsync: list %s root folders: %w", kind, err)
+	}
+	return tagLabels(tags), roots, nil
+}
+
+// tagLabels indexes one instance's tags by id.
+func tagLabels(tags []arr.Tag) map[int]string {
+	out := make(map[int]string, len(tags))
+	for _, tag := range tags {
+		out[int(tag.ID)] = tag.Label
+	}
+	return out
+}
+
+// resolveArrTags turns arr tag ids into a paired id/label snapshot. Ids the
+// instance no longer lists are dropped: keeping an unresolvable id would record
+// a tag that no longer exists, and ADR-0009 matches by label.
+func resolveArrTags(ids []int, labels map[int]string) ([]int64, []string) {
+	tagIDs := make([]int64, 0, len(ids))
+	tagLabels := make([]string, 0, len(ids))
+	for _, id := range ids {
+		label, ok := labels[id]
+		if !ok {
+			continue
+		}
+		tagIDs = append(tagIDs, int64(id))
+		tagLabels = append(tagLabels, label)
+	}
+	return tagIDs, tagLabels
+}
+
+// rootFolderFor picks the longest configured root folder containing
+// mediaFolder (canonical arr path, ADR-0009). Paths are compared as arr
+// reports them, so a root with a trailing slash still matches.
+func rootFolderFor(mediaFolder string, roots []arr.RootFolder) string {
+	best := ""
+	for _, root := range roots {
+		path := strings.TrimRight(root.Path, "/")
+		if path == "" {
+			continue
+		}
+		if mediaFolder == path || strings.HasPrefix(mediaFolder, path+"/") {
+			if len(path) > len(best) {
+				best = path
+			}
+		}
+	}
+	return best
 }
 
 // connections reads settings arr.connections.

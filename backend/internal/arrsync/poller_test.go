@@ -380,7 +380,9 @@ func readCache(t *testing.T, st *store.Store) map[string]cacheRow {
 		        COALESCE(tmdb_id,0), COALESCE(tvdb_id,0), title, COALESCE(original_language_iso2,''),
 		        COALESCE(year,0), season_number, episode_number, COALESCE(episode_title,''),
 		        COALESCE(media_folder_path,''), COALESCE(target_file_path,''),
-		        matches_target_tags, eligibility_status
+		        matches_target_tags, eligibility_status,
+		        COALESCE(arr_tag_ids_json,'[]'), COALESCE(arr_tag_labels_json,'[]'),
+		        COALESCE(root_folder_path,'')
 		 FROM arr_library_cache`)
 	if err != nil {
 		t.Fatalf("query cache: %v", err)
@@ -395,12 +397,21 @@ func readCache(t *testing.T, st *store.Store) map[string]cacheRow {
 			episode *int64
 			media   string
 			ext     int64
+			idsJSON string
+			lblJSON string
 		)
 		if err := rows.Scan(&row.ID, &row.InstanceID, &media, &ext, &row.SeriesID,
 			&row.TMDBID, &row.TVDBID, &row.Title, &row.OriginalLanguageISO2, &row.Year,
 			&season, &episode, &row.EpisodeTitle, &row.MediaFolderPath, &row.TargetFilePath,
-			&row.MatchesTargetTags, &row.EligibilityStatus); err != nil {
+			&row.MatchesTargetTags, &row.EligibilityStatus, &idsJSON, &lblJSON,
+			&row.RootFolderPath); err != nil {
 			t.Fatalf("scan cache row: %v", err)
+		}
+		if err := json.Unmarshal([]byte(idsJSON), &row.ArrTagIDs); err != nil {
+			t.Fatalf("decode arr tag ids %q: %v", idsJSON, err)
+		}
+		if err := json.Unmarshal([]byte(lblJSON), &row.ArrTagLabels); err != nil {
+			t.Fatalf("decode arr tag labels %q: %v", lblJSON, err)
 		}
 		if season != nil {
 			v := int(*season)
@@ -438,6 +449,9 @@ type cacheRow struct {
 	TargetFilePath       string
 	MatchesTargetTags    bool
 	EligibilityStatus    string
+	ArrTagIDs            []int64
+	ArrTagLabels         []string
+	RootFolderPath       string
 }
 
 func cacheIDs(t *testing.T, st *store.Store) map[string]int64 {
@@ -522,9 +536,224 @@ func TestSyncUpdatesChangedRowAndDeletesVanished(t *testing.T) {
 }
 
 type fakeRadarr struct {
-	movies []arr.Movie
+	movies  []arr.Movie
+	tags    []arr.Tag
+	roots   []arr.RootFolder
+	tagsErr error
 }
 
 func (f *fakeRadarr) Movies(context.Context) ([]arr.Movie, error) {
 	return f.movies, nil
+}
+
+func (f *fakeRadarr) Tags(context.Context) ([]arr.Tag, error) {
+	if f.tagsErr != nil {
+		return nil, f.tagsErr
+	}
+	return f.tags, nil
+}
+
+func (f *fakeRadarr) RootFolders(context.Context) ([]arr.RootFolder, error) {
+	return f.roots, nil
+}
+
+// TestSyncCachesArrTagsAndRootFolder is the M9c foundation path: tags are
+// resolved to labels from /api/v3/tag, episodes inherit their series' tags and
+// every row records the longest matching canonical root-folder path.
+func TestSyncCachesArrTagsAndRootFolder(t *testing.T) {
+	r := newRig(t)
+	radarr := arrmock.New(arrmock.Radarr, "key-radarr", arrmock.Fixtures{
+		Tags: []arrmock.Tag{
+			{ID: 1, Label: "dub"},
+			{ID: 4, Label: "Polish Dubbing"},
+			{ID: 9, Label: "unused"},
+		},
+		// /media/movies wins over /media: the canonical root is the most
+		// specific configured prefix.
+		RootFolders: []arrmock.RootFolder{{ID: 1, Path: "/media"}, {ID: 2, Path: "/media/movies"}},
+		Movies: []arrmock.Movie{{
+			ID: 7, Title: "Shrek", Year: 2001, TmdbID: 808, HasFile: true,
+			Path: "/media/movies/Shrek (2001)", Tags: []int{4, 1},
+			OriginalLanguage: arrmock.Language{ID: 1, Name: "English"},
+			MovieFile:        &arrmock.MovieFile{Path: "/media/movies/Shrek (2001)/Shrek [ArcA310].mkv"},
+		}},
+	})
+	defer radarr.Close()
+	sonarr := arrmock.New(arrmock.Sonarr, "key-sonarr", arrmock.Fixtures{
+		Tags:        []arrmock.Tag{{ID: 2, Label: "keep"}},
+		RootFolders: []arrmock.RootFolder{{ID: 1, Path: "/media/tv"}},
+		Series: []arrmock.Series{{
+			ID: 3, Title: "The Expanse", Year: 2015, TvdbID: 280619,
+			Path: "/media/tv/The Expanse", Tags: []int{2},
+			OriginalLanguage: arrmock.Language{ID: 2, Name: "English"},
+		}},
+		Episodes: []arrmock.Episode{{
+			ID: 42, SeriesID: 3, SeasonNumber: 1, EpisodeNumber: 1, Title: "Dulcinea", HasFile: true,
+			EpisodeFile: &arrmock.EpisodeFile{Path: "/media/tv/The Expanse/Season 01/S01E01.mkv"},
+		}},
+	})
+	defer sonarr.Close()
+
+	r.configure(
+		settings.ArrConnection{Kind: "radarr", BaseURL: radarr.URL, Enabled: true},
+		settings.ArrConnection{Kind: "sonarr", BaseURL: sonarr.URL, Enabled: true},
+	)
+	r.key("radarr", radarr.APIKey())
+	r.key("sonarr", sonarr.APIKey())
+
+	if _, err := r.newPoller(time.Minute).Sync(context.Background()); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+
+	rows := readCache(t, r.store)
+	movie := rows["movie|7"]
+	if want := []int64{1, 4}; !equalInt64s(movie.ArrTagIDs, want) {
+		t.Errorf("movie tag ids = %v, want %v", movie.ArrTagIDs, want)
+	}
+	if want := []string{"dub", "Polish Dubbing"}; !equalStrings(movie.ArrTagLabels, want) {
+		t.Errorf("movie tag labels = %v, want %v", movie.ArrTagLabels, want)
+	}
+	if movie.RootFolderPath != "/media/movies" {
+		t.Errorf("movie root folder = %q, want /media/movies", movie.RootFolderPath)
+	}
+
+	episode := rows["episode|42"]
+	if want := []int64{2}; !equalInt64s(episode.ArrTagIDs, want) {
+		t.Errorf("episode tag ids = %v, want the series tags %v", episode.ArrTagIDs, want)
+	}
+	if want := []string{"keep"}; !equalStrings(episode.ArrTagLabels, want) {
+		t.Errorf("episode tag labels = %v, want %v", episode.ArrTagLabels, want)
+	}
+	if episode.RootFolderPath != "/media/tv" {
+		t.Errorf("episode root folder = %q, want /media/tv", episode.RootFolderPath)
+	}
+}
+
+// TestSyncRefreshesArrTagSnapshot pins the poll refresh: a tag removed from the
+// item, and a tag deleted from the instance, both disappear on the next pass
+// instead of lingering in the cache.
+func TestSyncRefreshesArrTagSnapshot(t *testing.T) {
+	r := newRig(t)
+	r.configure(settings.ArrConnection{Kind: "radarr", BaseURL: "http://radarr.invalid", Enabled: true})
+	if err := r.secrets.Set("arr.radarr.api_key", "key"); err != nil {
+		t.Fatalf("set secret: %v", err)
+	}
+
+	src := &fakeRadarr{
+		tags:  []arr.Tag{{ID: 1, Label: "dub"}, {ID: 4, Label: "Polish Dubbing"}},
+		roots: []arr.RootFolder{{Path: "/media/movies"}},
+		movies: []arr.Movie{{
+			ID: 7, Title: "Shrek", Year: 2001, HasFile: true,
+			Path: "/media/movies/Shrek", Tags: []int{1, 4},
+			OriginalLanguage: arr.Language{ID: 1, Name: "English"},
+			MovieFile:        &arr.MediaFile{Path: "/media/movies/Shrek/Shrek.mkv"},
+		}},
+	}
+	p, err := New(Deps{
+		Store: r.store, Settings: r.settings, Secrets: r.secrets,
+		Interval:  time.Minute,
+		NewRadarr: func(baseURL, apiKey string) (RadarrSource, error) { return src, nil },
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := p.Sync(context.Background()); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	before := readCache(t, r.store)["movie|7"]
+	if len(before.ArrTagLabels) != 2 {
+		t.Fatalf("initial labels = %v, want 2", before.ArrTagLabels)
+	}
+
+	// The operator removed tag 1 from the movie and deleted tag 4 from Radarr.
+	src.movies[0].Tags = []int{4}
+	src.tags = []arr.Tag{{ID: 1, Label: "dub"}}
+	stats, err := p.Sync(context.Background())
+	if err != nil {
+		t.Fatalf("Sync (changed): %v", err)
+	}
+	if stats.Updated != 1 {
+		t.Fatalf("stats = %+v, want 1 updated", stats)
+	}
+	after := readCache(t, r.store)["movie|7"]
+	if after.ID != before.ID {
+		t.Errorf("row id = %d, want %d (update in place)", after.ID, before.ID)
+	}
+	if len(after.ArrTagLabels) != 0 {
+		t.Errorf("labels = %v, want empty: id 4 is no longer reachable from the instance tag list", after.ArrTagLabels)
+	}
+	if len(after.ArrTagIDs) != 0 {
+		t.Errorf("ids = %v, want empty (unresolvable ids are not persisted)", after.ArrTagIDs)
+	}
+}
+
+// TestSyncFailsInstanceWhenTagsUnreadable pins fail-closed metadata: a failed
+// tag read leaves the previous snapshot in place instead of caching an empty
+// one (which would silently change eligibility later).
+func TestSyncFailsInstanceWhenTagsUnreadable(t *testing.T) {
+	r := newRig(t)
+	r.configure(settings.ArrConnection{Kind: "radarr", BaseURL: "http://radarr.invalid", Enabled: true})
+	if err := r.secrets.Set("arr.radarr.api_key", "key"); err != nil {
+		t.Fatalf("set secret: %v", err)
+	}
+
+	src := &fakeRadarr{
+		tags: []arr.Tag{{ID: 1, Label: "dub"}},
+		movies: []arr.Movie{{
+			ID: 7, Title: "Shrek", Year: 2001, HasFile: true,
+			Path: "/media/movies/Shrek", Tags: []int{1},
+			OriginalLanguage: arr.Language{ID: 1, Name: "English"},
+			MovieFile:        &arr.MediaFile{Path: "/media/movies/Shrek/Shrek.mkv"},
+		}},
+	}
+	p, err := New(Deps{
+		Store: r.store, Settings: r.settings, Secrets: r.secrets,
+		Interval:  time.Minute,
+		NewRadarr: func(baseURL, apiKey string) (RadarrSource, error) { return src, nil },
+		Logf:      t.Logf,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := p.Sync(context.Background()); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	before := readCache(t, r.store)["movie|7"]
+
+	src.tagsErr = errors.New("radarr unavailable")
+	stats, err := p.Sync(context.Background())
+	if err == nil {
+		t.Fatal("Sync succeeded although the tag read failed")
+	}
+	if stats.Failed != 1 || stats.Updated != 0 || stats.Deleted != 0 {
+		t.Fatalf("stats = %+v, want 1 failed instance and no cache writes", stats)
+	}
+	after := readCache(t, r.store)["movie|7"]
+	if after.ID != before.ID || len(after.ArrTagLabels) != 1 || after.ArrTagLabels[0] != "dub" {
+		t.Errorf("cache row = %+v, want the previous snapshot untouched", after)
+	}
+}
+
+func equalInt64s(a, b []int64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

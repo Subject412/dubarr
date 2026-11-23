@@ -76,7 +76,9 @@ describe('session expiry (IMP-2, MIN-2)', () => {
     const { client } = renderWithProviders(<App />, { route: '/library' })
     const clear = vi.spyOn(client, 'clear')
 
-    const button = await screen.findByRole('button', { name: /log out/i })
+    // Account actions moved into the username menu (issue #6).
+    await user.click(await screen.findByRole('button', { name: 'admin' }))
+    const button = await screen.findByRole('menuitem', { name: /log out/i })
     await user.click(button)
 
     await waitFor(() => expect(clear).toHaveBeenCalled())

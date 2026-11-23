@@ -328,6 +328,11 @@ export const api = {
       body: JSON.stringify({ username, password }),
     }),
   logout: () => request<void>('/api/auth/logout', { method: 'POST' }),
+  changePassword: (currentPassword: string, newPassword: string) =>
+    request<void>('/api/auth/password', {
+      method: 'POST',
+      body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }),
+    }),
   settings: () => request<SettingsEnvelope>('/api/settings'),
   saveSettings: (settings: Record<string, unknown>) =>
     request<SettingsEnvelope>('/api/settings', {

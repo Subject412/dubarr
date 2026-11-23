@@ -243,6 +243,20 @@ export function useLogout(): UseMutationResult<void, Error, void> {
   })
 }
 
+/**
+ * Changes the signed-in user's password. The server keeps this session valid
+ * and revokes the user's other sessions, so there is nothing to redirect to.
+ */
+export function useChangePassword(): UseMutationResult<
+  void,
+  Error,
+  { currentPassword: string; newPassword: string }
+> {
+  return useMutation({
+    mutationFn: ({ currentPassword, newPassword }) => api.changePassword(currentPassword, newPassword),
+  })
+}
+
 export function useSaveSettings(): UseMutationResult<
   SettingsEnvelope,
   Error,

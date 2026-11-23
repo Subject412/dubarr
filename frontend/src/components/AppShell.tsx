@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Link, NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { useLogout, useMe } from '../lib/hooks'
 import { cn } from '../lib/cn'
@@ -7,7 +7,8 @@ import {
   SETTINGS_SECTIONS,
   type SettingsSection,
 } from '../lib/settings-sections'
-import { Badge, Button } from './ui'
+import { Badge } from './ui'
+import { ChangePasswordDialog } from './ChangePasswordDialog'
 
 type NavChild = {
   to: string
@@ -60,6 +61,28 @@ export function AppShell() {
   // the chevron overrides it until the next top-level navigation.
   const [manuallyExpanded, setManuallyExpanded] = useState<boolean | null>(null)
   const settingsExpanded = manuallyExpanded ?? onSettings
+
+  // Account menu: the username badge is its trigger.
+  const [menuOpen, setMenuOpen] = useState(false)
+  const [passwordOpen, setPasswordOpen] = useState(false)
+  const menuRef = useRef<HTMLDivElement>(null)
+
+  // Close on outside click and on Escape, as the menu has no backdrop.
+  useEffect(() => {
+    if (!menuOpen) return
+    const onPointerDown = (event: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(event.target as Node)) setMenuOpen(false)
+    }
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setMenuOpen(false)
+    }
+    document.addEventListener('mousedown', onPointerDown)
+    document.addEventListener('keydown', onKeyDown)
+    return () => {
+      document.removeEventListener('mousedown', onPointerDown)
+      document.removeEventListener('keydown', onKeyDown)
+    }
+  }, [menuOpen])
 
   const signOut = () => {
     logout.mutate(undefined, {
@@ -165,11 +188,54 @@ export function AppShell() {
             <h1 className="text-sm font-semibold tracking-wide text-zinc-200">Dubarr</h1>
           </div>
           <div className="flex items-center gap-3">
-            <Badge tone="neutral">{me.data?.username ?? 'signed in'}</Badge>
+            <div className="relative" ref={menuRef}>
+              <button
+                type="button"
+                aria-haspopup="menu"
+                aria-expanded={menuOpen}
+                aria-controls="account-menu"
+                onClick={() => setMenuOpen((open) => !open)}
+                className="inline-flex items-center gap-1 rounded-full border border-ink-600 bg-ink-800 px-2.5 py-0.5 text-xs font-medium text-zinc-300 hover:bg-ink-700 hover:text-zinc-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent-400"
+              >
+                {me.data?.username ?? 'signed in'}
+                <span aria-hidden className={cn('text-[10px] transition-transform', menuOpen && 'rotate-180')}>
+                  ▾
+                </span>
+              </button>
+              {menuOpen && (
+                <div
+                  id="account-menu"
+                  role="menu"
+                  aria-label="Account menu"
+                  className="absolute right-0 z-40 mt-2 w-48 rounded-lg border border-ink-700 bg-ink-800 p-1 shadow-2xl"
+                >
+                  <button
+                    type="button"
+                    role="menuitem"
+                    className="block w-full rounded-md px-3 py-2 text-left text-sm text-zinc-300 hover:bg-ink-700 hover:text-zinc-100"
+                    onClick={() => {
+                      setMenuOpen(false)
+                      setPasswordOpen(true)
+                    }}
+                  >
+                    Change password
+                  </button>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    disabled={logout.isPending}
+                    className="block w-full rounded-md px-3 py-2 text-left text-sm text-zinc-300 hover:bg-ink-700 hover:text-zinc-100 disabled:opacity-60"
+                    onClick={() => {
+                      setMenuOpen(false)
+                      signOut()
+                    }}
+                  >
+                    {logout.isPending ? 'Signing out…' : 'Log out'}
+                  </button>
+                </div>
+              )}
+            </div>
             {me.data?.is_admin && <Badge tone="accent">Administrator</Badge>}
-            <Button variant="secondary" size="sm" onClick={signOut} disabled={logout.isPending}>
-              {logout.isPending ? 'Signing out…' : 'Log out'}
-            </Button>
           </div>
         </header>
 
@@ -220,6 +286,8 @@ export function AppShell() {
           </div>
         </main>
       </div>
+
+      {passwordOpen && <ChangePasswordDialog onClose={() => setPasswordOpen(false)} />}
     </div>
   )
 }

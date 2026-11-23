@@ -19,7 +19,7 @@ var (
 	// queued vault track, or a language mapping that does not resolve to
 	// exactly one track. It is checked before any write.
 	ErrAmbiguous = errors.New("mux: ambiguous target/track pairing")
-	// ErrIneligible reports a Tdarr Gate verdict of waiting_for_tags or
+	// ErrIneligible reports a Processing Gate verdict of waiting_for_tags or
 	// missing_target on re-check before muxing.
 	ErrIneligible = errors.New("mux: target is not tag-eligible")
 	// ErrTargetMissing reports an absent or non-regular target file.

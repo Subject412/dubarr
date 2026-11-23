@@ -10,13 +10,15 @@ import (
 //
 // targetPath is the file *arr reports (movieFile.path / episodeFile.path). An
 // item arr has no imported file for is missing_target and never eligible: there
-// is nothing to mux. Otherwise eligibility is decided by the target's base
-// filename through the shared Tdarr Gate rule (ADR-0005), exactly as the watch
-// path and the approval queue decide it.
-func classifyTarget(rule gate.Rule, targetPath string) (status string, matches bool) {
+// is nothing to mux. Otherwise the shared Processing Gate rule decides, with the
+// item's own cached arr metadata (labels and canonical root folder, ADR-0009)
+// so source_mode=arr/both narrows exactly this target. The metadata is the
+// snapshot of the current poll, so an arr tag edit is visible on the next pass
+// (at most 300 s later).
+func classifyTarget(rule gate.Rule, targetPath string, arr gate.ArrMetadata) (status string, matches bool) {
 	if targetPath == "" {
 		return string(gate.StatusMissingTarget), false
 	}
-	res := rule.Classify(filepath.Base(targetPath))
+	res := rule.Classify(filepath.Base(targetPath), arr)
 	return string(res.Status), res.Status == gate.StatusEligible
 }

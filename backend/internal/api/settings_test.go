@@ -154,7 +154,9 @@ func TestSettingsGetPutRoundtrip(t *testing.T) {
 	if err := json.Unmarshal(env.Settings[settings.KeyTargetTagFilter], &tf); err != nil {
 		t.Fatalf("decode tag filter: %v", err)
 	}
-	if len(tf.RequiredFilenameTags) != 1 || tf.RequiredFilenameTags[0] != "[ArcA310]" {
+	// ADR-0012: a fresh install ships no required tag and source_mode defaults
+	// to filename.
+	if len(tf.RequiredFilenameTags) != 0 || tf.SourceMode != "filename" || len(tf.RequiredArrTags) != 0 {
 		t.Fatalf("defaults not served: %+v", tf)
 	}
 

@@ -84,3 +84,47 @@ func TestSyncJobOutputPathPersists(t *testing.T) {
 		t.Error("SetSyncJobOutputPath accepted a missing job")
 	}
 }
+
+// TestLibraryCacheJobTargetCarriesArrMetadata wires the mux re-check: the job
+// projection must carry the arr tag labels and canonical root folder from
+// arr_library_cache so gate source_mode=arr/both can decide, and a legacy row
+// with no tag snapshot must decode as empty rather than error.
+func TestLibraryCacheJobTargetCarriesArrMetadata(t *testing.T) {
+	dir := t.TempDir()
+	st, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+
+	res, err := st.DB.Exec(
+		`INSERT INTO arr_instances (name, type, base_url, api_key_enc, api_key_last4, enabled) VALUES ('Radarr', 'radarr', 'http://radarr', x'00', 'abcd', 1)`)
+	if err != nil {
+		t.Fatalf("insert arr instance: %v", err)
+	}
+	instanceID, _ := res.LastInsertId()
+	if _, err := st.SyncLibraryCache(ctx, instanceID, []LibraryCacheItem{{
+		MediaType:         "movie",
+		ExternalItemID:    7,
+		Title:             "Shrek",
+		TargetFilePath:    "/media/movies/Shrek/Shrek.mkv",
+		RootFolderPath:    "/media/movies",
+		ArrTagIDs:         []int64{1, 4},
+		ArrTagLabels:      []string{"dub", "Polish Dubbing"},
+		EligibilityStatus: "eligible",
+	}}); err != nil {
+		t.Fatalf("SyncLibraryCache: %v", err)
+	}
+	var id int64
+	if err := st.DB.QueryRow(`SELECT id FROM arr_library_cache`).Scan(&id); err != nil {
+		t.Fatalf("read cache id: %v", err)
+	}
+	got, ok, err := st.LibraryCacheJobTargetByID(ctx, id)
+	if err != nil || !ok {
+		t.Fatalf("LibraryCacheJobTargetByID = %v/%v", ok, err)
+	}
+	if len(got.ArrTagLabels) != 2 || got.ArrTagLabels[1] != "Polish Dubbing" || got.RootFolderPath != "/media/movies" {
+		t.Errorf("job target arr metadata = %+v, want labels and root folder", got)
+	}
+}

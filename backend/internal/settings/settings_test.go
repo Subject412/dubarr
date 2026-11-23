@@ -48,10 +48,10 @@ func TestSeedDefaults(t *testing.T) {
 	}
 
 	tf := decode[TargetTagFilter](t, all[KeyTargetTagFilter])
-	if len(tf.RequiredFilenameTags) != 1 || tf.RequiredFilenameTags[0] != "[ArcA310]" {
-		t.Errorf("required tags = %v, want [ArcA310]", tf.RequiredFilenameTags)
+	if len(tf.RequiredFilenameTags) != 0 {
+		t.Errorf("required tags = %v, want empty (ADR 0012)", tf.RequiredFilenameTags)
 	}
-	if tf.TagMatchMode != "ANY" || tf.TagCaseSensitive || !tf.EnforceTagFilter {
+	if tf.SourceMode != "filename" || tf.TagMatchMode != "ANY" || tf.TagCaseSensitive || !tf.EnforceTagFilter {
 		t.Errorf("tag filter = %+v", tf)
 	}
 	if tf.ExcludedFilenameTags == nil {
@@ -512,5 +512,135 @@ func TestMuxOutputMode(t *testing.T) {
 	}
 	if got := decode[MuxOptions](t, all[KeyMuxOptions]); got.OutputMode != MuxOutputReplace {
 		t.Errorf("served legacy output_mode = %q, want %q", got.OutputMode, MuxOutputReplace)
+	}
+}
+
+// TestSeedTargetTagFilterNeutralDefault pins ADR 0012: a fresh install ships
+// an empty required-filename-tag list, so the gate blocks nothing until the
+// operator configures a criterion.
+func TestSeedTargetTagFilterNeutralDefault(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	if err := s.Seed(ctx, t.TempDir()); err != nil {
+		t.Fatalf("Seed: %v", err)
+	}
+	tf := decode[TargetTagFilter](t, mustGet(t, s, ctx, KeyTargetTagFilter))
+	if len(tf.RequiredFilenameTags) != 0 {
+		t.Errorf("required tags = %v, want empty", tf.RequiredFilenameTags)
+	}
+	if tf.SourceMode != "filename" {
+		t.Errorf("source_mode = %q, want filename", tf.SourceMode)
+	}
+	if len(tf.RequiredArrTags) != 0 || len(tf.ExcludedArrTags) != 0 || len(tf.RootFolderPaths) != 0 {
+		t.Errorf("arr criteria = %+v, want empty", tf)
+	}
+	// Enforce stays on; it only has an effect once a criterion exists.
+	if !tf.EnforceTagFilter || tf.TagMatchMode != "ANY" || tf.ExcludedFilenameTags == nil {
+		t.Errorf("tag filter = %+v", tf)
+	}
+}
+
+// legacyTagFilter is a target.tag_filter row as written before ADR-0009 added
+// source_mode and the arr criteria.
+const legacyTagFilter = `{"required_filename_tags":["[CUSTOM]"],"tag_match_mode":"ALL","tag_case_sensitive":true,"excluded_filename_tags":["[X]"],"enforce_tag_filter":true}`
+
+func insertLegacyTagFilter(t *testing.T, s *Store) {
+	t.Helper()
+	if _, err := s.db.ExecContext(context.Background(),
+		`INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, ?)`,
+		KeyTargetTagFilter, legacyTagFilter, "2026-01-01 00:00:00"); err != nil {
+		t.Fatalf("insert legacy tag filter: %v", err)
+	}
+}
+
+// TestLegacyTagFilterMaterializesDefaults is the regression this slice exists
+// for: an existing stored section has no source_mode/arr fields, and Get, All
+// and Export must all serve it as filename-only with empty arr criteria.
+func TestLegacyTagFilterMaterializesDefaults(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	insertLegacyTagFilter(t, s)
+
+	check := func(where string, raw json.RawMessage) {
+		t.Helper()
+		tf := decode[TargetTagFilter](t, raw)
+		if tf.SourceMode != "filename" {
+			t.Errorf("%s source_mode = %q, want filename", where, tf.SourceMode)
+		}
+		if tf.RequiredArrTags == nil || len(tf.RequiredArrTags) != 0 ||
+			tf.ExcludedArrTags == nil || len(tf.ExcludedArrTags) != 0 ||
+			tf.RootFolderPaths == nil || len(tf.RootFolderPaths) != 0 {
+			t.Errorf("%s arr criteria = %+v, want empty slices", where, tf)
+		}
+		if len(tf.RequiredFilenameTags) != 1 || tf.RequiredFilenameTags[0] != "[CUSTOM]" {
+			t.Errorf("%s required tags = %v, want the stored [CUSTOM]", where, tf.RequiredFilenameTags)
+		}
+	}
+
+	check("Get", mustGet(t, s, ctx, KeyTargetTagFilter))
+	all, err := s.All(ctx)
+	if err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	check("All", all[KeyTargetTagFilter])
+	exp, err := s.Export(ctx)
+	if err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+	check("Export", exp.Settings[KeyTargetTagFilter])
+
+	// Seeding an existing install must not rewrite the stored row.
+	if err := s.Seed(ctx, t.TempDir()); err != nil {
+		t.Fatalf("Seed: %v", err)
+	}
+	var stored string
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT value FROM settings WHERE key = ?`, KeyTargetTagFilter).Scan(&stored); err != nil {
+		t.Fatalf("read stored row: %v", err)
+	}
+	if stored != legacyTagFilter {
+		t.Errorf("stored row = %s, want untouched legacy value", stored)
+	}
+}
+
+// TestTargetTagFilterValidation covers the new write-time checks: a known
+// source mode, non-empty arr tag labels, canonical absolute root paths, and an
+// enforced gate that may legitimately have no filename tags when an arr
+// criterion exists.
+func TestTargetTagFilterValidation(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+
+	valid := `{"source_mode":"both","required_filename_tags":[],"tag_match_mode":"ANY","tag_case_sensitive":false,"excluded_filename_tags":[],"enforce_tag_filter":true,"required_arr_tags":["dub"],"excluded_arr_tags":[],"root_folder_paths":["/media/movies/","/media/tv"]}`
+	if err := s.Set(ctx, KeyTargetTagFilter, json.RawMessage(valid)); err != nil {
+		t.Fatalf("Set(valid arr criteria): %v", err)
+	}
+	tf := decode[TargetTagFilter](t, mustGet(t, s, ctx, KeyTargetTagFilter))
+	if tf.SourceMode != "both" {
+		t.Errorf("source_mode = %q, want both", tf.SourceMode)
+	}
+	if len(tf.RootFolderPaths) != 2 || tf.RootFolderPaths[0] != "/media/movies" {
+		t.Errorf("root paths = %v, want canonicalized /media/movies", tf.RootFolderPaths)
+	}
+
+	// A language-looking label is a tag label, not a language token; the gate
+	// section must not apply target-language rules here.
+	if err := s.Set(ctx, KeyTargetTagFilter,
+		json.RawMessage(`{"source_mode":"arr","tag_match_mode":"ANY","enforce_tag_filter":true,"required_arr_tags":["pl"]}`)); err != nil {
+		t.Errorf("Set(arr tag label 'pl'): %v", err)
+	}
+
+	bad := map[string]string{
+		"unknown source mode":                `{"source_mode":"filename_only","tag_match_mode":"ANY","enforce_tag_filter":true,"required_filename_tags":["x"]}`,
+		"blank arr tag":                      `{"source_mode":"arr","tag_match_mode":"ANY","required_arr_tags":["  "]}`,
+		"blank excluded arr tag":             `{"source_mode":"arr","tag_match_mode":"ANY","excluded_arr_tags":[""]}`,
+		"relative root path":                 `{"source_mode":"arr","tag_match_mode":"ANY","root_folder_paths":["media/movies"]}`,
+		"traversal root path":                `{"source_mode":"arr","tag_match_mode":"ANY","root_folder_paths":["../media/movies"]}`,
+		"reserved token as required arr tag": `{"source_mode":"arr","tag_match_mode":"ANY","required_arr_tags":["org"]}`,
+	}
+	for name, body := range bad {
+		if err := s.Set(ctx, KeyTargetTagFilter, json.RawMessage(body)); err == nil {
+			t.Errorf("%s: Set accepted %s", name, body)
+		}
 	}
 }

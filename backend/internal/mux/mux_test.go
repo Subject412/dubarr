@@ -1112,3 +1112,40 @@ func TestOutputDestinationValidation(t *testing.T) {
 		})
 	}
 }
+
+// TestArrGateCriteriaBlockAndForceOverride wires ADR-0009 into the mux call
+// site: the verdict uses the arr metadata carried by the job, and force
+// override still bypasses the whole gate.
+func TestArrGateCriteriaBlockAndForceOverride(t *testing.T) {
+	h := newHarness(t)
+	job := h.job()
+	job.Gate = gate.Rule{
+		SourceMode:      gate.SourceArr,
+		RequiredArrTags: []string{"dub"},
+		Mode:            gate.MatchAny,
+		Enforce:         true,
+	}
+	job.Arr = gate.ArrMetadata{Found: true, Tags: []string{"keep"}}
+	if _, err := New(Dependencies{}).Mux(context.Background(), job); !errors.Is(err, ErrIneligible) {
+		t.Fatalf("Mux error = %v, want ErrIneligible for a non-matching arr tag", err)
+	}
+	if _, err := os.Stat(h.target + ".bak"); !errors.Is(err, os.ErrNotExist) {
+		t.Error(".bak created for an arr-ineligible target")
+	}
+
+	// A library row that satisfies the criterion lets the mux proceed.
+	job.Arr = gate.ArrMetadata{Found: true, Tags: []string{"Polish Dubbing", "dub"}, RootFolder: "/media/movies"}
+	if _, err := New(Dependencies{}).Mux(context.Background(), job); err != nil {
+		t.Fatalf("arr-eligible Mux: %v", err)
+	}
+
+	// Force bypasses the arr criterion too (the caller owns the switch).
+	h2 := newHarness(t)
+	job2 := h2.job()
+	job2.Gate = job.Gate
+	job2.Arr = gate.ArrMetadata{Found: false}
+	job2.Force = true
+	if _, err := New(Dependencies{}).Mux(context.Background(), job2); err != nil {
+		t.Fatalf("forced Mux with no arr row: %v", err)
+	}
+}

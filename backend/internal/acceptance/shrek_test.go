@@ -250,12 +250,25 @@ func fileSize(t *testing.T, path string) int64 {
 func (h *harness) assertUntaggedGateBlocksMux(t *testing.T, tagged string) {
 	t.Helper()
 	ctx := context.Background()
-	raw, ok, err := h.ss.Get(ctx, settings.KeyTargetTagFilter)
+	// ADR-0012 ships an empty required-tag default, so the M5-5 proof sets the
+	// marker it exercises explicitly instead of relying on seed data.
+	raw, err := json.Marshal(settings.TargetTagFilter{
+		RequiredFilenameTags: []string{"[ArcA310]"},
+		TagMatchMode:         "ANY",
+		EnforceTagFilter:     true,
+	})
+	if err != nil {
+		t.Fatalf("marshal tag filter: %v", err)
+	}
+	if err := h.ss.Set(ctx, settings.KeyTargetTagFilter, raw); err != nil {
+		t.Fatalf("set target.tag_filter: %v", err)
+	}
+	stored, ok, err := h.ss.Get(ctx, settings.KeyTargetTagFilter)
 	if err != nil || !ok {
 		t.Fatalf("read target.tag_filter = %v/%v, want seeded value", ok, err)
 	}
 	var tf settings.TargetTagFilter
-	if err := json.Unmarshal(raw, &tf); err != nil {
+	if err := json.Unmarshal(stored, &tf); err != nil {
 		t.Fatalf("decode target.tag_filter: %v", err)
 	}
 	rule := gate.RuleFromTagFilter(tf)

@@ -187,8 +187,9 @@ func (s *Store) SetSyncJobOutputPath(ctx context.Context, id int64, path string)
 }
 
 // LibraryCacheJobTarget is the arr library row a sync job needs: the target
-// video path, its gate verdict and the original language for reference
-// resolution.
+// video path, its gate verdict, the original language for reference resolution
+// and the arr metadata (tag labels + canonical root folder, ADR-0009) the gate
+// re-check consumes.
 type LibraryCacheJobTarget struct {
 	ID                   int64
 	TargetFilePath       string
@@ -196,6 +197,8 @@ type LibraryCacheJobTarget struct {
 	MatchesTargetTags    bool
 	OriginalLanguageISO2 string
 	MediaType            string
+	ArrTagLabels         []string
+	RootFolderPath       string
 }
 
 // LibraryCacheJobTargetByID reads the sync-relevant columns of one
@@ -206,12 +209,15 @@ func (s *Store) LibraryCacheJobTargetByID(ctx context.Context, id int64) (Librar
 		target sql.NullString
 		elig   sql.NullString
 		orig   sql.NullString
+		root   sql.NullString
+		labels string
 	)
 	err := s.DB.QueryRowContext(ctx, `
 		SELECT id, target_file_path, eligibility_status, matches_target_tags,
-		       original_language_iso2, media_type
+		       original_language_iso2, media_type,
+		       COALESCE(arr_tag_labels_json, '[]'), COALESCE(root_folder_path, '')
 		FROM arr_library_cache WHERE id = ?`, id).
-		Scan(&rec.ID, &target, &elig, &rec.MatchesTargetTags, &orig, &rec.MediaType)
+		Scan(&rec.ID, &target, &elig, &rec.MatchesTargetTags, &orig, &rec.MediaType, &labels, &root)
 	if errors.Is(err, sql.ErrNoRows) {
 		return LibraryCacheJobTarget{}, false, nil
 	}
@@ -221,6 +227,15 @@ func (s *Store) LibraryCacheJobTargetByID(ctx context.Context, id int64) (Librar
 	rec.TargetFilePath = target.String
 	rec.EligibilityStatus = elig.String
 	rec.OriginalLanguageISO2 = orig.String
+	rec.RootFolderPath = root.String
+	// Legacy rows carry '[]' from the column default; a malformed snapshot is
+	// reported rather than treated as untagged, because that would silently
+	// change an arr gate verdict.
+	var snapshot LibraryCacheItem
+	if err := decodeArrTagSnapshot("[]", labels, &snapshot); err != nil {
+		return LibraryCacheJobTarget{}, false, err
+	}
+	rec.ArrTagLabels = snapshot.ArrTagLabels
 	return rec, true, nil
 }
 

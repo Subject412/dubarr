@@ -1,10 +1,14 @@
-// Package gate implements the Tdarr Gate (PLAN.md M2-5, ADR-0005) and the
-// rule-based export-policy split.
+// Package gate implements the Processing Gate (GLOSSARY.md; ADR-0005 and
+// ADR-0009) and the rule-based export-policy split.
 //
-// The gate decides whether a target video is eligible for sync/mux by looking
-// for the configured processed-marker tag ("[ArcA310]" by default) on the
-// target. Donor ingestion is never gated; only targets are. The possible
-// states are the glossary's eligible / waiting_for_tags / missing_target.
+// The gate decides whether a target video is eligible for sync/mux. It has two
+// sources: the processed-marker tag on the target filename (ADR-0005) and the
+// optional arr criterion — Radarr/Sonarr tag labels and root-folder paths from
+// arr_library_cache (ADR-0009). Source modes are filename (default), arr and
+// both; active sources are AND-ed and a target with no arr library row fails
+// closed while the arr source is active. Donor ingestion is never gated; only
+// targets are. The possible states are the glossary's eligible /
+// waiting_for_tags / missing_target.
 //
 // Tag discovery has two sources:
 //
@@ -16,10 +20,10 @@
 //     or values — so tag content is extracted with the companion `mkvextract
 //     tags` (same mkvtoolnix package, same host/Docker image).
 //
-// Classification is a pure function of the target filename (Rule.Classify):
-// ADR-0005 makes the filename the only source of eligibility, so container tags
-// are read for informational/display purposes only and never broaden the gate.
-// Service binds the import-queue store to persist the outcome per candidate.
+// Container tags are read for informational/display purposes only and never
+// decide eligibility; the arr criterion comes from the arr poll cache, not from
+// the container. Service binds the import-queue store to persist the outcome
+// per candidate and evaluates the filename source only (donor ingestion).
 //
 // The export-policy split (SplitExportTracks) is likewise pure: it partitions
 // probed audio tracks into the policy import set (dub + original + reference

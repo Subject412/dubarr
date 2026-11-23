@@ -312,8 +312,13 @@ func (p *Poller) listItems(ctx context.Context, conn settings.ArrConnection, api
 			if movie.HasFile && movie.MovieFile != nil {
 				target = movie.MovieFile.Path
 			}
-			status, matches := classifyTarget(rule, target)
 			arrIDs, arrLabels := resolveArrTags(movie.Tags, labels)
+			root := rootFolderFor(movie.Path, roots)
+			status, matches := classifyTarget(rule, target, gate.ArrMetadata{
+				Found:      true,
+				Tags:       arrLabels,
+				RootFolder: root,
+			})
 			items = append(items, store.LibraryCacheItem{
 				MediaType:            "movie",
 				ExternalItemID:       int64(movie.ID),
@@ -322,7 +327,7 @@ func (p *Poller) listItems(ctx context.Context, conn settings.ArrConnection, api
 				OriginalLanguageISO2: probe.ISO639_1(movie.OriginalLanguage.Name),
 				Year:                 movie.Year,
 				MediaFolderPath:      movie.Path,
-				RootFolderPath:       rootFolderFor(movie.Path, roots),
+				RootFolderPath:       root,
 				ArrTagIDs:            arrIDs,
 				ArrTagLabels:         arrLabels,
 				TargetFilePath:       target,
@@ -361,7 +366,11 @@ func (p *Poller) listItems(ctx context.Context, conn settings.ArrConnection, api
 				if episode.HasFile && episode.EpisodeFile != nil {
 					target = episode.EpisodeFile.Path
 				}
-				status, matches := classifyTarget(rule, target)
+				status, matches := classifyTarget(rule, target, gate.ArrMetadata{
+					Found:      true,
+					Tags:       arrLabels,
+					RootFolder: root,
+				})
 				season, number := episode.SeasonNumber, episode.EpisodeNumber
 				items = append(items, store.LibraryCacheItem{
 					MediaType:            "episode",

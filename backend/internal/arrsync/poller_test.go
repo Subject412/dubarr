@@ -152,6 +152,12 @@ func TestSyncCachesMoviesAndEpisodes(t *testing.T) {
 	)
 	r.key("radarr", radarr.APIKey())
 	r.key("sonarr", sonarr.APIKey())
+	// ADR-0012 ships an empty default; this test asserts the filename criterion.
+	r.tagFilter(settings.TargetTagFilter{
+		RequiredFilenameTags: []string{"[ArcA310]"},
+		TagMatchMode:         "ANY",
+		EnforceTagFilter:     true,
+	})
 
 	p := r.newPoller(time.Minute)
 	stats, err := p.Sync(context.Background())
@@ -473,6 +479,12 @@ func TestSyncUpdatesChangedRowAndDeletesVanished(t *testing.T) {
 	if err := r.secrets.Set("arr.radarr.api_key", "key"); err != nil {
 		t.Fatalf("set secret: %v", err)
 	}
+	// This test asserts the filename criterion; ADR-0012's default is empty.
+	r.tagFilter(settings.TargetTagFilter{
+		RequiredFilenameTags: []string{"[ArcA310]"},
+		TagMatchMode:         "ANY",
+		EnforceTagFilter:     true,
+	})
 
 	src := &fakeRadarr{movies: []arr.Movie{{
 		ID: 7, Title: "Shrek", Year: 2001, HasFile: true,
@@ -756,4 +768,93 @@ func equalStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// tagFilter stores the target.tag_filter section explicitly. ADR-0012 ships an
+// empty default, so tests that assert filename gating set their own criterion.
+func (r *rig) tagFilter(tf settings.TargetTagFilter) {
+	r.t.Helper()
+	raw, err := json.Marshal(tf)
+	if err != nil {
+		r.t.Fatalf("marshal tag filter: %v", err)
+	}
+	if err := r.settings.Set(r.context(), settings.KeyTargetTagFilter, raw); err != nil {
+		r.t.Fatalf("set tag filter: %v", err)
+	}
+}
+
+// TestSyncArrSourceEligibility is the M9c call-site proof: the poller
+// classifies each movie/episode with its own arr tag labels and root folder,
+// so an arr criterion narrows eligibility without a second filename pass.
+func TestSyncArrSourceEligibility(t *testing.T) {
+	r := newRig(t)
+	radarr := arrmock.New(arrmock.Radarr, "key-radarr", arrmock.Fixtures{
+		Tags:        []arrmock.Tag{{ID: 1, Label: "dub"}, {ID: 2, Label: "keep"}},
+		RootFolders: []arrmock.RootFolder{{ID: 1, Path: "/media/movies"}, {ID: 2, Path: "/media/other"}},
+		Movies: []arrmock.Movie{
+			{
+				ID: 7, Title: "Shrek", Year: 2001, HasFile: true, Tags: []int{1},
+				Path: "/media/movies/Shrek", OriginalLanguage: arrmock.Language{ID: 1, Name: "English"},
+				MovieFile: &arrmock.MovieFile{Path: "/media/movies/Shrek/Shrek.mkv"},
+			},
+			{
+				ID: 8, Title: "Kept", Year: 2002, HasFile: true, Tags: []int{2},
+				Path: "/media/movies/Kept", OriginalLanguage: arrmock.Language{ID: 1, Name: "English"},
+				MovieFile: &arrmock.MovieFile{Path: "/media/movies/Kept/Kept.mkv"},
+			},
+			{
+				// Right tag, wrong root folder: root scoping narrows it out.
+				ID: 9, Title: "Elsewhere", Year: 2003, HasFile: true, Tags: []int{1},
+				Path: "/media/other/Elsewhere", OriginalLanguage: arrmock.Language{ID: 1, Name: "English"},
+				MovieFile: &arrmock.MovieFile{Path: "/media/other/Elsewhere/Elsewhere.mkv"},
+			},
+		},
+	})
+	defer radarr.Close()
+	sonarr := arrmock.New(arrmock.Sonarr, "key-sonarr", arrmock.Fixtures{
+		Tags:        []arrmock.Tag{{ID: 3, Label: "dub"}},
+		RootFolders: []arrmock.RootFolder{{ID: 1, Path: "/media/tv"}},
+		Series: []arrmock.Series{{
+			ID: 3, Title: "The Expanse", Year: 2015, TvdbID: 280619,
+			Path: "/media/tv/The Expanse", Tags: []int{3},
+			OriginalLanguage: arrmock.Language{ID: 2, Name: "English"},
+		}},
+		Episodes: []arrmock.Episode{{
+			ID: 42, SeriesID: 3, SeasonNumber: 1, EpisodeNumber: 1, Title: "Dulcinea", HasFile: true,
+			EpisodeFile: &arrmock.EpisodeFile{Path: "/media/tv/The Expanse/Season 01/S01E01 - Dulcinea.mkv"},
+		}},
+	})
+	defer sonarr.Close()
+
+	r.configure(
+		settings.ArrConnection{Kind: "radarr", BaseURL: radarr.URL, Enabled: true},
+		settings.ArrConnection{Kind: "sonarr", BaseURL: sonarr.URL, Enabled: true},
+	)
+	r.key("radarr", radarr.APIKey())
+	r.key("sonarr", sonarr.APIKey())
+	r.tagFilter(settings.TargetTagFilter{
+		SourceMode:       "arr",
+		RequiredArrTags:  []string{"DUB"},
+		RootFolderPaths:  []string{"/media/movies", "/media/tv"},
+		TagMatchMode:     "ANY",
+		EnforceTagFilter: true,
+	})
+
+	if _, err := r.newPoller(time.Minute).Sync(context.Background()); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+
+	rows := readCache(t, r.store)
+	if got := rows["movie|7"]; got.EligibilityStatus != "eligible" || !got.MatchesTargetTags {
+		t.Errorf("arr-tagged movie = %v/%q, want eligible (filename has no tag)", got.MatchesTargetTags, got.EligibilityStatus)
+	}
+	if got := rows["movie|8"]; got.EligibilityStatus != "waiting_for_tags" {
+		t.Errorf("movie without the required arr tag = %q, want waiting_for_tags", got.EligibilityStatus)
+	}
+	if got := rows["movie|9"]; got.EligibilityStatus != "waiting_for_tags" {
+		t.Errorf("movie outside the root allowlist = %q, want waiting_for_tags", got.EligibilityStatus)
+	}
+	if got := rows["episode|42"]; got.EligibilityStatus != "eligible" {
+		t.Errorf("series-tagged episode = %q, want eligible", got.EligibilityStatus)
+	}
 }

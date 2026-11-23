@@ -345,6 +345,7 @@ func (w *Worker) processJob(ctx context.Context, id int64) error {
 		OutputMode:     mode,
 		OutputDir:      outputDir,
 		Gate:           rule,
+		Arr:            gate.ArrMetadata{Found: true, Tags: lib.ArrTagLabels, RootFolder: lib.RootFolderPath},
 		Force:          w.forceOverride(ctx),
 		Report:         report,
 		Candidates:     candidates,

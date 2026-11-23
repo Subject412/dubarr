@@ -9,8 +9,10 @@
 //     filename resolves to several queued vault tracks, or the report's
 //     language does not map to exactly one of them, the call returns
 //     [ErrAmbiguous] and leaves every directory byte-identical.
-//  3. Re-check the Tdarr Gate against the base filename unless the caller
-//     forces an override (ADR-0005); ineligible targets return [ErrIneligible].
+//  3. Re-check the Processing Gate against the base filename and, when the
+//     arr source is active, the target's cached arr tags/root folder unless the
+//     caller forces an override (ADR-0005, ADR-0009); ineligible targets return
+//     [ErrIneligible].
 //  4. Copy the target into {WORK_DIR}/jobs/{id}/ (Copy-on-Work, ADR-0002) and
 //     let mkvmerge read only that copy plus the staged .mka. The target itself
 //     is opened read-only.

@@ -81,8 +81,13 @@ type Job struct {
 	KeepBak *bool
 	// SetDefault marks the appended track as the container default.
 	SetDefault bool
-	// Gate is the target.tag_filter rule re-checked against the base filename.
+	// Gate is the target.tag_filter rule re-checked against the base filename
+	// and, when the arr source is active, Arr.
 	Gate gate.Rule
+	// Arr is the target's arr_library_cache metadata (tag labels and canonical
+	// root folder, ADR-0009) used by the gate's arr source. Zero value means no
+	// arr row, which fails closed while that source is active.
+	Arr gate.ArrMetadata
 	// OutputMode is "" or "replace" (atomic replace of TargetPath) or
 	// "separate" (write <basename>.dubarr.mkv into OutputDir and leave the
 	// Target untouched, ADR-0011).
@@ -220,10 +225,10 @@ func (m *Muxer) Mux(ctx context.Context, job Job) (Result, error) {
 		return Result{}, err
 	}
 	if !job.Force {
-		res := job.Gate.Classify(filepath.Base(target))
+		res := job.Gate.Classify(filepath.Base(target), job.Arr)
 		if res.Status != gate.StatusEligible {
-			return Result{}, fmt.Errorf("%w: %s is %s (matched %v, missing %v)",
-				ErrIneligible, filepath.Base(target), res.Status, res.Matched, res.Missing)
+			return Result{}, fmt.Errorf("%w: %s is %s (matched %v, missing %v; arr matched %v, missing %v)",
+				ErrIneligible, filepath.Base(target), res.Status, res.Matched, res.Missing, res.ArrMatched, res.ArrMissing)
 		}
 	}
 	audio, err := resolveAudio(job.AudioPath, jobDir)

@@ -15,6 +15,7 @@ import { api } from '../lib/api'
 import { DEFAULT_SETTINGS as DEFAULTS } from '../lib/defaults'
 import { useSaveSettings, useSettings } from '../lib/hooks'
 import { PathField, PathListEditor } from '../components/PathPicker'
+import { ThemeSelector } from '../components/ThemeSelector'
 import {
   Alert,
   Badge,
@@ -180,6 +181,10 @@ export function SettingsPage() {
           </Button>
         }
       />
+
+      <div className="mb-5">
+        <ThemeSelector />
+      </div>
 
       {settings.isLoading && <Spinner label="Loading settings" />}
       {settings.error && <Alert>Could not load settings: {settings.error.message}</Alert>}

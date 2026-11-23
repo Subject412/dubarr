@@ -5,6 +5,7 @@ import { AppShell } from './components/AppShell'
 import { Alert, Button, Spinner } from './components/ui'
 import { UNAUTHORIZED_EVENT, type AuthStatus } from './lib/api'
 import { queryKeys, useAuthStatus, useMe } from './lib/hooks'
+import { ThemeProvider } from './lib/ThemeProvider'
 import { LoginPage } from './pages/Login'
 import { PlaceholderPage } from './pages/Placeholder'
 import { QueuePage } from './pages/Queue'
@@ -87,37 +88,39 @@ function App() {
   }, [navigate, queryClient])
 
   return (
-    <Routes>
-      <Route path="/setup" element={<SetupPage />} />
-      <Route path="/login" element={<LoginPage />} />
-      <Route element={<AuthGate />}>
-        <Route element={<AppShell />}>
-          <Route index element={<Navigate to="/library" replace />} />
-          <Route
-            path="/library"
-            element={
-              <PlaceholderPage
-                title="Library"
-                milestone="M2"
-                description="Browse titles, inspect tracks and start a sync job."
-              />
-            }
-          />
-          <Route
-            path="/queue"
-            element={<QueuePage />}
-          />
-          <Route path="/vault" element={<VaultPage />} />
-          <Route path="/sync" element={<SyncPage />} />
-          <Route path="/settings" element={<SettingsPage />} />
-          <Route path="/system" element={<SystemPage />} />
-          <Route element={<AdminRoute />}>
-            <Route path="/tokens" element={<TokensPage />} />
+    <ThemeProvider>
+      <Routes>
+        <Route path="/setup" element={<SetupPage />} />
+        <Route path="/login" element={<LoginPage />} />
+        <Route element={<AuthGate />}>
+          <Route element={<AppShell />}>
+            <Route index element={<Navigate to="/library" replace />} />
+            <Route
+              path="/library"
+              element={
+                <PlaceholderPage
+                  title="Library"
+                  milestone="M2"
+                  description="Browse titles, inspect tracks and start a sync job."
+                />
+              }
+            />
+            <Route
+              path="/queue"
+              element={<QueuePage />}
+            />
+            <Route path="/vault" element={<VaultPage />} />
+            <Route path="/sync" element={<SyncPage />} />
+            <Route path="/settings" element={<SettingsPage />} />
+            <Route path="/system" element={<SystemPage />} />
+            <Route element={<AdminRoute />}>
+              <Route path="/tokens" element={<TokensPage />} />
+            </Route>
+            <Route path="*" element={<Navigate to="/library" replace />} />
           </Route>
-          <Route path="*" element={<Navigate to="/library" replace />} />
         </Route>
-      </Route>
-    </Routes>
+      </Routes>
+    </ThemeProvider>
   )
 }
 

@@ -1,13 +1,31 @@
 @import "tailwindcss";
 
+/*
+ * The app is dark by default, so `dark:` must follow our resolved theme
+ * attribute rather than the OS preference (System mode resolves to a concrete
+ * data-theme on <html> before React mounts).
+ */
+@custom-variant dark (&:where([data-theme='dark'], [data-theme='dark'] *));
+
 @theme {
-  --color-ink-950: #0b0e13;
-  --color-ink-900: #11151d;
-  --color-ink-800: #171c26;
-  --color-ink-700: #212936;
+  /* Semantic tokens — dark palette (the default). Components read these
+     through the legacy ink-* / accent-* names, which are remapped below. */
+  --color-surface: #0b0e13;
+  --color-surface-muted: #11151d;
+  --color-surface-raised: #171c26;
+  --color-border: #212936;
+  --color-text: #e4e4e7;
+  --color-text-muted: #a1a1aa;
+  --color-accent: #2dd4bf;
+
+  --color-ink-950: var(--color-surface);
+  --color-ink-900: var(--color-surface-muted);
+  --color-ink-800: var(--color-surface-raised);
+  --color-ink-700: var(--color-border);
   --color-ink-600: #2c3646;
+  --color-ink-500: #7c8698;
   --color-accent-400: #5eead4;
-  --color-accent-500: #2dd4bf;
+  --color-accent-500: var(--color-accent);
   --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
 }
 
@@ -17,12 +35,67 @@ body,
   height: 100%;
 }
 
-:root {
+:root,
+[data-theme='dark'] {
   color-scheme: dark;
 }
 
+/*
+ * Light palette. Existing components were written against the dark ink-* /
+ * zinc-* shades, so the light theme inverts those scales instead of rewriting
+ * every class; the semantic tokens above are the values new UI should use.
+ */
+[data-theme='light'] {
+  color-scheme: light;
+
+  --color-surface: #f4f5f7;
+  --color-surface-muted: #ffffff;
+  --color-surface-raised: #ffffff;
+  --color-border: #d4d4d8;
+  --color-text: #1f2937;
+  --color-text-muted: #52525b;
+  --color-accent: #0f766e;
+
+  --color-ink-950: var(--color-surface);
+  --color-ink-900: var(--color-surface-muted);
+  --color-ink-800: #e8ebef;
+  --color-ink-700: #8b95a2;
+  --color-ink-600: #d4d4d8;
+  --color-ink-500: #64748b;
+  --color-accent-400: #115e59;
+  --color-accent-500: var(--color-accent);
+
+  /* Inverted neutrals: zinc-100..500 carry text, zinc-600 disabled copy. */
+  --color-zinc-100: #111827;
+  --color-zinc-200: #1f2937;
+  --color-zinc-300: #374151;
+  --color-zinc-400: #4b5563;
+  --color-zinc-500: #6b7280;
+  --color-zinc-600: #9ca3af;
+
+  /* Status shades used as "on dark" tints in badges, alerts and notices. */
+  --color-emerald-200: #065f46;
+  --color-emerald-300: #047857;
+  --color-emerald-700: #059669;
+  --color-emerald-800: #a7f3d0;
+  --color-emerald-900: #d1fae5;
+  --color-emerald-950: #ecfdf5;
+  --color-amber-300: #92400e;
+  --color-amber-500: #d97706;
+  --color-amber-700: #f59e0b;
+  --color-amber-800: #fde68a;
+  --color-amber-900: #fef3c7;
+  --color-amber-950: #fffbeb;
+  --color-red-300: #b91c1c;
+  --color-red-400: #b91c1c;
+  --color-red-700: #fca5a5;
+  --color-red-800: #fecaca;
+  --color-red-900: #fee2e2;
+  --color-red-950: #fef2f2;
+}
+
 body {
-  @apply bg-ink-950 text-zinc-200 antialiased;
+  @apply bg-surface text-text antialiased;
 }
 
 ::selection {
@@ -30,5 +103,5 @@ body {
 }
 
 * {
-  scrollbar-color: var(--color-ink-700) transparent;
+  scrollbar-color: var(--color-border) transparent;
 }

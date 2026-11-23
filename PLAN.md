@@ -1,7 +1,7 @@
 # Dubarr — Implementation Plan
 
 Spec: `IDEA.md`. Domain: `GLOSSARY.md`. Decisions: `docs/adr/0001–0007`. Contract: `AGENTS.md`.
-Execution: subagent-driven-development (fresh implementer per task → spec review → quality review). Gate protocol: **stop for user OK at each milestone gate (M1→M5)**.
+Execution: subagent-driven-development (fresh implementer per task → spec review → quality review). Gate protocol: **stop for user OK at each milestone gate (M1→M5)**. For issues #1–#13 (M7–M10 below) the user settled on continuous execution with **no stop-for-OK gates**; milestones remain work batches only.
 
 ## Settled defaults (grilling Q1–Q15)
 - `required_filename_tags: ["[ArcA310]"]` (Tdarr node/GPU processed-marker), `tag_match_mode: ANY`, `tag_case_sensitive: false`, `enforce_tag_filter: true`.
@@ -101,3 +101,13 @@ Full acceptance pass: container zero-env build+start, wizard creates admin + per
 - M6-2 — Token-management UI: frontend page for `/api/auth/tokens` (existing backend): list tokens (name, last4, created, last_used), create (name → show full token ONCE), revoke; admin-only nav entry; X-Api-Key usage hint.
 - M6-3 — `.bak` opt-in clean: settings option (storage.options.keep_bak default true per settled); when disabled, successful mux deletes the `.bak` after post-mux validation; UI toggle in settings; mux tests for both modes.
 - M6-4 — Release infrastructure: GitHub Actions release workflow (tag `v*` → build Go backend + Rust sync-engine + frontend embed into release archives: linux amd64/arm64 + windows amd64; checksums); tag guidelines doc (docs/RELEASING.md: semver, tag format, what goes in archives, `dubarr-sync` bundled path expectation).
+
+## M7–M10 (issues #1–#13; settled 2026-11-23, no stop-for-OK gates)
+
+Source: `.hermes/plans/issues-1-13.md` (grill round 1: Q1–Q23). Decisions: `docs/adr/0009–0012`. Domain: `GLOSSARY.md` (Processing Gate, Output Mode, Transcode Rule, Log Sink). Milestones below are work batches only; execution is continuous (user Q1 amendment).
+
+- **M7** — #5 role badge; #1 `${DUBARR_PORT:-8080}`; #7 theme (localStorage, dark default); #13 settings submenu + shared section registry; #3 per-option InfoTips. Deps: #13 → #3; #7 before new UI.
+- **M8** — #6 password change + account menu; #10 arr connection UI (test-connection button; full URL with explicit scheme); #12 logging sinks + `/logs` (redaction at sink); #4 root README + compose/env examples + build-from-source. Deps: #6→#5; #4→#1/#10/#12.
+- **M9** — #8 `org`/`all` reference tokens + prefer-original + wire `original_language_from_arr`; #2 mux output modes + new output root + result persistence; #9 arr tag/root-folder eligibility (migration 0003, ADR 0009). Deps: #10→#9; #8 before #9 (both touch gate); #2 before #11.
+- **M10** — #11 opt-in transcode rules (single ffmpeg encode with tempo, ffprobe verify, ADR 0010). Vault stays write-once/lossless.
+- Out of scope: live arr in tests, Windows CI, Docker socket logs, Tdarr API, in-container port override, per-media transcode overrides, git push.

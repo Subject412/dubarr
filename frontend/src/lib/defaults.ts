@@ -27,11 +27,15 @@ export const DEFAULT_SETTINGS: DubarrSettings = {
     export_mode: 'rule_based',
   },
   'target.tag_filter': {
-    required_filename_tags: ['[ArcA310]'],
+    required_filename_tags: [],
     tag_match_mode: 'ANY',
     tag_case_sensitive: false,
     excluded_filename_tags: [],
     enforce_tag_filter: true,
+    source_mode: 'filename',
+    required_arr_tags: [],
+    excluded_arr_tags: [],
+    root_folder_paths: [],
   },
   'sync.defaults': {
     max_offset_sec: 180,

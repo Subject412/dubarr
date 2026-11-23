@@ -34,21 +34,29 @@ export const SETTINGS_HELP: Record<SettingsSectionKey, Record<string, string>> =
       'Commentary tracks never become the Reference Track or the Target track.',
   },
   'target.tag_filter': {
+    source_mode:
+      'Where tags come from: tags in the Target filename, tags on the Radarr/Sonarr library item, or both. When both are used a file must satisfy each selected source, so adding a source can only narrow what is processed.',
     required_filename_tags:
       'Tags in the Target filename that make it eligible. The match mode decides how many of them must be present.',
     excluded_filename_tags:
       'Tags that always make a Target ineligible, whatever else matches.',
+    required_arr_tags:
+      'Radarr/Sonarr tag labels that make a library item eligible. Labels are compared case-insensitively unless case-sensitive matching is on; the match mode decides how many must be present.',
+    excluded_arr_tags:
+      'Radarr/Sonarr tag labels that always make a Target ineligible, whatever else matches.',
+    root_folder_paths:
+      'Allowlist of Radarr/Sonarr root folders. When set, only Targets inside one of these folders are processed. Leave empty to accept every root folder.',
     tag_match_mode:
-      'ANY: at least one required tag; ALL: every required tag; REGEX: each entry is treated as a regular expression.',
+      'ANY: at least one required tag; ALL: every required tag; REGEX: each entry is treated as a regular expression. Applies to filename tags and Radarr/Sonarr tags alike.',
     tag_case_sensitive: 'Match tags with exact letter case; off ignores case.',
     enforce_tag_filter:
-      'Reject Targets without a required tag. Donor ingestion into the Audio Vault is never gated.',
+      'Reject Targets that do not satisfy the filter. Donor ingestion into the Audio Vault is never gated.',
   },
   'security.options': {
     vault_read_only:
       'Keep the mounted Audio Vault read-only (0444): the write-once archive is never modified, only verified copies in the Work Area.',
     allow_force_tag_override:
-      'Let an operator bypass the destination tag gate for a single item. Off by default.',
+      'Let an operator bypass the processing filter for a single item. Off by default.',
     require_av1_warning: 'Show the AV1 hand-off warning before muxing into an AV1 Target.',
     require_av1_strict:
       'Treat the AV1 hand-off warning as a hard stop instead of an acknowledgement.',

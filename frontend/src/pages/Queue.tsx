@@ -250,7 +250,7 @@ export function QueuePage() {
     <div>
       <PageHeader
         title="Approval Queue"
-        description="Donor drops wait here until you approve them. Target, donor, languages and Tdarr Gate eligibility are pre-selected; no extraction happens in M2."
+        description="Donor drops wait here until you approve them. Target, donor, languages and Processing Gate eligibility are pre-selected; no extraction happens in M2."
         actions={
           <>
             <Badge tone={items.length > 0 ? 'accent' : 'neutral'}>{items.length} pending</Badge>

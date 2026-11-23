@@ -32,8 +32,9 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   },
   {
     key: 'target.tag_filter',
-    title: 'Target tag filter',
-    description: 'Tdarr destination filename gate (ADR-0005).',
+    title: 'Process only files tagged as …',
+    description:
+      'Only files that carry a required tag are processed. Add tags found in filenames, or require tags from Radarr/Sonarr.',
   },
   {
     key: 'security.options',

@@ -60,6 +60,7 @@ export function PathListEditor({
   onChange,
   hint,
   help,
+  emptyText = 'No media roots configured.',
 }: {
   label: string
   values: string[]
@@ -67,6 +68,8 @@ export function PathListEditor({
   hint?: string
   /** Long-form definition rendered in an info popover. */
   help?: string
+  /** Placeholder shown while the list is empty; defaults to media-root copy. */
+  emptyText?: string
 }) {
   const [open, setOpen] = useState(false)
   return (
@@ -82,7 +85,7 @@ export function PathListEditor({
       </div>
       {hint && <p className="text-xs text-zinc-500">{hint}</p>}
       {values.length === 0 ? (
-        <p className="text-xs text-zinc-500">No media roots configured.</p>
+        <p className="text-xs text-zinc-500">{emptyText}</p>
       ) : (
         <ul className="space-y-1">
           {values.map((path) => (

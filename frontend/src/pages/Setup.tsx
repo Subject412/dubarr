@@ -299,7 +299,7 @@ export function SetupPage() {
               <div>
                 <h2 className="text-lg font-semibold text-zinc-100">Languages &amp; tags</h2>
                 <p className="text-sm text-zinc-400">
-                  Tracks to import, reference languages to keep, and the Tdarr destination tag gate.
+                  Tracks to import, reference languages to keep, and which files the processing filter accepts.
                 </p>
               </div>
               {languageError && <Alert>{languageError}</Alert>}
@@ -340,7 +340,7 @@ export function SetupPage() {
                   inputLabel="Add required tag"
                   values={tagFilter.required_filename_tags}
                   onChange={(required_filename_tags) => setTagFilter({ ...tagFilter, required_filename_tags })}
-                  placeholder="[ArcA310]"
+                  placeholder="[TAG]"
                 />
               </div>
               <div className="grid gap-4 md:grid-cols-2">
@@ -434,7 +434,7 @@ export function SetupPage() {
               />
               <Toggle
                 label="Allow force tag override"
-                description="Permit per-item bypass of the destination tag gate."
+                description="Permit per-item bypass of the processing filter."
                 checked={security.allow_force_tag_override}
                 onChange={(allow_force_tag_override) => setSecurity({ ...security, allow_force_tag_override })}
               />

@@ -60,12 +60,21 @@ export type LanguagesPolicy = {
   export_mode: 'rule_based' | 'all'
 }
 
+/** Which sources the Processing Gate consults; active sources are AND-ed. */
+export type TagSourceMode = 'filename' | 'arr' | 'both'
+
 export type TargetTagFilter = {
   required_filename_tags: string[]
   tag_match_mode: 'ANY' | 'ALL' | 'REGEX'
   tag_case_sensitive: boolean
   excluded_filename_tags: string[]
   enforce_tag_filter: boolean
+  source_mode: TagSourceMode
+  /** Radarr/Sonarr tag labels; excluded labels always win. */
+  required_arr_tags: string[]
+  excluded_arr_tags: string[]
+  /** Allowlist of canonical Radarr/Sonarr root-folder paths. */
+  root_folder_paths: string[]
 }
 
 export type SyncDefaults = {

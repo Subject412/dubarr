@@ -394,12 +394,30 @@ export function SettingsPage() {
           >
             {(draft, update) => (
               <>
+                <Field
+                  label="Tag source"
+                  htmlFor="tag-source-mode"
+                  hint="Sources are combined: a file must satisfy each selected source."
+                  help={settingsHelp('target.tag_filter', 'source_mode')}
+                >
+                  <Select
+                    id="tag-source-mode"
+                    value={draft.source_mode ?? 'filename'}
+                    onChange={(event) =>
+                      update({ source_mode: event.target.value as TargetTagFilter['source_mode'] })
+                    }
+                  >
+                    <option value="filename">Filename tags</option>
+                    <option value="arr">Radarr/Sonarr tags</option>
+                    <option value="both">Filename and Radarr/Sonarr tags</option>
+                  </Select>
+                </Field>
                 <StringListEditor
                   label="Required filename tags"
                   inputLabel="Add required tag"
                   values={draft.required_filename_tags ?? []}
                   onChange={(required_filename_tags) => update({ required_filename_tags })}
-                  placeholder="[ArcA310]"
+                  placeholder="[TAG]"
                   help={settingsHelp('target.tag_filter', 'required_filename_tags')}
                 />
                 <StringListEditor
@@ -408,6 +426,29 @@ export function SettingsPage() {
                   values={draft.excluded_filename_tags ?? []}
                   onChange={(excluded_filename_tags) => update({ excluded_filename_tags })}
                   help={settingsHelp('target.tag_filter', 'excluded_filename_tags')}
+                />
+                <StringListEditor
+                  label="Required Radarr/Sonarr tags"
+                  inputLabel="Add required *arr tag"
+                  values={draft.required_arr_tags ?? []}
+                  onChange={(required_arr_tags) => update({ required_arr_tags })}
+                  placeholder="dub"
+                  help={settingsHelp('target.tag_filter', 'required_arr_tags')}
+                />
+                <StringListEditor
+                  label="Excluded Radarr/Sonarr tags"
+                  inputLabel="Add excluded *arr tag"
+                  values={draft.excluded_arr_tags ?? []}
+                  onChange={(excluded_arr_tags) => update({ excluded_arr_tags })}
+                  placeholder="cam"
+                  help={settingsHelp('target.tag_filter', 'excluded_arr_tags')}
+                />
+                <PathListEditor
+                  label="Radarr/Sonarr root folders"
+                  values={draft.root_folder_paths ?? []}
+                  onChange={(root_folder_paths) => update({ root_folder_paths })}
+                  emptyText="No root folders configured — every root folder is accepted."
+                  help={settingsHelp('target.tag_filter', 'root_folder_paths')}
                 />
                 <div className="grid gap-4 md:grid-cols-2">
                   <Field

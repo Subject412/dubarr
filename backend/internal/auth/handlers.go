@@ -273,6 +273,110 @@ func (s *Service) handleMe(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, user)
 }
 
+// handleChangePassword updates the caller's own password. The caller's current
+// session stays valid and every other session of the same user is revoked
+// (Q10); API tokens are machine credentials and are deliberately untouched.
+func (s *Service) handleChangePassword(w http.ResponseWriter, r *http.Request) {
+	user, ok := UserFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
+	var req struct {
+		CurrentPassword string `json:"current_password"`
+		NewPassword     string `json:"new_password"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if len(req.NewPassword) < minPasswordLen {
+		writeError(w, http.StatusBadRequest, "new password must be at least 8 characters")
+		return
+	}
+	if req.NewPassword == req.CurrentPassword {
+		writeError(w, http.StatusBadRequest, "new password must differ from the current password")
+		return
+	}
+	if req.CurrentPassword == "" {
+		writeError(w, http.StatusBadRequest, "current password is required")
+		return
+	}
+
+	ctx := r.Context()
+	var storedHash string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT password_hash FROM users WHERE id = ?`, user.ID).Scan(&storedHash)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusForbidden, "invalid current password")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not change password")
+		return
+	}
+
+	// Every failure to confirm the current password is reported identically and
+	// carries no stored-hash detail. It is a 403, not a 401: the session itself
+	// is still valid, and a 401 would make the SPA bounce to /login on a typo.
+	okHash, err := VerifyPassword(storedHash, req.CurrentPassword)
+	if err != nil || !okHash {
+		writeError(w, http.StatusForbidden, "invalid current password")
+		return
+	}
+
+	// Hash outside the transaction: Argon2id is deliberately slow and must not
+	// hold the write lock.
+	hash, err := hashPassword(req.NewPassword)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not change password")
+		return
+	}
+
+	// The caller's cookie digest identifies the one session to keep. A bearer
+	// caller has no session, so an empty digest keeps none.
+	keepDigest := ""
+	if ck, err := r.Cookie(sessionCookieName); err == nil && ck.Value != "" {
+		keepDigest = hashToken(ck.Value)
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not change password")
+		return
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	res, err := tx.ExecContext(ctx,
+		`UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+		hash, user.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not change password")
+		return
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not change password")
+		return
+	}
+	if affected == 0 {
+		writeError(w, http.StatusInternalServerError, "could not change password")
+		return
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM sessions WHERE user_id = ? AND token_hash <> ?`, user.ID, keepDigest,
+	); err != nil {
+		writeError(w, http.StatusInternalServerError, "could not change password")
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		writeError(w, http.StatusInternalServerError, "could not change password")
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // handleListTokens returns the caller's tokens, masked.
 func (s *Service) handleListTokens(w http.ResponseWriter, r *http.Request) {
 	user, ok := UserFromContext(r.Context())

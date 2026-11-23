@@ -14,6 +14,8 @@ export const SETTINGS_HELP: Record<SettingsSectionKey, Record<string, string>> =
       'Audio Vault: the write-once archive of extracted tracks, kept outside the video library so replacing a video never deletes its audio.',
     work_dir:
       'Work Area: isolated scratch space. Every job copies vault tracks here and verifies their checksums before processing.',
+    output_dir:
+      'Destination for the "write to the mux output folder" mode: the muxed file lands here as <name>.dubarr.mkv and the library file is left untouched. Must not be the Audio Vault or inside it.',
     media_roots:
       'Library folders Dubarr is allowed to read Targets from. Paths are canonicalized and confined to these roots.',
   },
@@ -62,8 +64,10 @@ export const SETTINGS_HELP: Record<SettingsSectionKey, Record<string, string>> =
   },
   'mux.options': {
     keep_bak:
-      'Keep a .bak copy of the replaced Target. Off replaces the original atomically with no backup.',
+      'Keep a .bak copy of the replaced Target. Off replaces the original atomically with no backup. Ignored when the output mode writes to the mux output folder, because nothing is replaced.',
     track_title_in_mkv: 'Track title written into the Matroska container for the muxed audio.',
+    output_mode:
+      'Replace: atomically overwrite the library file (optional .bak). Write to the mux output folder: save <name>.dubarr.mkv in the Mux output folder instead, refuse to overwrite an existing file and skip the *arr rescan.',
   },
   'watch.options': {
     scan_interval_sec: 'How often the Watch Folder is scanned for new donors.',

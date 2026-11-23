@@ -17,7 +17,7 @@ import type {
  * form ever renders an empty, unsaveable object.
  */
 export const DEFAULT_SETTINGS: DubarrSettings = {
-  'storage.paths': { watch_dir: '', vault_dir: '', work_dir: '', media_roots: [] },
+  'storage.paths': { watch_dir: '', vault_dir: '', work_dir: '', output_dir: '', media_roots: [] },
   'languages.policy': {
     target_import_languages: ['pl'],
     extra_reference_languages: ['en'],
@@ -46,7 +46,11 @@ export const DEFAULT_SETTINGS: DubarrSettings = {
     require_av1_warning: true,
     require_av1_strict: false,
   },
-  'mux.options': { keep_bak: true, track_title_in_mkv: 'Polski Dubbing' },
+  'mux.options': {
+    keep_bak: true,
+    track_title_in_mkv: 'Polski Dubbing',
+    output_mode: 'replace',
+  },
   'watch.options': { scan_interval_sec: 10, stability_check_interval_sec: 4 },
   'arr.options': { poll_interval_sec: 300, manual_sync: true },
   'imports.options': { donor_patterns: ['PL.DUB'] },

@@ -381,3 +381,98 @@ describe('setup wizard tag filter step', () => {
     expect(body.settings['target.tag_filter'].tag_match_mode).toBe('REGEX')
   })
 })
+
+describe('mux output destination', () => {
+  const settings = {
+    'storage.paths': {
+      watch_dir: '/watch',
+      vault_dir: '/vault',
+      work_dir: '/work',
+      output_dir: '/deliver',
+      media_roots: [],
+    },
+    'mux.options': {
+      keep_bak: true,
+      track_title_in_mkv: 'Polski Dubbing',
+      output_mode: 'replace',
+    },
+  }
+
+  function mockMuxFetch(): ReturnType<typeof vi.fn> {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/api/settings') && isMethod(init, 'PUT')) {
+        return jsonResponse({ settings })
+      }
+      if (url.includes('/api/settings')) {
+        return jsonResponse({ settings })
+      }
+      return jsonResponse({ error: 'unexpected' }, 404)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    return fetchMock
+  }
+
+  function savedSection(fetchMock: ReturnType<typeof vi.fn>, key: string) {
+    const put = fetchMock.mock.calls.find(([, init]) => isMethod(init, 'PUT'))
+    expect(put).toBeDefined()
+    const body = JSON.parse(String(put?.[1]?.body)) as {
+      settings: Record<string, Record<string, unknown>>
+    }
+    return body.settings[key]
+  }
+
+  it('offers both destination modes and saves separate', async () => {
+    const user = userEvent.setup()
+    const fetchMock = mockMuxFetch()
+    renderWithProviders(<SettingsPage />, { route: '/settings' })
+
+    expect(await screen.findByRole('heading', { name: 'Mux options' })).toBeInTheDocument()
+    const mode = screen.getByLabelText('Output mode') as HTMLSelectElement
+    expect(Array.from(mode.options).map((option) => option.value)).toEqual(['replace', 'separate'])
+    expect(mode.value).toBe('replace')
+
+    await user.selectOptions(mode, 'separate')
+    await user.click(screen.getByLabelText('Save Mux options'))
+
+    await waitFor(() => expect(fetchMock.mock.calls.some(([, init]) => isMethod(init, 'PUT'))).toBe(true))
+    expect(savedSection(fetchMock, 'mux.options')).toMatchObject({
+      keep_bak: true,
+      track_title_in_mkv: 'Polski Dubbing',
+      output_mode: 'separate',
+    })
+  })
+
+  it('saves the mux output folder with the section', async () => {
+    const user = userEvent.setup()
+    const fetchMock = mockMuxFetch()
+    renderWithProviders(<SettingsPage />, { route: '/settings' })
+
+    expect(await screen.findByRole('heading', { name: 'Storage paths' })).toBeInTheDocument()
+    const field = screen.getByLabelText('Mux output folder')
+    expect(field).toHaveValue('/deliver')
+    await user.clear(field)
+    await user.type(field, '/deliver/new')
+    await user.click(screen.getByLabelText('Save Storage paths'))
+
+    await waitFor(() => expect(fetchMock.mock.calls.some(([, init]) => isMethod(init, 'PUT'))).toBe(true))
+    expect(savedSection(fetchMock, 'storage.paths')).toMatchObject({
+      watch_dir: '/watch',
+      vault_dir: '/vault',
+      work_dir: '/work',
+      output_dir: '/deliver/new',
+      media_roots: [],
+    })
+  })
+
+  it('explains that keep_bak does not apply in separate mode', async () => {
+    const user = userEvent.setup()
+    mockMuxFetch()
+    renderWithProviders(<SettingsPage />, { route: '/settings' })
+
+    const help = await screen.findByLabelText('About Keep .bak backup')
+    await user.hover(help)
+    const tip = await screen.findByRole('tooltip')
+    expect(tip).toHaveTextContent(/ignored when the output mode writes to the mux output folder/i)
+  })
+})

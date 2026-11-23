@@ -305,6 +305,12 @@ export function SettingsPage() {
                     value={draft.work_dir}
                     onChange={(work_dir) => update({ work_dir })}
                   />
+                  <PathField
+                    label="Mux output folder"
+                    help={settingsHelp('storage.paths', 'output_dir')}
+                    value={draft.output_dir ?? ''}
+                    onChange={(output_dir) => update({ output_dir })}
+                  />
                 </div>
                 <PathListEditor
                   label="Media roots"
@@ -527,6 +533,22 @@ export function SettingsPage() {
           >
             {(draft, update) => (
               <>
+                <Field
+                  label="Output mode"
+                  htmlFor="mux-output-mode"
+                  help={settingsHelp('mux.options', 'output_mode')}
+                >
+                  <Select
+                    id="mux-output-mode"
+                    value={draft.output_mode ?? 'replace'}
+                    onChange={(event) =>
+                      update({ output_mode: event.target.value === 'separate' ? 'separate' : 'replace' })
+                    }
+                  >
+                    <option value="replace">Replace the target in place</option>
+                    <option value="separate">Write to the mux output folder</option>
+                  </Select>
+                </Field>
                 <Toggle
                   label="Keep .bak backup"
                   help={settingsHelp('mux.options', 'keep_bak')}

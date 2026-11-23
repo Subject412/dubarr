@@ -46,6 +46,8 @@ export type StoragePaths = {
   watch_dir: string
   vault_dir: string
   work_dir: string
+  /** Destination root for mux output_mode=separate (ADR-0011). */
+  output_dir: string
   media_roots: string[]
 }
 
@@ -81,9 +83,13 @@ export type SecurityOptions = {
   require_av1_strict: boolean
 }
 
+export type MuxOutputMode = 'replace' | 'separate'
+
 export type MuxOptions = {
   keep_bak: boolean
   track_title_in_mkv: string
+  /** replace: atomically overwrite the Target; separate: write to output_dir (ADR-0011). */
+  output_mode: MuxOutputMode
 }
 
 export type WatchOptions = {
@@ -263,6 +269,8 @@ export type SyncJob = {
   target_library_cache_id: number
   target_video_path?: string
   target_lang_iso2?: string
+  /** Where mux published the file (Target, or the separate-mode deliverable). */
+  output_path?: string
   sync_method?: string
   calculated_offset_ms: number
   report?: SyncReport

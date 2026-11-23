@@ -31,6 +31,9 @@ type Client interface {
 	QualityProfiles(ctx context.Context) ([]QualityProfile, error)
 	// RootFolders lists configured media roots.
 	RootFolders(ctx context.Context) ([]RootFolder, error)
+	// Tags lists configured tags (GET /api/v3/tag). Both products expose the
+	// same endpoint and payload.
+	Tags(ctx context.Context) ([]Tag, error)
 }
 
 // Radarr is the Radarr-specific client surface.
@@ -163,6 +166,14 @@ func (c *core) QualityProfiles(ctx context.Context) ([]QualityProfile, error) {
 func (c *core) RootFolders(ctx context.Context) ([]RootFolder, error) {
 	out := []RootFolder{}
 	err := c.get(ctx, "/api/v3/rootfolder", &out)
+	return out, err
+}
+
+// Tags implements Client. Radarr and Sonarr share GET /api/v3/tag, so one
+// implementation serves both.
+func (c *core) Tags(ctx context.Context) ([]Tag, error) {
+	out := []Tag{}
+	err := c.get(ctx, "/api/v3/tag", &out)
 	return out, err
 }
 

@@ -14,6 +14,14 @@ type Language struct {
 	Name string `json:"name"`
 }
 
+// Tag is one *arr tag from GET /api/v3/tag. Radarr and Sonarr expose the same
+// shape, and ADR-0009 matches eligibility by Label. IDs are not stable across
+// instances, so they only ever identify a tag within its own instance.
+type Tag struct {
+	ID    int64  `json:"id"`
+	Label string `json:"label"`
+}
+
 // Movie is the subset of a Radarr /api/v3/movie record Dubarr needs.
 type Movie struct {
 	ID               int      `json:"id"`
@@ -26,6 +34,8 @@ type Movie struct {
 	Monitored        bool     `json:"monitored"`
 	HasFile          bool     `json:"hasFile"`
 	OriginalLanguage Language `json:"originalLanguage"`
+	// Tags are the tag ids attached to the movie; resolve them with Tags().
+	Tags []int `json:"tags"`
 	// MovieFile is the imported file, nil when HasFile is false.
 	MovieFile *MediaFile `json:"movieFile"`
 }
@@ -43,6 +53,8 @@ type Series struct {
 	// OriginalLanguage is the series' original audio language (Sonarr v4 /
 	// v3 API returns it on the series object); empty when the instance omits it.
 	OriginalLanguage Language `json:"originalLanguage"`
+	// Tags are the tag ids attached to the series; episodes inherit them.
+	Tags []int `json:"tags"`
 }
 
 // QualityProfile is a named quality profile from /api/v3/qualityprofile.

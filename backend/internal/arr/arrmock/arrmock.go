@@ -45,6 +45,7 @@ type Movie struct {
 	Monitored        bool       `json:"monitored"`
 	HasFile          bool       `json:"hasFile"`
 	OriginalLanguage Language   `json:"originalLanguage"`
+	Tags             []int      `json:"tags"`
 	MovieFile        *MovieFile `json:"movieFile,omitempty"`
 }
 
@@ -59,6 +60,7 @@ type Series struct {
 	QualityProfileID int      `json:"qualityProfileId"`
 	Monitored        bool     `json:"monitored"`
 	OriginalLanguage Language `json:"originalLanguage"`
+	Tags             []int    `json:"tags"`
 }
 
 // QualityProfile is an /api/v3/qualityprofile element.
@@ -75,6 +77,12 @@ type RootFolder struct {
 	FreeSpace  int64  `json:"freeSpace"`
 }
 
+// Tag is an /api/v3/tag element. Both products serve the same shape.
+type Tag struct {
+	ID    int64  `json:"id"`
+	Label string `json:"label"`
+}
+
 // Fixtures is the content the fake serves. Empty slices produce empty arrays,
 // exactly like a configured-but-empty instance.
 type Fixtures struct {
@@ -83,6 +91,7 @@ type Fixtures struct {
 	Episodes        []Episode
 	QualityProfiles []QualityProfile
 	RootFolders     []RootFolder
+	Tags            []Tag
 }
 
 // RecordedRequest is one request observed by the fake.
@@ -139,6 +148,10 @@ func New(kind Kind, apiKey string, fx Fixtures) *Server {
 	}))
 	mux.HandleFunc("/api/v3/rootfolder", s.handle(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, nonNil(fx.RootFolders))
+	}))
+	// /api/v3/tag exists on both products with an identical payload.
+	mux.HandleFunc("/api/v3/tag", s.handle(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, nonNil(fx.Tags))
 	}))
 	// Commands are shared by both products; the fake records the decoded body
 	// so tests can assert the exact command name and id.

@@ -3,11 +3,11 @@
 Self-hosted dubbing-sync appliance. Domain language: `GLOSSARY.md`. Spec: `IDEA.md` (read-only reference). Decisions: `docs/adr/` — do not contradict an ADR without a new one. License: MIT (`LICENSE`).
 
 ## Stack
-- Backend: Go 1.23+ (toolchain 1.27), module `github.com/Subject412/dubarr/backend`. Pure-Go SQLite (`modernc.org/sqlite`, WAL). REST + WebSocket. SPA embedded via `go:embed`.
+- Backend: Go 1.26.0 (toolchain 1.27; from `backend/go.mod`), module `github.com/Subject412/dubarr/backend`. Pure-Go SQLite (`modernc.org/sqlite`, WAL). REST + WebSocket. SPA embedded via `go:embed`.
 - DSP: Rust CLI `dubarr-sync` (edition 2021; clap, hound, rustfft, serde, serde_json). Reads WAV PCM slices. `offset_ms = t_target − t_donor`.
 - Frontend: React 19 + TypeScript 7 + Vite 8 + Tailwind 4 (`@tailwindcss/vite`, `@theme` in CSS); react-router 7; tanstack-query 5; wavesurfer.js (Sync Studio, M5). Dark *arr-style UI. Lint: `oxlint`.
 - External tools: `ffmpeg`, `ffprobe`, `mkvmerge` on PATH; `/api/health` reports availability.
-- No Python anywhere. No app settings or secrets in env vars (only `--data-dir`/`--listen`/`--desktop`; PUID/PGID in Docker).
+- No Python anywhere. No app settings or secrets in env vars. Bootstrap flags: `--data-dir`/`--listen`/`--desktop`, plus `--log-level`/`--log-file` (ADR-0013) and the one-shot `rekey --keyfile` (ADR-0008); PUID/PGID in Docker.
 
 ## Commands
 - Backend: `cd backend && go build ./cmd/dubarr && go test ./... && go vet ./...`
@@ -23,7 +23,7 @@ Each `internal/<pkg>` exposes `RegisterRoutes(mux *http.ServeMux, deps Dependenc
 - Conventional commits, branch `main`. Never commit media (`testfiles/`), `data/`, or secrets.
 - Protected (orchestrator-only writes): `AGENTS.md`, `PLAN.md`, `GLOSSARY.md`, `docs/adr/**`, `LICENSE`, applied migrations.
 - Vault write-once. Every job Copy-on-Work into WORK_DIR + SHA-256 verify; never modify VAULT_DIR in place.
-- Target video never transcoded. Mux only tag-eligible targets (Tdarr Gate) unless force override allowed by settings.
+- Target video never transcoded. Mux only tag-eligible targets (Processing Gate, formerly Tdarr Gate — see ADR-0009) unless force override allowed by settings.
 - Secrets AES-256-GCM (12-byte nonce || ciphertext || tag); master key OS keyring (native) / 0600 keyfile (Docker). `X-Api-Key` header only; scrub secrets from logs/errors. Never print secrets.
 - Paths canonicalized + `filepath.EvalSymlinks`, confined to configured roots. DATA_DIR 0700; db/keyfile 0600.
 - Fixture tests run on COPIES in scratch; originals read-only. `go test` + `cargo test` green before any milestone gate.

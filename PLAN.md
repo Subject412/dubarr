@@ -1,6 +1,6 @@
 # Dubarr — Implementation Plan
 
-Spec: `IDEA.md`. Domain: `GLOSSARY.md`. Decisions: `docs/adr/0001–0007`. Contract: `AGENTS.md`.
+Spec: `IDEA.md`. Domain: `GLOSSARY.md`. Decisions: `docs/adr/0001–0013`. Contract: `AGENTS.md`.
 Execution: subagent-driven-development (fresh implementer per task → spec review → quality review). Gate protocol: **stop for user OK at each milestone gate (M1→M5)**. For issues #1–#13 (M7–M10 below) the user settled on continuous execution with **no stop-for-OK gates**; milestones remain work batches only.
 
 ## Settled defaults (grilling Q1–Q15)

@@ -152,6 +152,62 @@ describe('info tooltip (issue #3)', () => {
     expect(control).toBeInTheDocument()
   })
 
+  it('flips below the control — not the trigger — and clamps inside the viewport', async () => {
+    const user = userEvent.setup()
+    await renderSettings()
+
+    const trigger = screen.getByRole('button', { name: 'About Vault folder' })
+    const control = screen.getByLabelText('Vault folder')
+
+    const viewport = { width: 1024, height: 800 }
+    vi.spyOn(window, 'innerWidth', 'get').mockReturnValue(viewport.width)
+    vi.spyOn(window, 'innerHeight', 'get').mockReturnValue(viewport.height)
+
+    const rect = (top: number, left: number, width: number, height: number): DOMRect => ({
+      top,
+      bottom: top + height,
+      left,
+      right: left + width,
+      width,
+      height,
+      x: left,
+      y: top,
+      toJSON: () => ({}),
+    })
+    // Trigger sits in the label row right at the top of the viewport: there is
+    // no room above, so the popover must flip. The control is the next element.
+    const triggerRect = rect(10, 100, 16, 16)
+    const controlRect = rect(34, 100, 300, 32)
+    const tipRect = rect(0, 0, 288, 60)
+    const emptyRect = rect(0, 0, 0, 0)
+
+    vi.spyOn(Element.prototype, 'getBoundingClientRect').mockImplementation(function (
+      this: Element,
+    ) {
+      if (this === trigger) return triggerRect
+      if (this === control) return controlRect
+      if (this.getAttribute('role') === 'tooltip') return tipRect
+      return emptyRect
+    })
+
+    await user.hover(trigger)
+    const tooltip = await screen.findByRole('tooltip')
+
+    const top = Number.parseInt(tooltip.style.top, 10)
+    const left = Number.parseInt(tooltip.style.left, 10)
+
+    // Never over the control it documents.
+    const overlapsControl = top < controlRect.bottom && top + tipRect.height > controlRect.top
+    expect(overlapsControl).toBe(false)
+    expect(top).toBeGreaterThanOrEqual(controlRect.bottom)
+
+    // And always inside the viewport.
+    expect(top).toBeGreaterThanOrEqual(8)
+    expect(top + tipRect.height).toBeLessThanOrEqual(viewport.height - 8)
+    expect(left).toBeGreaterThanOrEqual(8)
+    expect(left + tipRect.width).toBeLessThanOrEqual(viewport.width - 8)
+  })
+
   it('never puts help text into the settings payload', async () => {
     const user = userEvent.setup()
     const fetchMock = await renderSettingsAndReturnMock()

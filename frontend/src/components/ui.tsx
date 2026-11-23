@@ -70,8 +70,22 @@ export function Select({ className, children, ...props }: SelectHTMLAttributes<H
 /**
  * Small "i" button with a hover/focus popover. Fixed positioning keeps the
  * tooltip out of the document flow (no layout shift) and clamped inside the
- * viewport; it is always offset from the control so it never covers it.
+ * viewport; when there is no room above, it flips below the *control* it
+ * documents so it never covers it.
  */
+const CONTROL_SELECTOR = 'input, select, textarea, [role="switch"], [role="combobox"]'
+
+/** The form control associated with a help id (shares the trigger's aria-describedby). */
+function controlForHelpId(id: string, trigger: Element): Element | null {
+  if (!id) return null
+  for (const element of document.querySelectorAll('[aria-describedby]')) {
+    if (element === trigger || !element.matches(CONTROL_SELECTOR)) continue
+    const ids = (element.getAttribute('aria-describedby') ?? '').split(/\s+/)
+    if (ids.includes(id)) return element
+  }
+  return null
+}
+
 export function InfoTip({ id, label, text }: { id: string; label: string; text: string }) {
   const [open, setOpen] = useState(false)
   const [position, setPosition] = useState<{ top: number; left: number } | null>(null)
@@ -88,13 +102,25 @@ export function InfoTip({ id, label, text }: { id: string; label: string; text: 
     const size = tip.getBoundingClientRect()
     const margin = 8
     const viewportWidth = window.innerWidth || 1024
+    const viewportHeight = window.innerHeight || 768
     const centered = anchor.left + anchor.width / 2 - size.width / 2
     const left = Math.min(
       Math.max(margin, centered),
       Math.max(margin, viewportWidth - size.width - margin),
     )
+    // Prefer above the trigger. With no room there, flip below the control the
+    // tooltip describes (the next element in the label row), not below the
+    // trigger, which would cover that control. Always clamp to the viewport.
     const above = anchor.top - size.height - margin
-    setPosition({ top: above >= margin ? above : anchor.bottom + margin, left })
+    let top = above
+    if (above < margin) {
+      const control = controlForHelpId(trigger.getAttribute('aria-describedby') ?? '', trigger)
+      const controlRect = control?.getBoundingClientRect()
+      const base = controlRect && controlRect.height > 0 ? controlRect.bottom : anchor.bottom
+      top = base + margin
+    }
+    const maxTop = Math.max(margin, viewportHeight - size.height - margin)
+    setPosition({ top: Math.min(Math.max(margin, top), maxTop), left })
   }, [open])
 
   useEffect(() => {

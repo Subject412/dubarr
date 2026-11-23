@@ -1,28 +1,43 @@
 # docker/
 
-Container packaging for the Dubarr appliance (T8).
+Container packaging for the Dubarr appliance. For the project overview and
+source-build instructions, start at the [root README](../README.md).
 
 - `Dockerfile` — multi-stage build: Vite/TypeScript frontend → static Go server
   (`CGO_ENABLED=0`, SPA embedded via `go:embed`) → Debian slim runtime with
   `ffmpeg`, `ffprobe`, `mkvmerge` and a `PUID`/`PGID` entrypoint.
 - `entrypoint.sh` — remaps the `dubarr` user to `PUID`/`PGID` (default
-  1000/1000), fixes `/config` ownership (0700) and drops privileges with `gosu`.
-- `docker-compose.yml` — appliance service with a `/config` volume and a
-  read-only media mount (`MEDIA_PATH`, default `./media`). The host port is
-  published from `DUBARR_PORT` (default `8080`) onto the container's fixed
-  `8080`.
+  1000/1000), fixes `/config` ownership (0700) and drops privileges with
+  `gosu`.
+- `docker-compose.yml` — the canonical, all-defaults appliance service.
+- `docker-compose.example.yml` + `.env.example` — copy-ready variant with
+  non-default host values (port `8090`, custom media path, different
+  `PUID`/`PGID`, explicit config bind mount).
 
-Build and run from the repository root:
+## Compose variables
 
-```sh
-docker build -f docker/Dockerfile -t dubarr:latest .
-docker run -d --name dubarr -p 8080:8080 \
-  -e PUID=1000 -e PGID=1000 -v "$PWD/docker/config:/config" dubarr:latest
-```
+This is the single reference for the variables both compose files use. (Only
+the canonical file has defaults; the example reads its values from `.env`.)
 
-or `cd docker && docker compose up --build`.
+| Variable | Default | Consumed by | Purpose |
+| --- | --- | --- | --- |
+| `PUID` | `1000` | entrypoint, inside the container | uid the `dubarr` process runs as; must own `/config` and be able to read the media mount |
+| `PGID` | `1000` | entrypoint, inside the container | gid for the same process |
+| `MEDIA_PATH` | `./media` | Compose, on the host | host directory bind-mounted read-only at `/media` |
+| `DUBARR_PORT` | `8080` | Compose, on the host | published host port for the web UI |
 
-To publish the web UI on a different host port, set `DUBARR_PORT` in `docker/.env`:
+`PUID` and `PGID` are the only environment variables the image honours.
+`MEDIA_PATH` and `DUBARR_PORT` never enter the container: `DUBARR_PORT=8090`
+publishes `8090:8080` while the process keeps listening on `0.0.0.0:8080`, so
+`entrypoint.sh` and the image need no change.
+
+Application settings and secrets never come from the environment. The process
+is started with explicit flags (`--data-dir /config --listen 0.0.0.0:8080`) and
+everything else is configured in the first-run wizard and stored in `/config`
+(ADR-0003).
+
+To override the defaults, put the values in `docker/.env` (Compose loads it
+from this directory) or export them in the shell:
 
 ```sh
 PUID=1000
@@ -31,19 +46,41 @@ MEDIA_PATH=/srv/media
 DUBARR_PORT=8090
 ```
 
-`DUBARR_PORT=8090` publishes the service as `8090:8080` — the container still
-listens on `8080`, so `docker/entrypoint.sh` and the image need no change.
+## Run
 
-`PUID` and `PGID` are the only environment variables the image honours;
-`DUBARR_PORT` is read by Compose on the host to choose the published port and is
-never passed into the container. Application settings and secrets never come
-from the environment: the process
-is started with explicit flags (`--data-dir /config --listen 0.0.0.0:8080`) and
-everything else is configured in the first-run wizard and stored in `/config`.
+With the defaults:
+
+```sh
+cd docker
+docker compose up --build
+```
+
+With the example values:
+
+```sh
+cd docker
+cp .env.example .env    # edit PUID/PGID and MEDIA_PATH
+docker compose -f docker-compose.example.yml up --build
+```
+
+Or build and run without Compose from the repository root:
+
+```sh
+docker build -f docker/Dockerfile -t dubarr:latest .
+docker run -d --name dubarr -p 8080:8080 \
+  -e PUID=1000 -e PGID=1000 -v "$PWD/docker/config:/config" dubarr:latest
+```
+
+The UI is served on the published port (8080 by default, 8090 for the example
+above).
+
+## Secrets
 
 In a container there is no OS keyring (no D-Bus session), so `/api/health`
 reports `keyring_available: false` and the master key lives in
-`/config/.master.key` (mode 0600).
+`/config/.master.key` (mode 0600). Native installs use the OS keyring instead;
+switching between the two is explicit via `dubarr rekey --keyfile PATH`
+(ADR-0008).
 
 ## Logs
 
@@ -68,10 +105,15 @@ Logs written to `/config/logs/dubarr.log` survive container recreation because
     command: ["--log-level", "debug", "--log-file"]
 ```
 
-`--log-level` is a CLI flag (`debug|info|warn|error`, default `info`), not an
-environment variable: `entrypoint.sh` forwards extra arguments after its own
-`--data-dir/--listen`. Changing the level needs no app setting and no env var
+`--log-level` and `--log-file` are CLI flags (ADR-0013), not environment
+variables: `entrypoint.sh` forwards extra arguments after its own
+`--data-dir`/`--listen`. Changing the level needs no app setting and no env var
 (ADR-0003). Do **not** mount `/var/run/docker.sock` for logging.
 
-`dubarr-sync` (Rust DSP CLI) is not built yet (M3/M4); `/api/health` reports it
-as `available: false`.
+## DSP CLI
+
+`dubarr-sync` (Rust) is required for sync and mux jobs. The image does not
+include it, so `/api/health` reports it as `available: false` inside the
+container unless the binary is provided (bind-mount it and extend `PATH`, or
+build a derived image). A release archive ships `dubarr-sync` beside `dubarr`;
+see [docs/RELEASING.md](../docs/RELEASING.md).

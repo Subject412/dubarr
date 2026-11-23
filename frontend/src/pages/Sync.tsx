@@ -77,11 +77,29 @@ function JobRow({
             : 'border-ink-800 bg-ink-950/40 hover:border-ink-600 hover:bg-ink-800/50')
         }
       >
-        <div className="flex min-w-0 items-center gap-2">
+        <div className="flex min-w-0 flex-col gap-0.5 text-left">
           <span className="font-mono text-xs text-zinc-400">#{job.id}</span>
-          <span className="truncate text-sm text-zinc-200" title={job.target_video_path}>
-            {job.target_video_path || 'no target file'}
-          </span>
+          {job.output_path ? (
+            <span
+              data-testid={`sync-job-output-${job.id}`}
+              className="truncate text-sm text-zinc-200"
+              title={job.output_path}
+            >
+              <span className="mr-1 text-[11px] uppercase tracking-wider text-zinc-500">
+                Published path
+              </span>{' '}
+              {job.output_path}
+            </span>
+          ) : (
+            <span className="truncate text-sm text-zinc-200" title={job.target_video_path}>
+              {job.target_video_path || 'no target file'}
+            </span>
+          )}
+          {job.output_path && job.target_video_path && job.output_path !== job.target_video_path && (
+            <span className="truncate text-[11px] text-zinc-500" title={job.target_video_path}>
+              Target: {job.target_video_path}
+            </span>
+          )}
         </div>
         <div className="flex flex-wrap items-center gap-1.5">
           <Badge tone={status.tone}>{status.label}</Badge>
@@ -184,11 +202,24 @@ function JobDetail({
   const data = job.data
   const status = statusBadge(data.status)
   const canRerun = data.status === 'failed' && !rerunning
+  const showTargetFile = Boolean(
+    data.output_path && data.target_video_path && data.output_path !== data.target_video_path,
+  )
 
   return (
     <Card
       title={`Job #${data.id}`}
-      description={data.target_video_path || 'No target file recorded'}
+      description={
+        data.output_path ? (
+          <span data-testid="sync-detail-output">
+            Published path: <span className="font-mono">{data.output_path}</span>
+          </span>
+        ) : (
+          <span data-testid="sync-detail-target">
+            {data.target_video_path || 'No target file recorded'}
+          </span>
+        )
+      }
       actions={
         <>
           <span data-testid="sync-status">
@@ -216,6 +247,14 @@ function JobDetail({
             <dt className="text-[11px] uppercase tracking-wider text-zinc-500">Target language</dt>
             <dd className="mt-0.5 text-sm text-zinc-200">{data.target_lang_iso2 || '—'}</dd>
           </div>
+          {showTargetFile && (
+            <div className="sm:col-span-3">
+              <dt className="text-[11px] uppercase tracking-wider text-zinc-500">Target file</dt>
+              <dd data-testid="sync-detail-target" className="mt-0.5 break-all font-mono text-xs text-zinc-300">
+                {data.target_video_path}
+              </dd>
+            </div>
+          )}
         </dl>
 
         {data.status === 'failed' && data.error_message && (

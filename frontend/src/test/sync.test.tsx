@@ -224,4 +224,53 @@ describe('sync studio', () => {
       })
     })
   })
+
+  it('shows the published output path when mux wrote to a separate destination', async () => {
+    const outputPath = '/output/Shrek (2001) [Remux] [PL].mkv'
+    const job = makeJob({ id: 12, output_path: outputPath })
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input)
+        if (url.endsWith('/api/sync/jobs')) return jsonResponse({ items: [job] })
+        if (url.endsWith('/api/sync/jobs/12')) return jsonResponse(job)
+        return jsonResponse({ error: 'unexpected' }, 404)
+      }),
+    )
+    renderWithProviders(<SyncPage />, { route: '/sync' })
+
+    const row = await screen.findByTestId('sync-job-row-12')
+    const rowOutput = within(row).getByTestId('sync-job-output-12')
+    expect(rowOutput).toHaveTextContent(`Published path ${outputPath}`)
+    // The untouched target is still visible, but only as the secondary line.
+    expect(within(row).getByText(/^Target: \/media\/Shrek/)).toBeInTheDocument()
+
+    const detailOutput = await screen.findByTestId('sync-detail-output')
+    expect(detailOutput).toHaveTextContent(`Published path: ${outputPath}`)
+    expect(screen.getByTestId('sync-detail-target')).toHaveTextContent(
+      '/media/Shrek (2001) [Remux].mkv',
+    )
+  })
+
+  it('falls back to the target path when no output path was published', async () => {
+    const job = makeJob({ id: 13 })
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input)
+        if (url.endsWith('/api/sync/jobs')) return jsonResponse({ items: [job] })
+        if (url.endsWith('/api/sync/jobs/13')) return jsonResponse(job)
+        return jsonResponse({ error: 'unexpected' }, 404)
+      }),
+    )
+    renderWithProviders(<SyncPage />, { route: '/sync' })
+
+    const row = await screen.findByTestId('sync-job-row-13')
+    expect(within(row).getByText('/media/Shrek (2001) [Remux].mkv')).toBeInTheDocument()
+    expect(within(row).queryByText(/Published path/)).toBeNull()
+
+    const detailTarget = await screen.findByTestId('sync-detail-target')
+    expect(detailTarget).toHaveTextContent('/media/Shrek (2001) [Remux].mkv')
+    expect(screen.queryByTestId('sync-detail-output')).toBeNull()
+  })
 })

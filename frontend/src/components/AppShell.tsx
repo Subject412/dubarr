@@ -78,7 +78,7 @@ export function AppShell() {
           </div>
           <div className="flex items-center gap-3">
             <Badge tone="neutral">{me.data?.username ?? 'signed in'}</Badge>
-            {me.data?.is_admin && <Badge tone="accent">admin</Badge>}
+            {me.data?.is_admin && <Badge tone="accent">Administrator</Badge>}
             <Button variant="secondary" size="sm" onClick={signOut} disabled={logout.isPending}>
               {logout.isPending ? 'Signing out…' : 'Log out'}
             </Button>

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -60,6 +61,12 @@ type Job struct {
 	// TrackTitle is the Matroska track name (settings mux.options
 	// track_title_in_mkv). Empty selects [DefaultTrackTitle].
 	TrackTitle string
+	// KeepBak mirrors settings mux.options.keep_bak: nil or true leaves the
+	// original beside the target as <target>.bak. A pointer to false removes
+	// the backup again after the post-mux ffprobe validation passed and the
+	// atomic rename published. The pointer keeps the zero value meaning "keep",
+	// matching the shipped setting default.
+	KeepBak *bool
 	// SetDefault marks the appended track as the container default.
 	SetDefault bool
 	// Gate is the target.tag_filter rule re-checked against the base filename.
@@ -78,6 +85,8 @@ type Job struct {
 // Result describes a successful publish.
 type Result struct {
 	OutputPath string
+	// BackupPath is <target>.bak when the original was kept, and empty when
+	// Job.KeepBak was false and the backup was removed after publishing.
 	BackupPath string
 	// WorkCopy is the Copy-on-Work target input mkvmerge read.
 	WorkCopy string
@@ -103,6 +112,9 @@ type Dependencies struct {
 	Run func(ctx context.Context, name string, args ...string) ([]byte, error)
 	// Timeout bounds one invocation; 0 selects DefaultTimeout.
 	Timeout time.Duration
+	// Warnf receives non-fatal diagnostics such as a failed .bak removal;
+	// nil uses log.Printf with a "WARN" prefix.
+	Warnf func(format string, args ...any)
 }
 
 // Muxer performs tag-gated, atomic muxing.
@@ -112,6 +124,10 @@ type Muxer struct {
 	lookPath     func(string) (string, error)
 	run          func(ctx context.Context, name string, args ...string) ([]byte, error)
 	timeout      time.Duration
+	// remove deletes the sidecar backup when Job.KeepBak is false. Overridable
+	// so tests can exercise the WARN-but-succeed path.
+	remove func(string) error
+	warnf  func(string, ...any)
 }
 
 // New builds a Muxer. A missing tool is reported from Mux, not here.
@@ -122,6 +138,13 @@ func New(deps Dependencies) *Muxer {
 		lookPath:     deps.LookPath,
 		run:          deps.Run,
 		timeout:      deps.Timeout,
+		remove:       os.Remove,
+		warnf:        deps.Warnf,
+	}
+	if m.warnf == nil {
+		m.warnf = func(format string, args ...any) {
+			log.Printf("WARN "+format, args...)
+		}
 	}
 	if m.lookPath == nil {
 		m.lookPath = exec.LookPath
@@ -270,6 +293,17 @@ func (m *Muxer) Mux(ctx context.Context, job Job) (Result, error) {
 		return Result{}, fmt.Errorf("%w: rename output: %v", ErrPublish, err)
 	}
 	published = true
+
+	// mux.options.keep_bak=false: the validated, published target is the only
+	// artifact left. The backup is a convenience, so a failed removal is a WARN
+	// and never undoes a successful publish.
+	if job.KeepBak != nil && !*job.KeepBak {
+		if err := m.remove(bak); err != nil {
+			m.warnf("mux: keep the backup at %s: %v", bak, err)
+		} else {
+			bak = ""
+		}
+	}
 
 	return Result{
 		OutputPath: target,

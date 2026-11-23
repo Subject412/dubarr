@@ -340,6 +340,8 @@ func eligibleRule() gate.Rule {
 	return gate.Rule{Required: []string{"[TDARR]"}, Mode: gate.MatchAny, Enforce: true}
 }
 
+func boolPtr(v bool) *bool { return &v }
+
 type harness struct {
 	t      *testing.T
 	dir    string
@@ -758,6 +760,74 @@ func TestConcurrentMuxesUseDistinctTemps(t *testing.T) {
 	}
 	if _, err := os.Stat(h.target + ".bak"); err != nil {
 		t.Errorf("concurrent mux left no .bak: %v", err)
+	}
+}
+
+// TestMuxDiscardsBackupWhenKeepBakFalse covers settings mux.options.keep_bak=
+// false: the validated publish stands, but no <target>.bak is left behind.
+func TestMuxDiscardsBackupWhenKeepBakFalse(t *testing.T) {
+	h := newHarness(t)
+	beforeAudio := len(audioStreams(probeFile(t, h.target)))
+
+	job := h.job()
+	job.KeepBak = boolPtr(false)
+	res, err := New(Dependencies{}).Mux(context.Background(), job)
+	if err != nil {
+		t.Fatalf("Mux: %v", err)
+	}
+	if _, err := os.Stat(h.target + ".bak"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf(".bak still present (err = %v), want removed", err)
+	}
+	if res.BackupPath != "" {
+		t.Errorf("BackupPath = %q, want empty after removal", res.BackupPath)
+	}
+	if res.OutputPath != h.target {
+		t.Errorf("OutputPath = %q, want %q", res.OutputPath, h.target)
+	}
+	afterProbe := probeFile(t, h.target)
+	if got, want := len(audioStreams(afterProbe)), beforeAudio+1; got != want {
+		t.Errorf("audio tracks = %d, want %d", got, want)
+	}
+	if _, ok := findAudio(afterProbe, "pl", "PL DUB"); !ok {
+		t.Errorf("no pl/PL DUB audio track in %+v", audioStreams(afterProbe))
+	}
+	if leftovers, err := tempLeftovers(h.target); err != nil {
+		t.Fatalf("list temps: %v", err)
+	} else if len(leftovers) > 0 {
+		t.Errorf("temp files still present beside target: %v", leftovers)
+	}
+}
+
+// TestMuxBackupRemovalFailureWarnsAndPublishes: a failing .bak removal is a
+// WARN, never a mux failure. The backup simply stays on disk.
+func TestMuxBackupRemovalFailureWarnsAndPublishes(t *testing.T) {
+	h := newHarness(t)
+	var warnings []string
+	merr := New(Dependencies{Warnf: func(format string, args ...any) {
+		warnings = append(warnings, fmt.Sprintf(format, args...))
+	}})
+	merr.remove = func(string) error { return errors.New("remove denied") }
+
+	job := h.job()
+	job.KeepBak = boolPtr(false)
+	res, err := merr.Mux(context.Background(), job)
+	if err != nil {
+		t.Fatalf("Mux: %v", err)
+	}
+	if res.BackupPath != h.target+".bak" {
+		t.Errorf("BackupPath = %q, want %q (removal failed, backup stays)", res.BackupPath, h.target+".bak")
+	}
+	if _, err := os.Stat(h.target + ".bak"); err != nil {
+		t.Errorf("stat .bak: %v, want the backup left in place", err)
+	}
+	if len(warnings) != 1 {
+		t.Fatalf("warnings = %v, want exactly one", warnings)
+	}
+	if !strings.Contains(warnings[0], ".bak") || !strings.Contains(warnings[0], "remove denied") {
+		t.Errorf("warning %q should name the backup and the reason", warnings[0])
+	}
+	if _, ok := findAudio(probeFile(t, h.target), "pl", "PL DUB"); !ok {
+		t.Errorf("publish did not survive the backup removal failure")
 	}
 }
 

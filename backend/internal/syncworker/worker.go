@@ -328,6 +328,7 @@ func (w *Worker) processJob(ctx context.Context, id int64) error {
 		return err
 	}
 
+	opts, optsOK := w.muxOptions(ctx)
 	_, err = w.muxer.Mux(ctx, mux.Job{
 		ID:             id,
 		WorkDir:        w.workDir,
@@ -335,7 +336,8 @@ func (w *Worker) processJob(ctx context.Context, id int64) error {
 		TargetLangISO2: rec.TargetLangISO2,
 		AudioPath:      audio,
 		SyncOffsetMS:   offset,
-		TrackTitle:     w.trackTitle(ctx),
+		TrackTitle:     w.trackTitle(opts),
+		KeepBak:        keepBak(opts, optsOK),
 		Gate:           rule,
 		Force:          w.forceOverride(ctx),
 		Report:         report,
@@ -507,19 +509,37 @@ func (w *Worker) forceOverride(ctx context.Context) bool {
 	return sec.AllowForceTagOverride
 }
 
-func (w *Worker) trackTitle(ctx context.Context) string {
+func (w *Worker) trackTitle(opts settings.MuxOptions) string {
+	return strings.TrimSpace(opts.TrackTitleInMKV)
+}
+
+// muxOptions reads settings mux.options once per job. ok=false means the
+// settings are unavailable, and the caller falls back to the shipped defaults
+// (empty track title, backups kept).
+func (w *Worker) muxOptions(ctx context.Context) (settings.MuxOptions, bool) {
 	if w.settings == nil {
-		return ""
+		return settings.MuxOptions{}, false
 	}
 	raw, ok, err := w.settings.Get(ctx, settings.KeyMuxOptions)
 	if err != nil || !ok {
-		return ""
+		return settings.MuxOptions{}, false
 	}
 	var opts settings.MuxOptions
 	if json.Unmarshal(raw, &opts) != nil {
-		return ""
+		return settings.MuxOptions{}, false
 	}
-	return strings.TrimSpace(opts.TrackTitleInMKV)
+	return opts, true
+}
+
+// keepBak maps mux.options.keep_bak onto mux.Job.KeepBak: only an explicit
+// false becomes a pointer, so the muxer's default (keep) survives a missing or
+// unreadable settings row.
+func keepBak(opts settings.MuxOptions, ok bool) *bool {
+	if ok && !opts.KeepBak {
+		discard := false
+		return &discard
+	}
+	return nil
 }
 
 // cleanup removes {WORK_DIR}/jobs/{id}/ after a failure. Cleanup errors are

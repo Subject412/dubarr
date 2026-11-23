@@ -161,6 +161,48 @@ describe('settings section save', () => {
   })
 })
 
+describe('mux options keep_bak', () => {
+  function mockMuxFetch(): ReturnType<typeof vi.fn> {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/api/settings') && isMethod(init, 'PUT')) {
+        return jsonResponse({ settings: {} })
+      }
+      if (url.includes('/api/settings')) {
+        return jsonResponse({
+          settings: { 'mux.options': { keep_bak: true, track_title_in_mkv: 'Polski Dubbing' } },
+        })
+      }
+      return jsonResponse({ error: 'unexpected' }, 404)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    return fetchMock
+  }
+
+  it('defaults to keeping the backup and saves keep_bak=false after untoggling', async () => {
+    const user = userEvent.setup()
+    const fetchMock = mockMuxFetch()
+    renderWithProviders(<SettingsPage />, { route: '/settings' })
+    expect(await screen.findByRole('heading', { name: 'Mux options' })).toBeInTheDocument()
+
+    const toggle = screen.getByRole('switch', { name: 'Keep .bak backup' })
+    expect(toggle.getAttribute('aria-checked')).toBe('true')
+
+    await user.click(toggle)
+    await user.click(screen.getByLabelText('Save Mux options'))
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([, init]) => isMethod(init, 'PUT'))).toBe(true)
+    })
+
+    const put = fetchMock.mock.calls.find(([, init]) => isMethod(init, 'PUT'))
+    const body = JSON.parse(String(put?.[1]?.body)) as {
+      settings: { 'mux.options': { keep_bak: boolean; track_title_in_mkv: string } }
+    }
+    expect(body.settings['mux.options'].keep_bak).toBe(false)
+    expect(body.settings['mux.options'].track_title_in_mkv).toBe('Polski Dubbing')
+  })
+})
+
 describe('tag match mode (IDEA.md §3.5, ADR-0005)', () => {
   const tagFilter = (mode: string) => ({
     required_filename_tags: ['[ArcA310]'],

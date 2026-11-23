@@ -25,6 +25,7 @@
 package settings
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -84,6 +85,30 @@ type LanguagesPolicy struct {
 	ExcludeCommentary      bool `json:"exclude_commentary"`
 	// ExportMode is "rule_based" (only policy-selected tracks) or "all".
 	ExportMode string `json:"export_mode"`
+}
+
+// UnmarshalJSON makes an absent prefer_original_language mean true. Legacy rows
+// written before the key existed predate the settled upgrade default; plain
+// decoding would read them as false and silently flip the operator's policy.
+// An explicit false is preserved. Unknown fields stay rejected like every other
+// section decoded by normalize.
+func (p *LanguagesPolicy) UnmarshalJSON(data []byte) error {
+	type plain LanguagesPolicy
+	aux := struct {
+		*plain
+		PreferOriginalLanguage *bool `json:"prefer_original_language"`
+	}{plain: (*plain)(p)}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&aux); err != nil {
+		return err
+	}
+	if aux.PreferOriginalLanguage == nil {
+		p.PreferOriginalLanguage = true
+	} else {
+		p.PreferOriginalLanguage = *aux.PreferOriginalLanguage
+	}
+	return nil
 }
 
 // TargetTagFilter is the Tdarr destination filename gate (ADR-0005).
@@ -266,7 +291,27 @@ func (s *Store) Get(ctx context.Context, key string) (json.RawMessage, bool, err
 	if err != nil {
 		return nil, false, fmt.Errorf("settings: read %s: %w", key, err)
 	}
-	return json.RawMessage(value), true, nil
+	return serveable(key, value), true, nil
+}
+
+// serveable applies load-time defaults to a stored section before it reaches a
+// caller. It exists for languages.policy: a legacy row predates
+// prefer_original_language, and the UI/API/export all decode the served JSON
+// directly, so absence has to be materialized as the agreed default here too.
+func serveable(key, value string) json.RawMessage {
+	raw := json.RawMessage(value)
+	if key != KeyLanguagesPolicy {
+		return raw
+	}
+	var p LanguagesPolicy
+	if err := json.Unmarshal(raw, &p); err != nil {
+		return raw // a malformed legacy row keeps its raw bytes
+	}
+	blob, err := json.Marshal(p)
+	if err != nil {
+		return raw
+	}
+	return blob
 }
 
 // All returns every readable section, already stripped of non-section rows.
@@ -286,7 +331,7 @@ func (s *Store) All(ctx context.Context) (map[string]json.RawMessage, error) {
 		if !isKnownKey(key) || IsSensitiveKey(key) {
 			continue
 		}
-		out[key] = json.RawMessage(value)
+		out[key] = serveable(key, value)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("settings: iterate: %w", err)
@@ -378,7 +423,7 @@ func (s *Store) Export(ctx context.Context) (Export, error) {
 		if !isKnownKey(key) || IsSensitiveKey(key) {
 			continue
 		}
-		masked, err := maskFields(json.RawMessage(value))
+		masked, err := maskFields(serveable(key, value))
 		if err != nil {
 			// A non-JSON legacy row must never leak verbatim; drop it.
 			continue

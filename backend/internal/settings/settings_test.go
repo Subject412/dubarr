@@ -363,3 +363,67 @@ func TestExportWhitelistsKnownKeys(t *testing.T) {
 		t.Error("export dropped a whitelisted section")
 	}
 }
+
+// legacyLanguagesPolicyJSON is a row written before prefer_original_language
+// existed. Absence must mean the agreed upgrade default (true), not Go's zero
+// value: Seed uses INSERT OR IGNORE and never backfills the row.
+const legacyLanguagesPolicyJSON = `{"target_import_languages":["pl"],"extra_reference_languages":["en","all"],"original_language_from_arr":true,"exclude_commentary":true,"export_mode":"rule_based"}`
+
+func insertLegacyLanguagesPolicy(t *testing.T, s *Store) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`,
+		KeyLanguagesPolicy, legacyLanguagesPolicyJSON); err != nil {
+		t.Fatalf("insert legacy languages.policy: %v", err)
+	}
+}
+
+func TestLegacyLanguagesPolicyDefaultsPreferOriginalLanguage(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	insertLegacyLanguagesPolicy(t, s)
+	// Seed is a no-op for an existing row; it must not be the thing that fixes
+	// the value.
+	if err := s.Seed(ctx, t.TempDir()); err != nil {
+		t.Fatalf("Seed: %v", err)
+	}
+
+	if got := decode[LanguagesPolicy](t, mustGet(t, s, ctx, KeyLanguagesPolicy)); !got.PreferOriginalLanguage {
+		t.Error("Get: PreferOriginalLanguage = false for a legacy row, want true")
+	}
+	all, err := s.All(ctx)
+	if err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	if got := decode[LanguagesPolicy](t, all[KeyLanguagesPolicy]); !got.PreferOriginalLanguage {
+		t.Error("All (API payload): PreferOriginalLanguage = false for a legacy row, want true")
+	}
+	exp, err := s.Export(ctx)
+	if err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+	if got := decode[LanguagesPolicy](t, exp.Settings[KeyLanguagesPolicy]); !got.PreferOriginalLanguage {
+		t.Error("Export: PreferOriginalLanguage = false for a legacy row, want true")
+	}
+
+	// Set with the same legacy-shaped payload: an omitted key still means true.
+	if err := s.Set(ctx, KeyLanguagesPolicy, json.RawMessage(legacyLanguagesPolicyJSON)); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if got := decode[LanguagesPolicy](t, mustGet(t, s, ctx, KeyLanguagesPolicy)); !got.PreferOriginalLanguage {
+		t.Error("Set/Get: PreferOriginalLanguage = false after a keyless write, want true")
+	}
+}
+
+func TestLanguagesPolicyExplicitFalseSurvivesRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	in := `{"target_import_languages":["pl"],"extra_reference_languages":["en"],"original_language_from_arr":true,"prefer_original_language":false,"exclude_commentary":true,"export_mode":"rule_based"}`
+	if err := s.Set(ctx, KeyLanguagesPolicy, json.RawMessage(in)); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if got := decode[LanguagesPolicy](t, mustGet(t, s, ctx, KeyLanguagesPolicy)); got.PreferOriginalLanguage {
+		t.Error("explicit prefer_original_language=false read back as true")
+	}
+}

@@ -1,0 +1,186 @@
+name: release
+
+# Cut a release by pushing an annotated tag that matches vX.Y.Z (see
+# docs/RELEASING.md). Everything is built on one pinned Ubuntu runner so the
+# three archives are produced from the same commit and toolchain:
+#   * Go: native cross-compilation (CGO_ENABLED=0), no extra toolchain.
+#   * Rust: rustup target + distro cross GCC for linux-arm64 / windows-amd64.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: build archives
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write # softprops/action-gh-release creates the GitHub release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::tag ${GITHUB_REF_NAME} is not vMAJOR.MINOR.PATCH (see docs/RELEASING.md)"
+            exit 1
+          fi
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu,x86_64-pc-windows-gnu
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sync-engine
+
+      - name: Install Rust cross linkers
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu \
+            gcc-mingw-w64-x86-64 \
+            zip
+
+      # The SPA is embedded by Go (backend/web), so the Vite build must run
+      # before any `go build`. Vite writes into backend/web with
+      # emptyOutDir=false, preserving doc.go.
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+
+      - name: Build backend binaries
+        working-directory: backend
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p ../release-artifacts/bin
+          build() {
+            local goos="$1" goarch="$2" out="$3"
+            echo "building dubarr ${goos}/${goarch}"
+            CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" \
+              go build -trimpath \
+                -ldflags "-s -w -X main.version=${VERSION}" \
+                -o "../release-artifacts/bin/${out}" ./cmd/dubarr
+          }
+          build linux amd64 dubarr-linux-amd64
+          build linux arm64 dubarr-linux-arm64
+          build windows amd64 dubarr-windows-amd64.exe
+
+      - name: Build dubarr-sync
+        working-directory: sync-engine
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Host linux/amd64 (the target of ubuntu-22.04).
+          cargo build --release --locked --target x86_64-unknown-linux-gnu
+
+          # linux/arm64: glibc target linked by the distro cross GCC. The runner
+          # is pinned to Ubuntu 22.04, so the binary requires glibc >= 2.35
+          # (Debian 12 / Ubuntu 22.04 or newer).
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+            cargo build --release --locked --target aarch64-unknown-linux-gnu
+
+          # windows/amd64: GNU target linked by mingw-w64; rustc links the
+          # mingw runtime statically, so no extra DLLs ship.
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc \
+            cargo build --release --locked --target x86_64-pc-windows-gnu
+
+      - name: Assemble archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          ART="release-artifacts"
+          BIN="${ART}/bin"
+
+          make_readme() {
+            local slot="$1"
+            cat <<EOF
+          Dubarr ${VERSION} (${slot})
+
+          Contents
+            dubarr          web UI + backend (start with: ./dubarr --data-dir ./data --listen 127.0.0.1:8080)
+            dubarr-sync     Rust DSP engine used for audio offset analysis
+            LICENSE         MIT license
+
+          dubarr locates dubarr-sync on PATH. Keep both binaries in the same
+          directory and add that directory to PATH, or copy them to a directory
+          already on PATH (e.g. /usr/local/bin). Verify with GET /api/health:
+          "dubarr-sync" must report available: true.
+
+          ffmpeg, ffprobe and mkvmerge must also be installed and on PATH.
+          Full notes: https://github.com/${GITHUB_REPOSITORY}/blob/main/docs/RELEASING.md
+          EOF
+          }
+
+          stage_linux() {
+            local arch="$1" gosuffix="$2" rustdir="$3"
+            local dir="dubarr_${VERSION}_linux_${arch}"
+            mkdir -p "${ART}/${dir}"
+            cp "${BIN}/dubarr-linux-${gosuffix}" "${ART}/${dir}/dubarr"
+            cp "sync-engine/target/${rustdir}/release/dubarr-sync" "${ART}/${dir}/dubarr-sync"
+            cp LICENSE "${ART}/${dir}/LICENSE"
+            make_readme "linux/${arch}" > "${ART}/${dir}/README.txt"
+            chmod 0755 "${ART}/${dir}/dubarr" "${ART}/${dir}/dubarr-sync"
+            tar -C "${ART}" -czf "${ART}/${dir}.tar.gz" "${dir}"
+          }
+
+          stage_linux amd64 amd64 x86_64-unknown-linux-gnu
+          stage_linux arm64 arm64 aarch64-unknown-linux-gnu
+
+          dir="dubarr_${VERSION}_windows_amd64"
+          mkdir -p "${ART}/${dir}"
+          cp "${BIN}/dubarr-windows-amd64.exe" "${ART}/${dir}/dubarr.exe"
+          cp sync-engine/target/x86_64-pc-windows-gnu/release/dubarr-sync.exe "${ART}/${dir}/dubarr-sync.exe"
+          cp LICENSE "${ART}/${dir}/LICENSE"
+          make_readme "windows/amd64" > "${ART}/${dir}/README.txt"
+          (cd "${ART}" && zip -q -r "${dir}.zip" "${dir}")
+
+          (cd "${ART}" && sha256sum \
+            "dubarr_${VERSION}_linux_amd64.tar.gz" \
+            "dubarr_${VERSION}_linux_arm64.tar.gz" \
+            "dubarr_${VERSION}_windows_amd64.zip" \
+            > "dubarr_${VERSION}_checksums.txt")
+
+          ls -l "${ART}"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true
+          files: |
+            release-artifacts/*.tar.gz
+            release-artifacts/*.zip
+            release-artifacts/*_checksums.txt

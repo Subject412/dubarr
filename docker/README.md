@@ -45,5 +45,33 @@ In a container there is no OS keyring (no D-Bus session), so `/api/health`
 reports `keyring_available: false` and the master key lives in
 `/config/.master.key` (mode 0600).
 
+## Logs
+
+Two ways to read Dubarr logs, neither requiring the Docker socket:
+
+- **Host side** — everything the process writes to stderr goes through the
+  container's log driver:
+
+  ```sh
+  docker logs -f dubarr
+  ```
+
+- **App side** — the admin-only **Logs** tab in the web GUI shows the same
+  entries from the in-memory ring (last 1000), with level and component
+  filters. The runtime level can be changed there without a restart.
+
+Logs written to `/config/logs/dubarr.log` survive container recreation because
+`/config` is the bind-mounted data volume. The file sink is opt-in and rotated
+(10 MB × 3); enable it with `--log-file`:
+
+```yaml
+    command: ["--log-level", "debug", "--log-file"]
+```
+
+`--log-level` is a CLI flag (`debug|info|warn|error`, default `info`), not an
+environment variable: `entrypoint.sh` forwards extra arguments after its own
+`--data-dir/--listen`. Changing the level needs no app setting and no env var
+(ADR-0003). Do **not** mount `/var/run/docker.sock` for logging.
+
 `dubarr-sync` (Rust DSP CLI) is not built yet (M3/M4); `/api/health` reports it
 as `available: false`.

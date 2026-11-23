@@ -32,6 +32,7 @@ import (
 	"github.com/Subject412/dubarr/backend/internal/extract"
 	"github.com/Subject412/dubarr/backend/internal/gate"
 	"github.com/Subject412/dubarr/backend/internal/health"
+	"github.com/Subject412/dubarr/backend/internal/logs"
 	"github.com/Subject412/dubarr/backend/internal/mux"
 	"github.com/Subject412/dubarr/backend/internal/queue"
 	"github.com/Subject412/dubarr/backend/internal/secrets"
@@ -75,6 +76,13 @@ type Config struct {
 	// Desktop marks a desktop (native) deployment and opens the default
 	// browser via xdg-open once the server is listening.
 	Desktop bool
+	// LogLevel is the minimum severity written to any sink
+	// (debug|info|warn|error, default info). A flag, never an env var
+	// (ADR-0003); the Docker entrypoint forwards it via "$@".
+	LogLevel string
+	// LogFile enables the optional rotating file sink at
+	// <data-dir>/logs/dubarr.log (10 MB x 3). Off by default.
+	LogFile bool
 }
 
 // newFlagSet binds cfg to a fresh flag set. Help is left to the caller: with
@@ -84,6 +92,8 @@ func newFlagSet(cfg *Config) *flag.FlagSet {
 	fs.StringVar(&cfg.DataDir, "data-dir", "./data", "appliance data directory")
 	fs.StringVar(&cfg.Listen, "listen", "127.0.0.1:8080", "HTTP listen address")
 	fs.BoolVar(&cfg.Desktop, "desktop", false, "run as a desktop (native) deployment")
+	fs.StringVar(&cfg.LogLevel, "log-level", "info", "minimum log level: debug, info, warn or error")
+	fs.BoolVar(&cfg.LogFile, "log-file", false, "also write logs to <data-dir>/logs/dubarr.log (rotated)")
 	return fs
 }
 
@@ -106,6 +116,9 @@ func parseFlags(args []string) (Config, error) {
 	}
 	if cfg.Listen == "" {
 		return Config{}, errors.New("--listen must not be empty")
+	}
+	if _, ok := logs.ParseLevel(cfg.LogLevel); !ok {
+		return Config{}, fmt.Errorf("--log-level must be debug, info, warn or error (got %q)", cfg.LogLevel)
 	}
 	return cfg, nil
 }
@@ -176,6 +189,8 @@ type server struct {
 	library  *arrsync.Poller
 	mux      *http.ServeMux
 	http     *http.Server
+	// logs owns the central slog logger, its ring and optional file sink.
+	logs *logs.Logger
 
 	// scannerCancel stops the watch loop; nil when no scanner was started.
 	scannerCancel context.CancelFunc
@@ -225,6 +240,17 @@ func newServerWithSecrets(cfg Config, secOpts secrets.Options) (*server, error) 
 		return nil, fmt.Errorf("seed settings: %w", err)
 	}
 
+	logOpts := logs.Options{Level: cfg.LogLevel, Stderr: os.Stderr}
+	if cfg.LogFile {
+		logOpts.FilePath = filepath.Join(cfg.DataDir, "logs", "dubarr.log")
+	}
+	logger, err := logs.New(logOpts)
+	if err != nil {
+		_ = st.Close()
+		return nil, fmt.Errorf("open log sink: %w", err)
+	}
+	logger.Logger().Info("dubarr starting", "component", "main", "version", version)
+
 	mux := http.NewServeMux()
 
 	authSvc := auth.RegisterRoutes(mux, auth.Dependencies{
@@ -250,6 +276,12 @@ func newServerWithSecrets(cfg Config, secOpts secrets.Options) (*server, error) 
 	syncjob.RegisterRoutes(mux, syncjob.Dependencies{
 		DB:           st.DB,
 		Settings:     settingsStore,
+		RequireAdmin: authSvc.RequireAdmin,
+		Logger:       logger.Logger(),
+	})
+
+	logs.RegisterRoutes(mux, logs.Dependencies{
+		Logs:         logger,
 		RequireAdmin: authSvc.RequireAdmin,
 	})
 
@@ -277,6 +309,7 @@ func newServerWithSecrets(cfg Config, secOpts secrets.Options) (*server, error) 
 	spa, err := newSPAHandler(web.FS)
 	if err != nil {
 		_ = st.Close()
+		_ = logger.Close()
 		return nil, fmt.Errorf("mount SPA: %w", err)
 	}
 	mux.Handle("/", spa)
@@ -285,12 +318,12 @@ func newServerWithSecrets(cfg Config, secOpts secrets.Options) (*server, error) 
 	watchScanner, scanErr := wireScanner(scanCtx, scannerWiring{
 		Settings: settingsStore,
 		Store:    st,
-		Logf:     log.Printf,
+		Logf:     logger.Logf("watch"),
 	})
 	if scanErr != nil {
 		// A broken watch path must not take the HTTP API down: the operator
 		// can still fix storage.paths in the UI and restart.
-		log.Printf("dubarr: watch scanner disabled: %v", scanErr)
+		logger.Logger().Warn("watch scanner disabled", "component", "watch", "error", scanErr)
 		scanCancel()
 	} else if watchScanner != nil {
 		watchScanner.Start(scanCtx)
@@ -305,10 +338,10 @@ func newServerWithSecrets(cfg Config, secOpts secrets.Options) (*server, error) 
 		Settings: settingsStore,
 		Store:    st,
 		DataDir:  cfg.DataDir,
-		Logf:     log.Printf,
+		Logf:     logger.Logf("extract"),
 	})
 	if extractErr != nil {
-		log.Printf("dubarr: extraction worker disabled: %v", extractErr)
+		logger.Logger().Warn("extraction worker disabled", "component", "extract", "error", extractErr)
 		extractCancel()
 		extractCancel = nil
 	} else if extractWorker != nil {
@@ -326,10 +359,10 @@ func newServerWithSecrets(cfg Config, secOpts secrets.Options) (*server, error) 
 		Settings: settingsStore,
 		Store:    st,
 		Secrets:  sec,
-		Logf:     log.Printf,
+		Logf:     logger.Logf("syncworker"),
 	})
 	if syncErr != nil {
-		log.Printf("dubarr: sync worker disabled: %v", syncErr)
+		logger.Logger().Warn("sync worker disabled", "component", "syncworker", "error", syncErr)
 		syncCancel()
 		syncCancel = nil
 	} else if syncWorker != nil {
@@ -347,10 +380,10 @@ func newServerWithSecrets(cfg Config, secOpts secrets.Options) (*server, error) 
 		Settings: settingsStore,
 		Store:    st,
 		Secrets:  sec,
-		Logf:     log.Printf,
+		Logf:     logger.Logf("arrsync"),
 	})
 	if libraryErr != nil {
-		log.Printf("dubarr: arr library sync disabled: %v", libraryErr)
+		logger.Logger().Warn("arr library sync disabled", "component", "arrsync", "error", libraryErr)
 		libraryCancel()
 		libraryCancel = nil
 	} else if libraryPoller != nil {
@@ -374,6 +407,7 @@ func newServerWithSecrets(cfg Config, secOpts secrets.Options) (*server, error) 
 		syncCancel:    syncCancel,
 		libraryCancel: libraryCancel,
 		mux:           mux,
+		logs:          logger,
 	}
 	s.http = &http.Server{
 		Addr:              cfg.Listen,
@@ -874,8 +908,15 @@ func (s *server) Close() error {
 		if s.library != nil {
 			s.library.Stop()
 		}
+		if s.logs != nil {
+			if err := s.logs.Close(); err != nil && s.closeErr == nil {
+				s.closeErr = err
+			}
+		}
 		if s.store != nil {
-			s.closeErr = s.store.Close()
+			if err := s.store.Close(); err != nil && s.closeErr == nil {
+				s.closeErr = err
+			}
 		}
 	})
 	return s.closeErr

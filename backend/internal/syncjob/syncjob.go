@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"net/http"
 	"os"
@@ -73,6 +74,9 @@ type Dependencies struct {
 	FFmpegPath string
 	// Prober overrides the ffprobe wrapper (tests).
 	Prober *probe.Prober
+	// Logger is the central logger (nil keeps the stdlib default for the
+	// dubarr-sync bridge handshake).
+	Logger *slog.Logger
 }
 
 // Service holds the resolved dependencies for the registered handlers.
@@ -84,6 +88,7 @@ type Service struct {
 	workDir      string
 	ffmpegPath   string
 	prober       *probe.Prober
+	logger       *slog.Logger
 }
 
 // RegisterRoutes mounts:
@@ -100,6 +105,7 @@ func RegisterRoutes(mux *http.ServeMux, deps Dependencies) *Service {
 		workDir:      deps.WorkDir,
 		ffmpegPath:   deps.FFmpegPath,
 		prober:       deps.Prober,
+		logger:       deps.Logger,
 	}
 	admin := func(h http.HandlerFunc) http.Handler {
 		if svc.requireAdmin == nil {
@@ -468,7 +474,7 @@ func (s *Service) runAnalysis(ctx context.Context, rec store.SyncJobRecord) (ana
 
 	engine := s.engine
 	if engine == nil {
-		runner, err := sync.New("", sync.WithTimeout(analyze.JobTimeout(cfg)))
+		runner, err := sync.New("", sync.WithTimeout(analyze.JobTimeout(cfg)), sync.WithLogger(s.logger))
 		if err != nil {
 			return analyze.Report{}, err
 		}

@@ -72,6 +72,31 @@ under `<data-dir>/logs/`. In Compose, pass them as a command override:
 command: ["--log-level", "debug", "--log-file"]
 ```
 
+### Mux output destinations
+
+`mux.options.output_mode` decides where a finished mux lands
+([ADR-0011](docs/adr/0011-mux-output-destination-modes.md)):
+
+| Mode | Behaviour |
+| --- | --- |
+| `replace` (default) | The muxed file atomically replaces the library Target; `keep_bak` keeps a `.bak` copy next to it. |
+| `separate` | The muxed file is written to the **Mux output folder** (`storage.paths.output_dir`) and the library Target is not touched. |
+
+In `separate` mode the name is derived from the source Target basename plus
+`.dubarr.mkv`: `Movie (2021) [TDARR].mkv` becomes
+`Movie (2021) [TDARR].dubarr.mkv`. The destination is never overwritten and
+never auto-suffixed — a job whose deliverable already exists fails with a clear
+error, so re-running a mux is an explicit decision. The folder is a storage
+root of its own (absolute, symlink-resolved, must exist) and may not be the
+Audio Vault or inside it; `keep_bak` does not apply because nothing is
+replaced, and the `*arr` rescan is skipped because the library file is
+unchanged. Temp files are created inside the destination folder so the final
+rename stays atomic on one filesystem: if the destination is on another
+filesystem from the temp, the job fails instead of falling back to a
+non-atomic copy. The tag gate and `ffprobe` validation still apply, and the
+vault is never written. Completed jobs record the published path, exposed as
+`output_path` by `GET /api/sync/jobs`.
+
 **Never commit** `data/`, `docker/config/`, `docker/media/`, media files,
 `.env` files, `.master.key` or `*.keyfile`. These paths are already in
 `.gitignore`; secrets and media must stay out of Git.

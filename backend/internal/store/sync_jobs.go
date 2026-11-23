@@ -26,6 +26,10 @@ type SyncJobRecord struct {
 	CreatedAt            string
 	UpdatedAt            string
 	WorkDirPath          string
+	// OutputPath is where the mux published the file (ADR-0011). In replace
+	// mode it is the Target; in separate mode it is the file inside
+	// storage.paths.output_dir. Empty until a mux has completed.
+	OutputPath string
 }
 
 // SyncJobCreate is the insert shape for POST /api/sync/jobs.
@@ -75,7 +79,7 @@ const syncJobColumns = `
 	       COALESCE(checkpoints_json, '[]'),
 	       COALESCE(error_message, ''),
 	       COALESCE(created_at, ''), COALESCE(updated_at, ''),
-	       COALESCE(work_dir_path, '')
+	       COALESCE(work_dir_path, ''), COALESCE(output_path, '')
 	FROM sync_mux_jobs`
 
 func scanSyncJob(scanner interface{ Scan(...any) error }) (SyncJobRecord, error) {
@@ -83,7 +87,7 @@ func scanSyncJob(scanner interface{ Scan(...any) error }) (SyncJobRecord, error)
 	err := scanner.Scan(&rec.ID, &rec.TargetTrackID, &rec.TargetLibraryCacheID,
 		&rec.TargetVideoPath, &rec.TargetLangISO2, &rec.Status, &rec.SyncMethod,
 		&rec.CalculatedOffsetMS, &rec.CheckpointsJSON, &rec.ErrorMessage,
-		&rec.CreatedAt, &rec.UpdatedAt, &rec.WorkDirPath)
+		&rec.CreatedAt, &rec.UpdatedAt, &rec.WorkDirPath, &rec.OutputPath)
 	return rec, err
 }
 
@@ -158,6 +162,26 @@ func (s *Store) SetSyncJobStatus(ctx context.Context, id int64, status, errMessa
 		WHERE id = ?`, status, errMessage, id)
 	if err != nil {
 		return fmt.Errorf("store: set sync job %d status: %w", id, err)
+	}
+	return nil
+}
+
+// SetSyncJobOutputPath records where a completed mux published the file
+// (ADR-0011). An empty path clears the column.
+func (s *Store) SetSyncJobOutputPath(ctx context.Context, id int64, path string) error {
+	res, err := s.DB.ExecContext(ctx, `
+		UPDATE sync_mux_jobs
+		SET output_path = NULLIF(?, ''), updated_at = CURRENT_TIMESTAMP
+		WHERE id = ?`, path, id)
+	if err != nil {
+		return fmt.Errorf("store: set sync job %d output path: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: set sync job %d output path rows: %w", id, err)
+	}
+	if n == 0 {
+		return fmt.Errorf("store: sync job %d not found", id)
 	}
 	return nil
 }

@@ -130,18 +130,21 @@ type createRequest struct {
 
 // JobInfo is the API shape of one sync job.
 type JobInfo struct {
-	ID                   int64           `json:"id"`
-	Status               string          `json:"status"`
-	VaultTrackID         int64           `json:"vault_track_id"`
-	TargetLibraryCacheID int64           `json:"target_library_cache_id"`
-	TargetVideoPath      string          `json:"target_video_path,omitempty"`
-	TargetLangISO2       string          `json:"target_lang_iso2,omitempty"`
-	SyncMethod           string          `json:"sync_method,omitempty"`
-	CalculatedOffsetMS   int64           `json:"calculated_offset_ms"`
-	Report               *analyze.Report `json:"report,omitempty"`
-	ErrorMessage         string          `json:"error_message,omitempty"`
-	CreatedAt            string          `json:"created_at,omitempty"`
-	UpdatedAt            string          `json:"updated_at,omitempty"`
+	ID                   int64  `json:"id"`
+	Status               string `json:"status"`
+	VaultTrackID         int64  `json:"vault_track_id"`
+	TargetLibraryCacheID int64  `json:"target_library_cache_id"`
+	TargetVideoPath      string `json:"target_video_path,omitempty"`
+	TargetLangISO2       string `json:"target_lang_iso2,omitempty"`
+	// OutputPath is where mux published the file (the Target in replace mode,
+	// the separate-mode file inside storage.paths.output_dir).
+	OutputPath         string          `json:"output_path,omitempty"`
+	SyncMethod         string          `json:"sync_method,omitempty"`
+	CalculatedOffsetMS int64           `json:"calculated_offset_ms"`
+	Report             *analyze.Report `json:"report,omitempty"`
+	ErrorMessage       string          `json:"error_message,omitempty"`
+	CreatedAt          string          `json:"created_at,omitempty"`
+	UpdatedAt          string          `json:"updated_at,omitempty"`
 }
 
 func (s *Service) handleCreate(w http.ResponseWriter, r *http.Request) {
@@ -296,6 +299,7 @@ func jobInfo(rec store.SyncJobRecord) JobInfo {
 		TargetLibraryCacheID: rec.TargetLibraryCacheID,
 		TargetVideoPath:      rec.TargetVideoPath,
 		TargetLangISO2:       rec.TargetLangISO2,
+		OutputPath:           rec.OutputPath,
 		SyncMethod:           rec.SyncMethod,
 		CalculatedOffsetMS:   rec.CalculatedOffsetMS,
 		ErrorMessage:         rec.ErrorMessage,

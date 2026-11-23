@@ -43,7 +43,7 @@ func TestResolvePriorityOrder(t *testing.T) {
 				track(1, 6, "jpn"),
 				track(2, 2, "eng"),
 			},
-			policy:   Languages{Targets: []string{"pl"}, References: []string{"en"}},
+			policy:   Languages{Targets: []string{"pl"}, References: []string{"en"}, PreferOriginalLanguage: true, OriginalLanguageFromArr: true},
 			original: "jpn",
 			wantPairs: []struct{ vault, target string }{
 				{"ja", "ja"},
@@ -305,6 +305,123 @@ func TestResolveSkipsCommentaryAndHandlesBadMetadata(t *testing.T) {
 			t.Fatalf("pairs = %+v", got.Pairs)
 		}
 	})
+}
+
+func TestResolveReferenceTokens(t *testing.T) {
+	base := Languages{Targets: []string{"pl"}, PreferOriginalLanguage: true, OriginalLanguageFromArr: true}
+
+	t.Run("org expands to the arr original with explicit entries first", func(t *testing.T) {
+		vault := []probe.AudioTrack{track(1, 2, "jpn"), track(2, 2, "eng")}
+		target := []probe.AudioTrack{track(1, 2, "jpn"), track(2, 2, "eng")}
+		policy := base
+		policy.References = []string{"en", "org"}
+		policy.PreferOriginalLanguage = false // isolate the token from Priority 1
+		got := Resolve(target, vault, policy, "jpn")
+		want := []string{"en", "ja"}
+		if !equal(gotLangs(got), want) {
+			t.Fatalf("pairs = %v, want %v", gotLangs(got), want)
+		}
+	})
+
+	t.Run("org without an arr original is skipped and resolution continues", func(t *testing.T) {
+		vault := []probe.AudioTrack{track(1, 2, "jpn"), track(2, 2, "eng")}
+		target := []probe.AudioTrack{track(1, 2, "jpn"), track(2, 2, "eng")}
+		policy := base
+		policy.References = []string{"org"}
+		policy.PreferOriginalLanguage = false
+		got := Resolve(target, vault, policy, "")
+		want := []string{"en", "ja"} // implicit shared languages in lexical order
+		if !equal(gotLangs(got), want) {
+			t.Fatalf("pairs = %v, want %v", gotLangs(got), want)
+		}
+		if got.Reason != "" {
+			t.Errorf("reason = %q, want empty (token is skipped, not fatal)", got.Reason)
+		}
+	})
+
+	t.Run("org is skipped when the original equals a target language", func(t *testing.T) {
+		vault := []probe.AudioTrack{track(1, 2, "pol"), track(2, 2, "eng")}
+		target := []probe.AudioTrack{track(1, 2, "pol"), track(2, 2, "eng")}
+		policy := base
+		policy.References = []string{"org"}
+		policy.PreferOriginalLanguage = false
+		got := Resolve(target, vault, policy, "pol")
+		want := []string{"en"}
+		if !equal(gotLangs(got), want) {
+			t.Fatalf("pairs = %v, want %v", gotLangs(got), want)
+		}
+	})
+
+	t.Run("all is lexical after explicit entries and deduped", func(t *testing.T) {
+		vault := []probe.AudioTrack{track(1, 2, "jpn"), track(2, 2, "eng"), track(3, 2, "fre")}
+		target := []probe.AudioTrack{track(1, 2, "jpn"), track(2, 2, "eng"), track(3, 2, "fre")}
+		policy := base
+		policy.References = []string{"ja", "all", "ja"}
+		policy.PreferOriginalLanguage = false
+		got := Resolve(target, vault, policy, "")
+		want := []string{"ja", "en", "fr"}
+		if !equal(gotLangs(got), want) {
+			t.Fatalf("pairs = %v, want %v", gotLangs(got), want)
+		}
+	})
+
+	t.Run("prefer original on puts the original first", func(t *testing.T) {
+		vault := []probe.AudioTrack{track(1, 2, "jpn"), track(2, 2, "eng")}
+		target := []probe.AudioTrack{track(1, 2, "jpn"), track(2, 2, "eng")}
+		policy := base
+		policy.References = []string{"en"}
+		got := Resolve(target, vault, policy, "jpn")
+		want := []string{"ja", "en"}
+		if !equal(gotLangs(got), want) {
+			t.Fatalf("pairs = %v, want %v", gotLangs(got), want)
+		}
+	})
+
+	t.Run("prefer original off leaves the original as a later candidate", func(t *testing.T) {
+		vault := []probe.AudioTrack{track(1, 2, "jpn"), track(2, 2, "eng")}
+		target := []probe.AudioTrack{track(1, 2, "jpn"), track(2, 2, "eng")}
+		policy := base
+		policy.References = []string{"en"}
+		policy.PreferOriginalLanguage = false
+		got := Resolve(target, vault, policy, "jpn")
+		want := []string{"en", "ja"}
+		if !equal(gotLangs(got), want) {
+			t.Fatalf("pairs = %v, want %v", gotLangs(got), want)
+		}
+	})
+
+	t.Run("original_language_from_arr off disables Priority 1 and the org token", func(t *testing.T) {
+		vault := []probe.AudioTrack{track(1, 2, "jpn"), track(2, 2, "eng")}
+		target := []probe.AudioTrack{track(1, 2, "jpn"), track(2, 2, "eng")}
+		policy := base
+		policy.References = []string{"org"}
+		policy.OriginalLanguageFromArr = false
+		got := Resolve(target, vault, policy, "jpn")
+		want := []string{"en", "ja"} // no Priority 1, no org; implicit shared lexical
+		if !equal(gotLangs(got), want) {
+			t.Fatalf("pairs = %v, want %v", gotLangs(got), want)
+		}
+	})
+}
+
+func gotLangs(res Result) []string {
+	out := make([]string, 0, len(res.Pairs))
+	for _, p := range res.Pairs {
+		out = append(out, p.Vault.LanguageISO1)
+	}
+	return out
+}
+
+func equal(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func TestReportPredicates(t *testing.T) {

@@ -538,8 +538,10 @@ func (s *Service) analysisPolicy(ctx context.Context) (reflang.Languages, analyz
 		var lp settings.LanguagesPolicy
 		if json.Unmarshal(raw, &lp) == nil {
 			policy = reflang.Languages{
-				Targets:    append([]string(nil), lp.TargetImportLanguages...),
-				References: append([]string(nil), lp.ExtraReferenceLanguages...),
+				Targets:                 append([]string(nil), lp.TargetImportLanguages...),
+				References:              append([]string(nil), lp.ExtraReferenceLanguages...),
+				PreferOriginalLanguage:  lp.PreferOriginalLanguage,
+				OriginalLanguageFromArr: lp.OriginalLanguageFromArr,
 			}
 		}
 	}

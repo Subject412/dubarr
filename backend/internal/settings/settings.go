@@ -37,6 +37,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Subject412/dubarr/backend/internal/langtoken"
 	"github.com/Subject412/dubarr/backend/internal/secrets"
 )
 
@@ -77,7 +78,10 @@ type LanguagesPolicy struct {
 	TargetImportLanguages   []string `json:"target_import_languages"`
 	ExtraReferenceLanguages []string `json:"extra_reference_languages"`
 	OriginalLanguageFromArr bool     `json:"original_language_from_arr"`
-	ExcludeCommentary       bool     `json:"exclude_commentary"`
+	// PreferOriginalLanguage makes the arr original the first-choice reference.
+	// Off keeps it available as an ordinary reference candidate.
+	PreferOriginalLanguage bool `json:"prefer_original_language"`
+	ExcludeCommentary      bool `json:"exclude_commentary"`
 	// ExportMode is "rule_based" (only policy-selected tracks) or "all".
 	ExportMode string `json:"export_mode"`
 }
@@ -178,6 +182,7 @@ func Defaults(dataDir string) map[string]any {
 			TargetImportLanguages:   []string{"pl"},
 			ExtraReferenceLanguages: []string{"en"},
 			OriginalLanguageFromArr: true,
+			PreferOriginalLanguage:  true,
 			ExcludeCommentary:       true,
 			ExportMode:              "rule_based",
 		},
@@ -563,9 +568,24 @@ func validateLanguages(p *LanguagesPolicy) error {
 	if p.ExtraReferenceLanguages == nil {
 		p.ExtraReferenceLanguages = []string{}
 	}
-	for _, code := range append(append([]string{}, p.TargetImportLanguages...), p.ExtraReferenceLanguages...) {
+	for _, code := range p.TargetImportLanguages {
+		if langtoken.IsReserved(code) {
+			return fmt.Errorf("target import language %q is a reserved reference token, not a language code", code)
+		}
 		if !iso1or3.MatchString(code) {
 			return fmt.Errorf("language code %q must be a lowercase ISO 639-1/2 code", code)
+		}
+	}
+	for i, raw := range p.ExtraReferenceLanguages {
+		// Reserved tokens are canonicalized to lowercase and never validated as
+		// ISO codes; anything else must be a lowercase ISO 639-1/2 code.
+		if tok, ok := langtoken.Token(raw); ok {
+			p.ExtraReferenceLanguages[i] = tok
+			continue
+		}
+		if !iso1or3.MatchString(raw) {
+			return fmt.Errorf("language code %q must be a lowercase ISO 639-1/2 code or a reserved token (%s, %s)",
+				raw, langtoken.Org, langtoken.All)
 		}
 	}
 	switch p.ExportMode {

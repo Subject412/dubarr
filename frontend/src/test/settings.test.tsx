@@ -161,6 +161,83 @@ describe('settings section save', () => {
   })
 })
 
+describe('languages policy reference tokens', () => {
+  const storedPolicy = {
+    target_import_languages: ['pl'],
+    extra_reference_languages: ['en'],
+    original_language_from_arr: true,
+    prefer_original_language: true,
+    exclude_commentary: true,
+    export_mode: 'rule_based',
+  }
+
+  function mockLanguagesFetch(policy: typeof storedPolicy = storedPolicy): ReturnType<typeof vi.fn> {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/api/settings') && isMethod(init, 'PUT')) {
+        return jsonResponse({ settings: {} })
+      }
+      if (url.includes('/api/settings')) {
+        return jsonResponse({ settings: { 'languages.policy': policy } })
+      }
+      return jsonResponse({ error: 'unexpected' }, 404)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    return fetchMock
+  }
+
+  function savedPolicy(fetchMock: ReturnType<typeof vi.fn>) {
+    const put = fetchMock.mock.calls.find(([, init]) => isMethod(init, 'PUT'))
+    expect(put).toBeDefined()
+    const body = JSON.parse(String(put?.[1]?.body)) as {
+      settings: { 'languages.policy': typeof storedPolicy }
+    }
+    return body.settings['languages.policy']
+  }
+
+  it('adds org and all from friendly presets and saves the tokens', async () => {
+    const user = userEvent.setup()
+    const fetchMock = mockLanguagesFetch()
+    renderWithProviders(<SettingsPage />, { route: '/settings' })
+    expect(await screen.findByRole('heading', { name: 'Languages policy' })).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'org — original language from *arr' }))
+    await user.click(screen.getByRole('button', { name: 'all — any shared language' }))
+    await user.click(screen.getByLabelText('Save Languages policy'))
+
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([, init]) => isMethod(init, 'PUT'))).toBe(true)
+    })
+    expect(savedPolicy(fetchMock).extra_reference_languages).toEqual(['en', 'org', 'all'])
+  })
+
+  it('renders friendly labels for stored tokens', async () => {
+    mockLanguagesFetch({ ...storedPolicy, extra_reference_languages: ['org', 'all'] })
+    renderWithProviders(<SettingsPage />, { route: '/settings' })
+    expect(await screen.findByRole('heading', { name: 'Languages policy' })).toBeInTheDocument()
+
+    expect(screen.getByText('org — original language from *arr')).toBeInTheDocument()
+    expect(screen.getByText('all — any shared language')).toBeInTheDocument()
+  })
+
+  it('saves prefer_original_language=false when the toggle is switched off', async () => {
+    const user = userEvent.setup()
+    const fetchMock = mockLanguagesFetch()
+    renderWithProviders(<SettingsPage />, { route: '/settings' })
+    expect(await screen.findByRole('heading', { name: 'Languages policy' })).toBeInTheDocument()
+
+    const toggle = screen.getByRole('switch', { name: 'Prefer original language as reference' })
+    expect(toggle.getAttribute('aria-checked')).toBe('true')
+    await user.click(toggle)
+    await user.click(screen.getByLabelText('Save Languages policy'))
+
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([, init]) => isMethod(init, 'PUT'))).toBe(true)
+    })
+    expect(savedPolicy(fetchMock).prefer_original_language).toBe(false)
+  })
+})
+
 describe('mux options keep_bak', () => {
   function mockMuxFetch(): ReturnType<typeof vi.fn> {
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {

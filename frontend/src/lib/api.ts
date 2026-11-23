@@ -53,6 +53,7 @@ export type LanguagesPolicy = {
   target_import_languages: string[]
   extra_reference_languages: string[]
   original_language_from_arr: boolean
+  prefer_original_language: boolean
   exclude_commentary: boolean
   export_mode: 'rule_based' | 'all'
 }

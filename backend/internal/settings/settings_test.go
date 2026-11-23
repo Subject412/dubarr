@@ -3,6 +3,7 @@ package settings
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -64,7 +65,7 @@ func TestSeedDefaults(t *testing.T) {
 	if len(lp.ExtraReferenceLanguages) != 1 || lp.ExtraReferenceLanguages[0] != "en" {
 		t.Errorf("reference languages = %v", lp.ExtraReferenceLanguages)
 	}
-	if !lp.ExcludeCommentary || !lp.OriginalLanguageFromArr || lp.ExportMode != "rule_based" {
+	if !lp.ExcludeCommentary || !lp.OriginalLanguageFromArr || !lp.PreferOriginalLanguage || lp.ExportMode != "rule_based" {
 		t.Errorf("languages policy = %+v", lp)
 	}
 
@@ -147,6 +148,39 @@ func TestRoundtrip(t *testing.T) {
 	got := decode[LanguagesPolicy](t, out)
 	if len(got.TargetImportLanguages) != 2 || got.TargetImportLanguages[1] != "cs" || got.ExportMode != "all" || got.ExcludeCommentary {
 		t.Fatalf("roundtrip mismatch: %+v", got)
+	}
+}
+
+func TestLanguagesPolicyNormalizesReferenceTokens(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	in := `{"target_import_languages":["pl"],"extra_reference_languages":["ORG","all","en"],"original_language_from_arr":true,"prefer_original_language":true,"exclude_commentary":true,"export_mode":"rule_based"}`
+	if err := s.Set(ctx, KeyLanguagesPolicy, json.RawMessage(in)); err != nil {
+		t.Fatalf("Set with reference tokens: %v", err)
+	}
+	got := decode[LanguagesPolicy](t, mustGet(t, s, ctx, KeyLanguagesPolicy))
+	want := []string{"org", "all", "en"}
+	if len(got.ExtraReferenceLanguages) != len(want) {
+		t.Fatalf("reference languages = %v, want %v", got.ExtraReferenceLanguages, want)
+	}
+	for i := range want {
+		if got.ExtraReferenceLanguages[i] != want[i] {
+			t.Fatalf("reference languages = %v, want %v (tokens canonical lowercase)", got.ExtraReferenceLanguages, want)
+		}
+	}
+	if !got.PreferOriginalLanguage {
+		t.Error("PreferOriginalLanguage = false, want true")
+	}
+}
+
+func TestLanguagesPolicyRejectsReferenceTokensAsTargets(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	for _, token := range []string{"org", "all"} {
+		in := fmt.Sprintf(`{"target_import_languages":[%q],"extra_reference_languages":[],"original_language_from_arr":true,"exclude_commentary":true,"export_mode":"rule_based"}`, token)
+		if err := s.Set(ctx, KeyLanguagesPolicy, json.RawMessage(in)); err == nil {
+			t.Errorf("Set accepted %q as a target import language", token)
+		}
 	}
 }
 

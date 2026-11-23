@@ -42,6 +42,12 @@ import {
   Toggle,
 } from '../components/ui'
 
+/** Friendly labels for the reserved Reference Language tokens (GLOSSARY). */
+const REFERENCE_TOKEN_PRESETS = [
+  { value: 'org', label: 'org — original language from *arr' },
+  { value: 'all', label: 'all — any shared language' },
+]
+
 function Section<T extends object>({
   sectionKey,
   value,
@@ -332,6 +338,7 @@ export function SettingsPage() {
                   onChange={(extra_reference_languages) => update({ extra_reference_languages })}
                   placeholder="en"
                   help={settingsHelp('languages.policy', 'extra_reference_languages')}
+                  presets={REFERENCE_TOKEN_PRESETS}
                 />
                 <Field
                   label="Export mode"
@@ -354,6 +361,12 @@ export function SettingsPage() {
                   help={settingsHelp('languages.policy', 'original_language_from_arr')}
                   checked={draft.original_language_from_arr}
                   onChange={(original_language_from_arr) => update({ original_language_from_arr })}
+                />
+                <Toggle
+                  label="Prefer original language as reference"
+                  help={settingsHelp('languages.policy', 'prefer_original_language')}
+                  checked={draft.prefer_original_language}
+                  onChange={(prefer_original_language) => update({ prefer_original_language })}
                 />
                 <Toggle
                   label="Exclude commentary tracks"

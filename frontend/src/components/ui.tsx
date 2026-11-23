@@ -371,6 +371,14 @@ export function Spinner({ label = 'Loading' }: { label?: string }) {
   )
 }
 
+/** One-click preset for a StringListEditor (e.g. a reserved language token). */
+export type StringListPreset = {
+  /** Stored value, e.g. a reserved language token. */
+  value: string
+  /** Friendly chip/preset label shown instead of the raw value. */
+  label: string
+}
+
 /** Editable list of short strings (languages, filename tags). */
 export function StringListEditor({
   label,
@@ -380,6 +388,7 @@ export function StringListEditor({
   addLabel = 'Add',
   inputLabel,
   help,
+  presets = [],
 }: {
   label: string
   values: string[]
@@ -389,6 +398,8 @@ export function StringListEditor({
   inputLabel: string
   /** Long-form definition rendered in an info popover. */
   help?: string
+  /** One-click special entries (e.g. reserved language tokens). */
+  presets?: StringListPreset[]
 }) {
   const [text, setText] = useState('')
 
@@ -397,6 +408,9 @@ export function StringListEditor({
     if (next && !values.includes(next)) onChange([...values, next])
     setText('')
   }
+
+  const labelFor = (value: string) => presets.find((preset) => preset.value === value)?.label ?? value
+  const available = presets.filter((preset) => !values.includes(preset.value))
 
   return (
     <div className="space-y-2">
@@ -411,7 +425,7 @@ export function StringListEditor({
             key={value}
             className="inline-flex items-center gap-1 rounded-full border border-ink-600 bg-ink-800 px-2.5 py-1 text-xs text-zinc-200"
           >
-            {value}
+            {labelFor(value)}
             <button
               type="button"
               aria-label={`Remove ${value}`}
@@ -423,6 +437,21 @@ export function StringListEditor({
           </span>
         ))}
       </div>
+      {available.length > 0 && (
+        <div className="flex flex-wrap gap-1.5">
+          {available.map((preset) => (
+            <button
+              key={preset.value}
+              type="button"
+              aria-label={preset.label}
+              className="rounded-full border border-dashed border-ink-600 px-2.5 py-1 text-xs text-zinc-400 hover:border-accent-500 hover:text-accent-300"
+              onClick={() => onChange([...values, preset.value])}
+            >
+              + {preset.label}
+            </button>
+          ))}
+        </div>
+      )}
       <div className="flex gap-2">
         <Input
           aria-label={inputLabel}

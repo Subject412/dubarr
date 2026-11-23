@@ -22,6 +22,7 @@ export const DEFAULT_SETTINGS: DubarrSettings = {
     target_import_languages: ['pl'],
     extra_reference_languages: ['en'],
     original_language_from_arr: true,
+    prefer_original_language: true,
     exclude_commentary: true,
     export_mode: 'rule_based',
   },

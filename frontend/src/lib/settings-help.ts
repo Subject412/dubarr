@@ -26,6 +26,8 @@ export const SETTINGS_HELP: Record<SettingsSectionKey, Record<string, string>> =
       'Rule based keeps the tracks the Export Policy selects; All tracks keeps every donor track, with beyond-policy tracks still needing explicit approval.',
     original_language_from_arr:
       'Use Radarr/Sonarr metadata to identify the Original Language, which becomes the first-choice Reference Language.',
+    prefer_original_language:
+      'Make the arr-reported Original Language the first-choice Reference Language unless it is a Target Language (the dub being synchronized).',
     exclude_commentary:
       'Commentary tracks never become the Reference Track or the Target track.',
   },

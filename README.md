@@ -82,7 +82,7 @@ command: ["--log-level", "debug", "--log-file"]
 
 | Tool | Version | Notes |
 | --- | --- | --- |
-| Go | 1.26 or newer | `backend/go.mod` declares `go 1.26.0`; the container and CI use 1.27 |
+| Go | 1.26 or newer | `backend/go.mod` declares `go 1.26.0`; the Docker image uses `golang:1.27-alpine`, CI uses the `go.mod` version |
 | Node.js + npm | Node 24 or newer | Vite 8 / TypeScript 7 (image: `node:24-alpine`) |
 | Rust + Cargo | stable | `dubarr-sync`, edition 2021 |
 | `ffmpeg`, `ffprobe` | any current build | extraction, probing, previews |

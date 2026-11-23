@@ -16,15 +16,18 @@ source-build instructions, start at the [root README](../README.md).
 
 ## Compose variables
 
-This is the single reference for the variables both compose files use. (Only
-the canonical file has defaults; the example reads its values from `.env`.)
+This is the single reference for the variables both compose files use. Both
+files carry inline `${VAR:-…}` fallbacks, so each runs with no `.env`: the
+canonical file falls back to the defaults below, while the example deliberately
+falls back to non-default values (port `8090`, `/srv/media/library`,
+`PUID`/`PGID` `1001`). A `docker/.env` overrides either set.
 
-| Variable | Default | Consumed by | Purpose |
-| --- | --- | --- | --- |
-| `PUID` | `1000` | entrypoint, inside the container | uid the `dubarr` process runs as; must own `/config` and be able to read the media mount |
-| `PGID` | `1000` | entrypoint, inside the container | gid for the same process |
-| `MEDIA_PATH` | `./media` | Compose, on the host | host directory bind-mounted read-only at `/media` |
-| `DUBARR_PORT` | `8080` | Compose, on the host | published host port for the web UI |
+| Variable | Canonical default | Example fallback | Consumed by | Purpose |
+| --- | --- | --- | --- | --- |
+| `PUID` | `1000` | `1001` | entrypoint, inside the container | uid the `dubarr` process runs as; must own `/config` and be able to read the media mount |
+| `PGID` | `1000` | `1001` | entrypoint, inside the container | gid for the same process |
+| `MEDIA_PATH` | `./media` | `/srv/media/library` | Compose, on the host | host directory bind-mounted read-only at `/media` |
+| `DUBARR_PORT` | `8080` | `8090` | Compose, on the host | published host port for the web UI |
 
 `PUID` and `PGID` are the only environment variables the image honours.
 `MEDIA_PATH` and `DUBARR_PORT` never enter the container: `DUBARR_PORT=8090`
@@ -36,8 +39,8 @@ is started with explicit flags (`--data-dir /config --listen 0.0.0.0:8080`) and
 everything else is configured in the first-run wizard and stored in `/config`
 (ADR-0003).
 
-To override the defaults, put the values in `docker/.env` (Compose loads it
-from this directory) or export them in the shell:
+To change any of these values, put them in `docker/.env` (Compose loads it from
+this directory) or export them in the shell:
 
 ```sh
 PUID=1000

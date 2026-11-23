@@ -17,8 +17,11 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
+	"sort"
 	"strings"
 	"time"
 )
@@ -52,6 +55,15 @@ type LibraryCacheItem struct {
 	EpisodeTitle         string
 	// MediaFolderPath is the arr folder (movie.path / series.path).
 	MediaFolderPath string
+	// RootFolderPath is the canonical arr root folder containing
+	// MediaFolderPath (ADR-0009); empty when no configured root matches.
+	RootFolderPath string
+	// ArrTagIDs/ArrTagLabels are the item's arr tag snapshot, paired by
+	// index. Episodes carry their series' tags. Each sync replaces the pair,
+	// so removed tags disappear instead of accumulating. Legacy rows decode
+	// as empty.
+	ArrTagIDs    []int64
+	ArrTagLabels []string
 	// TargetFilePath is the resolved on-disk video, empty when arr has none.
 	TargetFilePath string
 	// MatchesTargetTags is the Tdarr Gate verdict for the target filename.
@@ -172,6 +184,7 @@ func (s *Store) SyncLibraryCache(ctx context.Context, instanceID int64, items []
 		if err := validateLibraryItem(item); err != nil {
 			return LibrarySyncStats{}, err
 		}
+		item = normalizeArrTagSnapshot(item)
 		key := libraryKey{mediaType: item.MediaType, externalID: item.ExternalItemID}
 		if _, dup := seen[key]; dup {
 			return LibrarySyncStats{}, fmt.Errorf("%w: duplicate %s %d in snapshot",
@@ -242,7 +255,9 @@ func (s *Store) libraryCacheRows(ctx context.Context, instanceID int64) (map[lib
 		        COALESCE(original_title, ''), COALESCE(original_language_iso2, ''),
 		        COALESCE(year, 0), season_number, episode_number,
 		        COALESCE(episode_title, ''), COALESCE(media_folder_path, ''),
-		        COALESCE(target_file_path, ''), matches_target_tags, eligibility_status
+		        COALESCE(target_file_path, ''), matches_target_tags, eligibility_status,
+		        COALESCE(arr_tag_ids_json, '[]'), COALESCE(arr_tag_labels_json, '[]'),
+		        COALESCE(root_folder_path, '')
 		 FROM arr_library_cache WHERE arr_instance_id = ?`, instanceID)
 	if err != nil {
 		return nil, fmt.Errorf("store: read library cache: %w", err)
@@ -257,12 +272,18 @@ func (s *Store) libraryCacheRows(ctx context.Context, instanceID int64) (map[lib
 			episode  sql.NullInt64
 			media    string
 			external int64
+			idsJSON  string
+			lblJSON  string
 		)
 		if err := rows.Scan(&row.ID, &media, &external, &row.SeriesID, &row.TMDBID, &row.TVDBID,
 			&row.Title, &row.OriginalTitle, &row.OriginalLanguageISO2, &row.Year,
 			&season, &episode, &row.EpisodeTitle, &row.MediaFolderPath, &row.TargetFilePath,
-			&row.MatchesTargetTags, &row.EligibilityStatus); err != nil {
+			&row.MatchesTargetTags, &row.EligibilityStatus, &idsJSON, &lblJSON,
+			&row.RootFolderPath); err != nil {
 			return nil, fmt.Errorf("store: scan library cache row: %w", err)
+		}
+		if err := decodeArrTagSnapshot(idsJSON, lblJSON, &row.LibraryCacheItem); err != nil {
+			return nil, err
 		}
 		row.MediaType = media
 		row.ExternalItemID = external
@@ -287,14 +308,17 @@ func insertLibraryCacheRow(ctx context.Context, tx *sql.Tx, instanceID int64, it
 		`INSERT INTO arr_library_cache
 		 (arr_instance_id, media_type, external_item_id, series_id, tmdb_id, tvdb_id,
 		  title, original_title, original_language_iso2, year, season_number, episode_number,
-		  episode_title, media_folder_path, target_file_path, matches_target_tags,
+		  episode_title, media_folder_path, root_folder_path, target_file_path,
+		  arr_tag_ids_json, arr_tag_labels_json, matches_target_tags,
 		  eligibility_status, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		instanceID, item.MediaType, item.ExternalItemID, nullInt(item.SeriesID),
 		nullInt(item.TMDBID), nullInt(item.TVDBID), item.Title, nullStr(item.OriginalTitle),
 		nullStr(item.OriginalLanguageISO2), nullInt(int64(item.Year)),
 		nullIntPtr(item.SeasonNumber), nullIntPtr(item.EpisodeNumber),
-		nullStr(item.EpisodeTitle), nullStr(item.MediaFolderPath), nullStr(item.TargetFilePath),
+		nullStr(item.EpisodeTitle), nullStr(item.MediaFolderPath), nullStr(item.RootFolderPath),
+		nullStr(item.TargetFilePath), encodeArrTagIDs(item.ArrTagIDs),
+		encodeArrTagLabels(item.ArrTagLabels),
 		item.MatchesTargetTags, item.EligibilityStatus, now); err != nil {
 		return fmt.Errorf("store: insert library row %s %d: %w", item.MediaType, item.ExternalItemID, err)
 	}
@@ -306,13 +330,16 @@ func updateLibraryCacheRow(ctx context.Context, tx *sql.Tx, id int64, item Libra
 		`UPDATE arr_library_cache
 		 SET series_id = ?, tmdb_id = ?, tvdb_id = ?, title = ?, original_title = ?,
 		     original_language_iso2 = ?, year = ?, season_number = ?, episode_number = ?,
-		     episode_title = ?, media_folder_path = ?, target_file_path = ?,
+		     episode_title = ?, media_folder_path = ?, root_folder_path = ?, target_file_path = ?,
+		     arr_tag_ids_json = ?, arr_tag_labels_json = ?,
 		     matches_target_tags = ?, eligibility_status = ?, updated_at = ?
 		 WHERE id = ?`,
 		nullInt(item.SeriesID), nullInt(item.TMDBID), nullInt(item.TVDBID), item.Title,
 		nullStr(item.OriginalTitle), nullStr(item.OriginalLanguageISO2), nullInt(int64(item.Year)),
 		nullIntPtr(item.SeasonNumber), nullIntPtr(item.EpisodeNumber),
-		nullStr(item.EpisodeTitle), nullStr(item.MediaFolderPath), nullStr(item.TargetFilePath),
+		nullStr(item.EpisodeTitle), nullStr(item.MediaFolderPath), nullStr(item.RootFolderPath),
+		nullStr(item.TargetFilePath), encodeArrTagIDs(item.ArrTagIDs),
+		encodeArrTagLabels(item.ArrTagLabels),
 		item.MatchesTargetTags, item.EligibilityStatus, now, id); err != nil {
 		return fmt.Errorf("store: update library row %d: %w", id, err)
 	}
@@ -339,6 +366,91 @@ func validateLibraryItem(item LibraryCacheItem) error {
 		return fmt.Errorf("%w: eligibility_status %q is not a gate verdict",
 			ErrInvalidLibraryItem, item.EligibilityStatus)
 	}
+	if len(item.ArrTagIDs) != len(item.ArrTagLabels) {
+		return fmt.Errorf("%w: %s %d has %d arr tag ids but %d labels",
+			ErrInvalidLibraryItem, item.MediaType, item.ExternalItemID,
+			len(item.ArrTagIDs), len(item.ArrTagLabels))
+	}
+	return nil
+}
+
+// normalizeArrTagSnapshot canonicalises the tag snapshot: pairs sorted by id
+// and duplicate ids dropped. A stable order keeps the diff from rewriting rows
+// every pass, while the pairing between id and label is preserved.
+func normalizeArrTagSnapshot(item LibraryCacheItem) LibraryCacheItem {
+	if len(item.ArrTagIDs) == 0 {
+		item.ArrTagIDs = nil
+		item.ArrTagLabels = nil
+		return item
+	}
+	type pair struct {
+		id    int64
+		label string
+	}
+	pairs := make([]pair, len(item.ArrTagIDs))
+	for i := range item.ArrTagIDs {
+		pairs[i] = pair{id: item.ArrTagIDs[i], label: item.ArrTagLabels[i]}
+	}
+	sort.Slice(pairs, func(i, j int) bool { return pairs[i].id < pairs[j].id })
+
+	ids := make([]int64, 0, len(pairs))
+	labels := make([]string, 0, len(pairs))
+	for i, p := range pairs {
+		if i > 0 && p.id == pairs[i-1].id {
+			continue
+		}
+		ids = append(ids, p.id)
+		labels = append(labels, p.label)
+	}
+	item.ArrTagIDs = ids
+	item.ArrTagLabels = labels
+	return item
+}
+
+// encodeArrTagIDs renders the id snapshot as JSON for arr_tag_ids_json.
+// Marshalling a []int64 cannot fail, so an error can only mean a future type
+// change; the empty array is the safe fallback.
+func encodeArrTagIDs(ids []int64) string {
+	if len(ids) == 0 {
+		return "[]"
+	}
+	b, err := json.Marshal(ids)
+	if err != nil {
+		return "[]"
+	}
+	return string(b)
+}
+
+// encodeArrTagLabels renders the label snapshot as JSON. Labels are sorted by
+// their id (see normalizeArrTagSnapshot), so JSON order is stable.
+func encodeArrTagLabels(labels []string) string {
+	if len(labels) == 0 {
+		return "[]"
+	}
+	b, err := json.Marshal(labels)
+	if err != nil {
+		return "[]"
+	}
+	return string(b)
+}
+
+// decodeArrTagSnapshot reads the JSON columns back. Legacy rows carry '[]' via
+// the column default, so they decode as empty metadata; malformed JSON is
+// reported instead of silently treated as "untagged" (which could change
+// eligibility once ADR-0009 is wired into the gate).
+func decodeArrTagSnapshot(idsJSON, labelsJSON string, out *LibraryCacheItem) error {
+	out.ArrTagIDs = []int64{}
+	out.ArrTagLabels = []string{}
+	if idsJSON != "" {
+		if err := json.Unmarshal([]byte(idsJSON), &out.ArrTagIDs); err != nil {
+			return fmt.Errorf("store: decode arr tag ids %q: %w", idsJSON, err)
+		}
+	}
+	if labelsJSON != "" {
+		if err := json.Unmarshal([]byte(labelsJSON), &out.ArrTagLabels); err != nil {
+			return fmt.Errorf("store: decode arr tag labels %q: %w", labelsJSON, err)
+		}
+	}
 	return nil
 }
 
@@ -358,6 +470,9 @@ func libraryItemEqual(row libraryCacheRow, item LibraryCacheItem) bool {
 		intPtrEqual(row.EpisodeNumber, item.EpisodeNumber) &&
 		row.EpisodeTitle == item.EpisodeTitle &&
 		row.MediaFolderPath == item.MediaFolderPath &&
+		row.RootFolderPath == item.RootFolderPath &&
+		slices.Equal(row.ArrTagIDs, item.ArrTagIDs) &&
+		slices.Equal(row.ArrTagLabels, item.ArrTagLabels) &&
 		row.TargetFilePath == item.TargetFilePath &&
 		row.MatchesTargetTags == item.MatchesTargetTags &&
 		row.EligibilityStatus == item.EligibilityStatus

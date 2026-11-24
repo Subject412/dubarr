@@ -27,3 +27,4 @@ target/
 # Secrets & keys — never commit
 .master.key
 *.keyfile
+.hermes/

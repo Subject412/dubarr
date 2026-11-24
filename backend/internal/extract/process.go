@@ -103,10 +103,18 @@ func (w *Worker) processJob(ctx context.Context, job store.ImportExtractionJob) 
 		// Validate against this track's own donor duration: donor audio tracks
 		// may differ in length, so the container duration is only a fallback.
 		// Prefer ffprobe's per-stream duration; mkvmerge's per-track value (when
-		// its JSON reports one) and the container duration follow.
+		// its JSON reports one, mkvmerge >= 86) follows. Older mkvmerge omits
+		// per-track statistics entirely, so measure that track directly.
 		duration := track.Duration
 		if duration <= 0 {
 			duration = mkvTracks[pos].Duration
+		}
+		if duration <= 0 {
+			measured, merr := w.measureDonorTrack(ctx, donor, mkvTracks[pos].ID)
+			if merr != nil {
+				return fmt.Errorf("extract: donor %s track %d: %w", donor, mkvTracks[pos].ID, merr)
+			}
+			duration = measured
 		}
 		if duration <= 0 {
 			duration = media.Duration
@@ -260,6 +268,30 @@ func (w *Worker) audioTracks(ctx context.Context, donor string) ([]mkvAudioTrack
 		tracks = append(tracks, mkvAudioTrack{ID: track.ID, Duration: duration})
 	}
 	return tracks, nil
+}
+
+// measureDonorTrack extracts one donor track to a scratch file and probes it,
+// giving its own duration independently of mkvmerge's identification version.
+func (w *Worker) measureDonorTrack(ctx context.Context, donor string, id int) (time.Duration, error) {
+	bin, err := w.mkvextractBinary()
+	if err != nil {
+		return 0, err
+	}
+	dir, err := os.MkdirTemp("", "dubarr-donor-measure-*")
+	if err != nil {
+		return 0, err
+	}
+	defer os.RemoveAll(dir)
+	out := filepath.Join(dir, "track.mka")
+	outp, err := w.run(ctx, bin, "tracks", donor, fmt.Sprintf("%d:%s", id, out))
+	if err != nil {
+		return 0, fmt.Errorf("mkvextract track %d: %w: %s", id, err, firstLine(outp))
+	}
+	info, err := w.prober.Probe(ctx, out)
+	if err != nil {
+		return 0, fmt.Errorf("probe extracted donor track %d: %w", id, err)
+	}
+	return info.Duration, nil
 }
 
 // audioPosition maps a probed track's container-wide stream index to its

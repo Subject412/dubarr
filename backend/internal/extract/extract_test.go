@@ -335,6 +335,30 @@ func (h *harness) assertStagedTrack(path, codec string, channels int, duration t
 	}
 }
 
+// The direct donor measurement is the fallback for mkvmerge versions that do
+// not report per-track statistics in JSON identification.
+func TestMeasureDonorTrackReportsOwnDuration(t *testing.T) {
+	h := newHarness(t)
+	donor := buildAudioDonor(t, t.TempDir(), "Unequal.mkv",
+		testDonorTrack{lang: "pol", seconds: 3, channels: 1},
+		testDonorTrack{lang: "eng", seconds: 10, channels: 1})
+	mkvTracks, err := h.worker.audioTracks(h.ctx, donor)
+	if err != nil {
+		t.Fatalf("audioTracks: %v", err)
+	}
+	if len(mkvTracks) < 2 {
+		t.Fatalf("audioTracks = %d tracks, want 2", len(mkvTracks))
+	}
+	first := mkvTracks[0]
+	got, err := h.worker.measureDonorTrack(h.ctx, donor, first.ID)
+	if err != nil {
+		t.Fatalf("measureDonorTrack: %v", err)
+	}
+	if delta := got - 3*time.Second; delta > 100*time.Millisecond || delta < -100*time.Millisecond {
+		t.Errorf("measured duration = %v, want about 3s", got)
+	}
+}
+
 // TestExtractionPairsAudioTracksPositionallyWithVideoStream is the M3-1 review
 // regression: a donor with a video stream shifts ffprobe's audio stream indices
 // to 1..N while mkvmerge's audio-only id list starts at 0..N-1, so indexing the

@@ -216,9 +216,9 @@ func TestShrekEndToEnd(t *testing.T) {
 	}
 	assertNoSecrets(t, secretMarker, logs, apiResponse)
 
-	// Staging is kept on success for inspection (M5-1 contract).
-	if _, err := os.Stat(filepath.Join(h.work, "jobs", strconv.FormatInt(rec.ID, 10))); err != nil {
-		t.Fatalf("staging should be kept on success: %v", err)
+	// Issue #23: a completed sync job leaves no {WORK_DIR}/jobs/{id}/ behind.
+	if _, err := os.Stat(filepath.Join(h.work, "jobs", strconv.FormatInt(rec.ID, 10))); !os.IsNotExist(err) {
+		t.Fatalf("staging should be removed after a completed job, stat err = %v", err)
 	}
 }
 

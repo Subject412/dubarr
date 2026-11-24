@@ -29,7 +29,9 @@ tags.
 
 ## What a tag triggers
 
-`.github/workflows/release.yml` runs on every `v*` tag push and:
+Two workflows run on every `v*` tag push; both start from the same commit.
+
+`.github/workflows/release.yml`:
 
 1. validates the tag, sets up Node 24, Go (from `backend/go.mod`) and Rust;
 2. builds the SPA (`frontend/`: `npm ci && npm run build`) into `backend/web`,
@@ -39,10 +41,32 @@ tags.
 5. writes the archives and `dubarr_<version>_checksums.txt`, then creates the
    GitHub release with `softprops/action-gh-release`.
 
-No repository secrets are required: the workflow uses the automatic
-`GITHUB_TOKEN` with `contents: write` scoped to the release job only (top-level
-permissions are `contents: read`). Actions are pinned to major versions;
-`runs-on` is pinned to `ubuntu-22.04` so the Linux glibc floor does not drift.
+`.github/workflows/docker-release.yml`:
+
+1. validates the tag, sets up QEMU + Buildx and logs in to GHCR and Docker Hub;
+2. derives shared tags from the version: `X.Y.Z`, `X.Y`, `latest`;
+3. builds `docker/Dockerfile` natively per platform for `linux/amd64` and
+   `linux/arm64` (frontend → Go → Rust `dubarr-sync` → Debian slim runtime);
+4. pushes the multi-arch manifest to `ghcr.io/subject412/dubarr` and
+   `subject412/dubarr` with the same tag set.
+
+Archive releases use the automatic `GITHUB_TOKEN` with `contents: write` scoped
+to the release job only. The Docker job requests `packages: write` for GHCR and
+needs two repository secrets:
+
+| Secret | Purpose |
+| --- | --- |
+| `DOCKERHUB_USERNAME` | Docker Hub account name for `subject412/dubarr` |
+| `DOCKERHUB_TOKEN` | Docker Hub access token (read/write) |
+
+Create both at Settings → Secrets and variables → Actions. The Docker workflow
+makes the GHCR `dubarr` package public via the Packages API and flips the
+Docker Hub `subject412/dubarr` repository to public after the push, so pulls
+work unauthenticated without manual package/repository settings.
+
+Actions are pinned to major versions. The archive job pins `ubuntu-22.04` so
+the Linux glibc floor does not drift; the Docker job uses `ubuntu-24.04` for
+Buildx/QEMU support.
 
 ## Archive layout
 
@@ -63,7 +87,8 @@ sha256sum -c dubarr_<version>_checksums.txt   # Linux (from the directory holdin
 
 The release does **not** contain ffmpeg, ffprobe or mkvmerge; install those from
 your distribution (`ffmpeg`, `mkvtoolnix`) and make sure they are on `PATH`.
-No Docker image is published by this workflow.
+Container images are built separately by `.github/workflows/docker-release.yml`
+and include ffmpeg, ffprobe, mkvmerge and `dubarr-sync`.
 
 ## How `dubarr-sync` is located at runtime
 
@@ -147,13 +172,20 @@ workflow does not rewrite `Cargo.toml`.
    `dubarr-sync`, `ffmpeg`, `ffprobe` and `mkvmerge`.
 7. Publish/announce the generated release notes; do not edit published assets
    in place.
+8. Watch the `Docker Release` workflow; confirm both registries show the
+   multi-arch manifest (`docker buildx imagetools inspect
+   subject412/dubarr:<version>`), then `docker pull subject412/dubarr:<version>`
+   on the target host and check `/api/health` reports `dubarr-sync`,
+   `ffmpeg`, `ffprobe` and `mkvmerge` available.
 
 ## CI prerequisites
 
 - GitHub Actions enabled for the repository; no self-hosted runners.
 - Workflow permissions: the repository default should allow read-only tokens
-  (the release job requests `contents: write` explicitly).
+  (the release job requests `contents: write`; the Docker job requests
+  `packages: write`).
+- Repository secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` for the Docker
+  release workflow; a public `subject412/dubarr` Docker Hub repository.
 - The repository must not require status checks that these workflows do not
   produce; `ci.yml` job names are `backend (go)`, `sync-engine (rust)` and
   `frontend (vite)`.
-- No secrets or environment variables are needed for either workflow.

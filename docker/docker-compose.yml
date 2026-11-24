@@ -1,12 +1,21 @@
-# Dubarr appliance service.
+# Dubarr appliance service — the single documented example stack.
 #
 #   cd docker && docker compose up --build
 #
-# Zero application environment: the only container variables are PUID/PGID,
-# consumed by the entrypoint to pick the container user's uid/gid. DUBARR_PORT
-# is read by Compose on the host to choose the published port — it never enters
-# the container. Settings and secrets are configured through the first-run
-# wizard and stored in /config — never here.
+# Every value below has an all-defaults `${VAR:-…}` fallback, so this file runs
+# as-is. To adapt it, put overrides in docker/.env (Compose loads it from this
+# directory) or export them in the shell; every variable is documented once in
+# docker/README.md.
+#
+# Zero application environment (ADR-0003): the only container variables are
+# PUID/PGID, consumed by the entrypoint to pick the container user's uid/gid.
+# Settings and secrets are configured through the first-run wizard and stored
+# in /config — never here.
+#
+# DUBARR_PORT is read by Compose on the host to choose the published port; the
+# container always listens on 8080, so it never enters the container.
+# CONFIG_PATH and MEDIA_PATH are likewise host-side paths consumed by Compose
+# when it builds the bind mounts — neither ever enters the container.
 services:
   dubarr:
     build:
@@ -21,8 +30,9 @@ services:
       PUID: "${PUID:-1000}"
       PGID: "${PGID:-1000}"
     volumes:
-      # Appliance state: database, master keyfile, cache. Persist this.
-      - ./config:/config
+      # Appliance state: database, master keyfile and logs. Persist this and
+      # back it up — losing it loses the encrypted secrets.
+      - "${CONFIG_PATH:-./config}:/config"
       # Media roots. Point MEDIA_PATH at the host library; mounted read-only
       # because the appliance never modifies source media in place.
       - "${MEDIA_PATH:-./media}:/media:ro"

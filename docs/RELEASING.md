@@ -59,10 +59,10 @@ needs two repository secrets:
 | `DOCKERHUB_USERNAME` | Docker Hub account name for `subject928/dubarr` |
 | `DOCKERHUB_TOKEN` | Docker Hub access token (read/write/delete) |
 
-Create both at Settings → Secrets and variables → Actions. The Docker workflow
-makes the GHCR `dubarr` package public via the Packages API and flips the
-Docker Hub `subject928/dubarr` repository to public after the push, so pulls
-work unauthenticated without manual package/repository settings.
+Create both at Settings → Secrets and variables → Actions. GHCR images in the
+public GitHub repository are pullable unauthenticated; the workflow verifies
+the Docker Hub `subject928/dubarr` repository is public (flipping it if it was
+created private), so pulls work without manual package/repository settings.
 
 Actions are pinned to major versions. The archive job pins `ubuntu-22.04` so
 the Linux glibc floor does not drift; the Docker job uses `ubuntu-24.04` for

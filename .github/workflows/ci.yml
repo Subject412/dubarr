@@ -26,6 +26,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ffmpeg mkvtoolnix
+      - name: Media tool versions
+        run: |
+          mkvmerge --version | head -1
+          ffprobe -version | head -1
       - name: Vet
         working-directory: backend
         run: go vet ./...

@@ -383,7 +383,8 @@ func TestExtractionValidatesPerTrackDonorDuration(t *testing.T) {
 		t.Fatalf("ProcessOnce = (%v, %v), want (true, nil)", processed, err)
 	}
 	if status, msg := h.status(id); status != "completed" || msg != "" {
-		t.Fatalf("status = %q err %q, want completed with no error", status, msg)
+		t.Fatalf("status = %q err %q, want completed with no error (probed pl track duration %v, container %v)",
+			status, msg, media.Tracks[0].Duration, media.Duration)
 	}
 	// The 3s track must validate against 3s, not the 10s container duration.
 	h.assertStagedTrack(h.stagedByLang(id, ".pl."), "pcm_s16le", 1, 3*time.Second)

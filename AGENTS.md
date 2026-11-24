@@ -24,6 +24,7 @@ Each `internal/<pkg>` exposes `RegisterRoutes(mux *http.ServeMux, deps Dependenc
 - Protected (orchestrator-only writes): `AGENTS.md`, `PLAN.md`, `GLOSSARY.md`, `docs/adr/**`, `LICENSE`, applied migrations.
 - Vault write-once. Every job Copy-on-Work into WORK_DIR + SHA-256 verify; never modify VAULT_DIR in place.
 - Target video never transcoded. Mux only tag-eligible targets (Processing Gate, formerly Tdarr Gate — see ADR-0009) unless force override allowed by settings.
+- Opt-in Transcode Rules (`audio.options`, ADR-0010): shipped empty; conditions match PRE-TEMPO vault metadata and the first matching enabled rule wins. When a rule matches, re-encode only the Work Area copy (never VAULT_DIR) in ONE ffmpeg pass that also applies any required tempo factor; ffprobe must confirm codec/channels/duration or the job fails clearly, and the encoder is checked before the job starts. Atomic mux publication, language tags and `mux.options.track_title_in_mkv` are unchanged.
 - Secrets AES-256-GCM (12-byte nonce || ciphertext || tag); master key OS keyring (native) / 0600 keyfile (Docker). `X-Api-Key` header only; scrub secrets from logs/errors. Never print secrets.
 - Paths canonicalized + `filepath.EvalSymlinks`, confined to configured roots. DATA_DIR 0700; db/keyfile 0600.
 - Fixture tests run on COPIES in scratch; originals read-only. `go test` + `cargo test` green before any milestone gate.

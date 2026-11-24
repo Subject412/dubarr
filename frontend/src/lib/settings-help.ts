@@ -77,6 +77,36 @@ export const SETTINGS_HELP: Record<SettingsSectionKey, Record<string, string>> =
     output_mode:
       'Replace: atomically overwrite the library file (optional .bak). Write to the mux output folder: save <name>.dubarr.mkv in the Mux output folder instead, refuse to overwrite an existing file and skip the *arr rescan.',
   },
+  'audio.options': {
+    rules:
+      'Ordered, opt-in Transcode Rules. The first enabled rule whose conditions all match the PRE-TEMPO vault track is applied to a copy in the Work Area; with no rules the audio is copied losslessly and nothing is re-encoded.',
+    when_source_codecs:
+      'Source codec names (ffmpeg codec_name values such as pcm_s16le or ac3). The track matches if its codec appears anywhere in this list; entries are compared case-insensitively.',
+    when_source_codec_regex:
+      'Optional regular expression matched against the source codec name, for example ^pcm_.*$ to catch every PCM flavour.',
+    when_min_bitrate_bps:
+      'Only match tracks whose archived bitrate is at least this many bits per second.',
+    when_max_bitrate_bps:
+      'Only match tracks whose archived bitrate is at most this many bits per second.',
+    when_channel_count: 'Only match tracks with exactly this channel count.',
+    when_channel_layout:
+      'Only match tracks with this ffmpeg channel layout (stereo, 5.1, 7.1, ...). Layout names are validated so a typo is rejected on save.',
+    when_sample_rate:
+      'Only match tracks whose archived sample rate is exactly this value in Hz.',
+    when_lang_iso2: 'Only match tracks tagged with this two-letter language code, e.g. pl.',
+    when_variant:
+      'Only match tracks with this variant label, e.g. dubbing or commentary.',
+    then_codec:
+      'Output format. keep copies the track untouched; opus, aac, flac and PCM re-encode it in the Work Area only — the Audio Vault file is never modified.',
+    then_bitrate_bps:
+      'Target bitrate for Opus or AAC. Lossless formats (FLAC/PCM) ignore this field.',
+    then_channels: 'Downmix/upmix to this channel count; a matching layout is chosen automatically.',
+    then_channel_layout:
+      'Explicit ffmpeg output layout (stereo, 5.1, ...). Takes precedence over the channel count when both are set.',
+    then_sample_rate: 'Output sample rate in Hz.',
+    enabled:
+      'Disabled rules stay in the list but are never matched. Rules are evaluated top to bottom; move a rule up to give it priority.',
+  },
   'watch.options': {
     scan_interval_sec: 'How often the Watch Folder is scanned for new donors.',
     stability_check_interval_sec:

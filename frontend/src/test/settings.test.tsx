@@ -630,3 +630,91 @@ describe('neutral processing-gate wording', () => {
     expect(screen.queryByText(/Tdarr/i)).not.toBeInTheDocument()
   })
 })
+
+describe('audio transcode rules', () => {
+  function mockAudioFetch(): ReturnType<typeof vi.fn> {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/api/settings') && isMethod(init, 'GET')) {
+        return jsonResponse({ settings: {} })
+      }
+      if (url.includes('/api/settings') && isMethod(init, 'PUT')) {
+        return jsonResponse({ settings: {} })
+      }
+      return jsonResponse({ error: 'unexpected' }, 404)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    return fetchMock
+  }
+
+  function savedRules(fetchMock: ReturnType<typeof vi.fn>) {
+    const put = fetchMock.mock.calls.find(([, init]) => isMethod(init, 'PUT'))
+    expect(put).toBeDefined()
+    const body = JSON.parse(String(put?.[1]?.body)) as {
+      settings: { 'audio.options': { rules: unknown[] } }
+    }
+    return body.settings['audio.options'].rules
+  }
+
+  it('defaults to no rules and states that nothing is transcoded', async () => {
+    mockAudioFetch()
+    renderWithProviders(<SettingsPage />, { route: '/settings' })
+
+    expect(await screen.findByRole('heading', { name: 'Audio transcoding' })).toBeInTheDocument()
+    expect(
+      screen.getByText('No rules — audio is copied losslessly.'),
+    ).toBeInTheDocument()
+    expect(DEFAULT_SETTINGS['audio.options']).toEqual({ rules: [] })
+  })
+
+  it('adds an ordered Opus rule and saves the whole audio.options section', async () => {
+    const user = userEvent.setup()
+    const fetchMock = mockAudioFetch()
+    renderWithProviders(<SettingsPage />, { route: '/settings' })
+    expect(await screen.findByRole('heading', { name: 'Audio transcoding' })).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Add rule' }))
+    await user.type(screen.getByLabelText('Add source codec'), 'pcm_s16le{Enter}')
+    await user.type(screen.getByLabelText('Rule 1 bitrate (bps)'), '96000')
+    await user.type(screen.getByLabelText('Rule 1 output channels'), '2')
+
+    await user.click(screen.getByLabelText('Save Audio transcoding'))
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([, init]) => isMethod(init, 'PUT'))).toBe(true)
+    })
+
+    const rules = savedRules(fetchMock)
+    expect(rules).toHaveLength(1)
+    expect(rules[0]).toMatchObject({
+      enabled: true,
+      when: { source_codecs: ['pcm_s16le'] },
+      then: { codec: 'opus', bitrate_bps: 96000, channels: 2 },
+    })
+  })
+
+  it('strips incompatible action fields when the output codec changes', async () => {
+    const user = userEvent.setup()
+    const fetchMock = mockAudioFetch()
+    renderWithProviders(<SettingsPage />, { route: '/settings' })
+    expect(await screen.findByRole('heading', { name: 'Audio transcoding' })).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Add rule' }))
+    await user.type(screen.getByLabelText('Rule 1 bitrate (bps)'), '96000')
+    await user.type(screen.getByLabelText('Rule 1 output channels'), '2')
+    await user.selectOptions(screen.getByLabelText('Rule 1 output codec'), 'flac')
+    await user.selectOptions(screen.getByLabelText('Rule 1 output codec'), 'keep')
+
+    await user.click(screen.getByLabelText('Save Audio transcoding'))
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([, init]) => isMethod(init, 'PUT'))).toBe(true)
+    })
+
+    const rule = savedRules(fetchMock)[0] as {
+      then: Record<string, unknown>
+    }
+    expect(rule.then.codec).toBe('keep')
+    for (const field of ['bitrate_bps', 'channels', 'channel_layout', 'sample_rate']) {
+      expect(Object.prototype.hasOwnProperty.call(rule.then, field)).toBe(false)
+    }
+  })
+})

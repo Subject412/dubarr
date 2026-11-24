@@ -77,6 +77,41 @@ export type TargetTagFilter = {
   root_folder_paths: string[]
 }
 
+export type TranscodeCodec = 'keep' | 'opus' | 'aac' | 'flac' | 'pcm_s16le' | 'pcm_s24le' | 'pcm_f32le'
+
+/**
+ * One opt-in Audio Transcode Rule (ADR-0010). Conditions are AND-ed and match
+ * the PRE-TEMPO vault-track metadata; the first enabled rule that matches wins.
+ * An empty rule list keeps the historical lossless-copy behaviour.
+ */
+export type TranscodeRule = {
+  enabled: boolean
+  when: {
+    /** Exact ffmpeg codec names, matched case-insensitively. */
+    source_codecs?: string[]
+    /** Optional RE2 pattern matched against the source codec name. */
+    source_codec_regex?: string
+    min_bitrate_bps?: number | null
+    max_bitrate_bps?: number | null
+    channel_count?: number | null
+    /** Canonical ffmpeg layout name (stereo, 5.1, ...). */
+    channel_layout?: string
+    sample_rate?: number | null
+    lang_iso2?: string
+    variant?: string
+  }
+  then: {
+    codec: TranscodeCodec
+    bitrate_bps?: number | null
+    channels?: number | null
+    channel_layout?: string
+    sample_rate?: number | null
+  }
+}
+
+/** `audio.options`: ordered, global Transcode Rules. Global only, no per-media overrides. */
+export type AudioOptions = { rules: TranscodeRule[] }
+
 export type SyncDefaults = {
   max_offset_sec: number
   checkpoint_positions_pct: number[]
@@ -153,6 +188,7 @@ export type DubarrSettings = {
   'sync.defaults': SyncDefaults
   'security.options': SecurityOptions
   'mux.options': MuxOptions
+  'audio.options': AudioOptions
   'watch.options': WatchOptions
   'arr.options': ArrOptions
   'imports.options': ImportsOptions

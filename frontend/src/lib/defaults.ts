@@ -1,5 +1,6 @@
 import type {
   ArrOptions,
+  AudioOptions,
   DubarrSettings,
   ImportsOptions,
   LanguagesPolicy,
@@ -55,6 +56,8 @@ export const DEFAULT_SETTINGS: DubarrSettings = {
     track_title_in_mkv: 'Polski Dubbing',
     output_mode: 'replace',
   },
+  // Shipped default: no rules, no transcoding (ADR-0010).
+  'audio.options': { rules: [] } as AudioOptions,
   'watch.options': { scan_interval_sec: 10, stability_check_interval_sec: 4 },
   'arr.options': { poll_interval_sec: 300, manual_sync: true },
   'imports.options': { donor_patterns: ['PL.DUB'] },
@@ -62,6 +65,7 @@ export const DEFAULT_SETTINGS: DubarrSettings = {
 
 export type {
   ArrOptions,
+  AudioOptions,
   ImportsOptions,
   LanguagesPolicy,
   MuxOptions,

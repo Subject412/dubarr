@@ -40,6 +40,15 @@ const SETTINGS = {
     require_av1_strict: false,
   },
   'mux.options': { keep_bak: true, track_title_in_mkv: 'Polski Dubbing' },
+  'audio.options': {
+    rules: [
+      {
+        enabled: true,
+        when: { source_codecs: ['pcm_s16le'] },
+        then: { codec: 'opus', bitrate_bps: 96000, channels: 2 },
+      },
+    ],
+  },
   'watch.options': { scan_interval_sec: 10, stability_check_interval_sec: 4 },
   'arr.options': { poll_interval_sec: 300, manual_sync: true },
   'imports.options': { donor_patterns: ['PL.DUB'] },

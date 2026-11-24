@@ -52,6 +52,12 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
     description: 'Atomic muxing side effects.',
   },
   {
+    key: 'audio.options',
+    title: 'Audio transcoding',
+    description:
+      'Opt-in rules that re-encode the injected audio into a predictable format. The Audio Vault stays lossless and write-once; with no rules nothing is transcoded.',
+  },
+  {
     key: 'watch.options',
     title: 'Watch options',
     description: 'Donor-folder scanning cadence and stability window.',

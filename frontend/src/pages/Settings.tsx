@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import type {
   ArrOptions,
+  AudioOptions,
   ImportsOptions,
   LanguagesPolicy,
   MuxOptions,
@@ -27,6 +28,7 @@ import {
 import { ArrConnectionsSection } from '../components/ArrConnections'
 import { PathField, PathListEditor } from '../components/PathPicker'
 import { ThemeSelector } from '../components/ThemeSelector'
+import { TranscodeRulesEditor } from '../components/TranscodeRulesEditor'
 import {
   Alert,
   Badge,
@@ -608,6 +610,16 @@ export function SettingsPage() {
                   />
                 </Field>
               </>
+            )}
+          </Section>
+
+          <Section<AudioOptions>
+            sectionKey="audio.options"
+            value={(data['audio.options'] as AudioOptions) ?? DEFAULTS['audio.options']}
+            save={save}
+          >
+            {(draft, update) => (
+              <TranscodeRulesEditor value={draft} onChange={(next) => update(next)} />
             )}
           </Section>
 

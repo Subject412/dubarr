@@ -179,7 +179,7 @@ building locally, set `image: subject928/dubarr:latest` in
 
 ## Documentation
 
-- [IDEA.md](IDEA.md) — product specification and scope boundaries.
+- [IDEA.md](IDEA.md) — historical design narrative (non-normative; see the authority banner at the top).
 - [GLOSSARY.md](GLOSSARY.md) — domain vocabulary (donor, target, vault, gate…).
 - [PLAN.md](PLAN.md) — milestones, defaults and implementation plan.
 - [docs/adr/](docs/adr/) — architecture decision records.

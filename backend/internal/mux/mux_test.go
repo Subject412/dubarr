@@ -463,10 +463,11 @@ func TestMuxPublishesAtomicallyWithBackup(t *testing.T) {
 		t.Errorf("added codec = %q, want pcm_s16le (copied, never transcoded)", added.CodecName)
 	}
 
-	// The target was copied into the job's Work Area first (Copy-on-Work).
-	workCopy := filepath.Join(h.work, "jobs", "42", "target.mkv")
-	if got := sha256File(t, workCopy); got != beforeTargetHash {
-		t.Errorf("work copy hash = %s, want staged original %s", got, beforeTargetHash)
+	// Issue #23: a completed mux leaves no staging behind. The target was
+	// copied into the job's Work Area (Copy-on-Work) and that copy lived in
+	// the job directory Mux has now removed.
+	if _, err := os.Stat(filepath.Join(h.work, "jobs", "42")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("job staging still present after a publish: %v", err)
 	}
 
 	// Command shape follows IDEA.md:397-403: target as input, then the

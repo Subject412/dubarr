@@ -199,8 +199,10 @@ func New(deps Dependencies) *Muxer {
 // uniquely named hidden temp in the destination directory (same filesystem),
 // ffprobe validates the result, and only then is the temp renamed into place —
 // after a backup copy of the original in replace mode. Any failure removes only
-// the temp this call created and leaves the original bytes in place; staging
-// cleanup belongs to the caller.
+// the temp this call created and leaves the original bytes in place. Staging is
+// owned by this call: once {WORK_DIR}/jobs/{id} has been created, every return
+// path removes it again, so no caller has to. That removal is idempotent, which
+// keeps a second cleanup by the sync worker a no-op.
 func (m *Muxer) Mux(ctx context.Context, job Job) (Result, error) {
 	target, _, jobDir, lang, err := job.normalize()
 	if err != nil {
@@ -256,6 +258,17 @@ func (m *Muxer) Mux(ctx context.Context, job Job) (Result, error) {
 	if err := os.MkdirAll(jobDir, 0o755); err != nil {
 		return Result{}, fmt.Errorf("%w: create job dir: %v", ErrPublish, err)
 	}
+	// Issue #23: this call owns the staging it creates. From here on, every
+	// return path — the published success and every failure below — removes
+	// {WORK_DIR}/jobs/{id}, so a standalone Mux leaves no directory behind.
+	// os.RemoveAll treats an already absent directory as success, which keeps
+	// the sync worker's own cleanup of the same job harmless. Aborts above
+	// return before this point and therefore never touch a caller's staging.
+	defer func() {
+		if err := os.RemoveAll(jobDir); err != nil {
+			m.warnf("mux: remove job staging %s: %v", jobDir, err)
+		}
+	}()
 	workCopy := filepath.Join(jobDir, "target"+filepath.Ext(target))
 	if err := copyFile(target, workCopy, 0o644); err != nil {
 		return Result{}, fmt.Errorf("%w: work copy: %v", ErrPublish, err)

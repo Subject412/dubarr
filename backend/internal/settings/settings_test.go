@@ -3,6 +3,7 @@ package settings
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -642,5 +643,116 @@ func TestTargetTagFilterValidation(t *testing.T) {
 		if err := s.Set(ctx, KeyTargetTagFilter, json.RawMessage(body)); err == nil {
 			t.Errorf("%s: Set accepted %s", name, body)
 		}
+	}
+}
+
+func TestSeedAudioOptionsIsEmpty(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	if err := s.Seed(ctx, t.TempDir()); err != nil {
+		t.Fatalf("Seed: %v", err)
+	}
+	got := decode[AudioOptions](t, mustGet(t, s, ctx, KeyAudioOptions))
+	if got.Rules == nil || len(got.Rules) != 0 {
+		t.Fatalf("seeded audio.options = %#v, want an empty non-nil rule list (ADR-0010)", got.Rules)
+	}
+	all, err := s.All(ctx)
+	if err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	if _, ok := all[KeyAudioOptions]; !ok {
+		t.Fatal("All is missing the seeded audio.options section")
+	}
+}
+
+// A database written before audio.options existed has no row at all: Get
+// reports absence (the job path must treat that as "no rules"), while an
+// existing row without `rules` decodes as an empty list everywhere.
+func TestLegacyAudioOptionsDecodesAsEmpty(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+
+	if _, ok, err := s.Get(ctx, KeyAudioOptions); err != nil || ok {
+		t.Fatalf("Get(absent) = ok=%v err=%v, want not found", ok, err)
+	}
+	all, err := s.All(ctx)
+	if err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	if _, ok := all[KeyAudioOptions]; ok {
+		t.Fatal("All invented an audio.options row that does not exist")
+	}
+	exp, err := s.Export(ctx)
+	if err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+	if _, ok := exp.Settings[KeyAudioOptions]; ok {
+		t.Fatal("Export invented an audio.options row that does not exist")
+	}
+	// Decoding the zero section is how the worker treats an absent row.
+	zero := AudioOptions{}
+	if zero.Rules != nil {
+		t.Fatalf("zero AudioOptions = %#v", zero.Rules)
+	}
+
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, '{}', '2026-01-01 00:00:00')`,
+		KeyAudioOptions); err != nil {
+		t.Fatalf("insert legacy audio.options: %v", err)
+	}
+	check := func(where string, raw json.RawMessage) {
+		t.Helper()
+		got := decode[AudioOptions](t, raw)
+		if got.Rules == nil || len(got.Rules) != 0 {
+			t.Errorf("%s rules = %#v, want empty non-nil", where, got.Rules)
+		}
+	}
+	check("Get", mustGet(t, s, ctx, KeyAudioOptions))
+	all, err = s.All(ctx)
+	if err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	check("All", all[KeyAudioOptions])
+	exp, err = s.Export(ctx)
+	if err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+	check("Export", exp.Settings[KeyAudioOptions])
+}
+
+func TestAudioOptionsValidation(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	bad := map[string]string{
+		"unknown codec":       `{"rules":[{"enabled":true,"when":{},"then":{"codec":"mp3"}}]}`,
+		"bad layout":          `{"rules":[{"enabled":true,"when":{"channel_layout":"surround"},"then":{"codec":"opus"}}]}`,
+		"negative bitrate":    `{"rules":[{"enabled":true,"when":{"min_bitrate_bps":-1},"then":{"codec":"opus"}}]}`,
+		"malformed regex":     `{"rules":[{"enabled":true,"when":{"source_codec_regex":"([a-z"},"then":{"codec":"opus"}}]}`,
+		"unknown field":       `{"rules":[{"enabled":true,"when":{},"then":{"codec":"opus"},"bogus":1}]}`,
+		"negative action bit": `{"rules":[{"enabled":true,"when":{},"then":{"codec":"aac","bitrate_bps":-8}}]}`,
+	}
+	for name, body := range bad {
+		t.Run(name, func(t *testing.T) {
+			err := s.Set(ctx, KeyAudioOptions, json.RawMessage(body))
+			if err == nil {
+				t.Fatal("Set accepted an invalid audio.options payload")
+			}
+			if !errors.Is(err, ErrInvalidValue) {
+				t.Fatalf("error %v is not ErrInvalidValue", err)
+			}
+		})
+	}
+
+	// Valid rules round-trip and keep their order (first match wins).
+	body := `{"rules":[{"enabled":true,"when":{"source_codecs":["pcm_s16le"],"min_bitrate_bps":1536000},"then":{"codec":"opus","bitrate_bps":160000,"channels":2}},{"enabled":false,"when":{},"then":{"codec":"keep"}}]}`
+	if err := s.Set(ctx, KeyAudioOptions, json.RawMessage(body)); err != nil {
+		t.Fatalf("Set(valid): %v", err)
+	}
+	got := decode[AudioOptions](t, mustGet(t, s, ctx, KeyAudioOptions))
+	if len(got.Rules) != 2 || got.Rules[0].Then.Codec != "opus" || got.Rules[0].Then.BitrateBPS == nil || *got.Rules[0].Then.BitrateBPS != 160000 {
+		t.Fatalf("roundtrip rules = %+v", got.Rules)
+	}
+	if got.Rules[1].Enabled || got.Rules[1].Then.Codec != "keep" {
+		t.Fatalf("roundtrip second rule = %+v", got.Rules[1])
 	}
 }

@@ -135,6 +135,8 @@ func (w *Worker) processJob(ctx context.Context, job store.ImportExtractionJob) 
 				Codec:        got.Codec,
 				Channels:     channelLayout(got),
 				ChannelCount: got.Channels,
+				BitrateBPS:   got.BitrateBPS,
+				SampleRate:   got.SampleRate,
 				Duration:     info.Duration,
 			})
 		}

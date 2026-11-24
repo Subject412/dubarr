@@ -256,6 +256,46 @@ func TestExtractionSucceedsAndStagesLosslessTrack(t *testing.T) {
 	}
 }
 
+// TestVaultHookReceivesProbedBitrateAndSampleRate guards the metadata that
+// Transcode Rules match on: an archived PCM track must carry the sample rate
+// from its re-probe and a positive bitrate, not zeroes.
+func TestVaultHookReceivesProbedBitrateAndSampleRate(t *testing.T) {
+	h := newHarness(t)
+	var captured []StagedTrack
+	w, err := New(Dependencies{
+		Store:    h.db,
+		Settings: h.worker.settings,
+		DataDir:  h.data,
+		Prober:   h.worker.prober,
+		VaultHook: func(_ context.Context, _ store.ImportExtractionJob, tracks []StagedTrack) error {
+			captured = tracks
+			return nil
+		},
+		Logf: func(string, ...any) {},
+	})
+	if err != nil {
+		t.Fatalf("extract.New with vault hook: %v", err)
+	}
+	donor := buildAudioDonor(t, t.TempDir(), "Movie PL.mkv", testDonorTrack{lang: "pol", seconds: 0.1, channels: 1})
+	id := h.seedExtracting(donor)
+	if processed, err := w.ProcessOnce(h.ctx); err != nil || !processed {
+		t.Fatalf("ProcessOnce = (%v, %v), want (true, nil)", processed, err)
+	}
+	if status, msg := h.status(id); status != "completed" || msg != "" {
+		t.Fatalf("status = %q err %q, want completed", status, msg)
+	}
+	if len(captured) != 1 {
+		t.Fatalf("vault hook got %d tracks, want 1", len(captured))
+	}
+	got := captured[0]
+	if got.SampleRate != 8000 {
+		t.Errorf("SampleRate = %d, want 8000", got.SampleRate)
+	}
+	if got.BitrateBPS <= 0 {
+		t.Errorf("BitrateBPS = %d, want a positive probed bitrate", got.BitrateBPS)
+	}
+}
+
 // stagedByLang returns the staged output whose name contains segment (".pl.",
 // ".en."), or "" when none does.
 func (h *harness) stagedByLang(id int64, segment string) string {

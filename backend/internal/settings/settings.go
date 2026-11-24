@@ -10,6 +10,7 @@
 //	sync.defaults      max offset, checkpoint/preview sampling positions
 //	security.options   vault read-only, tag override, AV1 warnings
 //	mux.options        keep .bak, track title written into Matroska
+//	audio.options      opt-in Transcode Rules: codec/channels/bitrate/sample rate (ADR-0010)
 //	watch.options      watch-folder scan cadence and stability window
 //	arr.options        Radarr/Sonarr polling cadence
 //	arr.connections    Radarr/Sonarr instances (API keys live in internal/secrets)
@@ -40,6 +41,7 @@ import (
 
 	"github.com/Subject412/dubarr/backend/internal/langtoken"
 	"github.com/Subject412/dubarr/backend/internal/secrets"
+	"github.com/Subject412/dubarr/backend/internal/transcode"
 )
 
 // Section keys.
@@ -54,12 +56,13 @@ const (
 	KeyArrOptions      = "arr.options"
 	KeyArrConnections  = "arr.connections"
 	KeyImportsOptions  = "imports.options"
+	KeyAudioOptions    = "audio.options"
 )
 
 var knownKeys = []string{
 	KeyStoragePaths, KeyLanguagesPolicy, KeyTargetTagFilter, KeySyncDefaults,
 	KeySecurityOptions, KeyMuxOptions, KeyWatchOptions, KeyArrOptions,
-	KeyArrConnections, KeyImportsOptions,
+	KeyArrConnections, KeyImportsOptions, KeyAudioOptions,
 }
 
 // KnownKeys returns the writable section keys in stable order.
@@ -235,6 +238,12 @@ func (m *MuxOptions) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// AudioOptions is the audio.options section: an ordered, first-match-wins list
+// of Transcode Rules (ADR-0010). The type lives in internal/transcode so the
+// rule engine and the settings validator share one schema; an empty or absent
+// list keeps the lossless-copy behaviour.
+type AudioOptions = transcode.Options
+
 // WatchOptions configure donor-folder scanning. StabilityCheckIntervalSec is
 // how far apart the two size checks must be (>= 4 s per IDEA.md §3.5).
 type WatchOptions struct {
@@ -348,6 +357,10 @@ func Defaults(dataDir string) map[string]any {
 		KeyImportsOptions: ImportsOptions{
 			DonorPatterns: []string{"PL.DUB"},
 		},
+		KeyAudioOptions: AudioOptions{
+			// Shipped default: no rules, no transcoding (ADR-0010).
+			Rules: []transcode.Rule{},
+		},
 	}
 }
 
@@ -423,6 +436,18 @@ func serveable(key, value string) json.RawMessage {
 		return blob
 	case KeyTargetTagFilter:
 		var p TargetTagFilter
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return raw
+		}
+		blob, err := json.Marshal(p)
+		if err != nil {
+			return raw
+		}
+		return blob
+	case KeyAudioOptions:
+		// A legacy row without `rules` must serve an explicit empty list, so
+		// Get/All/Export and the job path all agree that no transcode applies.
+		var p AudioOptions
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return raw
 		}
@@ -694,6 +719,13 @@ func normalize(key string, raw json.RawMessage) (string, error) {
 		err = strict(raw, &p)
 		if err == nil {
 			err = validateImports(&p)
+		}
+		v = p
+	case KeyAudioOptions:
+		var p AudioOptions
+		err = strict(raw, &p)
+		if err == nil {
+			err = transcode.ValidateOptions(&p)
 		}
 		v = p
 	}

@@ -15,8 +15,10 @@
 //     no mux is attempted.
 //   - A rescan failure is logged and never changes a good mux result
 //     (M5-4 contract: best-effort, non-fatal).
-//   - Staging is kept on success for inspection, matching the M5-1 contract
-//     that the mux caller owns cleanup.
+//   - Staging is removed once the job finishes, on success and on failure
+//     (issue #23): Execute keeps it for the mux stage, the worker - which owns
+//     the mux - deletes it when the job reaches a terminal status. Directories
+//     left by an interrupted run are reaped when the worker starts.
 //
 // A panic in any seam is recovered and recorded as the job's failure so one
 // bad job cannot kill the drain loop.
@@ -185,6 +187,11 @@ func New(deps Dependencies) (*Worker, error) {
 }
 
 // Start launches the drain loop. Start is idempotent and a no-op after Stop.
+//
+// Before draining, Start reaps every {WORK_DIR}/jobs/{id}/ directory left over
+// from a previous run (issue #23): staging only has meaning for the job that
+// created it, so anything already on disk at boot belongs to a crashed or
+// killed run.
 func (w *Worker) Start(ctx context.Context) {
 	w.mu.Lock()
 	if w.started || w.stopped {
@@ -194,6 +201,11 @@ func (w *Worker) Start(ctx context.Context) {
 	w.started = true
 	ctx, cancel := context.WithCancel(ctx)
 	w.cancel = cancel
+	w.mu.Unlock()
+
+	w.reapStale(time.Now())
+
+	w.mu.Lock()
 	w.wg.Add(1)
 	w.mu.Unlock()
 
@@ -201,6 +213,19 @@ func (w *Worker) Start(ctx context.Context) {
 		defer w.wg.Done()
 		w.runLoop(ctx)
 	}()
+}
+
+// reapStale removes sync staging directories older than boot. Failures are
+// logged: a leftover directory must never keep the worker from draining.
+func (w *Worker) reapStale(boot time.Time) {
+	stager, err := workdir.New(w.workDir, w.store)
+	if err != nil {
+		w.logf("syncworker: startup reap skipped: %v", err)
+		return
+	}
+	if err := stager.ReapStale(boot); err != nil {
+		w.logf("syncworker: startup reap: %v", err)
+	}
 }
 
 // Stop cancels the loop and waits for the in-flight job to finish. Stop is
@@ -269,6 +294,10 @@ func (w *Worker) ProcessOnce(ctx context.Context) (processed bool, err error) {
 	if !ok {
 		return false, nil
 	}
+	// Issue #23: whatever happens to the job, its staging directory is
+	// removed once the worker is done with it - completed (after mux) or
+	// failed (Execute's own failure path is idempotent with this).
+	defer w.cleanup(id)
 
 	// A panic in any stage must fail only this job.
 	var jobErr error
@@ -288,7 +317,6 @@ func (w *Worker) ProcessOnce(ctx context.Context) (processed bool, err error) {
 		if ferr := w.store.SetSyncJobStatus(context.WithoutCancel(ctx), id, statusFailed, errorSummary(jobErr)); ferr != nil {
 			return true, ferr
 		}
-		w.cleanup(id)
 	}
 	return true, nil
 }
@@ -769,8 +797,8 @@ func withinDir(root, target string) bool {
 	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
 }
 
-// cleanup removes {WORK_DIR}/jobs/{id}/ after a failure. Cleanup errors are
-// logged; the job failure is already recorded.
+// cleanup removes {WORK_DIR}/jobs/{id}/ once a job finishes. Cleanup errors are
+// logged; the job outcome is already recorded.
 func (w *Worker) cleanup(jobID int64) {
 	stager, err := workdir.New(w.workDir, w.store)
 	if err != nil {

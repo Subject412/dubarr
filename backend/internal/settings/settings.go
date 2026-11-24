@@ -4,12 +4,13 @@
 // Layout follows IDEA.md §4: one row per settings section, the row value being
 // the JSON object for that section. Section keys:
 //
-//	storage.paths      watch_dir, vault_dir, work_dir, media_roots
+//	storage.paths      watch_dir, vault_dir, work_dir, output_dir, media_roots
 //	languages.policy   target/reference languages, commentary exclusion, export mode
-//	target.tag_filter  Tdarr destination filename gate (ADR-0005)
+//	target.tag_filter  Processing Gate: filename tags + optional arr tags/roots (ADR-0005, ADR-0009)
 //	sync.defaults      max offset, checkpoint/preview sampling positions
 //	security.options   vault read-only, tag override, AV1 warnings
 //	mux.options        keep .bak, track title written into Matroska
+//	audio.options      opt-in Transcode Rules: codec/channels/bitrate/sample rate (ADR-0010)
 //	watch.options      watch-folder scan cadence and stability window
 //	arr.options        Radarr/Sonarr polling cadence
 //	arr.connections    Radarr/Sonarr instances (API keys live in internal/secrets)
@@ -25,6 +26,7 @@
 package settings
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -37,7 +39,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Subject412/dubarr/backend/internal/langtoken"
 	"github.com/Subject412/dubarr/backend/internal/secrets"
+	"github.com/Subject412/dubarr/backend/internal/transcode"
 )
 
 // Section keys.
@@ -52,12 +56,13 @@ const (
 	KeyArrOptions      = "arr.options"
 	KeyArrConnections  = "arr.connections"
 	KeyImportsOptions  = "imports.options"
+	KeyAudioOptions    = "audio.options"
 )
 
 var knownKeys = []string{
 	KeyStoragePaths, KeyLanguagesPolicy, KeyTargetTagFilter, KeySyncDefaults,
 	KeySecurityOptions, KeyMuxOptions, KeyWatchOptions, KeyArrOptions,
-	KeyArrConnections, KeyImportsOptions,
+	KeyArrConnections, KeyImportsOptions, KeyAudioOptions,
 }
 
 // KnownKeys returns the writable section keys in stable order.
@@ -66,9 +71,14 @@ func KnownKeys() []string { return append([]string(nil), knownKeys...) }
 // StoragePaths are the five logical storage areas (IDEA.md §3.3). Empty values
 // mean "not configured yet" and are filled by the setup wizard.
 type StoragePaths struct {
-	WatchDir   string   `json:"watch_dir"`
-	VaultDir   string   `json:"vault_dir"`
-	WorkDir    string   `json:"work_dir"`
+	WatchDir string `json:"watch_dir"`
+	VaultDir string `json:"vault_dir"`
+	WorkDir  string `json:"work_dir"`
+	// OutputDir is the target-independent destination root for
+	// mux.options.output_mode=separate. It is a root in its own right (the
+	// muxer canonicalizes it again with EvalSymlinks) and must never overlap
+	// the Audio Vault (ADR-0002).
+	OutputDir  string   `json:"output_dir"`
 	MediaRoots []string `json:"media_roots"`
 }
 
@@ -77,18 +87,100 @@ type LanguagesPolicy struct {
 	TargetImportLanguages   []string `json:"target_import_languages"`
 	ExtraReferenceLanguages []string `json:"extra_reference_languages"`
 	OriginalLanguageFromArr bool     `json:"original_language_from_arr"`
-	ExcludeCommentary       bool     `json:"exclude_commentary"`
+	// PreferOriginalLanguage makes the arr original the first-choice reference.
+	// Off keeps it available as an ordinary reference candidate.
+	PreferOriginalLanguage bool `json:"prefer_original_language"`
+	ExcludeCommentary      bool `json:"exclude_commentary"`
 	// ExportMode is "rule_based" (only policy-selected tracks) or "all".
 	ExportMode string `json:"export_mode"`
 }
 
-// TargetTagFilter is the Tdarr destination filename gate (ADR-0005).
+// UnmarshalJSON makes an absent prefer_original_language mean true. Legacy rows
+// written before the key existed predate the settled upgrade default; plain
+// decoding would read them as false and silently flip the operator's policy.
+// An explicit false is preserved. Unknown fields stay rejected like every other
+// section decoded by normalize.
+func (p *LanguagesPolicy) UnmarshalJSON(data []byte) error {
+	type plain LanguagesPolicy
+	aux := struct {
+		*plain
+		PreferOriginalLanguage *bool `json:"prefer_original_language"`
+	}{plain: (*plain)(p)}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&aux); err != nil {
+		return err
+	}
+	if aux.PreferOriginalLanguage == nil {
+		p.PreferOriginalLanguage = true
+	} else {
+		p.PreferOriginalLanguage = *aux.PreferOriginalLanguage
+	}
+	return nil
+}
+
+// TargetTagFilter is the Processing Gate (GLOSSARY.md): the filename criterion
+// from ADR-0005 plus the optional arr criterion from ADR-0009.
+//
+// SourceMode selects which sources are consulted ("filename", "arr" or
+// "both"); the active sources are AND-ed, so adding the arr source can only
+// narrow eligibility. RequiredArrTags/ExcludedArrTags are Radarr/Sonarr tag
+// labels (matched case-insensitively by default) and RootFolderPaths are
+// canonical arr root-folder paths. Legacy stored rows predate these fields and
+// decode as source_mode=filename with empty arr criteria (see UnmarshalJSON).
 type TargetTagFilter struct {
 	RequiredFilenameTags []string `json:"required_filename_tags"`
 	TagMatchMode         string   `json:"tag_match_mode"`
 	TagCaseSensitive     bool     `json:"tag_case_sensitive"`
 	ExcludedFilenameTags []string `json:"excluded_filename_tags"`
 	EnforceTagFilter     bool     `json:"enforce_tag_filter"`
+	// SourceMode is filename (default) | arr | both.
+	SourceMode string `json:"source_mode"`
+	// RequiredArrTags/ExcludedArrTags are arr tag labels; the same ANY/ALL/
+	// REGEX match mode and case sensitivity apply. Excluded labels always win.
+	RequiredArrTags []string `json:"required_arr_tags"`
+	ExcludedArrTags []string `json:"excluded_arr_tags"`
+	// RootFolderPaths is an allowlist of canonical arr root folders.
+	RootFolderPaths []string `json:"root_folder_paths"`
+}
+
+// Processing Gate source modes (ADR-0009).
+const (
+	SourceModeFilename = "filename"
+	SourceModeArr      = "arr"
+	SourceModeBoth     = "both"
+)
+
+// UnmarshalJSON materialises the ADR-0009 defaults, so a section written before
+// source_mode existed keeps its exact previous behaviour and Get/All/Export all
+// serve the complete shape. Unknown fields still fail: the settings store
+// rejects typos rather than silently dropping them.
+func (t *TargetTagFilter) UnmarshalJSON(data []byte) error {
+	type plain TargetTagFilter
+	aux := struct {
+		*plain
+		SourceMode *string `json:"source_mode"`
+	}{plain: (*plain)(t)}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&aux); err != nil {
+		return err
+	}
+	if aux.SourceMode == nil {
+		t.SourceMode = SourceModeFilename
+	} else {
+		t.SourceMode = strings.ToLower(strings.TrimSpace(*aux.SourceMode))
+	}
+	if t.RequiredArrTags == nil {
+		t.RequiredArrTags = []string{}
+	}
+	if t.ExcludedArrTags == nil {
+		t.ExcludedArrTags = []string{}
+	}
+	if t.RootFolderPaths == nil {
+		t.RootFolderPaths = []string{}
+	}
+	return nil
 }
 
 // SyncDefaults bounds the automatic offset search and sampling windows.
@@ -108,11 +200,49 @@ type SecurityOptions struct {
 	RequireAV1Strict      bool `json:"require_av1_strict"`
 }
 
+// Mux output destination modes (ADR-0011).
+const (
+	MuxOutputReplace  = "replace"
+	MuxOutputSeparate = "separate"
+)
+
 // MuxOptions control atomic muxing side effects.
 type MuxOptions struct {
 	KeepBak         bool   `json:"keep_bak"`
 	TrackTitleInMKV string `json:"track_title_in_mkv"`
+	// OutputMode is "replace" (atomically replace the Target, current
+	// behaviour) or "separate" (write <basename>.dubarr.mkv into
+	// storage.paths.output_dir and leave the Target untouched, ADR-0011).
+	OutputMode string `json:"output_mode"`
 }
+
+// UnmarshalJSON makes an absent output_mode mean "replace". Legacy rows written
+// before the key existed must keep the current in-place behaviour; plain
+// decoding would read them as an empty mode and fail validation.
+func (m *MuxOptions) UnmarshalJSON(data []byte) error {
+	type plain MuxOptions
+	aux := struct {
+		*plain
+		OutputMode *string `json:"output_mode"`
+	}{plain: (*plain)(m)}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&aux); err != nil {
+		return err
+	}
+	if aux.OutputMode == nil {
+		m.OutputMode = MuxOutputReplace
+	} else {
+		m.OutputMode = *aux.OutputMode
+	}
+	return nil
+}
+
+// AudioOptions is the audio.options section: an ordered, first-match-wins list
+// of Transcode Rules (ADR-0010). The type lives in internal/transcode so the
+// rule engine and the settings validator share one schema; an empty or absent
+// list keeps the lossless-copy behaviour.
+type AudioOptions = transcode.Options
 
 // WatchOptions configure donor-folder scanning. StabilityCheckIntervalSec is
 // how far apart the two size checks must be (>= 4 s per IDEA.md §3.5).
@@ -178,15 +308,22 @@ func Defaults(dataDir string) map[string]any {
 			TargetImportLanguages:   []string{"pl"},
 			ExtraReferenceLanguages: []string{"en"},
 			OriginalLanguageFromArr: true,
+			PreferOriginalLanguage:  true,
 			ExcludeCommentary:       true,
 			ExportMode:              "rule_based",
 		},
 		KeyTargetTagFilter: TargetTagFilter{
-			RequiredFilenameTags: []string{"[ArcA310]"},
+			// ADR-0012: a fresh install ships no required tag, so the gate
+			// blocks nothing until the operator configures a criterion.
+			RequiredFilenameTags: []string{},
 			TagMatchMode:         "ANY",
 			TagCaseSensitive:     false,
 			ExcludedFilenameTags: []string{},
 			EnforceTagFilter:     true,
+			SourceMode:           SourceModeFilename,
+			RequiredArrTags:      []string{},
+			ExcludedArrTags:      []string{},
+			RootFolderPaths:      []string{},
 		},
 		KeySyncDefaults: SyncDefaults{
 			MaxOffsetSec:           180,
@@ -204,6 +341,7 @@ func Defaults(dataDir string) map[string]any {
 		KeyMuxOptions: MuxOptions{
 			KeepBak:         true,
 			TrackTitleInMKV: "Polski Dubbing",
+			OutputMode:      MuxOutputReplace,
 		},
 		KeyWatchOptions: WatchOptions{
 			ScanIntervalSec:           10,
@@ -218,6 +356,10 @@ func Defaults(dataDir string) map[string]any {
 		},
 		KeyImportsOptions: ImportsOptions{
 			DonorPatterns: []string{"PL.DUB"},
+		},
+		KeyAudioOptions: AudioOptions{
+			// Shipped default: no rules, no transcoding (ADR-0010).
+			Rules: []transcode.Rule{},
 		},
 	}
 }
@@ -261,7 +403,62 @@ func (s *Store) Get(ctx context.Context, key string) (json.RawMessage, bool, err
 	if err != nil {
 		return nil, false, fmt.Errorf("settings: read %s: %w", key, err)
 	}
-	return json.RawMessage(value), true, nil
+	return serveable(key, value), true, nil
+}
+
+// serveable applies load-time defaults to a stored section before it reaches a
+// caller. It exists for languages.policy, mux.options and target.tag_filter:
+// legacy rows predate prefer_original_language / output_mode / source_mode, and
+// the UI/API/export all decode the served JSON directly, so absence has to be
+// materialized as the agreed default here too.
+func serveable(key, value string) json.RawMessage {
+	raw := json.RawMessage(value)
+	switch key {
+	case KeyLanguagesPolicy:
+		var p LanguagesPolicy
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return raw // a malformed legacy row keeps its raw bytes
+		}
+		blob, err := json.Marshal(p)
+		if err != nil {
+			return raw
+		}
+		return blob
+	case KeyMuxOptions:
+		var p MuxOptions
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return raw
+		}
+		blob, err := json.Marshal(p)
+		if err != nil {
+			return raw
+		}
+		return blob
+	case KeyTargetTagFilter:
+		var p TargetTagFilter
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return raw
+		}
+		blob, err := json.Marshal(p)
+		if err != nil {
+			return raw
+		}
+		return blob
+	case KeyAudioOptions:
+		// A legacy row without `rules` must serve an explicit empty list, so
+		// Get/All/Export and the job path all agree that no transcode applies.
+		var p AudioOptions
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return raw
+		}
+		blob, err := json.Marshal(p)
+		if err != nil {
+			return raw
+		}
+		return blob
+	default:
+		return raw
+	}
 }
 
 // All returns every readable section, already stripped of non-section rows.
@@ -281,7 +478,7 @@ func (s *Store) All(ctx context.Context) (map[string]json.RawMessage, error) {
 		if !isKnownKey(key) || IsSensitiveKey(key) {
 			continue
 		}
-		out[key] = json.RawMessage(value)
+		out[key] = serveable(key, value)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("settings: iterate: %w", err)
@@ -373,7 +570,7 @@ func (s *Store) Export(ctx context.Context) (Export, error) {
 		if !isKnownKey(key) || IsSensitiveKey(key) {
 			continue
 		}
-		masked, err := maskFields(json.RawMessage(value))
+		masked, err := maskFields(serveable(key, value))
 		if err != nil {
 			// A non-JSON legacy row must never leak verbatim; drop it.
 			continue
@@ -489,6 +686,9 @@ func normalize(key string, raw json.RawMessage) (string, error) {
 		if err == nil && strings.TrimSpace(p.TrackTitleInMKV) == "" {
 			err = errors.New("track_title_in_mkv is required")
 		}
+		if err == nil {
+			err = validateMuxOptions(&p)
+		}
 		v = p
 	case KeyWatchOptions:
 		var p WatchOptions
@@ -521,6 +721,13 @@ func normalize(key string, raw json.RawMessage) (string, error) {
 			err = validateImports(&p)
 		}
 		v = p
+	case KeyAudioOptions:
+		var p AudioOptions
+		err = strict(raw, &p)
+		if err == nil {
+			err = transcode.ValidateOptions(&p)
+		}
+		v = p
 	}
 	if err != nil {
 		return "", fmt.Errorf("%w: %s: %v", ErrInvalidValue, key, err)
@@ -548,12 +755,44 @@ func validateStorage(p *StoragePaths) error {
 	if p.MediaRoots == nil {
 		p.MediaRoots = []string{}
 	}
-	for _, path := range append([]string{p.WatchDir, p.VaultDir, p.WorkDir}, p.MediaRoots...) {
+	for _, path := range append([]string{p.WatchDir, p.VaultDir, p.WorkDir, p.OutputDir}, p.MediaRoots...) {
 		if path != "" && !filepath.IsAbs(path) {
 			return fmt.Errorf("path %q must be absolute", path)
 		}
 	}
+	// ADR-0002: nothing is ever written into the Audio Vault. The mux worker
+	// repeats this check on the EvalSymlinks-resolved paths; here a lexical
+	// comparison catches the obvious misconfiguration at save time.
+	if p.OutputDir != "" && p.VaultDir != "" {
+		if pathWithin(filepath.Clean(p.VaultDir), filepath.Clean(p.OutputDir)) {
+			return errors.New("output_dir must not be the vault folder or inside it")
+		}
+	}
 	return nil
+}
+
+// pathWithin reports whether target is root or below it. Both paths must
+// already be cleaned (and, where they exist, EvalSymlinks-resolved).
+func pathWithin(root, target string) bool {
+	rel, err := filepath.Rel(root, target)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
+}
+
+func validateMuxOptions(p *MuxOptions) error {
+	// An absent or empty mode keeps the historical in-place behaviour; a
+	// caller that sends only keep_bak must not be rejected.
+	if p.OutputMode == "" {
+		p.OutputMode = MuxOutputReplace
+	}
+	switch p.OutputMode {
+	case MuxOutputReplace, MuxOutputSeparate:
+		return nil
+	default:
+		return fmt.Errorf(`output_mode must be %q or %q`, MuxOutputReplace, MuxOutputSeparate)
+	}
 }
 
 func validateLanguages(p *LanguagesPolicy) error {
@@ -563,9 +802,24 @@ func validateLanguages(p *LanguagesPolicy) error {
 	if p.ExtraReferenceLanguages == nil {
 		p.ExtraReferenceLanguages = []string{}
 	}
-	for _, code := range append(append([]string{}, p.TargetImportLanguages...), p.ExtraReferenceLanguages...) {
+	for _, code := range p.TargetImportLanguages {
+		if langtoken.IsReserved(code) {
+			return fmt.Errorf("target import language %q is a reserved reference token, not a language code", code)
+		}
 		if !iso1or3.MatchString(code) {
 			return fmt.Errorf("language code %q must be a lowercase ISO 639-1/2 code", code)
+		}
+	}
+	for i, raw := range p.ExtraReferenceLanguages {
+		// Reserved tokens are canonicalized to lowercase and never validated as
+		// ISO codes; anything else must be a lowercase ISO 639-1/2 code.
+		if tok, ok := langtoken.Token(raw); ok {
+			p.ExtraReferenceLanguages[i] = tok
+			continue
+		}
+		if !iso1or3.MatchString(raw) {
+			return fmt.Errorf("language code %q must be a lowercase ISO 639-1/2 code or a reserved token (%s, %s)",
+				raw, langtoken.Org, langtoken.All)
 		}
 	}
 	switch p.ExportMode {
@@ -583,16 +837,87 @@ func validateTagFilter(p *TargetTagFilter) error {
 	if p.ExcludedFilenameTags == nil {
 		p.ExcludedFilenameTags = []string{}
 	}
+	// SourceMode is caught here as well as in UnmarshalJSON: Set/Apply accept a
+	// decoded struct from any caller, so the check cannot live only in JSON.
+	if p.SourceMode == "" {
+		p.SourceMode = SourceModeFilename
+	}
+	p.SourceMode = strings.ToLower(strings.TrimSpace(p.SourceMode))
+	switch p.SourceMode {
+	case SourceModeFilename, SourceModeArr, SourceModeBoth:
+	default:
+		return fmt.Errorf(`source_mode must be %q, %q or %q`, SourceModeFilename, SourceModeArr, SourceModeBoth)
+	}
 	switch strings.ToUpper(p.TagMatchMode) {
 	case "ALL", "ANY", "REGEX":
 		p.TagMatchMode = strings.ToUpper(p.TagMatchMode)
 	default:
 		return errors.New(`tag_match_mode must be ALL, ANY or REGEX`)
 	}
-	if p.EnforceTagFilter && len(p.RequiredFilenameTags) == 0 {
-		return errors.New("enforce_tag_filter requires at least one required_filename_tag")
+	if p.RequiredArrTags == nil {
+		p.RequiredArrTags = []string{}
 	}
+	if p.ExcludedArrTags == nil {
+		p.ExcludedArrTags = []string{}
+	}
+	for _, list := range []struct {
+		name  string
+		items []string
+	}{
+		{"required_arr_tags", p.RequiredArrTags},
+		{"excluded_arr_tags", p.ExcludedArrTags},
+	} {
+		for i := range list.items {
+			label := strings.TrimSpace(list.items[i])
+			if label == "" {
+				return fmt.Errorf("%s entries must not be empty", list.name)
+			}
+			// Reference-language tokens (org/all) belong to languages.policy;
+			// they are not arr tag labels and would silently never match.
+			if langtoken.IsReserved(label) {
+				return fmt.Errorf("%s entry %q is a reference-language token, not an arr tag label", list.name, label)
+			}
+			list.items[i] = label
+		}
+	}
+	if p.RootFolderPaths == nil {
+		p.RootFolderPaths = []string{}
+	}
+	roots := make([]string, 0, len(p.RootFolderPaths))
+	seenRoots := make(map[string]bool, len(p.RootFolderPaths))
+	for _, raw := range p.RootFolderPaths {
+		root, err := canonicalRootFolderPath(raw)
+		if err != nil {
+			return err
+		}
+		if seenRoots[root] {
+			continue
+		}
+		seenRoots[root] = true
+		roots = append(roots, root)
+	}
+	p.RootFolderPaths = roots
+	// An enforced gate may legitimately have no criterion at all: ADR-0012
+	// ships exactly that, and the gate treats an empty criterion as no-op.
 	return nil
+}
+
+// canonicalRootFolderPath confines a configured root folder to a canonical
+// absolute path. Radarr/Sonarr report absolute paths, so a relative or
+// traversal-shaped entry can never match a cached root and is rejected instead
+// of silently disabling the root criterion.
+func canonicalRootFolderPath(raw string) (string, error) {
+	path := strings.TrimSpace(raw)
+	if path == "" {
+		return "", errors.New("root_folder_paths entries must not be empty")
+	}
+	if strings.ContainsRune(path, 0) {
+		return "", fmt.Errorf("root folder path %q contains a NUL byte", raw)
+	}
+	if !filepath.IsAbs(path) {
+		return "", fmt.Errorf("root folder path %q must be absolute", raw)
+	}
+	return filepath.Clean(path), nil
 }
 
 func validateArrConnections(p *ArrConnections) error {

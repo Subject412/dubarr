@@ -256,6 +256,46 @@ func TestExtractionSucceedsAndStagesLosslessTrack(t *testing.T) {
 	}
 }
 
+// TestVaultHookReceivesProbedBitrateAndSampleRate guards the metadata that
+// Transcode Rules match on: an archived PCM track must carry the sample rate
+// from its re-probe and a positive bitrate, not zeroes.
+func TestVaultHookReceivesProbedBitrateAndSampleRate(t *testing.T) {
+	h := newHarness(t)
+	var captured []StagedTrack
+	w, err := New(Dependencies{
+		Store:    h.db,
+		Settings: h.worker.settings,
+		DataDir:  h.data,
+		Prober:   h.worker.prober,
+		VaultHook: func(_ context.Context, _ store.ImportExtractionJob, tracks []StagedTrack) error {
+			captured = tracks
+			return nil
+		},
+		Logf: func(string, ...any) {},
+	})
+	if err != nil {
+		t.Fatalf("extract.New with vault hook: %v", err)
+	}
+	donor := buildAudioDonor(t, t.TempDir(), "Movie PL.mkv", testDonorTrack{lang: "pol", seconds: 0.1, channels: 1})
+	id := h.seedExtracting(donor)
+	if processed, err := w.ProcessOnce(h.ctx); err != nil || !processed {
+		t.Fatalf("ProcessOnce = (%v, %v), want (true, nil)", processed, err)
+	}
+	if status, msg := h.status(id); status != "completed" || msg != "" {
+		t.Fatalf("status = %q err %q, want completed", status, msg)
+	}
+	if len(captured) != 1 {
+		t.Fatalf("vault hook got %d tracks, want 1", len(captured))
+	}
+	got := captured[0]
+	if got.SampleRate != 8000 {
+		t.Errorf("SampleRate = %d, want 8000", got.SampleRate)
+	}
+	if got.BitrateBPS <= 0 {
+		t.Errorf("BitrateBPS = %d, want a positive probed bitrate", got.BitrateBPS)
+	}
+}
+
 // stagedByLang returns the staged output whose name contains segment (".pl.",
 // ".en."), or "" when none does.
 func (h *harness) stagedByLang(id int64, segment string) string {
@@ -292,6 +332,30 @@ func (h *harness) assertStagedTrack(path, codec string, channels int, duration t
 	}
 	if delta := info.Duration - duration; delta > DurationTolerance || delta < -DurationTolerance {
 		h.t.Errorf("%s duration %v, want %v (±%v)", path, info.Duration, duration, DurationTolerance)
+	}
+}
+
+// The direct donor measurement is the fallback for mkvmerge versions that do
+// not report per-track statistics in JSON identification.
+func TestMeasureDonorTrackReportsOwnDuration(t *testing.T) {
+	h := newHarness(t)
+	donor := buildAudioDonor(t, t.TempDir(), "Unequal.mkv",
+		testDonorTrack{lang: "pol", seconds: 3, channels: 1},
+		testDonorTrack{lang: "eng", seconds: 10, channels: 1})
+	mkvTracks, err := h.worker.audioTracks(h.ctx, donor)
+	if err != nil {
+		t.Fatalf("audioTracks: %v", err)
+	}
+	if len(mkvTracks) < 2 {
+		t.Fatalf("audioTracks = %d tracks, want 2", len(mkvTracks))
+	}
+	first := mkvTracks[0]
+	got, err := h.worker.measureDonorTrack(h.ctx, donor, first.ID)
+	if err != nil {
+		t.Fatalf("measureDonorTrack: %v", err)
+	}
+	if delta := got - 3*time.Second; delta > 100*time.Millisecond || delta < -100*time.Millisecond {
+		t.Errorf("measured duration = %v, want about 3s", got)
 	}
 }
 
@@ -343,7 +407,8 @@ func TestExtractionValidatesPerTrackDonorDuration(t *testing.T) {
 		t.Fatalf("ProcessOnce = (%v, %v), want (true, nil)", processed, err)
 	}
 	if status, msg := h.status(id); status != "completed" || msg != "" {
-		t.Fatalf("status = %q err %q, want completed with no error", status, msg)
+		t.Fatalf("status = %q err %q, want completed with no error (probed pl track duration %v, container %v)",
+			status, msg, media.Tracks[0].Duration, media.Duration)
 	}
 	// The 3s track must validate against 3s, not the 10s container duration.
 	h.assertStagedTrack(h.stagedByLang(id, ".pl."), "pcm_s16le", 1, 3*time.Second)

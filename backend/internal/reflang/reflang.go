@@ -9,10 +9,12 @@
 // Priority order (IDEA.md:365-369):
 //
 //  1. Priority 1 (same_lang_reference): the media's original language exists
-//     in both the donor group and the target (e.g. ja <-> ja).
+//     in both the donor group and the target (e.g. ja <-> ja). Active only when
+//     the policy trusts arr metadata and prefers the original (see Languages).
 //  2. Priority 2 (same_lang_reference): any other shared, non-target language
 //     (e.g. en <-> en), configured reference languages first, then the rest
-//     in lexical order.
+//     in lexical order. The reserved tokens org/all expand here through
+//     internal/langtoken.
 //  3. Priority 3 (lowpass_fallback): no shared reference language exists, so
 //     the incoming (target-language) vault track is compared low-pass 30-200
 //     Hz against the target's original, English or first non-commentary
@@ -20,7 +22,8 @@
 //
 // Tracks tagged "und" or with no usable language are never selected as a
 // language reference (settled: und never policy, see gate.SplitExportTracks).
-// Commentary tracks are never references.
+// Commentary tracks (disposition flag or a commentary title, see
+// probe.AudioTrack.IsCommentary) are never references.
 //
 // The package performs no I/O and executes no processes; callers own the
 // actual copying and FFmpeg slicing.
@@ -31,19 +34,28 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/Subject412/dubarr/backend/internal/langtoken"
 	"github.com/Subject412/dubarr/backend/internal/probe"
 )
 
-// Languages is the language policy input to Resolve. It mirrors the two
-// language lists of settings.LanguagesPolicy without importing it, keeping
-// this package a pure metadata function.
+// Languages is the language policy input to Resolve. It mirrors the language
+// fields of settings.LanguagesPolicy without importing it, keeping this package
+// a pure metadata function.
 type Languages struct {
 	// Targets are the target import (dub/lektor) languages, e.g. ["pl"]. They
 	// are the languages being synchronized and therefore never references.
 	Targets []string
 	// References are extra reference languages in user priority order, e.g.
-	// ["en"] (settings.ExtraReferenceLanguages).
+	// ["en"] (settings.ExtraReferenceLanguages). They may contain the reserved
+	// tokens "org" and "all" (see internal/langtoken).
 	References []string
+	// PreferOriginalLanguage makes the arr-reported original language the
+	// first-choice reference (Priority 1). settings.PreferOriginalLanguage.
+	PreferOriginalLanguage bool
+	// OriginalLanguageFromArr gates arr metadata: when false, Priority 1 is
+	// disabled and the org token expands to nothing.
+	// settings.OriginalLanguageFromArr.
+	OriginalLanguageFromArr bool
 }
 
 // Method is the sync_method a pair resolves to (IDEA.md:295).
@@ -96,12 +108,19 @@ func Resolve(targetTracks []probe.AudioTrack, vaultTracks []probe.AudioTrack, po
 	}
 
 	original := probe.ISO639_1(originalLanguage)
+	// The arr original is only consulted for Priority 1 and the org token when
+	// the operator trusts arr metadata. Priority 3 keeps using the metadata as
+	// a target preference, which is independent of reference-language policy.
+	arrOriginal := ""
+	if policy.OriginalLanguageFromArr {
+		arrOriginal = original
+	}
 	targets := langSet(policy.Targets)
 	seen := make(map[string]bool, len(policy.Targets)+len(policy.References)+1)
 
 	// add appends one pair for lang when both sides have a usable track.
 	add := func(lang string, method Method, reason string) bool {
-		if lang == "" || seen[lang] {
+		if lang == "" || targets[lang] || seen[lang] {
 			return false
 		}
 		v, ok := bestTrack(vaultTracks, lang)
@@ -119,23 +138,22 @@ func Resolve(targetTracks []probe.AudioTrack, vaultTracks []probe.AudioTrack, po
 
 	// Priority 1: original language present in both groups. A target import
 	// language is the dub being synchronized, so it cannot double as its own
-	// reference even when the arr reports it as original.
-	if original != "" && !targets[original] {
-		add(original, SameLangReference,
-			fmt.Sprintf("priority 1 (same_lang_reference): original language %q present in donor group and target", original))
+	// reference even when the arr reports it as original. The guard holds
+	// regardless of the preference toggle.
+	if arrOriginal != "" && policy.PreferOriginalLanguage {
+		add(arrOriginal, SameLangReference,
+			fmt.Sprintf("priority 1 (same_lang_reference): original language %q present in donor group and target", arrOriginal))
 	}
 
 	// Priority 2: policy reference languages in their configured order, then
-	// any other shared non-target language deterministically.
-	for _, raw := range policy.References {
-		lang := probe.ISO639_1(raw)
-		if lang == "" || targets[lang] {
-			continue
-		}
+	// any other shared non-target language deterministically. The reserved
+	// tokens org/all expand here, after explicit entries, so both the resolver
+	// and the export policy use one normalizer (internal/langtoken).
+	shared := sharedLanguages(vaultTracks, targetTracks)
+	for _, lang := range langtoken.Expand(policy.References, arrOriginal, shared, policy.Targets) {
 		add(lang, SameLangReference,
 			fmt.Sprintf("priority 2 (same_lang_reference): shared reference language %q", lang))
 	}
-	shared := sharedLanguages(vaultTracks, targetTracks)
 	sort.Strings(shared)
 	for _, lang := range shared {
 		if targets[lang] || seen[lang] {
@@ -201,7 +219,7 @@ func normLang(t probe.AudioTrack) string {
 
 // usable reports whether t may act as a language reference at all.
 func usable(t probe.AudioTrack) bool {
-	return !t.Disposition.Comment && normLang(t) != ""
+	return !t.IsCommentary() && normLang(t) != ""
 }
 
 // bestTrack selects the highest-quality non-commentary track in lang.
@@ -255,7 +273,7 @@ func lowpassTarget(targetTracks []probe.AudioTrack, original string) (probe.Audi
 		return t, true
 	}
 	for _, t := range targetTracks {
-		if !t.Disposition.Comment {
+		if !t.IsCommentary() {
 			return t, true
 		}
 	}

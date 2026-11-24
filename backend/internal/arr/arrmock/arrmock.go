@@ -35,28 +35,32 @@ type Language struct {
 
 // Movie is a Radarr /api/v3/movie element.
 type Movie struct {
-	ID               int      `json:"id"`
-	Title            string   `json:"title"`
-	Year             int      `json:"year"`
-	TmdbID           int      `json:"tmdbId"`
-	Path             string   `json:"path"`
-	FolderName       string   `json:"folderName"`
-	QualityProfileID int      `json:"qualityProfileId"`
-	Monitored        bool     `json:"monitored"`
-	HasFile          bool     `json:"hasFile"`
-	OriginalLanguage Language `json:"originalLanguage"`
+	ID               int        `json:"id"`
+	Title            string     `json:"title"`
+	Year             int        `json:"year"`
+	TmdbID           int        `json:"tmdbId"`
+	Path             string     `json:"path"`
+	FolderName       string     `json:"folderName"`
+	QualityProfileID int        `json:"qualityProfileId"`
+	Monitored        bool       `json:"monitored"`
+	HasFile          bool       `json:"hasFile"`
+	OriginalLanguage Language   `json:"originalLanguage"`
+	Tags             []int      `json:"tags"`
+	MovieFile        *MovieFile `json:"movieFile,omitempty"`
 }
 
 // Series is a Sonarr /api/v3/series element.
 type Series struct {
-	ID               int    `json:"id"`
-	Title            string `json:"title"`
-	Year             int    `json:"year"`
-	TvdbID           int    `json:"tvdbId"`
-	Path             string `json:"path"`
-	FolderName       string `json:"folderName"`
-	QualityProfileID int    `json:"qualityProfileId"`
-	Monitored        bool   `json:"monitored"`
+	ID               int      `json:"id"`
+	Title            string   `json:"title"`
+	Year             int      `json:"year"`
+	TvdbID           int      `json:"tvdbId"`
+	Path             string   `json:"path"`
+	FolderName       string   `json:"folderName"`
+	QualityProfileID int      `json:"qualityProfileId"`
+	Monitored        bool     `json:"monitored"`
+	OriginalLanguage Language `json:"originalLanguage"`
+	Tags             []int    `json:"tags"`
 }
 
 // QualityProfile is an /api/v3/qualityprofile element.
@@ -73,13 +77,21 @@ type RootFolder struct {
 	FreeSpace  int64  `json:"freeSpace"`
 }
 
+// Tag is an /api/v3/tag element. Both products serve the same shape.
+type Tag struct {
+	ID    int64  `json:"id"`
+	Label string `json:"label"`
+}
+
 // Fixtures is the content the fake serves. Empty slices produce empty arrays,
 // exactly like a configured-but-empty instance.
 type Fixtures struct {
 	Movies          []Movie
 	Series          []Series
+	Episodes        []Episode
 	QualityProfiles []QualityProfile
 	RootFolders     []RootFolder
+	Tags            []Tag
 }
 
 // RecordedRequest is one request observed by the fake.
@@ -137,6 +149,10 @@ func New(kind Kind, apiKey string, fx Fixtures) *Server {
 	mux.HandleFunc("/api/v3/rootfolder", s.handle(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, nonNil(fx.RootFolders))
 	}))
+	// /api/v3/tag exists on both products with an identical payload.
+	mux.HandleFunc("/api/v3/tag", s.handle(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, nonNil(fx.Tags))
+	}))
 	// Commands are shared by both products; the fake records the decoded body
 	// so tests can assert the exact command name and id.
 	mux.HandleFunc("/api/v3/command", s.handle(func(w http.ResponseWriter, r *http.Request) {
@@ -165,6 +181,7 @@ func New(kind Kind, apiKey string, fx Fixtures) *Server {
 		mux.HandleFunc("/api/v3/series", s.handle(func(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusOK, nonNil(fx.Series))
 		}))
+		mux.HandleFunc("/api/v3/episode", s.serveEpisodes(fx.Episodes))
 	}
 
 	s.Server = httptest.NewServer(mux)

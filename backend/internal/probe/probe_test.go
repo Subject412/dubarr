@@ -189,6 +189,7 @@ func (f *fakeRunner) count() int {
 const fakeProbeJSON = `{
   "streams": [
     {"index":0,"codec_name":"aac","codec_type":"audio","channels":2,"channel_layout":"stereo",
+     "bit_rate":"128000","sample_rate":48000,"duration":"10.5",
      "tags":{"language":"pol","title":"Dubbing"},"disposition":{"default":1,"dub":0}},
     {"index":1,"codec_name":"ac3","codec_type":"video","channels":0,"tags":{"language":"eng"}}
   ],
@@ -216,6 +217,15 @@ func TestProbeCacheHitOnSameStat(t *testing.T) {
 		}
 		if info.Duration != 123456*time.Millisecond {
 			t.Errorf("Duration = %v, want 123.456s", info.Duration)
+		}
+		if info.Tracks[0].BitrateBPS != 128000 {
+			t.Errorf("BitrateBPS = %d, want 128000", info.Tracks[0].BitrateBPS)
+		}
+		if info.Tracks[0].SampleRate != 48000 {
+			t.Errorf("SampleRate = %d, want 48000", info.Tracks[0].SampleRate)
+		}
+		if info.Tracks[0].Duration != 10500*time.Millisecond {
+			t.Errorf("Duration = %v, want 10.5s", info.Tracks[0].Duration)
 		}
 	}
 	if got := fr.count(); got != 1 {

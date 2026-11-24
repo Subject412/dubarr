@@ -158,9 +158,9 @@ describe('watch scanner restart notice', () => {
     })
     renderWithProviders(<SettingsPage />, { route: '/settings' })
 
-    expect(await screen.findByRole('heading', { name: 'Target tag filter' })).toBeInTheDocument()
+    expect(await screen.findByRole('heading', { name: 'Process only files tagged as …' })).toBeInTheDocument()
     await user.click(screen.getByRole('switch', { name: 'Case sensitive' }))
-    await user.click(screen.getByLabelText('Save Target tag filter'))
+    await user.click(screen.getByLabelText('Save Process only files tagged as …'))
 
     expect(
       await screen.findByText(/restart required to apply watch changes/i),

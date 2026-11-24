@@ -20,8 +20,11 @@ type CandidateStore interface {
 
 // Service classifies import-queue candidates and records the verdict.
 //
-// Classification is filename-only (ADR-0005); container tags are informational
-// and are read through Tagger, not consulted here.
+// The import queue carries donor drops, and donor ingestion is never gated by
+// arr metadata (ADR-0005): a donor file has no arr library row, so Service
+// evaluates the rule with its arr source disabled. Target eligibility (arr
+// tags/root folders, ADR-0009) is decided by the arr poller and re-checked by
+// the muxer, which both carry the target's ArrMetadata.
 type Service struct {
 	rule  Rule
 	store CandidateStore
@@ -55,7 +58,7 @@ func (s *Service) ClassifyCandidate(ctx context.Context, sourcePath, targetPath 
 		case info.IsDir():
 			res.Status = StatusMissingTarget
 		default:
-			res = s.rule.Classify(filepath.Base(targetPath))
+			res = s.rule.FilenameOnly().Classify(filepath.Base(targetPath))
 			res.TargetPath = targetPath
 		}
 	}

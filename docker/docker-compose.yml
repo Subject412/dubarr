@@ -2,9 +2,11 @@
 #
 #   cd docker && docker compose up --build
 #
-# Zero application environment: the only variables are PUID/PGID, consumed by
-# the entrypoint to pick the container user's uid/gid. Settings and secrets are
-# configured through the first-run wizard and stored in /config — never here.
+# Zero application environment: the only container variables are PUID/PGID,
+# consumed by the entrypoint to pick the container user's uid/gid. DUBARR_PORT
+# is read by Compose on the host to choose the published port — it never enters
+# the container. Settings and secrets are configured through the first-run
+# wizard and stored in /config — never here.
 services:
   dubarr:
     build:
@@ -14,7 +16,7 @@ services:
     container_name: dubarr
     restart: unless-stopped
     ports:
-      - "8080:8080"
+      - "${DUBARR_PORT:-8080}:8080"
     environment:
       PUID: "${PUID:-1000}"
       PGID: "${PGID:-1000}"

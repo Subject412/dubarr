@@ -448,3 +448,21 @@ func mustRead(t *testing.T, path string) []byte {
 	}
 	return data
 }
+
+// A languages.policy row written before prefer_original_language existed must
+// resolve as true: the resolver's Priority 1 must not silently switch off on
+// upgraded installs.
+func TestAnalysisPolicyDefaultsLegacyPreferOriginal(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	legacy := `{"target_import_languages":["pl"],"extra_reference_languages":["en"],"original_language_from_arr":true,"exclude_commentary":true,"export_mode":"rule_based"}`
+	if _, err := f.db.DB.ExecContext(ctx,
+		`INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`,
+		settings.KeyLanguagesPolicy, legacy); err != nil {
+		t.Fatalf("insert legacy languages.policy: %v", err)
+	}
+	policy, _ := f.svc.analysisPolicy(ctx)
+	if !policy.PreferOriginalLanguage {
+		t.Error("analysisPolicy: PreferOriginalLanguage = false for a legacy row, want true")
+	}
+}

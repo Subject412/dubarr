@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -61,6 +63,46 @@ func TestParseFlagsRejectsEmptyDataDir(t *testing.T) {
 func TestParseFlagsRejectsUnknownFlag(t *testing.T) {
 	if _, err := parseFlags([]string{"--nope"}); err == nil {
 		t.Fatal("parseFlags accepted an unknown flag")
+	}
+}
+
+func TestParseFlagsLogLevel(t *testing.T) {
+	cfg, err := parseFlags(nil)
+	if err != nil {
+		t.Fatalf("parseFlags(nil): %v", err)
+	}
+	if cfg.LogLevel != "info" {
+		t.Errorf("default LogLevel = %q, want info", cfg.LogLevel)
+	}
+	if cfg.LogFile {
+		t.Error("default LogFile = true, want false (file sink is opt-in)")
+	}
+
+	cfg, err = parseFlags([]string{"--log-level", "debug", "--log-file"})
+	if err != nil {
+		t.Fatalf("parseFlags(--log-level debug): %v", err)
+	}
+	if cfg.LogLevel != "debug" {
+		t.Errorf("LogLevel = %q, want debug", cfg.LogLevel)
+	}
+	if !cfg.LogFile {
+		t.Error("LogFile = false after --log-file")
+	}
+
+	if _, err := parseFlags([]string{"--log-level", "verbose"}); err == nil {
+		t.Fatal("parseFlags accepted an unknown --log-level")
+	}
+}
+
+func TestLogsRouteIsRegisteredAndAdminOnly(t *testing.T) {
+	srv := newTestServer(t)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/logs", nil))
+	if rec.Code == http.StatusNotFound {
+		t.Fatal("GET /api/logs is not registered")
+	}
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("GET /api/logs unauthenticated = %d, want 401", rec.Code)
 	}
 }
 

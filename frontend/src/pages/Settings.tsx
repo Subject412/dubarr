@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import type {
   ArrOptions,
+  AudioOptions,
   ImportsOptions,
   LanguagesPolicy,
   MuxOptions,
@@ -14,7 +16,19 @@ import type {
 import { api } from '../lib/api'
 import { DEFAULT_SETTINGS as DEFAULTS } from '../lib/defaults'
 import { useSaveSettings, useSettings } from '../lib/hooks'
+import { settingsHelp } from '../lib/settings-help'
+import {
+  isSettingsSectionKey,
+  SETTINGS_SECTIONS,
+  settingsSection,
+  settingsSectionId,
+  settingsSectionKeyFromId,
+  type SettingsSectionKey,
+} from '../lib/settings-sections'
+import { ArrConnectionsSection } from '../components/ArrConnections'
 import { PathField, PathListEditor } from '../components/PathPicker'
+import { ThemeSelector } from '../components/ThemeSelector'
+import { TranscodeRulesEditor } from '../components/TranscodeRulesEditor'
 import {
   Alert,
   Badge,
@@ -30,17 +44,19 @@ import {
   Toggle,
 } from '../components/ui'
 
+/** Friendly labels for the reserved Reference Language tokens (GLOSSARY). */
+const REFERENCE_TOKEN_PRESETS = [
+  { value: 'org', label: 'org — original language from *arr' },
+  { value: 'all', label: 'all — any shared language' },
+]
+
 function Section<T extends object>({
-  title,
-  description,
   sectionKey,
   value,
   save,
   onSaved,
   children,
 }: {
-  title: string
-  description: string
   sectionKey: SettingsKey
   value: T
   save: (key: SettingsKey, value: T) => Promise<unknown>
@@ -49,6 +65,7 @@ function Section<T extends object>({
   children: (draft: T, update: (patch: Partial<T>) => void) => ReactNode
 }) {
   const [draft, setDraft] = useState<T>(value)
+  const { title, description } = settingsSection(sectionKey)
   const [status, setStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
   const [error, setError] = useState('')
   const [dirty, setDirty] = useState(false)
@@ -86,6 +103,7 @@ function Section<T extends object>({
 
   return (
     <Card
+      id={settingsSectionId(sectionKey)}
       title={title}
       description={description}
       actions={
@@ -116,14 +134,16 @@ function NumberField({
   value,
   onChange,
   hint,
+  help,
 }: {
   label: string
   value: number
   onChange: (next: number) => void
   hint?: string
+  help?: string
 }) {
   return (
-    <Field label={label} hint={hint} htmlFor={undefined}>
+    <Field label={label} hint={hint} help={help} htmlFor={undefined}>
       <Input
         type="number"
         aria-label={label}
@@ -144,6 +164,60 @@ export function SettingsPage() {
   const flagWatchRestart = () => setWatchRestartNotice(true)
 
   const data = settings.data?.settings
+
+  // Category navigation lives in the URL (`/settings?section=<key>`) so the
+  // location is shareable and browser back/forward keeps working. Cards are
+  // only scrolled, never remounted, so unsaved drafts survive a switch.
+  const [searchParams, setSearchParams] = useSearchParams()
+  const sectionParam = searchParams.get('section')
+  const activeSection = isSettingsSectionKey(sectionParam) ? sectionParam : null
+  const activeSectionRef = useRef<SettingsSectionKey | null>(activeSection)
+  // URL writes made by the observer itself must not scroll the page again.
+  const scrollFromObserver = useRef<SettingsSectionKey | null>(null)
+  // Programmatic scrolling fires observer entries; ignore them briefly so the
+  // explicit selection is not immediately overwritten.
+  const ignoreObserverUntil = useRef(0)
+  const sectionsReady = Boolean(data)
+
+  useEffect(() => {
+    if (!activeSection) return
+    activeSectionRef.current = activeSection
+    if (scrollFromObserver.current === activeSection) {
+      scrollFromObserver.current = null
+      return
+    }
+    const target = document.getElementById(settingsSectionId(activeSection))
+    if (!target) return
+    ignoreObserverUntil.current = Date.now() + 700
+    target.scrollIntoView?.({ block: 'start' })
+  }, [activeSection, sectionsReady])
+
+  // Scrolling manually through the page keeps the submenu highlight and the
+  // URL in step, without adding history entries.
+  useEffect(() => {
+    if (!sectionsReady || typeof IntersectionObserver === 'undefined') return
+    const nodes = SETTINGS_SECTIONS.map((section) =>
+      document.getElementById(settingsSectionId(section.key)),
+    ).filter((node): node is HTMLElement => Boolean(node))
+    if (nodes.length === 0) return
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (Date.now() < ignoreObserverUntil.current) return
+        const topmost = entries
+          .filter((entry) => entry.isIntersecting)
+          .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top)[0]
+        const key = topmost ? settingsSectionKeyFromId(topmost.target.id) : null
+        if (!key || key === activeSectionRef.current) return
+        activeSectionRef.current = key
+        scrollFromObserver.current = key
+        setSearchParams({ section: key }, { replace: true })
+      },
+      { root: document.querySelector('main'), rootMargin: '0px 0px -60% 0px' },
+    )
+    nodes.forEach((node) => observer.observe(node))
+    return () => observer.disconnect()
+  }, [sectionsReady, setSearchParams])
 
   const save = (key: SettingsKey, value: object) => saveSettings.mutateAsync({ [key]: value })
 
@@ -181,6 +255,10 @@ export function SettingsPage() {
         }
       />
 
+      <div className="mb-5">
+        <ThemeSelector />
+      </div>
+
       {settings.isLoading && <Spinner label="Loading settings" />}
       {settings.error && <Alert>Could not load settings: {settings.error.message}</Alert>}
       {exportError && <Alert>{exportError}</Alert>}
@@ -201,8 +279,6 @@ export function SettingsPage() {
       {data && (
         <div className="space-y-5">
           <Section<StoragePaths>
-            title="Storage paths"
-            description="Watch folder, vault, working area and media roots (absolute paths)."
             sectionKey="storage.paths"
             value={(data['storage.paths'] as StoragePaths) ?? DEFAULTS['storage.paths']}
             save={save}
@@ -215,33 +291,40 @@ export function SettingsPage() {
                 <div className="grid gap-4 md:grid-cols-2">
                   <PathField
                     label="Watch folder"
+                    help={settingsHelp('storage.paths', 'watch_dir')}
                     value={draft.watch_dir}
                     onChange={(watch_dir) => update({ watch_dir })}
                   />
                   <PathField
                     label="Vault folder"
+                    help={settingsHelp('storage.paths', 'vault_dir')}
                     value={draft.vault_dir}
                     onChange={(vault_dir) => update({ vault_dir })}
                   />
                   <PathField
                     label="Work folder"
+                    help={settingsHelp('storage.paths', 'work_dir')}
                     value={draft.work_dir}
                     onChange={(work_dir) => update({ work_dir })}
+                  />
+                  <PathField
+                    label="Mux output folder"
+                    help={settingsHelp('storage.paths', 'output_dir')}
+                    value={draft.output_dir ?? ''}
+                    onChange={(output_dir) => update({ output_dir })}
                   />
                 </div>
                 <PathListEditor
                   label="Media roots"
                   values={draft.media_roots ?? []}
                   onChange={(media_roots) => update({ media_roots })}
-                  hint="Libraries Dubarr is allowed to read from."
+                  help={settingsHelp('storage.paths', 'media_roots')}
                 />
               </>
             )}
           </Section>
 
           <Section<LanguagesPolicy>
-            title="Languages policy"
-            description="Which dubbing tracks are imported and which reference tracks are kept."
             sectionKey="languages.policy"
             value={(data['languages.policy'] as LanguagesPolicy) ?? DEFAULTS['languages.policy']}
             save={save}
@@ -254,6 +337,7 @@ export function SettingsPage() {
                   values={draft.target_import_languages ?? []}
                   onChange={(target_import_languages) => update({ target_import_languages })}
                   placeholder="pl"
+                  help={settingsHelp('languages.policy', 'target_import_languages')}
                 />
                 <StringListEditor
                   label="Extra reference languages"
@@ -261,8 +345,14 @@ export function SettingsPage() {
                   values={draft.extra_reference_languages ?? []}
                   onChange={(extra_reference_languages) => update({ extra_reference_languages })}
                   placeholder="en"
+                  help={settingsHelp('languages.policy', 'extra_reference_languages')}
+                  presets={REFERENCE_TOKEN_PRESETS}
                 />
-                <Field label="Export mode" htmlFor="export-mode">
+                <Field
+                  label="Export mode"
+                  htmlFor="export-mode"
+                  help={settingsHelp('languages.policy', 'export_mode')}
+                >
                   <Select
                     id="export-mode"
                     value={draft.export_mode}
@@ -276,13 +366,19 @@ export function SettingsPage() {
                 </Field>
                 <Toggle
                   label="Original language from *arr"
-                  description="Use Radarr/Sonarr metadata to identify the original track."
+                  help={settingsHelp('languages.policy', 'original_language_from_arr')}
                   checked={draft.original_language_from_arr}
                   onChange={(original_language_from_arr) => update({ original_language_from_arr })}
                 />
                 <Toggle
+                  label="Prefer original language as reference"
+                  help={settingsHelp('languages.policy', 'prefer_original_language')}
+                  checked={draft.prefer_original_language}
+                  onChange={(prefer_original_language) => update({ prefer_original_language })}
+                />
+                <Toggle
                   label="Exclude commentary tracks"
-                  description="Commentary audio never becomes the reference or target track."
+                  help={settingsHelp('languages.policy', 'exclude_commentary')}
                   checked={draft.exclude_commentary}
                   onChange={(exclude_commentary) => update({ exclude_commentary })}
                 />
@@ -291,8 +387,6 @@ export function SettingsPage() {
           </Section>
 
           <Section<TargetTagFilter>
-            title="Target tag filter"
-            description="Tdarr destination filename gate (ADR-0005)."
             sectionKey="target.tag_filter"
             value={(data['target.tag_filter'] as TargetTagFilter) ?? DEFAULTS['target.tag_filter']}
             save={save}
@@ -302,21 +396,68 @@ export function SettingsPage() {
           >
             {(draft, update) => (
               <>
+                <Field
+                  label="Tag source"
+                  htmlFor="tag-source-mode"
+                  hint="Sources are combined: a file must satisfy each selected source."
+                  help={settingsHelp('target.tag_filter', 'source_mode')}
+                >
+                  <Select
+                    id="tag-source-mode"
+                    value={draft.source_mode ?? 'filename'}
+                    onChange={(event) =>
+                      update({ source_mode: event.target.value as TargetTagFilter['source_mode'] })
+                    }
+                  >
+                    <option value="filename">Filename tags</option>
+                    <option value="arr">Radarr/Sonarr tags</option>
+                    <option value="both">Filename and Radarr/Sonarr tags</option>
+                  </Select>
+                </Field>
                 <StringListEditor
                   label="Required filename tags"
                   inputLabel="Add required tag"
                   values={draft.required_filename_tags ?? []}
                   onChange={(required_filename_tags) => update({ required_filename_tags })}
-                  placeholder="[ArcA310]"
+                  placeholder="[TAG]"
+                  help={settingsHelp('target.tag_filter', 'required_filename_tags')}
                 />
                 <StringListEditor
                   label="Excluded filename tags"
                   inputLabel="Add excluded tag"
                   values={draft.excluded_filename_tags ?? []}
                   onChange={(excluded_filename_tags) => update({ excluded_filename_tags })}
+                  help={settingsHelp('target.tag_filter', 'excluded_filename_tags')}
+                />
+                <StringListEditor
+                  label="Required Radarr/Sonarr tags"
+                  inputLabel="Add required *arr tag"
+                  values={draft.required_arr_tags ?? []}
+                  onChange={(required_arr_tags) => update({ required_arr_tags })}
+                  placeholder="dub"
+                  help={settingsHelp('target.tag_filter', 'required_arr_tags')}
+                />
+                <StringListEditor
+                  label="Excluded Radarr/Sonarr tags"
+                  inputLabel="Add excluded *arr tag"
+                  values={draft.excluded_arr_tags ?? []}
+                  onChange={(excluded_arr_tags) => update({ excluded_arr_tags })}
+                  placeholder="cam"
+                  help={settingsHelp('target.tag_filter', 'excluded_arr_tags')}
+                />
+                <PathListEditor
+                  label="Radarr/Sonarr root folders"
+                  values={draft.root_folder_paths ?? []}
+                  onChange={(root_folder_paths) => update({ root_folder_paths })}
+                  emptyText="No root folders configured — every root folder is accepted."
+                  help={settingsHelp('target.tag_filter', 'root_folder_paths')}
                 />
                 <div className="grid gap-4 md:grid-cols-2">
-                  <Field label="Tag match mode" htmlFor="tag-match-mode">
+                  <Field
+                    label="Tag match mode"
+                    htmlFor="tag-match-mode"
+                    help={settingsHelp('target.tag_filter', 'tag_match_mode')}
+                  >
                     <Select
                       id="tag-match-mode"
                       value={draft.tag_match_mode}
@@ -334,12 +475,13 @@ export function SettingsPage() {
                   <div className="space-y-1">
                     <Toggle
                       label="Case sensitive"
+                      help={settingsHelp('target.tag_filter', 'tag_case_sensitive')}
                       checked={draft.tag_case_sensitive}
                       onChange={(tag_case_sensitive) => update({ tag_case_sensitive })}
                     />
                     <Toggle
                       label="Enforce tag filter"
-                      description="Reject targets without a required tag."
+                      help={settingsHelp('target.tag_filter', 'enforce_tag_filter')}
                       checked={draft.enforce_tag_filter}
                       onChange={(enforce_tag_filter) => update({ enforce_tag_filter })}
                     />
@@ -350,8 +492,6 @@ export function SettingsPage() {
           </Section>
 
           <Section<SecurityOptions>
-            title="Security options"
-            description="Safety switches around the vault and AV1 hand-off."
             sectionKey="security.options"
             value={(data['security.options'] as SecurityOptions) ?? DEFAULTS['security.options']}
             save={save}
@@ -360,23 +500,25 @@ export function SettingsPage() {
               <>
                 <Toggle
                   label="Vault read-only"
-                  description="Mounted vault is never modified by Dubarr."
+                  help={settingsHelp('security.options', 'vault_read_only')}
                   checked={draft.vault_read_only}
                   onChange={(vault_read_only) => update({ vault_read_only })}
                 />
                 <Toggle
                   label="Allow force tag override"
-                  description="Operators may bypass the destination tag gate per item."
+                  help={settingsHelp('security.options', 'allow_force_tag_override')}
                   checked={draft.allow_force_tag_override}
                   onChange={(allow_force_tag_override) => update({ allow_force_tag_override })}
                 />
                 <Toggle
                   label="Require AV1 warning acknowledgement"
+                  help={settingsHelp('security.options', 'require_av1_warning')}
                   checked={draft.require_av1_warning}
                   onChange={(require_av1_warning) => update({ require_av1_warning })}
                 />
                 <Toggle
                   label="Require AV1 strict mode"
+                  help={settingsHelp('security.options', 'require_av1_strict')}
                   checked={draft.require_av1_strict}
                   onChange={(require_av1_strict) => update({ require_av1_strict })}
                 />
@@ -385,8 +527,6 @@ export function SettingsPage() {
           </Section>
 
           <Section<SyncDefaults>
-            title="Sync defaults"
-            description="Automatic offset search bounds and sampling windows."
             sectionKey="sync.defaults"
             value={(data['sync.defaults'] as SyncDefaults) ?? DEFAULTS['sync.defaults']}
             save={save}
@@ -398,47 +538,71 @@ export function SettingsPage() {
                     label="Max offset (s)"
                     value={draft.max_offset_sec}
                     onChange={(max_offset_sec) => update({ max_offset_sec })}
+                    help={settingsHelp('sync.defaults', 'max_offset_sec')}
                   />
                   <NumberField
                     label="Checkpoint window (s)"
                     value={draft.checkpoint_window_sec}
                     onChange={(checkpoint_window_sec) => update({ checkpoint_window_sec })}
+                    help={settingsHelp('sync.defaults', 'checkpoint_window_sec')}
                   />
                   <NumberField
                     label="Preview window (s)"
                     value={draft.preview_window_sec}
                     onChange={(preview_window_sec) => update({ preview_window_sec })}
+                    help={settingsHelp('sync.defaults', 'preview_window_sec')}
                   />
                 </div>
                 <ListEditor
                   label="Checkpoint positions (%)"
                   values={draft.checkpoint_positions_pct ?? []}
                   onChange={(checkpoint_positions_pct) => update({ checkpoint_positions_pct })}
+                  help={settingsHelp('sync.defaults', 'checkpoint_positions_pct')}
                 />
                 <ListEditor
                   label="Preview positions (%)"
                   values={draft.preview_positions_pct ?? []}
                   onChange={(preview_positions_pct) => update({ preview_positions_pct })}
+                  help={settingsHelp('sync.defaults', 'preview_positions_pct')}
                 />
               </>
             )}
           </Section>
 
           <Section<MuxOptions>
-            title="Mux options"
-            description="Atomic muxing side effects."
             sectionKey="mux.options"
             value={(data['mux.options'] as MuxOptions) ?? DEFAULTS['mux.options']}
             save={save}
           >
             {(draft, update) => (
               <>
+                <Field
+                  label="Output mode"
+                  htmlFor="mux-output-mode"
+                  help={settingsHelp('mux.options', 'output_mode')}
+                >
+                  <Select
+                    id="mux-output-mode"
+                    value={draft.output_mode ?? 'replace'}
+                    onChange={(event) =>
+                      update({ output_mode: event.target.value === 'separate' ? 'separate' : 'replace' })
+                    }
+                  >
+                    <option value="replace">Replace the target in place</option>
+                    <option value="separate">Write to the mux output folder</option>
+                  </Select>
+                </Field>
                 <Toggle
                   label="Keep .bak backup"
+                  help={settingsHelp('mux.options', 'keep_bak')}
                   checked={draft.keep_bak}
                   onChange={(keep_bak) => update({ keep_bak })}
                 />
-                <Field label="Track title written into Matroska" htmlFor="track-title">
+                <Field
+                  label="Track title written into Matroska"
+                  htmlFor="track-title"
+                  help={settingsHelp('mux.options', 'track_title_in_mkv')}
+                >
                   <Input
                     id="track-title"
                     value={draft.track_title_in_mkv}
@@ -449,9 +613,17 @@ export function SettingsPage() {
             )}
           </Section>
 
+          <Section<AudioOptions>
+            sectionKey="audio.options"
+            value={(data['audio.options'] as AudioOptions) ?? DEFAULTS['audio.options']}
+            save={save}
+          >
+            {(draft, update) => (
+              <TranscodeRulesEditor value={draft} onChange={(next) => update(next)} />
+            )}
+          </Section>
+
           <Section<WatchOptions>
-            title="Watch options"
-            description="Donor-folder scanning cadence and stability window."
             sectionKey="watch.options"
             value={(data['watch.options'] as WatchOptions) ?? DEFAULTS['watch.options']}
             save={save}
@@ -465,20 +637,20 @@ export function SettingsPage() {
                   label="Scan interval (s)"
                   value={draft.scan_interval_sec}
                   onChange={(scan_interval_sec) => update({ scan_interval_sec })}
+                  help={settingsHelp('watch.options', 'scan_interval_sec')}
                 />
                 <NumberField
                   label="Stability check interval (s)"
                   hint="Minimum 4 seconds per IDEA.md §3.5."
                   value={draft.stability_check_interval_sec}
                   onChange={(stability_check_interval_sec) => update({ stability_check_interval_sec })}
+                  help={settingsHelp('watch.options', 'stability_check_interval_sec')}
                 />
               </div>
             )}
           </Section>
 
           <Section<ImportsOptions>
-            title="Donor patterns"
-            description="Sibling filenames that mark a dropped file as a donor dub. Matching is case-insensitive; a pattern without * is a substring match, with * a glob."
             sectionKey="imports.options"
             value={(data['imports.options'] as ImportsOptions) ?? DEFAULTS['imports.options']}
             save={save}
@@ -490,13 +662,14 @@ export function SettingsPage() {
                 values={draft.donor_patterns ?? []}
                 onChange={(donor_patterns) => update({ donor_patterns })}
                 placeholder="PL.DUB"
+                help={settingsHelp('imports.options', 'donor_patterns')}
               />
             )}
           </Section>
 
+          <ArrConnectionsSection />
+
           <Section<ArrOptions>
-            title="*arr options"
-            description="Radarr/Sonarr polling."
             sectionKey="arr.options"
             value={(data['arr.options'] as ArrOptions) ?? DEFAULTS['arr.options']}
             save={save}
@@ -507,9 +680,11 @@ export function SettingsPage() {
                   label="Poll interval (s)"
                   value={draft.poll_interval_sec}
                   onChange={(poll_interval_sec) => update({ poll_interval_sec })}
+                  help={settingsHelp('arr.options', 'poll_interval_sec')}
                 />
                 <Toggle
                   label="Manual sync enabled"
+                  help={settingsHelp('arr.options', 'manual_sync')}
                   checked={draft.manual_sync}
                   onChange={(manual_sync) => update({ manual_sync })}
                 />

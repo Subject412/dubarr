@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"net/http"
 	"os"
@@ -73,6 +74,9 @@ type Dependencies struct {
 	FFmpegPath string
 	// Prober overrides the ffprobe wrapper (tests).
 	Prober *probe.Prober
+	// Logger is the central logger (nil keeps the stdlib default for the
+	// dubarr-sync bridge handshake).
+	Logger *slog.Logger
 }
 
 // Service holds the resolved dependencies for the registered handlers.
@@ -84,6 +88,7 @@ type Service struct {
 	workDir      string
 	ffmpegPath   string
 	prober       *probe.Prober
+	logger       *slog.Logger
 }
 
 // RegisterRoutes mounts:
@@ -100,6 +105,7 @@ func RegisterRoutes(mux *http.ServeMux, deps Dependencies) *Service {
 		workDir:      deps.WorkDir,
 		ffmpegPath:   deps.FFmpegPath,
 		prober:       deps.Prober,
+		logger:       deps.Logger,
 	}
 	admin := func(h http.HandlerFunc) http.Handler {
 		if svc.requireAdmin == nil {
@@ -124,18 +130,21 @@ type createRequest struct {
 
 // JobInfo is the API shape of one sync job.
 type JobInfo struct {
-	ID                   int64           `json:"id"`
-	Status               string          `json:"status"`
-	VaultTrackID         int64           `json:"vault_track_id"`
-	TargetLibraryCacheID int64           `json:"target_library_cache_id"`
-	TargetVideoPath      string          `json:"target_video_path,omitempty"`
-	TargetLangISO2       string          `json:"target_lang_iso2,omitempty"`
-	SyncMethod           string          `json:"sync_method,omitempty"`
-	CalculatedOffsetMS   int64           `json:"calculated_offset_ms"`
-	Report               *analyze.Report `json:"report,omitempty"`
-	ErrorMessage         string          `json:"error_message,omitempty"`
-	CreatedAt            string          `json:"created_at,omitempty"`
-	UpdatedAt            string          `json:"updated_at,omitempty"`
+	ID                   int64  `json:"id"`
+	Status               string `json:"status"`
+	VaultTrackID         int64  `json:"vault_track_id"`
+	TargetLibraryCacheID int64  `json:"target_library_cache_id"`
+	TargetVideoPath      string `json:"target_video_path,omitempty"`
+	TargetLangISO2       string `json:"target_lang_iso2,omitempty"`
+	// OutputPath is where mux published the file (the Target in replace mode,
+	// the separate-mode file inside storage.paths.output_dir).
+	OutputPath         string          `json:"output_path,omitempty"`
+	SyncMethod         string          `json:"sync_method,omitempty"`
+	CalculatedOffsetMS int64           `json:"calculated_offset_ms"`
+	Report             *analyze.Report `json:"report,omitempty"`
+	ErrorMessage       string          `json:"error_message,omitempty"`
+	CreatedAt          string          `json:"created_at,omitempty"`
+	UpdatedAt          string          `json:"updated_at,omitempty"`
 }
 
 func (s *Service) handleCreate(w http.ResponseWriter, r *http.Request) {
@@ -290,6 +299,7 @@ func jobInfo(rec store.SyncJobRecord) JobInfo {
 		TargetLibraryCacheID: rec.TargetLibraryCacheID,
 		TargetVideoPath:      rec.TargetVideoPath,
 		TargetLangISO2:       rec.TargetLangISO2,
+		OutputPath:           rec.OutputPath,
 		SyncMethod:           rec.SyncMethod,
 		CalculatedOffsetMS:   rec.CalculatedOffsetMS,
 		ErrorMessage:         rec.ErrorMessage,
@@ -468,7 +478,7 @@ func (s *Service) runAnalysis(ctx context.Context, rec store.SyncJobRecord) (ana
 
 	engine := s.engine
 	if engine == nil {
-		runner, err := sync.New("", sync.WithTimeout(analyze.JobTimeout(cfg)))
+		runner, err := sync.New("", sync.WithTimeout(analyze.JobTimeout(cfg)), sync.WithLogger(s.logger))
 		if err != nil {
 			return analyze.Report{}, err
 		}
@@ -532,8 +542,10 @@ func (s *Service) analysisPolicy(ctx context.Context) (reflang.Languages, analyz
 		var lp settings.LanguagesPolicy
 		if json.Unmarshal(raw, &lp) == nil {
 			policy = reflang.Languages{
-				Targets:    append([]string(nil), lp.TargetImportLanguages...),
-				References: append([]string(nil), lp.ExtraReferenceLanguages...),
+				Targets:                 append([]string(nil), lp.TargetImportLanguages...),
+				References:              append([]string(nil), lp.ExtraReferenceLanguages...),
+				PreferOriginalLanguage:  lp.PreferOriginalLanguage,
+				OriginalLanguageFromArr: lp.OriginalLanguageFromArr,
 			}
 		}
 	}

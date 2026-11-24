@@ -20,6 +20,7 @@ import (
 	"github.com/Subject412/dubarr/backend/internal/mux"
 	"github.com/Subject412/dubarr/backend/internal/settings"
 	"github.com/Subject412/dubarr/backend/internal/store"
+	"github.com/Subject412/dubarr/backend/internal/transcode"
 )
 
 type fakeExecutor struct {
@@ -266,6 +267,54 @@ func TestProcessOnceRunsExecuteMuxRescanChain(t *testing.T) {
 	}
 }
 
+// TestProcessOnceHonorsKeepBakSetting pins the mux.options.keep_bak plumbing:
+// the seeded default keeps the .bak, an explicit false passes through to
+// mux.Job.KeepBak.
+func TestProcessOnceHonorsKeepBakSetting(t *testing.T) {
+	cases := []struct {
+		name    string
+		keepBak bool
+		write   bool
+	}{
+		{name: "seeded default keeps backup", keepBak: true},
+		{name: "keep_bak false discards backup", keepBak: false, write: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			r := newRig(t)
+			if tc.write {
+				raw, err := json.Marshal(settings.MuxOptions{KeepBak: tc.keepBak, TrackTitleInMKV: "Polski Dubbing"})
+				if err != nil {
+					t.Fatalf("marshal mux.options: %v", err)
+				}
+				if err := r.settings.Set(ctx, settings.KeyMuxOptions, raw); err != nil {
+					t.Fatalf("set mux.options: %v", err)
+				}
+			}
+			jobID := r.newJob(t)
+			r.stage(t, jobID)
+
+			mx := &fakeMuxer{}
+			w := newWorker(t, r, &fakeExecutor{report: stableReport()}, mx, &fakeRescanner{})
+			if _, err := w.ProcessOnce(ctx); err != nil {
+				t.Fatalf("ProcessOnce: %v", err)
+			}
+			if len(mx.jobs) != 1 {
+				t.Fatalf("Mux calls = %d, want 1", len(mx.jobs))
+			}
+			got := mx.jobs[0].KeepBak
+			if tc.keepBak {
+				if got != nil && !*got {
+					t.Errorf("mux.Job.KeepBak = false, want keep (nil or true)")
+				}
+			} else if got == nil || *got {
+				t.Errorf("mux.Job.KeepBak = %v, want false", got)
+			}
+		})
+	}
+}
+
 func TestProcessOnceFailsUnmuxableVerdictWithoutMux(t *testing.T) {
 	r := newRig(t)
 	jobID := r.newJob(t)
@@ -440,5 +489,368 @@ func TestNewRejectsIncompleteDependencies(t *testing.T) {
 				t.Fatalf("New err = %v, want %v", err, tc.want)
 			}
 		})
+	}
+}
+
+func setStoragePaths(t *testing.T, s *settings.Store, paths settings.StoragePaths) {
+	t.Helper()
+	raw, err := json.Marshal(paths)
+	if err != nil {
+		t.Fatalf("marshal storage.paths: %v", err)
+	}
+	if err := s.Set(context.Background(), settings.KeyStoragePaths, raw); err != nil {
+		t.Fatalf("set storage.paths: %v", err)
+	}
+}
+
+func setMuxOptions(t *testing.T, s *settings.Store, opts settings.MuxOptions) {
+	t.Helper()
+	raw, err := json.Marshal(opts)
+	if err != nil {
+		t.Fatalf("marshal mux.options: %v", err)
+	}
+	if err := s.Set(context.Background(), settings.KeyMuxOptions, raw); err != nil {
+		t.Fatalf("set mux.options: %v", err)
+	}
+}
+
+// TestProcessOnceSeparateModeSkipsRescanAndRecordsOutputPath covers ADR-0011:
+// the worker resolves storage.paths.output_dir, passes it to the muxer, skips
+// the arr rescan (the library file is untouched) and stores the final path on
+// the job so GET /api/sync/jobs can show it.
+func TestProcessOnceSeparateModeSkipsRescanAndRecordsOutputPath(t *testing.T) {
+	r := newRig(t)
+	outDir := filepath.Join(t.TempDir(), "output")
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		t.Fatalf("mkdir output: %v", err)
+	}
+	resolvedOut, err := filepath.EvalSymlinks(outDir)
+	if err != nil {
+		t.Fatalf("resolve output: %v", err)
+	}
+	vaultDir := filepath.Join(filepath.Dir(outDir), "vault")
+	if err := os.MkdirAll(vaultDir, 0o755); err != nil {
+		t.Fatalf("mkdir vault: %v", err)
+	}
+	setStoragePaths(t, r.settings, settings.StoragePaths{
+		WorkDir: r.workDir, VaultDir: vaultDir, OutputDir: outDir,
+	})
+	setMuxOptions(t, r.settings, settings.MuxOptions{
+		KeepBak: true, TrackTitleInMKV: "Polski Dubbing", OutputMode: settings.MuxOutputSeparate,
+	})
+
+	jobID := r.newJob(t)
+	r.stage(t, jobID)
+	dest := filepath.Join(resolvedOut, "Movie (2020) [ArcA310].dubarr.mkv")
+	mx := &fakeMuxer{result: mux.Result{OutputPath: dest}}
+	rs := &fakeRescanner{}
+	w := newWorker(t, r, &fakeExecutor{report: stableReport()}, mx, rs)
+
+	if processed, err := w.ProcessOnce(context.Background()); err != nil || !processed {
+		t.Fatalf("ProcessOnce = %v/%v, want true/nil", processed, err)
+	}
+	if len(mx.jobs) != 1 {
+		t.Fatalf("Mux calls = %d, want 1", len(mx.jobs))
+	}
+	if got := mx.jobs[0].OutputMode; got != settings.MuxOutputSeparate {
+		t.Errorf("mux output mode = %q, want separate", got)
+	}
+	if got := mx.jobs[0].OutputDir; got != resolvedOut {
+		t.Errorf("mux output dir = %q, want %q", got, resolvedOut)
+	}
+	if len(rs.rows) != 0 {
+		t.Errorf("rescan ran in separate mode: %+v", rs.rows)
+	}
+	rec, ok, err := r.store.SyncJobByID(context.Background(), jobID)
+	if err != nil || !ok {
+		t.Fatalf("SyncJobByID = %v/%v", ok, err)
+	}
+	if rec.Status != "completed" {
+		t.Errorf("status = %q, want completed", rec.Status)
+	}
+	if rec.OutputPath != dest {
+		t.Errorf("output_path = %q, want %q", rec.OutputPath, dest)
+	}
+}
+
+// TestProcessOnceSeparateModeRejectsVaultOutputDir is the worker-side ADR-0002
+// guard: a settings row edited straight in SQLite cannot make the muxer write
+// into the Audio Vault.
+func TestProcessOnceSeparateModeRejectsVaultOutputDir(t *testing.T) {
+	r := newRig(t)
+	setStoragePaths(t, r.settings, settings.StoragePaths{
+		WorkDir: r.workDir, VaultDir: filepath.Join(t.TempDir(), "vault"), OutputDir: "",
+	})
+	// Bypass settings.Set so the worker's own guard is what rejects the row,
+	// mimicking a settings row edited directly in SQLite.
+	vaultDir := filepath.Join(t.TempDir(), "vault2")
+	outDir := filepath.Join(vaultDir, "deliver")
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	raw, err := json.Marshal(settings.StoragePaths{
+		WorkDir: r.workDir, VaultDir: vaultDir, OutputDir: outDir,
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if _, err := r.store.DB.Exec(
+		`UPDATE settings SET value = ? WHERE key = ?`, string(raw), settings.KeyStoragePaths,
+	); err != nil {
+		t.Fatalf("write storage.paths row: %v", err)
+	}
+	setMuxOptions(t, r.settings, settings.MuxOptions{
+		KeepBak: true, TrackTitleInMKV: "Polski Dubbing", OutputMode: settings.MuxOutputSeparate,
+	})
+
+	jobID := r.newJob(t)
+	r.stage(t, jobID)
+	mx := &fakeMuxer{}
+	w := newWorker(t, r, &fakeExecutor{report: stableReport()}, mx, &fakeRescanner{})
+
+	if processed, err := w.ProcessOnce(context.Background()); err != nil || !processed {
+		t.Fatalf("ProcessOnce = %v/%v, want true/nil", processed, err)
+	}
+	if len(mx.jobs) != 0 {
+		t.Fatalf("Mux ran with an output dir inside the vault: %+v", mx.jobs)
+	}
+	rec, _, _ := r.store.SyncJobByID(context.Background(), jobID)
+	if rec.Status != "failed" || !strings.Contains(rec.ErrorMessage, "vault") {
+		t.Errorf("status/message = %q/%q, want failed mentioning vault", rec.Status, rec.ErrorMessage)
+	}
+}
+
+// TestProcessOnceSeparateModeRequiresExistingOutputDir fails before mux when
+// the configured directory is missing or unset.
+func TestProcessOnceSeparateModeRequiresExistingOutputDir(t *testing.T) {
+	cases := []struct {
+		name string
+		dir  string
+	}{
+		{name: "missing directory", dir: "/definitely/not/here"},
+		{name: "unset output dir", dir: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRig(t)
+			setStoragePaths(t, r.settings, settings.StoragePaths{
+				WorkDir: r.workDir, VaultDir: filepath.Join(t.TempDir(), "vault"), OutputDir: tc.dir,
+			})
+			setMuxOptions(t, r.settings, settings.MuxOptions{
+				KeepBak: true, TrackTitleInMKV: "Polski Dubbing", OutputMode: settings.MuxOutputSeparate,
+			})
+			jobID := r.newJob(t)
+			r.stage(t, jobID)
+			mx := &fakeMuxer{}
+			w := newWorker(t, r, &fakeExecutor{report: stableReport()}, mx, &fakeRescanner{})
+
+			if processed, err := w.ProcessOnce(context.Background()); err != nil || !processed {
+				t.Fatalf("ProcessOnce = %v/%v, want true/nil", processed, err)
+			}
+			if len(mx.jobs) != 0 {
+				t.Fatalf("Mux ran without a usable output dir: %+v", mx.jobs)
+			}
+			rec, _, _ := r.store.SyncJobByID(context.Background(), jobID)
+			if rec.Status != "failed" {
+				t.Errorf("status = %q, want failed", rec.Status)
+			}
+		})
+	}
+}
+
+// fakeTranscoder records the pre-flight checks and encodes the worker asks for.
+type fakeTranscoder struct {
+	available map[string]bool
+	probes    []string
+	requests  []transcode.Request
+	err       error
+}
+
+func (f *fakeTranscoder) EncoderAvailable(_ context.Context, encoder string) (bool, string) {
+	f.probes = append(f.probes, encoder)
+	if f.available == nil {
+		return true, ""
+	}
+	ok := f.available[encoder]
+	if !ok {
+		return false, "encoder not found"
+	}
+	return true, ""
+}
+
+func (f *fakeTranscoder) Transcode(_ context.Context, req transcode.Request) (transcode.Result, error) {
+	f.requests = append(f.requests, req)
+	if f.err != nil {
+		return transcode.Result{}, f.err
+	}
+	return transcode.Result{
+		Path: req.Output, Codec: req.Plan.Codec,
+		Channels: req.Plan.Channels, BitrateBPS: req.Plan.BitrateBPS,
+	}, nil
+}
+
+func setAudioRules(t *testing.T, r *rig, body string) {
+	t.Helper()
+	if err := r.settings.Set(context.Background(), settings.KeyAudioOptions, json.RawMessage(body)); err != nil {
+		t.Fatalf("set audio.options: %v", err)
+	}
+}
+
+// TestProcessOnceAppliesTranscodeRule pins the ADR-0010 job path: the first
+// matching rule encodes the Work Area copy (never the vault file), and the mux
+// receives the encoded .mka instead of the staged original.
+func TestProcessOnceAppliesTranscodeRule(t *testing.T) {
+	r := newRig(t)
+	setAudioRules(t, r, `{"rules":[
+		{"enabled":false,"when":{},"then":{"codec":"flac"}},
+		{"enabled":true,"when":{"source_codecs":["pcm_s16le"],"lang_iso2":"pl"},"then":{"codec":"opus","bitrate_bps":96000,"channels":2}}
+	]}`)
+	jobID := r.newJob(t)
+	staged := r.stage(t, jobID)
+
+	vaultPath := filepath.Join(filepath.Dir(r.target), "track.pl.mka")
+	before, err := os.ReadFile(vaultPath)
+	if err != nil {
+		t.Fatalf("read vault track: %v", err)
+	}
+
+	mx := &fakeMuxer{}
+	tr := &fakeTranscoder{}
+	w := newWorker(t, r, &fakeExecutor{report: stableReport()}, mx, &fakeRescanner{})
+	w.transcoder = tr
+
+	if processed, err := w.ProcessOnce(context.Background()); err != nil || !processed {
+		t.Fatalf("ProcessOnce = %v/%v, want true/nil", processed, err)
+	}
+	if len(tr.probes) != 1 || tr.probes[0] != "libopus" {
+		t.Fatalf("encoder probes = %v, want [libopus]", tr.probes)
+	}
+	if len(tr.requests) != 1 {
+		t.Fatalf("transcode requests = %d, want 1", len(tr.requests))
+	}
+	req := tr.requests[0]
+	if req.Input != staged {
+		t.Fatalf("transcode input = %q, want staged copy %q", req.Input, staged)
+	}
+	if req.Plan.RuleIndex != 1 || req.Plan.Codec != "opus" || req.Plan.Channels != 2 || req.Plan.BitrateBPS != 96000 {
+		t.Fatalf("plan = %+v, want rule 1 opus stereo 96k", req.Plan)
+	}
+	if req.SourceChannels != 2 || req.SourceDurationMS != 0 || req.LangISO2 != "pl" {
+		t.Fatalf("source metadata = %+v", req)
+	}
+	if got, want := req.Output, filepath.Join(filepath.Dir(staged), "audio.transcoded.mka"); got != want {
+		t.Fatalf("transcode output = %q, want %q", got, want)
+	}
+	if len(mx.jobs) != 1 || mx.jobs[0].AudioPath != req.Output {
+		t.Fatalf("mux audio = %+v, want the encoded track", mx.jobs)
+	}
+	// The vault row's file is not an input and must stay byte-identical.
+	after, err := os.ReadFile(vaultPath)
+	if err != nil {
+		t.Fatalf("re-read vault track: %v", err)
+	}
+	if string(before) != string(after) {
+		t.Fatal("vault track content changed during the job")
+	}
+	rec, _, _ := r.store.SyncJobByID(context.Background(), jobID)
+	if rec.Status != "completed" {
+		t.Fatalf("status = %q (%s), want completed", rec.Status, rec.ErrorMessage)
+	}
+}
+
+// TestProcessOnceWithoutRulesKeepsStagedCopy covers both legacy shapes: an
+// absent section and an explicit empty list must mean "no transcode".
+func TestProcessOnceWithoutRulesKeepsStagedCopy(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string // empty means: delete the row entirely
+	}{
+		{"absent section", ""},
+		{"explicit empty rules", `{"rules":[]}`},
+		{"legacy object without rules", `{}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRig(t)
+			if tc.body == "" {
+				if _, err := r.store.DB.Exec(`DELETE FROM settings WHERE key = ?`, settings.KeyAudioOptions); err != nil {
+					t.Fatalf("delete audio.options: %v", err)
+				}
+			} else {
+				setAudioRules(t, r, tc.body)
+			}
+			jobID := r.newJob(t)
+			staged := r.stage(t, jobID)
+
+			mx := &fakeMuxer{}
+			tr := &fakeTranscoder{}
+			w := newWorker(t, r, &fakeExecutor{report: stableReport()}, mx, &fakeRescanner{})
+			w.transcoder = tr
+
+			if processed, err := w.ProcessOnce(context.Background()); err != nil || !processed {
+				t.Fatalf("ProcessOnce = %v/%v, want true/nil", processed, err)
+			}
+			if len(tr.probes) != 0 || len(tr.requests) != 0 {
+				t.Fatalf("transcoder used without rules: probes=%v requests=%d", tr.probes, len(tr.requests))
+			}
+			if len(mx.jobs) != 1 || mx.jobs[0].AudioPath != staged {
+				t.Fatalf("mux audio = %+v, want the untouched staged copy", mx.jobs)
+			}
+		})
+	}
+}
+
+// TestProcessOnceMissingEncoderFailsBeforeExecute proves a missing encoder is a
+// pre-flight error: no analysis, no staging, no mux.
+func TestProcessOnceMissingEncoderFailsBeforeExecute(t *testing.T) {
+	r := newRig(t)
+	setAudioRules(t, r, `{"rules":[{"enabled":true,"when":{},"then":{"codec":"opus","bitrate_bps":96000}}]}`)
+	jobID := r.newJob(t)
+
+	ex := &fakeExecutor{report: stableReport()}
+	mx := &fakeMuxer{}
+	tr := &fakeTranscoder{available: map[string]bool{"libopus": false}}
+	w := newWorker(t, r, ex, mx, &fakeRescanner{})
+	w.transcoder = tr
+
+	if processed, err := w.ProcessOnce(context.Background()); err != nil || !processed {
+		t.Fatalf("ProcessOnce = %v/%v, want true/nil", processed, err)
+	}
+	if len(ex.calls) != 0 || len(mx.jobs) != 0 || len(tr.requests) != 0 {
+		t.Fatalf("work happened without the encoder: exec=%v mux=%d transcode=%d", ex.calls, len(mx.jobs), len(tr.requests))
+	}
+	rec, _, _ := r.store.SyncJobByID(context.Background(), jobID)
+	if rec.Status != "failed" {
+		t.Fatalf("status = %q, want failed", rec.Status)
+	}
+	if !strings.Contains(rec.ErrorMessage, "libopus") {
+		t.Fatalf("error message %q does not name the missing encoder", rec.ErrorMessage)
+	}
+}
+
+// TestProcessOnceTranscodeVerificationFailureFailsJob proves a mismatch is a
+// hard job failure and never reaches mux.
+func TestProcessOnceTranscodeVerificationFailureFailsJob(t *testing.T) {
+	r := newRig(t)
+	setAudioRules(t, r, `{"rules":[{"enabled":true,"when":{"channel_count":2},"then":{"codec":"aac","bitrate_bps":128000}}]}`)
+	jobID := r.newJob(t)
+	r.stage(t, jobID)
+
+	mx := &fakeMuxer{}
+	tr := &fakeTranscoder{err: transcode.ErrVerify}
+	w := newWorker(t, r, &fakeExecutor{report: stableReport()}, mx, &fakeRescanner{})
+	w.transcoder = tr
+
+	if processed, err := w.ProcessOnce(context.Background()); err != nil || !processed {
+		t.Fatalf("ProcessOnce = %v/%v, want true/nil", processed, err)
+	}
+	if len(mx.jobs) != 0 {
+		t.Fatalf("mux ran after a failed encode: %+v", mx.jobs)
+	}
+	rec, _, _ := r.store.SyncJobByID(context.Background(), jobID)
+	if rec.Status != "failed" || !strings.Contains(rec.ErrorMessage, "verification") {
+		t.Fatalf("job = %q / %q, want a verification failure", rec.Status, rec.ErrorMessage)
+	}
+	if _, err := os.Stat(filepath.Join(r.workDir, "jobs", strconv.FormatInt(jobID, 10))); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("staging should be cleaned after a failure: %v", err)
 	}
 }

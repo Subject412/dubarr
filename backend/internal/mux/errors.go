@@ -19,7 +19,7 @@ var (
 	// queued vault track, or a language mapping that does not resolve to
 	// exactly one track. It is checked before any write.
 	ErrAmbiguous = errors.New("mux: ambiguous target/track pairing")
-	// ErrIneligible reports a Tdarr Gate verdict of waiting_for_tags or
+	// ErrIneligible reports a Processing Gate verdict of waiting_for_tags or
 	// missing_target on re-check before muxing.
 	ErrIneligible = errors.New("mux: target is not tag-eligible")
 	// ErrTargetMissing reports an absent or non-regular target file.
@@ -31,4 +31,14 @@ var (
 	// ErrPublish reports a filesystem failure while copying, backing up or
 	// atomically renaming the muxed output.
 	ErrPublish = errors.New("mux: atomic publish failed")
+	// ErrOutputDir reports an unusable storage.paths.output_dir: missing,
+	// not a directory or not resolvable. Separate mode cannot publish.
+	ErrOutputDir = errors.New("mux: output directory is not usable")
+	// ErrOutputExists reports a separate-mode destination that already exists.
+	// ADR-0011 forbids overwriting or auto-suffixing it.
+	ErrOutputExists = errors.New("mux: separate output already exists")
+	// ErrCrossDevice reports a rename across filesystems. There is
+	// deliberately no copy+delete fallback: it would lose atomicity
+	// (ADR-0011).
+	ErrCrossDevice = errors.New("mux: cannot publish across filesystems")
 )

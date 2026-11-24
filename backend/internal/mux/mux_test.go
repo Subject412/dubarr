@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 
 	"github.com/Subject412/dubarr/backend/internal/analyze"
@@ -339,6 +340,8 @@ func audioTrackIETF(t *testing.T, path string) string {
 func eligibleRule() gate.Rule {
 	return gate.Rule{Required: []string{"[TDARR]"}, Mode: gate.MatchAny, Enforce: true}
 }
+
+func boolPtr(v bool) *bool { return &v }
 
 type harness struct {
 	t      *testing.T
@@ -761,6 +764,74 @@ func TestConcurrentMuxesUseDistinctTemps(t *testing.T) {
 	}
 }
 
+// TestMuxDiscardsBackupWhenKeepBakFalse covers settings mux.options.keep_bak=
+// false: the validated publish stands, but no <target>.bak is left behind.
+func TestMuxDiscardsBackupWhenKeepBakFalse(t *testing.T) {
+	h := newHarness(t)
+	beforeAudio := len(audioStreams(probeFile(t, h.target)))
+
+	job := h.job()
+	job.KeepBak = boolPtr(false)
+	res, err := New(Dependencies{}).Mux(context.Background(), job)
+	if err != nil {
+		t.Fatalf("Mux: %v", err)
+	}
+	if _, err := os.Stat(h.target + ".bak"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf(".bak still present (err = %v), want removed", err)
+	}
+	if res.BackupPath != "" {
+		t.Errorf("BackupPath = %q, want empty after removal", res.BackupPath)
+	}
+	if res.OutputPath != h.target {
+		t.Errorf("OutputPath = %q, want %q", res.OutputPath, h.target)
+	}
+	afterProbe := probeFile(t, h.target)
+	if got, want := len(audioStreams(afterProbe)), beforeAudio+1; got != want {
+		t.Errorf("audio tracks = %d, want %d", got, want)
+	}
+	if _, ok := findAudio(afterProbe, "pl", "PL DUB"); !ok {
+		t.Errorf("no pl/PL DUB audio track in %+v", audioStreams(afterProbe))
+	}
+	if leftovers, err := tempLeftovers(h.target); err != nil {
+		t.Fatalf("list temps: %v", err)
+	} else if len(leftovers) > 0 {
+		t.Errorf("temp files still present beside target: %v", leftovers)
+	}
+}
+
+// TestMuxBackupRemovalFailureWarnsAndPublishes: a failing .bak removal is a
+// WARN, never a mux failure. The backup simply stays on disk.
+func TestMuxBackupRemovalFailureWarnsAndPublishes(t *testing.T) {
+	h := newHarness(t)
+	var warnings []string
+	merr := New(Dependencies{Warnf: func(format string, args ...any) {
+		warnings = append(warnings, fmt.Sprintf(format, args...))
+	}})
+	merr.remove = func(string) error { return errors.New("remove denied") }
+
+	job := h.job()
+	job.KeepBak = boolPtr(false)
+	res, err := merr.Mux(context.Background(), job)
+	if err != nil {
+		t.Fatalf("Mux: %v", err)
+	}
+	if res.BackupPath != h.target+".bak" {
+		t.Errorf("BackupPath = %q, want %q (removal failed, backup stays)", res.BackupPath, h.target+".bak")
+	}
+	if _, err := os.Stat(h.target + ".bak"); err != nil {
+		t.Errorf("stat .bak: %v, want the backup left in place", err)
+	}
+	if len(warnings) != 1 {
+		t.Fatalf("warnings = %v, want exactly one", warnings)
+	}
+	if !strings.Contains(warnings[0], ".bak") || !strings.Contains(warnings[0], "remove denied") {
+		t.Errorf("warning %q should name the backup and the reason", warnings[0])
+	}
+	if _, ok := findAudio(probeFile(t, h.target), "pl", "PL DUB"); !ok {
+		t.Errorf("publish did not survive the backup removal failure")
+	}
+}
+
 // diffKeys reports keys whose presence or hash differs.
 func diffKeys(want, got map[string]string) []string {
 	seen := map[string]bool{}
@@ -778,4 +849,303 @@ func diffKeys(want, got map[string]string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// separateHarness returns a job in separate mode plus the destination the
+// deterministic naming rule must produce.
+func (h *harness) separateHarness(t *testing.T) (Job, string, string) {
+	t.Helper()
+	outDir := filepath.Join(h.dir, "output")
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		t.Fatalf("mkdir output: %v", err)
+	}
+	job := h.job()
+	job.OutputMode = OutputModeSeparate
+	job.OutputDir = outDir
+	return job, outDir, filepath.Join(outDir, "Movie (2021) [TDARR].dubarr.mkv")
+}
+
+// TestSeparateModeWritesDeterministicOutputAndKeepsTarget covers ADR-0011:
+// separate mode publishes <basename>.dubarr.mkv into the output directory,
+// leaves the library Target byte-identical and never creates a .bak.
+func TestSeparateModeWritesDeterministicOutputAndKeepsTarget(t *testing.T) {
+	h := newHarness(t)
+	job, outDir, wantDest := h.separateHarness(t)
+	targetHash := sha256File(t, h.target)
+	beforeAudio := len(audioStreams(probeFile(t, h.target)))
+
+	res, err := New(Dependencies{}).Mux(context.Background(), job)
+	if err != nil {
+		t.Fatalf("Mux: %v", err)
+	}
+	if res.OutputPath != wantDest {
+		t.Fatalf("OutputPath = %q, want %q", res.OutputPath, wantDest)
+	}
+	if res.BackupPath != "" {
+		t.Errorf("BackupPath = %q, want empty in separate mode", res.BackupPath)
+	}
+	if got, want := sha256File(t, h.target), targetHash; got != want {
+		t.Errorf("target hash = %s, want unchanged %s", got, want)
+	}
+	if _, err := os.Stat(h.target + ".bak"); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf(".bak created in separate mode: %v", err)
+	}
+	if leftovers, err := tempLeftovers(wantDest); err != nil {
+		t.Fatalf("list temps: %v", err)
+	} else if len(leftovers) > 0 {
+		t.Errorf("temp files left in output dir: %v", leftovers)
+	}
+	entries, err := os.ReadDir(outDir)
+	if err != nil {
+		t.Fatalf("read output dir: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != filepath.Base(wantDest) {
+		t.Fatalf("output dir entries = %v, want only %s", entries, filepath.Base(wantDest))
+	}
+	doc := probeFile(t, wantDest)
+	if got, want := len(audioStreams(doc)), beforeAudio+1; got != want {
+		t.Fatalf("output audio tracks = %d, want %d", got, want)
+	}
+	if _, ok := findAudio(doc, "pl", "PL DUB"); !ok {
+		t.Errorf("no pl/PL DUB audio track in %+v", audioStreams(doc))
+	}
+}
+
+// TestSeparateModeTempIsCreatedInDestinationDir proves the temp lives beside
+// the final file, so the publishing rename never crosses filesystems.
+func TestSeparateModeTempIsCreatedInDestinationDir(t *testing.T) {
+	h := newHarness(t)
+	job, outDir, _ := h.separateHarness(t)
+
+	var tempDir string
+	m := New(Dependencies{})
+	m.rename = func(oldpath, newpath string) error {
+		tempDir = filepath.Dir(oldpath)
+		return os.Rename(oldpath, newpath)
+	}
+	if _, err := m.Mux(context.Background(), job); err != nil {
+		t.Fatalf("Mux: %v", err)
+	}
+	if tempDir != outDir {
+		t.Fatalf("temp dir = %q, want %q", tempDir, outDir)
+	}
+}
+
+// TestSeparateModeRefusesExistingDestination pins the collision policy: never
+// overwrite and never auto-suffix.
+func TestSeparateModeRefusesExistingDestination(t *testing.T) {
+	h := newHarness(t)
+	job, _, dest := h.separateHarness(t)
+	if err := os.WriteFile(dest, []byte("previous deliverable"), 0o644); err != nil {
+		t.Fatalf("seed destination: %v", err)
+	}
+	targetHash := sha256File(t, h.target)
+
+	if _, err := New(Dependencies{}).Mux(context.Background(), job); !errors.Is(err, ErrOutputExists) {
+		t.Fatalf("Mux error = %v, want ErrOutputExists", err)
+	}
+	if got, _ := os.ReadFile(dest); string(got) != "previous deliverable" {
+		t.Errorf("existing destination was modified: %q", got)
+	}
+	if got := sha256File(t, h.target); got != targetHash {
+		t.Error("target modified on collision")
+	}
+	if leftovers, err := tempLeftovers(dest); err != nil {
+		t.Fatalf("list temps: %v", err)
+	} else if len(leftovers) > 0 {
+		t.Errorf("temp files left after collision: %v", leftovers)
+	}
+}
+
+// TestSeparateModeCrossDeviceRenameFailsLoudly: a different-filesystem rename
+// is a clear error, never a copy+delete fallback (ADR-0011).
+func TestSeparateModeCrossDeviceRenameFailsLoudly(t *testing.T) {
+	h := newHarness(t)
+	job, _, dest := h.separateHarness(t)
+	targetHash := sha256File(t, h.target)
+
+	m := New(Dependencies{})
+	m.rename = func(oldpath, newpath string) error {
+		return &os.LinkError{Op: "rename", Old: oldpath, New: newpath, Err: syscall.EXDEV}
+	}
+	_, err := m.Mux(context.Background(), job)
+	if !errors.Is(err, ErrCrossDevice) {
+		t.Fatalf("Mux error = %v, want ErrCrossDevice", err)
+	}
+	if !strings.Contains(err.Error(), "different filesystems") {
+		t.Errorf("error %q should explain the cross-filesystem failure", err)
+	}
+	if _, err := os.Stat(dest); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("destination created despite cross-device failure: %v", err)
+	}
+	if got := sha256File(t, h.target); got != targetHash {
+		t.Error("target modified on cross-device failure")
+	}
+	if leftovers, err := tempLeftovers(dest); err != nil {
+		t.Fatalf("list temps: %v", err)
+	} else if len(leftovers) > 0 {
+		t.Errorf("temp files left after cross-device failure: %v", leftovers)
+	}
+}
+
+// TestSeparateModeValidatesBeforePublish keeps ADR-0004 in separate mode: a
+// failed post-mux probe leaves no destination file.
+func TestSeparateModeValidatesBeforePublish(t *testing.T) {
+	h := newHarness(t)
+	job, outDir, _ := h.separateHarness(t)
+	targetHash := sha256File(t, h.target)
+
+	run := func(ctx context.Context, bin string, args ...string) ([]byte, error) {
+		if filepath.Base(bin) == "ffprobe" {
+			if len(args) > 0 && filepath.Base(args[len(args)-1]) == "target.mkv" {
+				return []byte(`{"streams":[{"codec_type":"video"},{"codec_type":"audio"}]}`), nil
+			}
+			return []byte(`{"streams":[{"codec_type":"video"}]}`), nil
+		}
+		return execRun(ctx, bin, args...)
+	}
+	_, err := New(Dependencies{Run: run}).Mux(context.Background(), job)
+	if !errors.Is(err, ErrPublish) {
+		t.Fatalf("Mux error = %v, want ErrPublish", err)
+	}
+	entries, err := os.ReadDir(outDir)
+	if err != nil {
+		t.Fatalf("read output dir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("output dir not empty after failed validation: %v", entries)
+	}
+	if got := sha256File(t, h.target); got != targetHash {
+		t.Error("target modified after failed validation")
+	}
+}
+
+// TestSeparateModeIgnoresKeepBak: nothing was replaced, so keep_bak is inert
+// and the .bak removal hook is never called.
+func TestSeparateModeIgnoresKeepBak(t *testing.T) {
+	h := newHarness(t)
+	job, _, dest := h.separateHarness(t)
+	discard := false
+	job.KeepBak = &discard
+
+	removed := false
+	m := New(Dependencies{})
+	m.remove = func(string) error {
+		removed = true
+		return errors.New("should not be called")
+	}
+	res, err := m.Mux(context.Background(), job)
+	if err != nil {
+		t.Fatalf("Mux: %v", err)
+	}
+	if removed {
+		t.Error("keep_bak removal ran in separate mode")
+	}
+	if res.BackupPath != "" {
+		t.Errorf("BackupPath = %q, want empty", res.BackupPath)
+	}
+	if _, err := os.Stat(dest); err != nil {
+		t.Errorf("separate output missing: %v", err)
+	}
+	if _, err := os.Stat(h.target + ".bak"); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf(".bak created in separate mode: %v", err)
+	}
+}
+
+// TestSeparateModeStillEnforcesTheTagGate: the gate is evaluated against the
+// source Target in both modes.
+func TestSeparateModeStillEnforcesTheTagGate(t *testing.T) {
+	h := newHarness(t)
+	job, outDir, _ := h.separateHarness(t)
+	untagged := filepath.Join(h.dir, "Movie (2021).mkv")
+	if err := os.Rename(h.target, untagged); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	job.TargetPath = untagged
+	if _, err := New(Dependencies{}).Mux(context.Background(), job); !errors.Is(err, ErrIneligible) {
+		t.Fatalf("Mux error = %v, want ErrIneligible", err)
+	}
+	entries, err := os.ReadDir(outDir)
+	if err != nil {
+		t.Fatalf("read output dir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("output dir not empty after an ineligible target: %v", entries)
+	}
+}
+
+// TestOutputDestinationValidation covers unusable separate-mode destinations.
+func TestOutputDestinationValidation(t *testing.T) {
+	h := newHarness(t)
+	outDir := filepath.Join(h.dir, "output")
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		t.Fatalf("mkdir output: %v", err)
+	}
+	file := filepath.Join(h.dir, "not-a-dir")
+	if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	cases := []struct {
+		name   string
+		mutate func(*Job)
+		want   error
+	}{
+		{"unknown mode", func(j *Job) { j.OutputMode = "elsewhere" }, ErrInvalidJob},
+		{"missing dir", func(j *Job) { j.OutputMode = OutputModeSeparate; j.OutputDir = filepath.Join(h.dir, "nope") }, ErrOutputDir},
+		{"file not dir", func(j *Job) { j.OutputMode = OutputModeSeparate; j.OutputDir = file }, ErrOutputDir},
+		{"empty dir", func(j *Job) { j.OutputMode = OutputModeSeparate; j.OutputDir = "  " }, ErrInvalidJob},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			targetHash := sha256File(t, h.target)
+			job := h.job()
+			tc.mutate(&job)
+			if _, err := New(Dependencies{}).Mux(context.Background(), job); !errors.Is(err, tc.want) {
+				t.Fatalf("Mux error = %v, want %v", err, tc.want)
+			}
+			if got := sha256File(t, h.target); got != targetHash {
+				t.Error("target modified on invalid destination")
+			}
+			if _, err := os.Stat(filepath.Join(h.work, "jobs", "42", "target.mkv")); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("work copy written for an invalid destination: %v", err)
+			}
+		})
+	}
+}
+
+// TestArrGateCriteriaBlockAndForceOverride wires ADR-0009 into the mux call
+// site: the verdict uses the arr metadata carried by the job, and force
+// override still bypasses the whole gate.
+func TestArrGateCriteriaBlockAndForceOverride(t *testing.T) {
+	h := newHarness(t)
+	job := h.job()
+	job.Gate = gate.Rule{
+		SourceMode:      gate.SourceArr,
+		RequiredArrTags: []string{"dub"},
+		Mode:            gate.MatchAny,
+		Enforce:         true,
+	}
+	job.Arr = gate.ArrMetadata{Found: true, Tags: []string{"keep"}}
+	if _, err := New(Dependencies{}).Mux(context.Background(), job); !errors.Is(err, ErrIneligible) {
+		t.Fatalf("Mux error = %v, want ErrIneligible for a non-matching arr tag", err)
+	}
+	if _, err := os.Stat(h.target + ".bak"); !errors.Is(err, os.ErrNotExist) {
+		t.Error(".bak created for an arr-ineligible target")
+	}
+
+	// A library row that satisfies the criterion lets the mux proceed.
+	job.Arr = gate.ArrMetadata{Found: true, Tags: []string{"Polish Dubbing", "dub"}, RootFolder: "/media/movies"}
+	if _, err := New(Dependencies{}).Mux(context.Background(), job); err != nil {
+		t.Fatalf("arr-eligible Mux: %v", err)
+	}
+
+	// Force bypasses the arr criterion too (the caller owns the switch).
+	h2 := newHarness(t)
+	job2 := h2.job()
+	job2.Gate = job.Gate
+	job2.Arr = gate.ArrMetadata{Found: false}
+	job2.Force = true
+	if _, err := New(Dependencies{}).Mux(context.Background(), job2); err != nil {
+		t.Fatalf("forced Mux with no arr row: %v", err)
+	}
 }

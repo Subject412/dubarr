@@ -1,32 +1,18 @@
-# React + TypeScript + Vite
+# frontend/
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+React 19 + TypeScript 7 + Vite 8 + Tailwind 4 SPA for Dubarr.
 
-Currently, two official plugins are available:
-
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
-
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the Oxlint configuration
-
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
-
-```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
-}
+```sh
+npm install
+npm run dev     # dev server
+npm run build   # production build -> ../backend/web (embedded by the Go server)
+npm run lint    # oxlint
+npm test        # vitest
 ```
 
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+The build output directory is `../backend/web`; the Go binary embeds those
+assets, so run `npm run build` before `go build ./cmd/dubarr`. `emptyOutDir` is
+deliberately off so the embed stub (`backend/web/doc.go`) survives. Set
+`DUBARR_WEB_OUT` to redirect the build elsewhere for experiments.
+
+See the [root README](../README.md) for the full project and build order.

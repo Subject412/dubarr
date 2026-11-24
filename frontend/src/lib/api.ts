@@ -46,6 +46,8 @@ export type StoragePaths = {
   watch_dir: string
   vault_dir: string
   work_dir: string
+  /** Destination root for mux output_mode=separate (ADR-0011). */
+  output_dir: string
   media_roots: string[]
 }
 
@@ -53,9 +55,13 @@ export type LanguagesPolicy = {
   target_import_languages: string[]
   extra_reference_languages: string[]
   original_language_from_arr: boolean
+  prefer_original_language: boolean
   exclude_commentary: boolean
   export_mode: 'rule_based' | 'all'
 }
+
+/** Which sources the Processing Gate consults; active sources are AND-ed. */
+export type TagSourceMode = 'filename' | 'arr' | 'both'
 
 export type TargetTagFilter = {
   required_filename_tags: string[]
@@ -63,7 +69,48 @@ export type TargetTagFilter = {
   tag_case_sensitive: boolean
   excluded_filename_tags: string[]
   enforce_tag_filter: boolean
+  source_mode: TagSourceMode
+  /** Radarr/Sonarr tag labels; excluded labels always win. */
+  required_arr_tags: string[]
+  excluded_arr_tags: string[]
+  /** Allowlist of canonical Radarr/Sonarr root-folder paths. */
+  root_folder_paths: string[]
 }
+
+export type TranscodeCodec = 'keep' | 'opus' | 'aac' | 'flac' | 'pcm_s16le' | 'pcm_s24le' | 'pcm_f32le'
+
+/**
+ * One opt-in Audio Transcode Rule (ADR-0010). Conditions are AND-ed and match
+ * the PRE-TEMPO vault-track metadata; the first enabled rule that matches wins.
+ * An empty rule list keeps the historical lossless-copy behaviour.
+ */
+export type TranscodeRule = {
+  enabled: boolean
+  when: {
+    /** Exact ffmpeg codec names, matched case-insensitively. */
+    source_codecs?: string[]
+    /** Optional RE2 pattern matched against the source codec name. */
+    source_codec_regex?: string
+    min_bitrate_bps?: number | null
+    max_bitrate_bps?: number | null
+    channel_count?: number | null
+    /** Canonical ffmpeg layout name (stereo, 5.1, ...). */
+    channel_layout?: string
+    sample_rate?: number | null
+    lang_iso2?: string
+    variant?: string
+  }
+  then: {
+    codec: TranscodeCodec
+    bitrate_bps?: number | null
+    channels?: number | null
+    channel_layout?: string
+    sample_rate?: number | null
+  }
+}
+
+/** `audio.options`: ordered, global Transcode Rules. Global only, no per-media overrides. */
+export type AudioOptions = { rules: TranscodeRule[] }
 
 export type SyncDefaults = {
   max_offset_sec: number
@@ -80,9 +127,13 @@ export type SecurityOptions = {
   require_av1_strict: boolean
 }
 
+export type MuxOutputMode = 'replace' | 'separate'
+
 export type MuxOptions = {
   keep_bak: boolean
   track_title_in_mkv: string
+  /** replace: atomically overwrite the Target; separate: write to output_dir (ADR-0011). */
+  output_mode: MuxOutputMode
 }
 
 export type WatchOptions = {
@@ -93,6 +144,36 @@ export type WatchOptions = {
 export type ArrOptions = {
   poll_interval_sec: number
   manual_sync: boolean
+}
+
+/** Supported *arr applications; also the `{kind}` path segment on the API. */
+export type ArrConnectionKind = 'radarr' | 'sonarr'
+
+/**
+ * One saved Radarr/Sonarr connection as returned by GET /api/settings/arr.
+ * `api_key` is always the server mask (e.g. `********abcd`), never plaintext.
+ */
+export type ArrConnection = {
+  kind: ArrConnectionKind
+  base_url: string
+  enabled: boolean
+  api_key: string
+}
+
+export type ArrConnectionsResponse = {
+  instances: ArrConnection[]
+}
+
+/** PUT /api/settings/arr/{kind} body. An omitted `api_key` keeps the stored key. */
+export type ArrConnectionPayload = {
+  base_url: string
+  api_key?: string
+  enabled: boolean
+}
+
+export type ArrConnectionTestResult = {
+  ok: boolean
+  kind: ArrConnectionKind
 }
 
 /** Sibling filenames that mark a dropped file as a donor dub. */
@@ -107,6 +188,7 @@ export type DubarrSettings = {
   'sync.defaults': SyncDefaults
   'security.options': SecurityOptions
   'mux.options': MuxOptions
+  'audio.options': AudioOptions
   'watch.options': WatchOptions
   'arr.options': ArrOptions
   'imports.options': ImportsOptions
@@ -232,6 +314,8 @@ export type SyncJob = {
   target_library_cache_id: number
   target_video_path?: string
   target_lang_iso2?: string
+  /** Where mux published the file (Target, or the separate-mode deliverable). */
+  output_path?: string
   sync_method?: string
   calculated_offset_ms: number
   report?: SyncReport
@@ -247,6 +331,51 @@ export type SyncJobsResponse = {
 export type CreateSyncJobBody = {
   vault_track_id: number
   target_library_cache_id: number
+}
+
+/** Masked API token as returned by GET /api/auth/tokens (never the plaintext). */
+export type ApiToken = {
+  id: number
+  name: string
+  /** Leading characters stored for display, e.g. `dub_AbCdEfGh`. */
+  prefix: string
+  created_at: string
+  last_used_at?: string | null
+}
+
+export type ApiTokensResponse = {
+  tokens: ApiToken[]
+}
+
+/** POST /api/auth/tokens response: the plaintext token is present only here. */
+export type ApiTokenCreated = ApiToken & {
+  token: string
+}
+
+/** Log severities exposed by GET /api/logs and PUT /api/logs/level. */
+export type LogLevel = 'debug' | 'info' | 'warn' | 'error'
+
+/** One ring-buffer entry. `ts` is an RFC 3339 timestamp. */
+export type LogEntry = {
+  ts: string
+  level: LogLevel
+  component?: string
+  message: string
+  job_id?: string
+  media_id?: string
+}
+
+export type LogsResponse = {
+  entries: LogEntry[]
+  level: LogLevel
+}
+
+export type LogsQuery = {
+  /** Minimum severity; omitted means every entry kept in the ring. */
+  level?: LogLevel
+  component?: string
+  limit?: number
+  since?: string
 }
 
 export class ApiError extends Error {
@@ -309,6 +438,11 @@ export const api = {
       body: JSON.stringify({ username, password }),
     }),
   logout: () => request<void>('/api/auth/logout', { method: 'POST' }),
+  changePassword: (currentPassword: string, newPassword: string) =>
+    request<void>('/api/auth/password', {
+      method: 'POST',
+      body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }),
+    }),
   settings: () => request<SettingsEnvelope>('/api/settings'),
   saveSettings: (settings: Record<string, unknown>) =>
     request<SettingsEnvelope>('/api/settings', {
@@ -316,6 +450,16 @@ export const api = {
       body: JSON.stringify({ settings }),
     }),
   exportSettings: () => request<SettingsExport>('/api/settings/export'),
+  arrConnections: () => request<ArrConnectionsResponse>('/api/settings/arr'),
+  saveArrConnection: (kind: ArrConnectionKind, payload: ArrConnectionPayload) =>
+    request<ArrConnection>(`/api/settings/arr/${kind}`, {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    }),
+  deleteArrConnection: (kind: ArrConnectionKind) =>
+    request<void>(`/api/settings/arr/${kind}`, { method: 'DELETE' }),
+  testArrConnection: (kind: ArrConnectionKind) =>
+    request<ArrConnectionTestResult>(`/api/settings/arr/${kind}/test`, { method: 'POST' }),
   browse: (path: string) =>
     request<BrowseResponse>(`/api/system/browse?path=${encodeURIComponent(path)}`),
   health: () => request<Health>('/api/health'),
@@ -338,4 +482,26 @@ export const api = {
     }),
   rejectQueueItem: (id: number) =>
     request<QueueTransition>(`/api/queue/${id}/reject`, { method: 'POST' }),
+  tokens: () => request<ApiTokensResponse>('/api/auth/tokens'),
+  createToken: (name: string) =>
+    request<ApiTokenCreated>('/api/auth/tokens', {
+      method: 'POST',
+      body: JSON.stringify({ name }),
+    }),
+  revokeToken: (id: number) => request<void>(`/api/auth/tokens/${id}`, { method: 'DELETE' }),
+  logs: (query: LogsQuery = {}) => {
+    const params = new URLSearchParams()
+    if (query.level) params.set('level', query.level)
+    if (query.component) params.set('component', query.component)
+    if (query.limit != null) params.set('limit', String(query.limit))
+    if (query.since) params.set('since', query.since)
+    const qs = params.toString()
+    return request<LogsResponse>(`/api/logs${qs ? `?${qs}` : ''}`)
+  },
+  logLevel: () => request<{ level: LogLevel }>('/api/logs/level'),
+  setLogLevel: (level: LogLevel) =>
+    request<{ level: LogLevel }>('/api/logs/level', {
+      method: 'PUT',
+      body: JSON.stringify({ level }),
+    }),
 }

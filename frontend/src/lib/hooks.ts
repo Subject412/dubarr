@@ -8,11 +8,21 @@ import {
 import { useEffect, useState } from 'react'
 import {
   api,
+  type ApiTokenCreated,
+  type ApiTokensResponse,
+  type ArrConnection,
+  type ArrConnectionKind,
+  type ArrConnectionPayload,
+  type ArrConnectionsResponse,
+  type ArrConnectionTestResult,
   type AuthStatus,
   type BrowseResponse,
   type CreateSyncJobBody,
   type Health,
   type LibrarySearchResponse,
+  type LogLevel,
+  type LogsQuery,
+  type LogsResponse,
   type QueueResponse,
   type QueueTransition,
   type SettingsEnvelope,
@@ -33,6 +43,10 @@ export const queryKeys = {
   syncJob: (id: number) => ['sync', 'jobs', id] as const,
   browse: (path: string) => ['browse', path] as const,
   librarySearch: (q: string) => ['library', 'search', q] as const,
+  tokens: ['auth', 'tokens'] as const,
+  arrConnections: ['settings', 'arr'] as const,
+  logs: (query: LogsQuery = {}) => ['logs', query] as const,
+  logLevel: ['logs', 'level'] as const,
 }
 
 /** Public first-run probe; drives the route gate. */
@@ -59,6 +73,58 @@ export function useSettings(enabled = true): UseQueryResult<SettingsEnvelope> {
     queryKey: queryKeys.settings,
     queryFn: api.settings,
     enabled,
+  })
+}
+
+/**
+ * Saved Radarr/Sonarr connections. Never returns plaintext keys: the API only
+ * exposes the masked suffix, and the query is invalidated after every write.
+ */
+export function useArrConnections(enabled = true): UseQueryResult<ArrConnectionsResponse> {
+  return useQuery({
+    queryKey: queryKeys.arrConnections,
+    queryFn: api.arrConnections,
+    enabled,
+    retry: false,
+  })
+}
+
+export function useSaveArrConnection(): UseMutationResult<
+  ArrConnection,
+  Error,
+  { kind: ArrConnectionKind; payload: ArrConnectionPayload }
+> {
+  const client = useQueryClient()
+  return useMutation({
+    mutationFn: ({ kind, payload }) => api.saveArrConnection(kind, payload),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: queryKeys.arrConnections })
+    },
+  })
+}
+
+export function useDeleteArrConnection(): UseMutationResult<void, Error, ArrConnectionKind> {
+  const client = useQueryClient()
+  return useMutation({
+    mutationFn: (kind) => api.deleteArrConnection(kind),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: queryKeys.arrConnections })
+    },
+  })
+}
+
+export function useTestArrConnection(): UseMutationResult<
+  ArrConnectionTestResult,
+  Error,
+  ArrConnectionKind
+> {
+  const client = useQueryClient()
+  return useMutation({
+    mutationFn: (kind) => api.testArrConnection(kind),
+    onSuccess: () => {
+      // A successful ping reflects the saved connection, so refresh the list.
+      void client.invalidateQueries({ queryKey: queryKeys.arrConnections })
+    },
   })
 }
 
@@ -151,6 +217,33 @@ export function useRejectQueueItem(): UseMutationResult<QueueTransition, Error, 
   })
 }
 
+export function useTokens(): UseQueryResult<ApiTokensResponse> {
+  return useQuery({
+    queryKey: queryKeys.tokens,
+    queryFn: api.tokens,
+  })
+}
+
+export function useCreateToken(): UseMutationResult<ApiTokenCreated, Error, string> {
+  const client = useQueryClient()
+  return useMutation({
+    mutationFn: (name) => api.createToken(name),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: queryKeys.tokens })
+    },
+  })
+}
+
+export function useRevokeToken(): UseMutationResult<void, Error, number> {
+  const client = useQueryClient()
+  return useMutation({
+    mutationFn: (id) => api.revokeToken(id),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: queryKeys.tokens })
+    },
+  })
+}
+
 /** Debounces a fast-changing value (search input) before it drives a query. */
 export function useDebouncedValue<T>(value: T, delayMs = 300): T {
   const [debounced, setDebounced] = useState(value)
@@ -209,6 +302,53 @@ export function useLogout(): UseMutationResult<void, Error, void> {
     mutationFn: () => api.logout(),
     onSettled: () => {
       client.clear()
+    },
+  })
+}
+
+/**
+ * Changes the signed-in user's password. The server keeps this session valid
+ * and revokes the user's other sessions, so there is nothing to redirect to.
+ */
+export function useChangePassword(): UseMutationResult<
+  void,
+  Error,
+  { currentPassword: string; newPassword: string }
+> {
+  return useMutation({
+    mutationFn: ({ currentPassword, newPassword }) => api.changePassword(currentPassword, newPassword),
+  })
+}
+
+/**
+ * Ring-buffer entries for the Logs page. Polls while `live` is true so the
+ * tail follows the appliance without an SSE endpoint.
+ */
+export function useLogs(query: LogsQuery = {}, live = true): UseQueryResult<LogsResponse> {
+  return useQuery({
+    queryKey: queryKeys.logs(query),
+    queryFn: () => api.logs(query),
+    retry: false,
+    refetchInterval: live ? 2_000 : false,
+  })
+}
+
+/** Runtime minimum severity reported by GET /api/logs/level. */
+export function useLogLevel(): UseQueryResult<{ level: LogLevel }> {
+  return useQuery({
+    queryKey: queryKeys.logLevel,
+    queryFn: api.logLevel,
+    retry: false,
+  })
+}
+
+export function useSetLogLevel(): UseMutationResult<{ level: LogLevel }, Error, LogLevel> {
+  const client = useQueryClient()
+  return useMutation({
+    mutationFn: (level) => api.setLogLevel(level),
+    onSuccess: (data) => {
+      client.setQueryData(queryKeys.logLevel, data)
+      void client.invalidateQueries({ queryKey: ['logs'] })
     },
   })
 }

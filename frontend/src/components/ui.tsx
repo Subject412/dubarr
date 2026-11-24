@@ -1,11 +1,13 @@
 import type {
   ButtonHTMLAttributes,
   InputHTMLAttributes,
+  ReactElement,
   ReactNode,
   SelectHTMLAttributes,
 } from 'react'
-import { useEffect, useRef, useState } from 'react'
+import { cloneElement, isValidElement, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { cn } from '../lib/cn'
+import { helpIdFor } from '../lib/help-id'
 
 type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger'
 
@@ -65,25 +67,144 @@ export function Select({ className, children, ...props }: SelectHTMLAttributes<H
   )
 }
 
+/**
+ * Small "i" button with a hover/focus popover. Fixed positioning keeps the
+ * tooltip out of the document flow (no layout shift) and clamped inside the
+ * viewport; when there is no room above, it flips below the *control* it
+ * documents so it never covers it.
+ */
+const CONTROL_SELECTOR = 'input, select, textarea, [role="switch"], [role="combobox"]'
+
+/** The form control associated with a help id (shares the trigger's aria-describedby). */
+function controlForHelpId(id: string, trigger: Element): Element | null {
+  if (!id) return null
+  for (const element of document.querySelectorAll('[aria-describedby]')) {
+    if (element === trigger || !element.matches(CONTROL_SELECTOR)) continue
+    const ids = (element.getAttribute('aria-describedby') ?? '').split(/\s+/)
+    if (ids.includes(id)) return element
+  }
+  return null
+}
+
+export function InfoTip({ id, label, text }: { id: string; label: string; text: string }) {
+  const [open, setOpen] = useState(false)
+  const [position, setPosition] = useState<{ top: number; left: number } | null>(null)
+  const triggerRef = useRef<HTMLButtonElement>(null)
+  const tipRef = useRef<HTMLDivElement>(null)
+
+  // Measure after the tooltip exists so the clamp uses its real width/height.
+  useLayoutEffect(() => {
+    if (!open) return
+    const trigger = triggerRef.current
+    const tip = tipRef.current
+    if (!trigger || !tip) return
+    const anchor = trigger.getBoundingClientRect()
+    const size = tip.getBoundingClientRect()
+    const margin = 8
+    const viewportWidth = window.innerWidth || 1024
+    const viewportHeight = window.innerHeight || 768
+    const centered = anchor.left + anchor.width / 2 - size.width / 2
+    const left = Math.min(
+      Math.max(margin, centered),
+      Math.max(margin, viewportWidth - size.width - margin),
+    )
+    // Prefer above the trigger. With no room there, flip below the control the
+    // tooltip describes (the next element in the label row), not below the
+    // trigger, which would cover that control. Always clamp to the viewport.
+    const above = anchor.top - size.height - margin
+    let top = above
+    if (above < margin) {
+      const control = controlForHelpId(trigger.getAttribute('aria-describedby') ?? '', trigger)
+      const controlRect = control?.getBoundingClientRect()
+      const base = controlRect && controlRect.height > 0 ? controlRect.bottom : anchor.bottom
+      top = base + margin
+    }
+    const maxTop = Math.max(margin, viewportHeight - size.height - margin)
+    setPosition({ top: Math.min(Math.max(margin, top), maxTop), left })
+  }, [open])
+
+  useEffect(() => {
+    if (!open) return
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setOpen(false)
+    }
+    document.addEventListener('keydown', onKeyDown)
+    return () => document.removeEventListener('keydown', onKeyDown)
+  }, [open])
+
+  return (
+    <span className="inline-flex align-middle">
+      <button
+        ref={triggerRef}
+        type="button"
+        aria-label={`About ${label}`}
+        aria-describedby={id}
+        onMouseEnter={() => setOpen(true)}
+        onMouseLeave={() => setOpen(false)}
+        onFocus={() => setOpen(true)}
+        onBlur={() => setOpen(false)}
+        onKeyDown={(event) => {
+          if (event.key === 'Escape') setOpen(false)
+        }}
+        className="inline-flex h-4 w-4 items-center justify-center rounded-full border border-ink-600 text-[10px] font-semibold leading-none text-zinc-400 hover:border-accent-500 hover:text-accent-400 focus-visible:outline-2 focus-visible:outline-accent-400"
+      >
+        i
+      </button>
+      {open && (
+        <div
+          ref={tipRef}
+          id={id}
+          role="tooltip"
+          style={{ position: 'fixed', top: position?.top ?? 0, left: position?.left ?? 0 }}
+          className="z-50 w-72 max-w-[calc(100vw-1rem)] rounded-lg border border-ink-600 bg-ink-800 px-3 py-2 text-xs leading-relaxed text-zinc-200 shadow-xl"
+        >
+          {text}
+        </div>
+      )}
+    </span>
+  )
+}
+
+function FieldLabel({ label, htmlFor, help }: { label: string; htmlFor?: string; help?: string }) {
+  return (
+    <div className="flex items-center gap-1.5">
+      <label htmlFor={htmlFor} className="block text-sm font-medium text-zinc-200">
+        {label}
+      </label>
+      {help && <InfoTip id={helpIdFor(label)} label={label} text={help} />}
+    </div>
+  )
+}
+
 export function Field({
   label,
   hint,
   error,
   htmlFor,
+  help,
   children,
 }: {
   label: string
   hint?: string
   error?: string
   htmlFor?: string
+  /** Long-form definition rendered in an info popover instead of inline text. */
+  help?: string
   children: ReactNode
 }) {
+  const describedBy = help ? helpIdFor(label) : undefined
+  const content =
+    describedBy && isValidElement(children)
+      ? cloneElement(children as ReactElement<{ 'aria-describedby'?: string }>, {
+          'aria-describedby':
+            (children.props as { 'aria-describedby'?: string })['aria-describedby'] ?? describedBy,
+        })
+      : children
+
   return (
     <div className="space-y-1.5">
-      <label htmlFor={htmlFor} className="block text-sm font-medium text-zinc-200">
-        {label}
-      </label>
-      {children}
+      <FieldLabel label={label} htmlFor={htmlFor} help={help} />
+      {content}
       {hint && !error && <p className="text-xs text-zinc-500">{hint}</p>}
       {error && (
         <p role="alert" className="text-xs text-red-400">
@@ -95,12 +216,14 @@ export function Field({
 }
 
 export function Card({
+  id,
   title,
   description,
   actions,
   children,
   className,
 }: {
+  id?: string
   title?: ReactNode
   description?: ReactNode
   actions?: ReactNode
@@ -108,7 +231,10 @@ export function Card({
   className?: string
 }) {
   return (
-    <section className={cn('rounded-xl border border-ink-800 bg-ink-900 shadow-sm', className)}>
+    <section
+      id={id}
+      className={cn('scroll-mt-6 rounded-xl border border-ink-800 bg-ink-900 shadow-sm', className)}
+    >
       {(title || actions) && (
         <header className="flex flex-wrap items-start justify-between gap-3 border-b border-ink-800 px-5 py-4">
           <div>
@@ -151,18 +277,24 @@ export function Toggle({
   onChange,
   label,
   description,
+  help,
   disabled,
 }: {
   checked: boolean
   onChange: (next: boolean) => void
   label: string
   description?: string
+  /** Long-form definition rendered in an info popover. */
+  help?: string
   disabled?: boolean
 }) {
   return (
     <div className="flex items-start justify-between gap-4 py-2">
       <div>
-        <p className="text-sm font-medium text-zinc-200">{label}</p>
+        <div className="flex items-center gap-1.5">
+          <p className="text-sm font-medium text-zinc-200">{label}</p>
+          {help && <InfoTip id={helpIdFor(label)} label={label} text={help} />}
+        </div>
         {description && <p className="text-xs text-zinc-500">{description}</p>}
       </div>
       <button
@@ -170,6 +302,7 @@ export function Toggle({
         role="switch"
         aria-checked={checked}
         aria-label={label}
+        aria-describedby={help ? helpIdFor(label) : undefined}
         disabled={disabled}
         onClick={() => onChange(!checked)}
         className={cn(
@@ -238,6 +371,14 @@ export function Spinner({ label = 'Loading' }: { label?: string }) {
   )
 }
 
+/** One-click preset for a StringListEditor (e.g. a reserved language token). */
+export type StringListPreset = {
+  /** Stored value, e.g. a reserved language token. */
+  value: string
+  /** Friendly chip/preset label shown instead of the raw value. */
+  label: string
+}
+
 /** Editable list of short strings (languages, filename tags). */
 export function StringListEditor({
   label,
@@ -246,6 +387,8 @@ export function StringListEditor({
   placeholder,
   addLabel = 'Add',
   inputLabel,
+  help,
+  presets = [],
 }: {
   label: string
   values: string[]
@@ -253,6 +396,10 @@ export function StringListEditor({
   placeholder?: string
   addLabel?: string
   inputLabel: string
+  /** Long-form definition rendered in an info popover. */
+  help?: string
+  /** One-click special entries (e.g. reserved language tokens). */
+  presets?: StringListPreset[]
 }) {
   const [text, setText] = useState('')
 
@@ -262,9 +409,15 @@ export function StringListEditor({
     setText('')
   }
 
+  const labelFor = (value: string) => presets.find((preset) => preset.value === value)?.label ?? value
+  const available = presets.filter((preset) => !values.includes(preset.value))
+
   return (
     <div className="space-y-2">
-      <span className="block text-sm font-medium text-zinc-200">{label}</span>
+      <div className="flex items-center gap-1.5">
+        <span className="block text-sm font-medium text-zinc-200">{label}</span>
+        {help && <InfoTip id={helpIdFor(label)} label={label} text={help} />}
+      </div>
       <div className="flex flex-wrap gap-2">
         {values.length === 0 && <span className="text-xs text-zinc-500">No entries yet.</span>}
         {values.map((value) => (
@@ -272,7 +425,7 @@ export function StringListEditor({
             key={value}
             className="inline-flex items-center gap-1 rounded-full border border-ink-600 bg-ink-800 px-2.5 py-1 text-xs text-zinc-200"
           >
-            {value}
+            {labelFor(value)}
             <button
               type="button"
               aria-label={`Remove ${value}`}
@@ -284,9 +437,25 @@ export function StringListEditor({
           </span>
         ))}
       </div>
+      {available.length > 0 && (
+        <div className="flex flex-wrap gap-1.5">
+          {available.map((preset) => (
+            <button
+              key={preset.value}
+              type="button"
+              aria-label={preset.label}
+              className="rounded-full border border-dashed border-ink-600 px-2.5 py-1 text-xs text-zinc-400 hover:border-accent-500 hover:text-accent-300"
+              onClick={() => onChange([...values, preset.value])}
+            >
+              + {preset.label}
+            </button>
+          ))}
+        </div>
+      )}
       <div className="flex gap-2">
         <Input
           aria-label={inputLabel}
+          aria-describedby={help ? helpIdFor(label) : undefined}
           placeholder={placeholder}
           value={text}
           onChange={(event) => setText(event.target.value)}
@@ -309,11 +478,14 @@ export function ListEditor({
   onChange,
   label,
   hint,
+  help,
 }: {
   values: number[]
   onChange: (next: number[]) => void
   label: string
   hint?: string
+  /** Long-form definition rendered in an info popover. */
+  help?: string
 }) {
   const [text, setText] = useState(values.join(', '))
   const editing = useRef(false)
@@ -349,7 +521,7 @@ export function ListEditor({
   }
 
   return (
-    <Field label={label} hint={hint ?? 'Comma-separated percentages'} htmlFor={undefined}>
+    <Field label={label} hint={hint ?? 'Comma-separated percentages'} help={help} htmlFor={undefined}>
       <Input
         aria-label={label}
         value={text}

@@ -1,0 +1,32 @@
+# Example Dubarr stack with non-default host settings.
+#
+#   cd docker
+#   cp .env.example .env    # then edit the values for your host
+#   docker compose -f docker-compose.example.yml up -d --build
+#
+# The canonical all-defaults file is docker-compose.yml. Every variable below
+# is documented once in docker/README.md.
+#
+# Zero application environment: settings and secrets are configured in the
+# first-run wizard and stored in ./config, never here (ADR-0003). PUID/PGID
+# select the container user; DUBARR_PORT only chooses the host-published port
+# (the container always listens on 8080).
+services:
+  dubarr:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: dubarr:latest
+    container_name: dubarr
+    restart: unless-stopped
+    ports:
+      - "${DUBARR_PORT:-8090}:8080"
+    environment:
+      PUID: "${PUID:-1001}"
+      PGID: "${PGID:-1001}"
+    volumes:
+      # Explicit bind mount for appliance state (database, master key, logs).
+      # Keep this on persistent storage and back it up.
+      - ./config:/config
+      # Host library, read-only: Dubarr never modifies source media in place.
+      - "${MEDIA_PATH:-/srv/media/library}:/media:ro"

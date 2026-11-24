@@ -1,6 +1,7 @@
 package gate
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/Subject412/dubarr/backend/internal/settings"
@@ -121,5 +122,164 @@ func TestRuleFromTagFilter(t *testing.T) {
 	}
 	if !r.CaseSensitive || !r.Enforce {
 		t.Errorf("rule = %+v, want case-sensitive enforced", r)
+	}
+}
+
+// TestRuleArrSource pins ADR-0009: with source_mode=arr the arr criterion is
+// the gate, tags match by label and a target without a library row fails
+// closed while the filter is enforced.
+func TestRuleArrSource(t *testing.T) {
+	r := Rule{
+		SourceMode:      SourceArr,
+		RequiredArrTags: []string{"dub"},
+		Mode:            MatchAny,
+		Enforce:         true,
+	}
+	if got := r.Classify("Shrek (2001).mkv", ArrMetadata{Found: true, Tags: []string{"Polish Dubbing", "DUB"}}); got.Status != StatusEligible {
+		t.Errorf("label match: status = %q, want eligible", got.Status)
+	}
+	if got := r.Classify("Shrek (2001).mkv", ArrMetadata{Found: true, Tags: []string{"keep"}}); got.Status != StatusWaitingForTags {
+		t.Errorf("missing arr tag: status = %q, want waiting_for_tags", got.Status)
+	}
+	// Fail closed: no arr library row at all.
+	if got := r.Classify("Shrek (2001).mkv", ArrMetadata{}); got.Status != StatusWaitingForTags {
+		t.Errorf("no arr row: status = %q, want waiting_for_tags", got.Status)
+	}
+	// The filename criterion is not consulted in arr mode.
+	r.Required = []string{"[ArcA310]"}
+	if got := r.Classify("Shrek (2001) [ArcA310].mkv", ArrMetadata{Found: true, Tags: []string{"dub"}}); got.Status != StatusEligible {
+		t.Errorf("arr mode ignored filename tag: status = %q, want eligible", got.Status)
+	}
+}
+
+// TestRuleBothSource pins AND-across-sources: adding an arr criterion can only
+// narrow eligibility.
+func TestRuleBothSource(t *testing.T) {
+	r := Rule{
+		SourceMode:      SourceBoth,
+		Required:        []string{"[ArcA310]"},
+		RequiredArrTags: []string{"dub"},
+		Mode:            MatchAny,
+		Enforce:         true,
+	}
+	if got := r.Classify("f [ArcA310].mkv", ArrMetadata{Found: true, Tags: []string{"dub"}}); got.Status != StatusEligible {
+		t.Errorf("both pass: status = %q, want eligible", got.Status)
+	}
+	if got := r.Classify("f [ArcA310].mkv", ArrMetadata{Found: true, Tags: []string{"keep"}}); got.Status != StatusWaitingForTags {
+		t.Errorf("arr fails: status = %q, want waiting_for_tags", got.Status)
+	}
+	if got := r.Classify("f.mkv", ArrMetadata{Found: true, Tags: []string{"dub"}}); got.Status != StatusWaitingForTags {
+		t.Errorf("filename fails: status = %q, want waiting_for_tags", got.Status)
+	}
+	if got := r.Classify("f [ArcA310].mkv", ArrMetadata{}); got.Status != StatusWaitingForTags {
+		t.Errorf("no arr row: status = %q, want waiting_for_tags", got.Status)
+	}
+}
+
+func TestRuleArrMatchModesAndExcluded(t *testing.T) {
+	all := Rule{SourceMode: SourceArr, RequiredArrTags: []string{"dub", "kids"}, Mode: MatchAll, Enforce: true}
+	if got := all.Classify("f.mkv", ArrMetadata{Found: true, Tags: []string{"dub"}}); got.Status != StatusWaitingForTags {
+		t.Errorf("ALL with one of two: status = %q, want waiting_for_tags", got.Status)
+	}
+	if got := all.Classify("f.mkv", ArrMetadata{Found: true, Tags: []string{"dub", "Kids"}}); got.Status != StatusEligible {
+		t.Errorf("ALL with both: status = %q, want eligible", got.Status)
+	}
+
+	rex := Rule{SourceMode: SourceArr, RequiredArrTags: []string{`^dub`}, Mode: MatchRegex, Enforce: true}
+	if got := rex.Classify("f.mkv", ArrMetadata{Found: true, Tags: []string{"dub-pl"}}); got.Status != StatusEligible {
+		t.Errorf("REGEX match: status = %q, want eligible", got.Status)
+	}
+
+	// Excluded arr tags always win, even when the required tag matched.
+	excl := Rule{
+		SourceMode:      SourceArr,
+		RequiredArrTags: []string{"dub"},
+		ExcludedArrTags: []string{"broken"},
+		Mode:            MatchAny,
+		Enforce:         true,
+	}
+	if got := excl.Classify("f.mkv", ArrMetadata{Found: true, Tags: []string{"dub", "Broken"}}); got.Status != StatusWaitingForTags {
+		t.Errorf("excluded arr tag: status = %q, want waiting_for_tags", got.Status)
+	}
+	// A regex that cannot compile must never let a target through.
+	bad := Rule{SourceMode: SourceArr, RequiredArrTags: []string{"["}, Mode: MatchRegex, Enforce: true}
+	if got := bad.Classify("f.mkv", ArrMetadata{Found: true, Tags: []string{"dub"}}); got.Status != StatusWaitingForTags {
+		t.Errorf("invalid arr regex: status = %q, want waiting_for_tags", got.Status)
+	}
+}
+
+// TestRuleArrRootFolderScoping pins that root folders are selected by
+// canonical path: a cached root outside the allowlist is not eligible.
+func TestRuleArrRootFolderScoping(t *testing.T) {
+	r := Rule{
+		SourceMode:      SourceArr,
+		RootFolderPaths: []string{"/media/movies", "/media/tv"},
+		Mode:            MatchAny,
+		Enforce:         true,
+	}
+	if got := r.Classify("f.mkv", ArrMetadata{Found: true, RootFolder: "/media/movies"}); got.Status != StatusEligible {
+		t.Errorf("allowed root: status = %q, want eligible", got.Status)
+	}
+	if got := r.Classify("f.mkv", ArrMetadata{Found: true, RootFolder: "/media/anime"}); got.Status != StatusWaitingForTags {
+		t.Errorf("other root: status = %q, want waiting_for_tags", got.Status)
+	}
+	if got := r.Classify("f.mkv", ArrMetadata{Found: true}); got.Status != StatusWaitingForTags {
+		t.Errorf("unknown root: status = %q, want waiting_for_tags", got.Status)
+	}
+}
+
+// TestRuleFilenameSourceIgnoresArrMetadata keeps ADR-0005 behaviour for the
+// default mode: legacy/zero-value rules never consult arr metadata.
+func TestRuleFilenameSourceIgnoresArrMetadata(t *testing.T) {
+	r := Rule{Required: []string{"[ArcA310]"}, Mode: MatchAny, Enforce: true}
+	if got := r.Classify("f [ArcA310].mkv", ArrMetadata{Found: true, Tags: []string{"keep"}}); got.Status != StatusEligible {
+		t.Errorf("filename mode: status = %q, want eligible", got.Status)
+	}
+	if got := r.Classify("f.mkv", ArrMetadata{Found: true, Tags: []string{"[ArcA310]"}}); got.Status != StatusWaitingForTags {
+		t.Errorf("filename mode read arr tags: status = %q, want waiting_for_tags", got.Status)
+	}
+}
+
+// TestRuleArrEmptyCriteriaFailsClosedWithoutRow pins fail-closed even when the
+// arr source has no tag/root criterion: the row itself is the criterion.
+func TestRuleArrEmptyCriteriaFailsClosedWithoutRow(t *testing.T) {
+	r := Rule{SourceMode: SourceArr, Mode: MatchAny, Enforce: true}
+	if got := r.Classify("f.mkv", ArrMetadata{}); got.Status != StatusWaitingForTags {
+		t.Errorf("no row: status = %q, want waiting_for_tags", got.Status)
+	}
+	if got := r.Classify("f.mkv", ArrMetadata{Found: true}); got.Status != StatusEligible {
+		t.Errorf("row present: status = %q, want eligible", got.Status)
+	}
+}
+
+// TestRuleFromTagFilterLegacyDefaults pins that a stored section written before
+// source_mode existed decodes as filename-only with empty arr criteria.
+func TestRuleFromTagFilterLegacyDefaults(t *testing.T) {
+	var legacy settings.TargetTagFilter
+	if err := json.Unmarshal([]byte(`{"required_filename_tags":["[ArcA310]"],"tag_match_mode":"ANY","tag_case_sensitive":false,"excluded_filename_tags":[],"enforce_tag_filter":true}`), &legacy); err != nil {
+		t.Fatalf("decode legacy section: %v", err)
+	}
+	if legacy.SourceMode != "filename" {
+		t.Errorf("source_mode = %q, want filename", legacy.SourceMode)
+	}
+	if len(legacy.RequiredArrTags) != 0 || len(legacy.ExcludedArrTags) != 0 || len(legacy.RootFolderPaths) != 0 {
+		t.Errorf("legacy arr criteria = %+v, want empty", legacy)
+	}
+	r := RuleFromTagFilter(legacy)
+	if r.SourceMode != SourceFilename {
+		t.Errorf("rule source = %q, want filename", r.SourceMode)
+	}
+	if got := r.Classify("f.mkv", ArrMetadata{Found: true, Tags: []string{"dub"}}); got.Status != StatusWaitingForTags {
+		t.Errorf("legacy gate: status = %q, want waiting_for_tags", got.Status)
+	}
+
+	r = RuleFromTagFilter(settings.TargetTagFilter{
+		SourceMode:       "arr",
+		RequiredArrTags:  []string{"dub"},
+		RootFolderPaths:  []string{"/media/movies"},
+		EnforceTagFilter: true,
+	})
+	if r.SourceMode != SourceArr || len(r.RequiredArrTags) != 1 || len(r.RootFolderPaths) != 1 {
+		t.Errorf("rule = %+v, want arr source with criteria", r)
 	}
 }

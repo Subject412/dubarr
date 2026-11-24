@@ -3,6 +3,7 @@ import { Link, Navigate, useNavigate } from 'react-router-dom'
 import { ApiError, api, type LanguagesPolicy, type SecurityOptions, type StoragePaths, type TargetTagFilter } from '../lib/api'
 import { DEFAULT_SETTINGS } from '../lib/defaults'
 import { useAuthStatus, useSaveSettings, useSettings, useSetup } from '../lib/hooks'
+import { ArrConnectionsPanel } from '../components/ArrConnections'
 import { PathField, PathListEditor } from '../components/PathPicker'
 import { cn } from '../lib/cn'
 import {
@@ -16,7 +17,7 @@ import {
   Toggle,
 } from '../components/ui'
 
-const STEPS = ['Administrator', 'Storage', 'Languages & tags', 'Security', 'Finish'] as const
+const STEPS = ['Administrator', 'Storage', 'Languages & tags', '*arr connections', 'Security', 'Finish'] as const
 
 export function SetupPage() {
   const navigate = useNavigate()
@@ -151,7 +152,7 @@ export function SetupPage() {
     event.preventDefault()
     try {
       await saveStep('security.options', security)
-      setStep(4)
+      setStep(5)
     } catch (error) {
       setStepError(error instanceof Error ? error.message : 'Could not save security options.')
     }
@@ -298,7 +299,7 @@ export function SetupPage() {
               <div>
                 <h2 className="text-lg font-semibold text-zinc-100">Languages &amp; tags</h2>
                 <p className="text-sm text-zinc-400">
-                  Tracks to import, reference languages to keep, and the Tdarr destination tag gate.
+                  Tracks to import, reference languages to keep, and which files the processing filter accepts.
                 </p>
               </div>
               {languageError && <Alert>{languageError}</Alert>}
@@ -339,7 +340,7 @@ export function SetupPage() {
                   inputLabel="Add required tag"
                   values={tagFilter.required_filename_tags}
                   onChange={(required_filename_tags) => setTagFilter({ ...tagFilter, required_filename_tags })}
-                  placeholder="[ArcA310]"
+                  placeholder="[TAG]"
                 />
               </div>
               <div className="grid gap-4 md:grid-cols-2">
@@ -384,6 +385,32 @@ export function SetupPage() {
           )}
 
           {step === 3 && (
+            <div className="space-y-5">
+              <div>
+                <h2 className="text-lg font-semibold text-zinc-100">Radarr &amp; Sonarr</h2>
+                <p className="text-sm text-zinc-400">
+                  Optional: save connections now so original-language detection and library sync work
+                  immediately. You can skip this and add or rotate API keys later under Settings.
+                </p>
+              </div>
+              <ArrConnectionsPanel />
+              <div className="flex justify-between">
+                <Button type="button" variant="ghost" onClick={() => setStep(2)}>
+                  Back
+                </Button>
+                <div className="flex gap-2">
+                  <Button type="button" variant="ghost" onClick={() => setStep(4)}>
+                    Skip for now
+                  </Button>
+                  <Button type="button" onClick={() => setStep(4)}>
+                    Continue
+                  </Button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {step === 4 && (
             <form onSubmit={(event) => void submitSecurity(event)} className="space-y-5">
               <div>
                 <h2 className="text-lg font-semibold text-zinc-100">Security</h2>
@@ -407,7 +434,7 @@ export function SetupPage() {
               />
               <Toggle
                 label="Allow force tag override"
-                description="Permit per-item bypass of the destination tag gate."
+                description="Permit per-item bypass of the processing filter."
                 checked={security.allow_force_tag_override}
                 onChange={(allow_force_tag_override) => setSecurity({ ...security, allow_force_tag_override })}
               />
@@ -422,7 +449,7 @@ export function SetupPage() {
                 onChange={(require_av1_strict) => setSecurity({ ...security, require_av1_strict })}
               />
               <div className="flex justify-between">
-                <Button type="button" variant="ghost" onClick={() => setStep(2)}>
+                <Button type="button" variant="ghost" onClick={() => setStep(3)}>
                   Back
                 </Button>
                 <Button type="submit" disabled={saveSettings.isPending}>
@@ -432,7 +459,7 @@ export function SetupPage() {
             </form>
           )}
 
-          {step === 4 && (
+          {step === 5 && (
             <div className="space-y-5">
               <div>
                 <h2 className="text-lg font-semibold text-zinc-100">Ready to go</h2>
@@ -465,7 +492,7 @@ export function SetupPage() {
                 </div>
               </dl>
               <div className="flex justify-between">
-                <Button type="button" variant="ghost" onClick={() => setStep(3)}>
+                <Button type="button" variant="ghost" onClick={() => setStep(4)}>
                   Back
                 </Button>
                 <Button type="button" onClick={() => navigate('/library', { replace: true })}>

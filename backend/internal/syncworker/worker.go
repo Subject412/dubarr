@@ -33,6 +33,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -43,6 +44,7 @@ import (
 	"github.com/Subject412/dubarr/backend/internal/mux"
 	"github.com/Subject412/dubarr/backend/internal/settings"
 	"github.com/Subject412/dubarr/backend/internal/store"
+	"github.com/Subject412/dubarr/backend/internal/transcode"
 	"github.com/Subject412/dubarr/backend/internal/workdir"
 )
 
@@ -60,6 +62,10 @@ var (
 	// ErrUnmuxableVerdict reports a report the sync analysis itself rejected
 	// (drifting, unreliable, out_of_range). Mux is never attempted.
 	ErrUnmuxableVerdict = errors.New("syncworker: sync report is not muxable")
+	// ErrEncoderUnavailable reports that an enabled Transcode Rule needs an
+	// ffmpeg encoder this host does not provide (ADR-0010). The job fails
+	// before any analysis, staging or mux work starts.
+	ErrEncoderUnavailable = errors.New("syncworker: required audio encoder is unavailable")
 )
 
 // Executor is the M4-6 analysis seam. *syncjob.Service satisfies it.
@@ -77,6 +83,17 @@ type Rescanner interface {
 	RescanAfterMux(ctx context.Context, row arrrescan.LibraryCacheRow) error
 }
 
+// Transcoder is the ADR-0010 opt-in audio encode seam. *transcode.Transcoder
+// satisfies it; tests inject a fake to assert the plan and the failure paths.
+type Transcoder interface {
+	// EncoderAvailable is the pre-job check: a missing libopus must surface
+	// as ErrEncoderUnavailable before any work happens.
+	EncoderAvailable(ctx context.Context, encoder string) (bool, string)
+	// Transcode performs one ffmpeg pass on the Work Area copy and verifies
+	// the result.
+	Transcode(ctx context.Context, req transcode.Request) (transcode.Result, error)
+}
+
 // Dependencies configure a Worker.
 type Dependencies struct {
 	// Store persists sync job state and reads the vault/library rows. Required.
@@ -91,6 +108,10 @@ type Dependencies struct {
 	Muxer Muxer
 	// Rescanner notifies the arr instance after a publish. Required.
 	Rescanner Rescanner
+	// Transcoder applies opt-in Transcode Rules (ADR-0010). Optional: nil
+	// builds the ffmpeg-backed transcoder, so the composition root needs no
+	// extra wiring and a host without ffmpeg fails only the affected job.
+	Transcoder Transcoder
 	// WorkDir is storage.paths.work_dir (the Work Area root). Required.
 	WorkDir string
 	// Interval is the idle cadence; 0 selects DefaultInterval.
@@ -101,14 +122,15 @@ type Dependencies struct {
 
 // Worker consumes queued sync jobs serially.
 type Worker struct {
-	store     *store.Store
-	settings  *settings.Store
-	executor  Executor
-	muxer     Muxer
-	rescanner Rescanner
-	workDir   string
-	interval  time.Duration
-	logf      func(string, ...any)
+	store      *store.Store
+	settings   *settings.Store
+	executor   Executor
+	muxer      Muxer
+	rescanner  Rescanner
+	transcoder Transcoder
+	workDir    string
+	interval   time.Duration
+	logf       func(string, ...any)
 
 	mu      sync.Mutex
 	started bool
@@ -145,15 +167,20 @@ func New(deps Dependencies) (*Worker, error) {
 	if logf == nil {
 		logf = log.Printf
 	}
+	transcoder := deps.Transcoder
+	if transcoder == nil {
+		transcoder = transcode.New(transcode.Dependencies{})
+	}
 	return &Worker{
-		store:     deps.Store,
-		settings:  deps.Settings,
-		executor:  deps.Executor,
-		muxer:     deps.Muxer,
-		rescanner: deps.Rescanner,
-		workDir:   deps.WorkDir,
-		interval:  interval,
-		logf:      logf,
+		store:      deps.Store,
+		settings:   deps.Settings,
+		executor:   deps.Executor,
+		muxer:      deps.Muxer,
+		rescanner:  deps.Rescanner,
+		transcoder: transcoder,
+		workDir:    deps.WorkDir,
+		interval:   interval,
+		logf:       logf,
 	}, nil
 }
 
@@ -283,6 +310,21 @@ func (w *Worker) processJob(ctx context.Context, id int64) error {
 		return fmt.Errorf("syncworker: job %d not found", id)
 	}
 
+	// ADR-0010: Transcode Rules are matched against PRE-TEMPO vault-track
+	// metadata and the required encoder is verified BEFORE the job does any
+	// work, so a missing libopus fails with a clear error instead of midway
+	// through an encode (Q19).
+	plan, track, err := w.transcodePlan(ctx, rec)
+	if err != nil {
+		return err
+	}
+	if plan.Encode() {
+		if available, detail := w.transcoder.EncoderAvailable(ctx, plan.Encoder()); !available {
+			return fmt.Errorf("%w: rule %d needs %s for audio track %d: %s",
+				ErrEncoderUnavailable, plan.RuleIndex+1, plan.Encoder(), rec.TargetTrackID, detail)
+		}
+	}
+
 	report, err := w.executor.Execute(ctx, id)
 	if err != nil {
 		return err
@@ -314,6 +356,11 @@ func (w *Worker) processJob(ctx context.Context, id int64) error {
 	if err != nil {
 		return err
 	}
+	if plan.Encode() {
+		if audio, err = w.transcodeStaged(ctx, id, audio, plan, track); err != nil {
+			return err
+		}
+	}
 	offset := medianOffsetMS(report.OffsetsMS)
 	rule, err := w.gateRule(ctx)
 	if err != nil {
@@ -328,15 +375,24 @@ func (w *Worker) processJob(ctx context.Context, id int64) error {
 		return err
 	}
 
-	_, err = w.muxer.Mux(ctx, mux.Job{
+	opts, optsOK := w.muxOptions(ctx)
+	mode, outputDir, err := w.outputDestination(ctx, opts)
+	if err != nil {
+		return err
+	}
+	res, err := w.muxer.Mux(ctx, mux.Job{
 		ID:             id,
 		WorkDir:        w.workDir,
 		TargetPath:     targetPath,
 		TargetLangISO2: rec.TargetLangISO2,
 		AudioPath:      audio,
 		SyncOffsetMS:   offset,
-		TrackTitle:     w.trackTitle(ctx),
+		TrackTitle:     w.trackTitle(opts),
+		KeepBak:        keepBak(opts, optsOK),
+		OutputMode:     mode,
+		OutputDir:      outputDir,
 		Gate:           rule,
+		Arr:            gate.ArrMetadata{Found: true, Tags: lib.ArrTagLabels, RootFolder: lib.RootFolderPath},
 		Force:          w.forceOverride(ctx),
 		Report:         report,
 		Candidates:     candidates,
@@ -345,11 +401,22 @@ func (w *Worker) processJob(ctx context.Context, id int64) error {
 		return err
 	}
 
-	// M5-4: rescan is best-effort and never undoes a published mux.
-	if row, err := w.rescanRow(ctx, rec.TargetLibraryCacheID); err != nil {
-		w.logf("syncworker: job %d rescan skipped: %v", id, err)
-	} else if err := w.rescanner.RescanAfterMux(ctx, row); err != nil {
-		w.logf("syncworker: job %d rescan: %v", id, err)
+	// ADR-0011: record where the file landed so the API/UI can show it. This
+	// write must outlive a shutdown cancellation (the mux already published);
+	// a failure is logged and never undoes the publish.
+	if err := w.store.SetSyncJobOutputPath(context.WithoutCancel(ctx), id, res.OutputPath); err != nil {
+		w.logf("syncworker: job %d output path: %v", id, err)
+	}
+
+	// M5-4: rescan is best-effort and never undoes a published mux. Separate
+	// mode leaves the library Target untouched, so there is nothing for the
+	// arr to rescan (ADR-0011).
+	if mode != settings.MuxOutputSeparate {
+		if row, err := w.rescanRow(ctx, rec.TargetLibraryCacheID); err != nil {
+			w.logf("syncworker: job %d rescan skipped: %v", id, err)
+		} else if err := w.rescanner.RescanAfterMux(ctx, row); err != nil {
+			w.logf("syncworker: job %d rescan: %v", id, err)
+		}
 	}
 
 	// The mux already published, so the terminal status write must outlive a
@@ -507,19 +574,199 @@ func (w *Worker) forceOverride(ctx context.Context) bool {
 	return sec.AllowForceTagOverride
 }
 
-func (w *Worker) trackTitle(ctx context.Context) string {
+func (w *Worker) trackTitle(opts settings.MuxOptions) string {
+	return strings.TrimSpace(opts.TrackTitleInMKV)
+}
+
+// muxOptions reads settings mux.options once per job. ok=false means the
+// settings are unavailable, and the caller falls back to the shipped defaults
+// (empty track title, backups kept).
+func (w *Worker) muxOptions(ctx context.Context) (settings.MuxOptions, bool) {
 	if w.settings == nil {
-		return ""
+		return settings.MuxOptions{}, false
 	}
 	raw, ok, err := w.settings.Get(ctx, settings.KeyMuxOptions)
 	if err != nil || !ok {
-		return ""
+		return settings.MuxOptions{}, false
 	}
 	var opts settings.MuxOptions
 	if json.Unmarshal(raw, &opts) != nil {
-		return ""
+		return settings.MuxOptions{}, false
 	}
-	return strings.TrimSpace(opts.TrackTitleInMKV)
+	return opts, true
+}
+
+// audioOptions reads settings audio.options once per job. ok=false means the
+// section is absent (a legacy database), which means no rules at all.
+func (w *Worker) audioOptions(ctx context.Context) (settings.AudioOptions, bool, error) {
+	if w.settings == nil {
+		return settings.AudioOptions{}, false, nil
+	}
+	raw, ok, err := w.settings.Get(ctx, settings.KeyAudioOptions)
+	if err != nil {
+		return settings.AudioOptions{}, false, fmt.Errorf("syncworker: read audio.options: %w", err)
+	}
+	if !ok {
+		return settings.AudioOptions{}, false, nil
+	}
+	var opts settings.AudioOptions
+	if err := json.Unmarshal(raw, &opts); err != nil {
+		return settings.AudioOptions{}, false, fmt.Errorf("syncworker: decode audio.options: %w", err)
+	}
+	return opts, true, nil
+}
+
+// transcodePlan resolves the first matching Transcode Rule against the vault
+// track's PRE-TEMPO metadata (Q19). It always returns the vault track row so
+// the encode step can verify against its channels/duration. A missing or empty
+// rule list is not an error: the job keeps the historical copy behaviour.
+func (w *Worker) transcodePlan(ctx context.Context, rec store.SyncJobRecord) (transcode.Plan, store.VaultTrackRecord, error) {
+	track, ok, err := w.store.VaultTrackByID(ctx, rec.TargetTrackID)
+	if err != nil {
+		return transcode.Plan{}, store.VaultTrackRecord{}, err
+	}
+	if !ok {
+		return transcode.Plan{}, store.VaultTrackRecord{}, fmt.Errorf("syncworker: vault track %d not found", rec.TargetTrackID)
+	}
+	opts, found, err := w.audioOptions(ctx)
+	if err != nil {
+		return transcode.Plan{}, store.VaultTrackRecord{}, err
+	}
+	if !found || len(opts.Rules) == 0 {
+		return transcode.Plan{}, track, nil
+	}
+	plan, matched := transcode.Match(opts.Rules, transcode.TrackMeta{
+		Codec:         track.Codec,
+		ChannelCount:  track.ChannelCount,
+		ChannelLayout: track.Channels,
+		BitrateBPS:    track.BitrateBPS,
+		SampleRate:    track.SampleRate,
+		LangISO2:      track.LangISO2,
+		Variant:       track.Variant,
+	})
+	if !matched {
+		return transcode.Plan{}, track, nil
+	}
+	return plan, track, nil
+}
+
+// transcodeStaged applies a matched rule to the Copy-on-Work .mka Execute
+// staged. The vault file is never opened here (ADR-0002); the output lives in
+// the same job directory so mux's confinement check still accepts it.
+//
+// Timing and transcoding are one encode (Q20): the mux path's offset is an
+// mkvmerge `--sync` flag, not a re-encode, and any tempo factor must be folded
+// into this same plan (Plan.WithTempo) rather than applied as a second pass.
+// Language and title survive because mux writes them onto the appended track
+// (mux.options.track_title_in_mkv), and the encode carries the language tag.
+func (w *Worker) transcodeStaged(ctx context.Context, jobID int64, audio string, plan transcode.Plan, track store.VaultTrackRecord) (string, error) {
+	out := filepath.Join(w.workDir, "jobs", strconv.FormatInt(jobID, 10), "audio.transcoded.mka")
+	res, err := w.transcoder.Transcode(ctx, transcode.Request{
+		Input:            audio,
+		Output:           out,
+		Plan:             plan,
+		SourceChannels:   track.ChannelCount,
+		SourceDurationMS: track.DurationMS,
+		LangISO2:         track.LangISO2,
+	})
+	if err != nil {
+		return "", fmt.Errorf("syncworker: job %d transcode (rule %d): %w", jobID, plan.RuleIndex+1, err)
+	}
+	w.logf("syncworker: job %d transcoded rule %d to %s (%d ch, %d bps)", jobID, plan.RuleIndex+1, res.Codec, res.Channels, res.BitrateBPS)
+	return res.Path, nil
+}
+
+// keepBak maps mux.options.keep_bak onto mux.Job.KeepBak: only an explicit
+// false becomes a pointer, so the muxer's default (keep) survives a missing or
+// unreadable settings row.
+func keepBak(opts settings.MuxOptions, ok bool) *bool {
+	if ok && !opts.KeepBak {
+		discard := false
+		return &discard
+	}
+	return nil
+}
+
+// outputDestination resolves mux.options.output_mode and re-validates
+// storage.paths.output_dir in the worker (ADR-0011). The settings API already
+// checks the shape, but a row can be edited directly in SQLite, and the
+// EvalSymlinks-resolved vault guard is only meaningful here.
+//
+// replace mode returns the empty output dir; Mux then publishes in place.
+func (w *Worker) outputDestination(ctx context.Context, opts settings.MuxOptions) (string, string, error) {
+	mode := strings.TrimSpace(opts.OutputMode)
+	if mode == "" {
+		mode = settings.MuxOutputReplace
+	}
+	if mode != settings.MuxOutputSeparate {
+		// An unknown mode is rejected by the muxer itself.
+		return mode, "", nil
+	}
+	if w.settings == nil {
+		return "", "", fmt.Errorf("%w: storage.paths is unavailable", mux.ErrOutputDir)
+	}
+	raw, ok, err := w.settings.Get(ctx, settings.KeyStoragePaths)
+	if err != nil {
+		return "", "", fmt.Errorf("syncworker: read storage.paths: %w", err)
+	}
+	if !ok {
+		return "", "", fmt.Errorf("%w: storage.paths is not configured", mux.ErrOutputDir)
+	}
+	var paths settings.StoragePaths
+	if err := json.Unmarshal(raw, &paths); err != nil {
+		return "", "", fmt.Errorf("%w: decode storage.paths: %v", mux.ErrOutputDir, err)
+	}
+	if strings.TrimSpace(paths.OutputDir) == "" {
+		return "", "", fmt.Errorf("%w: separate output mode requires storage.paths.output_dir", mux.ErrOutputDir)
+	}
+	resolved, err := resolveOutputRoot(paths.OutputDir)
+	if err != nil {
+		return "", "", err
+	}
+	// ADR-0002: never write into the Audio Vault. Compare canonical paths when
+	// the vault exists, and fall back to the cleaned lexical paths otherwise.
+	if strings.TrimSpace(paths.VaultDir) != "" {
+		vault := filepath.Clean(paths.VaultDir)
+		if abs, err := filepath.Abs(vault); err == nil {
+			vault = abs
+		}
+		if canonical, err := filepath.EvalSymlinks(vault); err == nil {
+			vault = canonical
+		}
+		if withinDir(vault, resolved) {
+			return "", "", fmt.Errorf("%w: %s is the vault folder or inside it", mux.ErrOutputDir, resolved)
+		}
+	}
+	return settings.MuxOutputSeparate, resolved, nil
+}
+
+// resolveOutputRoot canonicalizes and checks the separate-mode destination root.
+func resolveOutputRoot(dir string) (string, error) {
+	abs, err := filepath.Abs(strings.TrimSpace(dir))
+	if err != nil {
+		return "", fmt.Errorf("%w: %s: %v", mux.ErrOutputDir, dir, err)
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", fmt.Errorf("%w: %s: %v", mux.ErrOutputDir, dir, err)
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return "", fmt.Errorf("%w: %s: %v", mux.ErrOutputDir, dir, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("%w: %s is not a directory", mux.ErrOutputDir, resolved)
+	}
+	return resolved, nil
+}
+
+// withinDir reports whether target is root or below it.
+func withinDir(root, target string) bool {
+	rel, err := filepath.Rel(root, target)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
 }
 
 // cleanup removes {WORK_DIR}/jobs/{id}/ after a failure. Cleanup errors are

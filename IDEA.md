@@ -33,7 +33,7 @@
 
 ### What Dubarr DOES NOT DO (Strict Boundaries):
 * **Does NOT transcode video** (e.g., to AV1)—an external pipeline (**Tdarr**) handles video transcoding and audio track cleanup. Video streams in target files must always remain untouched (`copy`).
-* **Does NOT re-encode lossy audio tracks** (AAC, AC3, E-AC3, Opus) unless forced by an FPS/tempo adjustment (in which case only that single incoming track copy is re-encoded).
+* **Does NOT re-encode lossy audio tracks** (AAC, AC3, E-AC3, Opus) unless forced by an FPS/tempo adjustment (in which case only that single incoming track copy is re-encoded) or unless an explicit, user-configured **Transcode Rule** matches (ADR-0010). Transcode Rules apply only to a Work Area copy and never modify the Audio Vault, which remains write-once and lossless.
 * **Does NOT modify or write inside `VAULT_DIR`** after initial atomic import of an `.mka` track.
 * **Does NOT accept application settings or API keys via environment variables.**
 * **Does NOT use Python** in runtime (neither in Docker nor natively)—to keep memory footprint minimal and distribution lightweight.
@@ -105,7 +105,7 @@ Dubarr separates five logical storage areas (configured via the Setup Wizard / S
      * Every `.mka` always ends with `.{iso2}.mka` and carries embedded Matroska track tags (`LanguageIETF` / legacy `Language` + track title) written during extraction.
 4. **`WORK_DIR`** (e.g., `/config/work` or a dedicated fast SSD mount `/work`) — Isolated scratch workspace:
    * `{WORK_DIR}/extract/{import_id}/` — Staging area for lossless extraction + `ffprobe` validation before atomic placement into `VAULT_DIR`.
-   * `{WORK_DIR}/jobs/{job_id}/` — Per-job workspace holding **copied** `.mka` files from `VAULT_DIR`, WAV chunks, `.ogg` studio previews, and tempo-adjusted audio files.
+   * `{WORK_DIR}/jobs/{job_id}/` — Per-job workspace holding **copied** `.mka` files from `VAULT_DIR`, WAV chunks, `.ogg` studio previews, tempo-adjusted audio files, and Work Area-only transcoded audio copies.
 5. **`MEDIA_ROOTS`** (e.g., `/media/...`) — Target media library folders with Radarr/Sonarr **Path Mappings** (e.g., `/data/media/movies` -> `/media/movies`).
 
 ### 3.4. Vault Immutability (Copy-on-Work Contract)
@@ -154,7 +154,7 @@ CREATE TABLE IF NOT EXISTS api_tokens (
 );
 
 -- 2. Application settings (JSON-serialized values stored in App Data folder)
--- Keys include: storage.paths, languages.policy, target.tag_filter, sync.defaults, security.options
+- Keys include: storage.paths, languages.policy, target.tag_filter, sync.defaults, security.options, mux.options, audio.options (ordered opt-in Transcode Rules; empty by default)
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,
@@ -390,9 +390,17 @@ Checking only the start of a movie fails to detect FPS drift or mid-movie edits.
 
 5.3. Final Muxing Rules
 
-Always read audio from {WORK_DIR}/jobs/{job_id}/, never from VAULT_DIR. Pass --language 0:{target_lang_iso2} (MKVToolNix natively converts ISO 639-1 two-letter codes such as pl into both LanguageIETF and legacy Matroska Language).
+Always read audio from {WORK_DIR}/jobs/{job_id}/, never from VAULT_DIR. Pass --language 0:{target_lang_iso2} (MKVToolNix natively converts ISO 639-1 two-letter codes such as pl into both LanguageIETF and legacy Matroska Language), and preserve the configured track_title_in_mkv.
 
-    Case 1 (speed_mode == 'none'):
+    Case 0 (an enabled Transcode Rule matches the Work Area copy — ADR-0010):
+
+        Rules are ordered and global; conditions match the PRE-TEMPO vault-track metadata (codec, channels/layout, bitrate, sample rate, language, variant) and the first matching rule wins. The action may keep the track or re-encode it to Opus, AAC, FLAC or PCM with explicit bitrate/channels/layout/sample rate. A matching rule with codec `keep` stops evaluation.
+
+        The re-encode reads the copied vault track and writes a temporary MKA in {WORK_DIR}/jobs/{job_id}/ using one ffmpeg invocation; if a tempo factor exists it is applied in the SAME pass (precedence: tempo first in the filter chain so the encoder sees the tempo-corrected stream; ffmpeg ordering documented in code). ffmpeg then runs ffprobe on the result and verifies the requested codec, channel count and duration within tolerance. Any mismatch fails the job with a clear error; the required encoder must be available before the job starts.
+
+        The Audio Vault file is never written; its SHA-256 is unchanged. Language tags and the configured track title are carried onto the appended track by mkvmerge exactly as in the other cases. Tracks archived before Transcode Rules existed carry NULL bitrate/sample_rate, so bitrate/sample-rate conditions match only archives recorded with metadata (fresh or re-archived).
+
+    Case 1 (speed_mode == 'none', no matching Transcode Rule):
 
         Invoke mkvmerge:
         Bash
@@ -431,7 +439,7 @@ Authentication, Setup & Settings
 
     GET /api/auth/tokens / POST /api/auth/tokens / DELETE /api/auth/tokens/{id} — manage hashed automation API tokens.
 
-    GET /api/settings / PUT /api/settings — read/update storage.paths (watch_dir, vault_dir, work_dir, media_roots), languages.policy (target languages, export mode, commentary exclusion), target.tag_filter (required/excluded filename tags, match mode, enforce toggle), and sync.defaults.
+    GET /api/settings / PUT /api/settings — read/update storage.paths (watch_dir, vault_dir, work_dir, media_roots), languages.policy (target languages, export mode, commentary exclusion), target.tag_filter (required/excluded filename tags, match mode, enforce toggle), mux.options (backup, track title, output mode), audio.options (ordered opt-in Transcode Rules; absent/empty means lossless copy), and sync.defaults.
 
     GET /api/settings/export — exports sanitized configuration JSON excluding all API keys, hashes, and master keys.
 

@@ -5,10 +5,32 @@
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Dubarr</title>
-    <script type="module" crossorigin src="/assets/index-D0LDJLlF.js"></script>
-    <link rel="stylesheet" crossorigin href="/assets/index-DG0DYJ-B.css">
+    <script>
+      // Resolve the stored theme before first paint so light mode never
+      // flashes the dark default. Mirrored by src/lib/theme.ts.
+      ;(function () {
+        try {
+          var stored = window.localStorage.getItem('dubarr.theme')
+          var preference =
+            stored === 'light' || stored === 'dark' || stored === 'system' ? stored : 'dark'
+          var dark = preference === 'dark'
+          if (preference === 'system') {
+            dark =
+              typeof window.matchMedia !== 'function' ||
+              window.matchMedia('(prefers-color-scheme: dark)').matches
+          }
+          var theme = dark ? 'dark' : 'light'
+          document.documentElement.dataset.theme = theme
+          document.documentElement.style.colorScheme = theme
+        } catch (error) {
+          document.documentElement.dataset.theme = 'dark'
+        }
+      })()
+    </script>
+    <script type="module" crossorigin src="/assets/index-B-untJcs.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-BKCzU3Iz.css">
   </head>
-  <body class="bg-ink-950">
+  <body>
     <div id="root"></div>
   </body>
 </html>

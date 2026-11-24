@@ -76,6 +76,7 @@ func RegisterRoutes(mux *http.ServeMux, deps Dependencies) *Service {
 	mux.HandleFunc("POST /api/auth/login", s.handleLogin)
 	mux.HandleFunc("POST /api/auth/logout", s.handleLogout)
 	mux.Handle("GET /api/auth/me", s.RequireAuth(http.HandlerFunc(s.handleMe)))
+	mux.Handle("POST /api/auth/password", s.RequireAuth(http.HandlerFunc(s.handleChangePassword)))
 
 	mux.Handle("GET /api/auth/tokens", s.RequireAuth(http.HandlerFunc(s.handleListTokens)))
 	mux.Handle("POST /api/auth/tokens", s.RequireAdmin(http.HandlerFunc(s.handleCreateToken)))

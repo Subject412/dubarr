@@ -65,6 +65,19 @@ func TestWireScannerClassifiesTaggedMKV(t *testing.T) {
 	if err := settingsStore.Set(ctx, settings.KeyWatchOptions, watchRaw); err != nil {
 		t.Fatalf("set watch options: %v", err)
 	}
+	// ADR-0012 ships an empty default; this test asserts a configured marker on
+	// the donor filename, so it sets the criterion explicitly.
+	tagRaw, err := json.Marshal(settings.TargetTagFilter{
+		RequiredFilenameTags: []string{"[ArcA310]"},
+		TagMatchMode:         "ANY",
+		EnforceTagFilter:     true,
+	})
+	if err != nil {
+		t.Fatalf("marshal tag filter: %v", err)
+	}
+	if err := settingsStore.Set(ctx, settings.KeyTargetTagFilter, tagRaw); err != nil {
+		t.Fatalf("set tag filter: %v", err)
+	}
 
 	sc, err := wireScanner(ctx, scannerWiring{
 		Settings: settingsStore,

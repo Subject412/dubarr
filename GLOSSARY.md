@@ -90,10 +90,40 @@ _Avoid_: unknown track
 The configurable rules deciding which donor tracks are pre-selected and kept: target languages, original language, extra reference languages, commentary exclusion. By default every policy-selected track is exported; keeping tracks beyond the policy requires explicit opt-in.
 _Avoid_: language rules, import policy
 
-**Tdarr Gate**:
-The filename-tag eligibility check ensuring only Tdarr-processed targets are synced/muxed; the tags mark the Tdarr node/GPU that processed the file. Donor ingestion into the Vault is never gated.
-_Avoid_: tag filter (when meaning the eligibility concept)
+**Processing Gate** (formerly **Tdarr Gate**):
+The eligibility check deciding whether a Target may be synced or muxed. It combines a filename-tag criterion with an optional arr-metadata criterion (arr tags and root folders); the two sources are AND-ed. Donor ingestion into the Audio Vault is never gated. "Tdarr Gate" remains a deprecated alias for the filename-tag-only form.
+_Avoid_: tag filter (when meaning the eligibility concept), Tdarr Gate (for the combined check)
+
+**Eligibility Source**:
+The origin of a Processing Gate criterion: `filename` (tags in the Target's basename), `arr` (Radarr/Sonarr tags and root folders), or `both`.
+_Avoid_: gate mode
 
 **Eligibility Status**:
-A target's state: eligible (required tags present), waiting_for_tags (tags missing, blocked while enforced), or missing_target (no file found).
+A target's state: eligible (all required criteria present), waiting_for_tags (criteria missing, blocked while enforced), or missing_target (no file found).
 _Avoid_: tag status
+
+### Output and processing
+
+**Output Mode**:
+The mux publication policy: `replace` (atomically replace the Target in place, with an optional backup) or `separate` (write the validated result to a configured output directory, leaving the Target untouched).
+_Avoid_: mux mode, save mode
+
+**Mux Output Path**:
+The final path of a published mux result, recorded on the sync job so the UI can show where the file landed.
+_Avoid_: output file (when meaning the recorded path)
+
+**Reference Language Token**:
+A reserved entry in Extra reference languages: `org` expands to the arr-reported Original Language, `all` expands to every usable shared language between the Donor Group and the Target.
+_Avoid_: magic language code
+
+**Prefer Original Language**:
+The policy making the arr-reported Original Language the first-choice Reference Language unless it equals a Target Language.
+_Avoid_: original-first flag
+
+**Transcode Rule**:
+An ordered condition/action pair applied to the Work Area copy of a vault track before muxing. The first matching rule selects the output codec, channels, bitrate and sample rate; with no rules the track is copied untouched. Rules never modify the Audio Vault.
+_Avoid_: profile, preset (when meaning a single rule)
+
+**Log Sink**:
+A destination for redacted log entries: stderr, a bounded in-memory ring buffer for the GUI, or an optional rotating file under DATA_DIR.
+_Avoid_: log target

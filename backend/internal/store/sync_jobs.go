@@ -26,6 +26,10 @@ type SyncJobRecord struct {
 	CreatedAt            string
 	UpdatedAt            string
 	WorkDirPath          string
+	// OutputPath is where the mux published the file (ADR-0011). In replace
+	// mode it is the Target; in separate mode it is the file inside
+	// storage.paths.output_dir. Empty until a mux has completed.
+	OutputPath string
 }
 
 // SyncJobCreate is the insert shape for POST /api/sync/jobs.
@@ -75,7 +79,7 @@ const syncJobColumns = `
 	       COALESCE(checkpoints_json, '[]'),
 	       COALESCE(error_message, ''),
 	       COALESCE(created_at, ''), COALESCE(updated_at, ''),
-	       COALESCE(work_dir_path, '')
+	       COALESCE(work_dir_path, ''), COALESCE(output_path, '')
 	FROM sync_mux_jobs`
 
 func scanSyncJob(scanner interface{ Scan(...any) error }) (SyncJobRecord, error) {
@@ -83,7 +87,7 @@ func scanSyncJob(scanner interface{ Scan(...any) error }) (SyncJobRecord, error)
 	err := scanner.Scan(&rec.ID, &rec.TargetTrackID, &rec.TargetLibraryCacheID,
 		&rec.TargetVideoPath, &rec.TargetLangISO2, &rec.Status, &rec.SyncMethod,
 		&rec.CalculatedOffsetMS, &rec.CheckpointsJSON, &rec.ErrorMessage,
-		&rec.CreatedAt, &rec.UpdatedAt, &rec.WorkDirPath)
+		&rec.CreatedAt, &rec.UpdatedAt, &rec.WorkDirPath, &rec.OutputPath)
 	return rec, err
 }
 
@@ -162,9 +166,30 @@ func (s *Store) SetSyncJobStatus(ctx context.Context, id int64, status, errMessa
 	return nil
 }
 
+// SetSyncJobOutputPath records where a completed mux published the file
+// (ADR-0011). An empty path clears the column.
+func (s *Store) SetSyncJobOutputPath(ctx context.Context, id int64, path string) error {
+	res, err := s.DB.ExecContext(ctx, `
+		UPDATE sync_mux_jobs
+		SET output_path = NULLIF(?, ''), updated_at = CURRENT_TIMESTAMP
+		WHERE id = ?`, path, id)
+	if err != nil {
+		return fmt.Errorf("store: set sync job %d output path: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: set sync job %d output path rows: %w", id, err)
+	}
+	if n == 0 {
+		return fmt.Errorf("store: sync job %d not found", id)
+	}
+	return nil
+}
+
 // LibraryCacheJobTarget is the arr library row a sync job needs: the target
-// video path, its gate verdict and the original language for reference
-// resolution.
+// video path, its gate verdict, the original language for reference resolution
+// and the arr metadata (tag labels + canonical root folder, ADR-0009) the gate
+// re-check consumes.
 type LibraryCacheJobTarget struct {
 	ID                   int64
 	TargetFilePath       string
@@ -172,6 +197,8 @@ type LibraryCacheJobTarget struct {
 	MatchesTargetTags    bool
 	OriginalLanguageISO2 string
 	MediaType            string
+	ArrTagLabels         []string
+	RootFolderPath       string
 }
 
 // LibraryCacheJobTargetByID reads the sync-relevant columns of one
@@ -182,12 +209,15 @@ func (s *Store) LibraryCacheJobTargetByID(ctx context.Context, id int64) (Librar
 		target sql.NullString
 		elig   sql.NullString
 		orig   sql.NullString
+		root   sql.NullString
+		labels string
 	)
 	err := s.DB.QueryRowContext(ctx, `
 		SELECT id, target_file_path, eligibility_status, matches_target_tags,
-		       original_language_iso2, media_type
+		       original_language_iso2, media_type,
+		       COALESCE(arr_tag_labels_json, '[]'), COALESCE(root_folder_path, '')
 		FROM arr_library_cache WHERE id = ?`, id).
-		Scan(&rec.ID, &target, &elig, &rec.MatchesTargetTags, &orig, &rec.MediaType)
+		Scan(&rec.ID, &target, &elig, &rec.MatchesTargetTags, &orig, &rec.MediaType, &labels, &root)
 	if errors.Is(err, sql.ErrNoRows) {
 		return LibraryCacheJobTarget{}, false, nil
 	}
@@ -197,6 +227,15 @@ func (s *Store) LibraryCacheJobTargetByID(ctx context.Context, id int64) (Librar
 	rec.TargetFilePath = target.String
 	rec.EligibilityStatus = elig.String
 	rec.OriginalLanguageISO2 = orig.String
+	rec.RootFolderPath = root.String
+	// Legacy rows carry '[]' from the column default; a malformed snapshot is
+	// reported rather than treated as untagged, because that would silently
+	// change an arr gate verdict.
+	var snapshot LibraryCacheItem
+	if err := decodeArrTagSnapshot("[]", labels, &snapshot); err != nil {
+		return LibraryCacheJobTarget{}, false, err
+	}
+	rec.ArrTagLabels = snapshot.ArrTagLabels
 	return rec, true, nil
 }
 

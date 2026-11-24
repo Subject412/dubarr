@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"reflect"
 	"testing"
 	"time"
 
@@ -83,7 +84,7 @@ func TestRadarrClientReadsAgainstMock(t *testing.T) {
 					QualityProfileID: 4, Monitored: true, HasFile: true,
 					OriginalLanguage: arr.Language{ID: 1, Name: "English"},
 				}
-				if got != want {
+				if !reflect.DeepEqual(got, want) {
 					t.Errorf("movie[0] = %+v, want %+v", got, want)
 				}
 				if movies[1].Monitored || movies[1].HasFile {

@@ -94,6 +94,24 @@ type AudioTrack struct {
 	LanguageISO2B string      `json:"language_iso2b"`
 	Title         string      `json:"title"`
 	Disposition   Disposition `json:"disposition"`
+	// BitrateBPS is the stream's nominal bitrate (ffprobe `bit_rate`, bps) and
+	// SampleRate its sample rate in Hz. Both are 0 when the container omits
+	// them; Transcode Rules treat a configured threshold on an unknown value as
+	// non-matching rather than guessing.
+	BitrateBPS int `json:"bitrate_bps"`
+	SampleRate int `json:"sample_rate"`
+	// Duration is the stream's own duration (ffprobe `duration`, seconds). It
+	// differs from the container duration when donor tracks have unequal
+	// lengths, and extraction validates each output against this value.
+	Duration time.Duration `json:"duration"`
+}
+
+// IsCommentary reports whether the track is commentary: either the muxer set
+// the disposition flag or the title says so (some muxers drop the flag). Both
+// the reference resolver and the export policy share this predicate so
+// title-only commentary is excluded identically on every path.
+func (t AudioTrack) IsCommentary() bool {
+	return t.Disposition.Comment || strings.Contains(strings.ToLower(t.Title), "commentary")
 }
 
 // MediaInfo is the probe result for one file.
@@ -252,16 +270,43 @@ func execRun(ctx context.Context, name string, args ...string) ([]byte, error) {
 	return cmd.Output()
 }
 
+// ffprobeNumber accepts ffprobe's quoted numeric fields and the bare numbers
+// used by fixtures, storing the raw text for parsePositiveInt.
+type ffprobeNumber string
+
+func (n *ffprobeNumber) UnmarshalJSON(data []byte) error {
+	raw := strings.TrimSpace(string(data))
+	if raw == "" || raw == "null" {
+		*n = ""
+		return nil
+	}
+	if raw[0] != '"' {
+		*n = ffprobeNumber(raw)
+		return nil
+	}
+	var text string
+	if err := json.Unmarshal(data, &text); err != nil {
+		return err
+	}
+	*n = ffprobeNumber(text)
+	return nil
+}
+
 // ffprobeDoc is the subset of ffprobe's JSON output Dubarr consumes.
 type ffprobeDoc struct {
 	Streams []struct {
-		Index         int               `json:"index"`
-		CodecName     string            `json:"codec_name"`
-		CodecType     string            `json:"codec_type"`
-		Channels      int               `json:"channels"`
-		ChannelLayout string            `json:"channel_layout"`
-		Tags          map[string]string `json:"tags"`
-		Disposition   map[string]int    `json:"disposition"`
+		Index         int    `json:"index"`
+		CodecName     string `json:"codec_name"`
+		CodecType     string `json:"codec_type"`
+		Channels      int    `json:"channels"`
+		ChannelLayout string `json:"channel_layout"`
+		// BitRate/SampleRate accept either JSON form: ffprobe prints them as
+		// quoted strings, while hand-written fixtures often use bare numbers.
+		BitRate     ffprobeNumber     `json:"bit_rate"`
+		SampleRate  ffprobeNumber     `json:"sample_rate"`
+		Duration    string            `json:"duration"`
+		Tags        map[string]string `json:"tags"`
+		Disposition map[string]int    `json:"disposition"`
 	} `json:"streams"`
 	Format struct {
 		FormatName string `json:"format_name"`
@@ -291,6 +336,10 @@ func parseFFprobe(path string, raw []byte) (*MediaInfo, error) {
 		}
 		tags := lowerTags(s.Tags)
 		lang := tags["language"]
+		var trackDuration time.Duration
+		if d, err := strconv.ParseFloat(strings.TrimSpace(s.Duration), 64); err == nil && d > 0 {
+			trackDuration = time.Duration(math.Round(d * float64(time.Second)))
+		}
 		info.Tracks = append(info.Tracks, AudioTrack{
 			Index:         s.Index,
 			Codec:         s.CodecName,
@@ -301,9 +350,23 @@ func parseFFprobe(path string, raw []byte) (*MediaInfo, error) {
 			LanguageISO2B: ISO639_2B(lang),
 			Title:         tags["title"],
 			Disposition:   dispositionFrom(s.Disposition),
+			BitrateBPS:    parsePositiveInt(string(s.BitRate)),
+			SampleRate:    parsePositiveInt(string(s.SampleRate)),
+			Duration:      trackDuration,
 		})
 	}
 	return info, nil
+}
+
+// parsePositiveInt parses an optional numeric field ("" or "N/A" -> 0). A
+// non-negative integer is kept; anything else is treated as unknown so callers
+// fail closed on a configured threshold instead of guessing zero.
+func parsePositiveInt(raw string) int {
+	v, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || v < 0 {
+		return 0
+	}
+	return v
 }
 
 // lowerTags lower-cases tag keys: Matroska writers disagree on LANGUAGE vs

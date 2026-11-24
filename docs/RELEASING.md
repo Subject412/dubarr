@@ -48,7 +48,7 @@ Two workflows run on every `v*` tag push; both start from the same commit.
 3. builds `docker/Dockerfile` natively per platform for `linux/amd64` and
    `linux/arm64` (frontend → Go → Rust `dubarr-sync` → Debian slim runtime);
 4. pushes the multi-arch manifest to `ghcr.io/subject412/dubarr` and
-   `subject412/dubarr` with the same tag set.
+   `subject928/dubarr` with the same tag set.
 
 Archive releases use the automatic `GITHUB_TOKEN` with `contents: write` scoped
 to the release job only. The Docker job requests `packages: write` for GHCR and
@@ -56,12 +56,12 @@ needs two repository secrets:
 
 | Secret | Purpose |
 | --- | --- |
-| `DOCKERHUB_USERNAME` | Docker Hub account name for `subject412/dubarr` |
-| `DOCKERHUB_TOKEN` | Docker Hub access token (read/write) |
+| `DOCKERHUB_USERNAME` | Docker Hub account name for `subject928/dubarr` |
+| `DOCKERHUB_TOKEN` | Docker Hub access token (read/write/delete) |
 
 Create both at Settings → Secrets and variables → Actions. The Docker workflow
 makes the GHCR `dubarr` package public via the Packages API and flips the
-Docker Hub `subject412/dubarr` repository to public after the push, so pulls
+Docker Hub `subject928/dubarr` repository to public after the push, so pulls
 work unauthenticated without manual package/repository settings.
 
 Actions are pinned to major versions. The archive job pins `ubuntu-22.04` so
@@ -174,7 +174,7 @@ workflow does not rewrite `Cargo.toml`.
    in place.
 8. Watch the `Docker Release` workflow; confirm both registries show the
    multi-arch manifest (`docker buildx imagetools inspect
-   subject412/dubarr:<version>`), then `docker pull subject412/dubarr:<version>`
+   subject928/dubarr:<version>`), then `docker pull subject928/dubarr:<version>`
    on the target host and check `/api/health` reports `dubarr-sync`,
    `ffmpeg`, `ffprobe` and `mkvmerge` available.
 
@@ -185,7 +185,7 @@ workflow does not rewrite `Cargo.toml`.
   (the release job requests `contents: write`; the Docker job requests
   `packages: write`).
 - Repository secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` for the Docker
-  release workflow; a public `subject412/dubarr` Docker Hub repository.
+  release workflow; a public `subject928/dubarr` Docker Hub repository.
 - The repository must not require status checks that these workflows do not
   produce; `ci.yml` job names are `backend (go)`, `sync-engine (rust)` and
   `frontend (vite)`.

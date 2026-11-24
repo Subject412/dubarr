@@ -60,7 +60,7 @@ jobs:
         with:
           images: |
             ghcr.io/subject412/dubarr
-            subject412/dubarr
+            subject928/dubarr
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}

@@ -113,9 +113,13 @@ type Result struct {
 	// BackupPath is <target>.bak when the original was kept, and empty when
 	// Job.KeepBak was false and the backup was removed after publishing.
 	BackupPath string
-	// WorkCopy is the Copy-on-Work target input mkvmerge read.
+	// WorkCopy is the Copy-on-Work target copy mkvmerge read. With AudioPath
+	// it names an input of this call, not an artifact: the job staging
+	// directory is removed before Mux returns, so both paths are already gone
+	// and serve only as log and job-record identifiers. A caller that needs
+	// the bytes must copy or record them before calling Mux.
 	WorkCopy string
-	// AudioPath is the staged .mka that was appended.
+	// AudioPath is the staged .mka that was appended; see WorkCopy.
 	AudioPath string
 	// Language and TrackTitle are what were written onto the new track.
 	Language   string

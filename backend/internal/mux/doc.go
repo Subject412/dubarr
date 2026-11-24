@@ -30,6 +30,9 @@
 //     opt-in later step.
 //
 // Any failure removes only the temp files this call created and leaves the
-// original untouched. WORK_DIR staging is the caller's to clean up, and
+// original untouched. Mux owns its job staging directory and removes
+// {WORK_DIR}/jobs/{id}/ on every return that created it, so no caller has to;
+// that removal also takes the inputs [Result].WorkCopy and
+// [Result].AudioPath name, so those paths no longer exist once Mux returns.
 // VAULT_DIR is never opened for writing.
 package mux

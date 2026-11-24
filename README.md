@@ -172,9 +172,9 @@ cd sync-engine && cargo build && cargo test && cargo clippy
 Docker image build: `docker build -f docker/Dockerfile -t dubarr:latest .`
 
 Published multi-arch images (`linux/amd64`, `linux/arm64`) are pushed to GHCR
-(`ghcr.io/subject412/dubarr`) and Docker Hub (`subject412/dubarr`) on every
+(`ghcr.io/subject412/dubarr`) and Docker Hub (`subject928/dubarr`) on every
 release tag; see [docs/RELEASING.md](docs/RELEASING.md). To use one instead of
-building locally, set `image: subject412/dubarr:latest` in
+building locally, set `image: subject928/dubarr:latest` in
 `docker/docker-compose.yml` and remove the `build:` block.
 
 ## Documentation

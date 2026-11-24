@@ -4,7 +4,7 @@ Spec: `IDEA.md`. Domain: `GLOSSARY.md`. Decisions: `docs/adr/0001–0013`. Contr
 Execution: subagent-driven-development (fresh implementer per task → spec review → quality review). Gate protocol: **stop for user OK at each milestone gate (M1→M5)**. For issues #1–#13 (M7–M10 below) the user settled on continuous execution with **no stop-for-OK gates**; milestones remain work batches only.
 
 ## Settled defaults (grilling Q1–Q15)
-- `required_filename_tags: ["[ArcA310]"]` (Tdarr node/GPU processed-marker), `tag_match_mode: ANY`, `tag_case_sensitive: false`, `enforce_tag_filter: true`.
+- `required_filename_tags: []` (empty = neutral, ADR-0012 — a fresh install blocks nothing), `tag_match_mode: ANY`, `tag_case_sensitive: false`, `enforce_tag_filter: true`.
 - Target import languages `["pl"]`; extra reference languages `["en"]`; original language from arr; commentary excluded.
 - Export default: policy-selected tracks exported (dub + original + selected reference); beyond-policy tracks opt-in (Q14b).
 - Untagged (`und`) donor tracks: manual pick only, never auto-imported.
@@ -62,14 +62,14 @@ React shell: dark *arr-style layout, react-router, tanstack-query, Tailwind. Fir
 Full acceptance pass: container zero-env build+start, wizard creates admin + persists paths/rules in DATA_DIR, /api/health all tools, native run, `go test ./...` + `go vet` green, no secrets in env/logs. Report evidence. GATE: stop for user OK before M2.
 
 ## Milestones 2–5 (outline; detailed tasks drafted at each gate)
-- M2: arr clients (mock-first) + watch scanner + ffprobe/ISO-2 + Tdarr Gate eligibility + Approval Queue UI. Acceptance: donor drop → approval card pre-selected; eligible vs waiting_for_tags.
+- M2: arr clients (mock-first) + watch scanner + ffprobe/ISO-2 + Processing Gate eligibility + Approval Queue UI. Acceptance: donor drop → approval card pre-selected; eligible vs waiting_for_tags.
 
 ### M2 tasks (drafted at gate, 2026-11-22)
 - M2-1 — Mock-first arr integration: `internal/arr` client interface (Radarr + Sonarr REST v3) with a mock server implementation (ADR-0007); real client behind the same interface; table-driven tests against mocks (list series/movies, quality profiles, paths, test-connection). No live keys in tests.
 - M2-2 — Arr settings + key storage: base URLs + API keys stored via `internal/secrets` (UI-only entry, never env/chat); settings CRUD + connection-test endpoint; per-arr enabled flag.
 - M2-3 — Watch scanner: `internal/watch` periodic scan (10s default, settled), detects new media files in configured roots (canonicalized paths, symlink-confined), debounces, registers candidates in DB.
 - M2-4 — ffprobe probe + ISO-639-2: probe target/donor audio tracks (codec, channels, language tags) via ffprobe; map language names/codes to ISO-639-2; cache probe results per file (mtime-keyed).
-- M2-5 — Tdarr Gate eligibility: `[ArcA310]` tag gate (settled; force-override OFF): tag-eligible vs waiting_for_tags classification on candidates; rule-based export policy (policy tracks default, extras opt-in — settled).
+- M2-5 — Processing Gate eligibility: user-configured filename tags (empty default = neutral, ADR-0012; force-override OFF): eligible vs waiting_for_tags classification on candidates; rule-based export policy (policy tracks default, extras opt-in — settled). Donors are never tag-gated.
 - M2-6 — Approval Queue: backend queue API + frontend queue UI; donor drop → approval card pre-selected (target + matched donor, languages, eligibility badge); approve/reject actions (no mux in M2 — approval only).
 - M3: approve → lossless extraction → validated .mka → atomic immutable Vault (0444) + Vault UI. Acceptance: .{iso2}.mka + sha256 + zero staging leftovers.
 
@@ -110,4 +110,4 @@ Source: `.hermes/plans/issues-1-13.md` (grill round 1: Q1–Q23). Decisions: `do
 - **M8** — #6 password change + account menu; #10 arr connection UI (test-connection button; full URL with explicit scheme); #12 logging sinks + `/logs` (redaction at sink); #4 root README + compose/env examples + build-from-source. Deps: #6→#5; #4→#1/#10/#12.
 - **M9** — #8 `org`/`all` reference tokens + prefer-original + wire `original_language_from_arr`; #2 mux output modes + new output root + result persistence; #9 arr tag/root-folder eligibility (migration 0003, ADR 0009). Deps: #10→#9; #8 before #9 (both touch gate); #2 before #11.
 - **M10** — #11 opt-in transcode rules (single ffmpeg encode with tempo, ffprobe verify, ADR 0010). Vault stays write-once/lossless.
-- Out of scope: live arr in tests, Windows CI, Docker socket logs, Tdarr API, in-container port override, per-media transcode overrides, git push.
+- Out of scope: live arr in tests, Windows CI, Docker socket logs, third-party processing APIs, in-container port override, per-media transcode overrides, git push.

@@ -27,3 +27,6 @@ target/
 # Secrets & keys — never commit
 .master.key
 *.keyfile
+
+# Hermes agent state
+.hermes/

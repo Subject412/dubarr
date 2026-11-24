@@ -140,9 +140,9 @@ cp target/release/dubarr-sync "$HOME/.local/bin/"
 
 Ensure `$HOME/.local/bin` is on your `PATH`, or copy `dubarr-sync` into any
 directory that is. The DSP CLI is a separate program: without it the web UI and
-library browsing work, but sync jobs and muxing do not. The Docker image does
-not bundle `dubarr-sync`, so `/api/health` inside the container reports it
-unavailable unless you provide the binary.
+library browsing work, but sync jobs and muxing do not. The Docker image
+bundles `dubarr-sync` in `/app` and puts `/app` on `PATH`, so `/api/health`
+inside the container reports it available.
 
 ### Run
 
@@ -170,6 +170,12 @@ cd sync-engine && cargo build && cargo test && cargo clippy
 ```
 
 Docker image build: `docker build -f docker/Dockerfile -t dubarr:latest .`
+
+Published multi-arch images (`linux/amd64`, `linux/arm64`) are pushed to GHCR
+(`ghcr.io/subject412/dubarr`) and Docker Hub (`subject412/dubarr`) on every
+release tag; see [docs/RELEASING.md](docs/RELEASING.md). To use one instead of
+building locally, set `image: subject412/dubarr:latest` in
+`docker/docker-compose.yml` and remove the `build:` block.
 
 ## Documentation
 

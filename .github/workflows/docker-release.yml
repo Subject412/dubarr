@@ -1,0 +1,125 @@
+name: Docker Release
+
+# Publishes the appliance image when a release tag is pushed. Tags are shared
+# by GHCR and Docker Hub: X.Y.Z, X.Y and latest (see docs/RELEASING.md).
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  docker:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Validate tag
+        run: |
+          TAG="$GITHUB_REF_NAME"
+          printf 'tag=%s\n' "$TAG"
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::tag '$TAG' does not match vX.Y.Z[-prerelease]"
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          registry: https://index.docker.io/v1/
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ghcr.io/subject412/dubarr
+            subject412/dubarr
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: VERSION=${{ github.ref_name }}
+          provenance: false
+          sbom: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # A public repository does not automatically make its GHCR package
+      # pullable; set the package visibility explicitly.
+      - name: Make GHCR package public
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { data } = await github.request(
+              'PATCH /user/packages/{package_type}/{package_name}',
+              {
+                package_type: 'container',
+                package_name: 'dubarr',
+                visibility: 'public',
+              }
+            )
+            core.info(`GHCR package visibility: ${data.visibility}`)
+
+      # Docker Hub also keeps repositories private by default. The push above
+      # creates the repo, so flip it to public in the same run.
+      - name: Make Docker Hub repository public
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -eu
+          payload=$(jq -nc \
+            --arg u "$DOCKERHUB_USERNAME" \
+            --arg p "$DOCKERHUB_TOKEN" \
+            '{username: $u, password: $p}')
+          token=$(curl -fsS -X POST https://hub.docker.com/v2/users/login/ \
+            -H 'Content-Type: application/json' \
+            -d "$payload" | jq -r '.token')
+          if [ -z "$token" ] || [ "$token" = "null" ]; then
+            echo "::error::Docker Hub login did not return a token"
+            exit 1
+          fi
+          curl -fsS -X PATCH \
+            "https://hub.docker.com/v2/repositories/${DOCKERHUB_USERNAME}/dubarr/" \
+            -H "Authorization: JWT $token" \
+            -H 'Content-Type: application/json' \
+            -d '{"is_private": false}'
+          echo "Docker Hub repository ${DOCKERHUB_USERNAME}/dubarr set public"

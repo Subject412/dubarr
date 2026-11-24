@@ -115,8 +115,8 @@ variables: `entrypoint.sh` forwards extra arguments after its own
 
 ## DSP CLI
 
-`dubarr-sync` (Rust) is required for sync and mux jobs. The image does not
-include it, so `/api/health` reports it as `available: false` inside the
-container unless the binary is provided (bind-mount it and extend `PATH`, or
-build a derived image). A release archive ships `dubarr-sync` beside `dubarr`;
-see [docs/RELEASING.md](../docs/RELEASING.md).
+`dubarr-sync` (Rust) is required for sync and mux jobs. It is bundled at
+`/app/dubarr-sync` and `/app` is on the container `PATH`, so `/api/health`
+reports it available out of the box. Native installs still keep both binaries
+side by side on `PATH`; release archives ship them together (see
+[docs/RELEASING.md](../docs/RELEASING.md)).

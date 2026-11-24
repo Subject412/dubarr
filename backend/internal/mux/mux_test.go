@@ -215,6 +215,58 @@ func TestStaleTempBesideTargetIsFlagged(t *testing.T) {
 	}
 }
 
+// TestMuxCopyOnWorkStagesVerbatimTarget restores the Copy-on-Work integrity
+// assertion lost when issue #23 made Mux remove its own staging: the target is
+// copied byte-for-byte into {WORK_DIR}/jobs/{id}/ before mkvmerge reads it.
+// The copy only exists between MkdirAll and the deferred RemoveAll, so it is
+// observed through the Run hook at the moment mkvmerge is invoked: argv is
+// "-o <temp> --quiet <workCopy> ...", which is the only read of those bytes.
+func TestMuxCopyOnWorkStagesVerbatimTarget(t *testing.T) {
+	h := newHarness(t)
+	originalHash := sha256File(t, h.target)
+	wantCopy := filepath.Join(h.work, "jobs", "42", "target.mkv")
+
+	var observedPath, observedHash string
+	var observedErr error
+	run := func(ctx context.Context, bin string, args ...string) ([]byte, error) {
+		if filepath.Base(bin) == "mkvmerge" {
+			if len(args) < 4 {
+				t.Fatalf("mkvmerge argv too short: %v", args)
+			}
+			observedPath = args[3]
+			observedErr = nil
+			if _, err := os.Stat(observedPath); err != nil {
+				observedErr = err
+			} else {
+				observedHash = sha256File(t, observedPath)
+			}
+		}
+		return execRun(ctx, bin, args...)
+	}
+
+	if _, err := New(Dependencies{Run: run}).Mux(context.Background(), h.job()); err != nil {
+		t.Fatalf("Mux: %v", err)
+	}
+
+	if observedPath == "" {
+		t.Fatal("mkvmerge was never invoked; the staged copy was not observed")
+	}
+	if observedPath != wantCopy {
+		t.Errorf("mkvmerge read %q, want the staged copy at %q", observedPath, wantCopy)
+	}
+	if observedErr != nil {
+		t.Fatalf("staged copy %s at mkvmerge time: %v", observedPath, observedErr)
+	}
+	if observedHash != originalHash {
+		t.Errorf("staged copy sha256 = %s, want the target's %s (Copy-on-Work not verbatim)", observedHash, originalHash)
+	}
+
+	// The observed copy was the transient staging, not a surviving artifact.
+	if _, err := os.Stat(wantCopy); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("staged copy %s still present after Mux returned: %v", wantCopy, err)
+	}
+}
+
 // snapshot records every regular file under dir with its hash.
 func snapshot(t *testing.T, dir string) map[string]string {
 	t.Helper()

@@ -1113,6 +1113,41 @@ func TestOutputDestinationValidation(t *testing.T) {
 	}
 }
 
+// TestMuxRemovesJobStagingOnReturn pins issue #23: a standalone Mux call owns
+// its staging. Once Mux returns — on success and on a failure that happened
+// after the job directory was created — {WORK_DIR}/jobs/{id} is gone, so a
+// caller that never runs the sync worker leaves no directory behind. Removal
+// is idempotent, so the worker's own cleanup of the same job stays harmless.
+func TestMuxRemovesJobStagingOnReturn(t *testing.T) {
+	staging := func(h *harness) string { return filepath.Join(h.work, "jobs", "42") }
+
+	t.Run("success", func(t *testing.T) {
+		h := newHarness(t)
+		if _, err := New(Dependencies{}).Mux(context.Background(), h.job()); err != nil {
+			t.Fatalf("Mux: %v", err)
+		}
+		if _, err := os.Stat(staging(h)); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("job staging %s still present after a successful mux: %v", staging(h), err)
+		}
+	})
+
+	// A muxer failure happens after the job directory and the work copy exist
+	// (mkvmerge cannot write its output), so this exercises the failure path
+	// that used to leave the directory behind.
+	t.Run("tool failure", func(t *testing.T) {
+		h := newHarness(t)
+		if _, err := New(Dependencies{MKVMergePath: "/bin/false"}).Mux(context.Background(), h.job()); !errors.Is(err, ErrTool) {
+			t.Fatalf("Mux error = %v, want ErrTool", err)
+		}
+		if _, err := os.Stat(staging(h)); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("job staging %s still present after a failed mux: %v", staging(h), err)
+		}
+		if _, err := os.Stat(h.target + ".bak"); !errors.Is(err, os.ErrNotExist) {
+			t.Error(".bak created despite failed mux")
+		}
+	})
+}
+
 // TestArrGateCriteriaBlockAndForceOverride wires ADR-0009 into the mux call
 // site: the verdict uses the arr metadata carried by the job, and force
 // override still bypasses the whole gate.

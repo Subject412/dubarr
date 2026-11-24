@@ -58,7 +58,7 @@ type CandidateStore interface {
 }
 
 // CandidateHook is invoked once for every newly recorded candidate. It lets
-// the composition root classify the file (Tdarr Gate) without making the
+// the composition root classify the file (Processing Gate) without making the
 // scanner depend on the gate or the store's gate columns.
 //
 // The hook runs after the row is committed, so a hook failure never drops the

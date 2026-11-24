@@ -1,4 +1,4 @@
-// Package mux publishes a synchronized audio track into a Tdarr-tagged target
+// Package mux publishes a synchronized audio track into a tag-eligible target
 // MKV without transcoding it (PLAN.md M5-1, ADR-0004).
 //
 // [Muxer.Mux] is the pipeline behind the future POST /api/sync/jobs/{id}/mux:

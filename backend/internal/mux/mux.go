@@ -58,7 +58,7 @@ type Job struct {
 	ID int64
 	// WorkDir is storage.paths.work_dir (the Work Area root), not the job dir.
 	WorkDir string
-	// TargetPath is the library MKV to publish into. Only the Tdarr Gate and
+	// TargetPath is the library MKV to publish into. Only the Processing Gate and
 	// the copy read it; it is never edited in place.
 	TargetPath string
 	// TargetLangISO2 is the language of the incoming track (audio_tracks
@@ -190,7 +190,7 @@ func New(deps Dependencies) *Muxer {
 
 // Mux publishes one synchronized track into its target.
 //
-// Order is deliberate: verdict, ambiguity and the Tdarr Gate are all resolved
+// Order is deliberate: verdict, ambiguity and the Processing Gate are all resolved
 // read-only before the first write, so an abort leaves the target directory and
 // the Work Area untouched. The destination (ADR-0011) is resolved next: replace
 // mode publishes over the Target, separate mode publishes

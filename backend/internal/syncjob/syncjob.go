@@ -213,7 +213,7 @@ func (s *Service) handleCreate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, jobInfo(rec))
 }
 
-// eligibilityError enforces the Tdarr Gate verdict. Force (already checked
+// eligibilityError enforces the Processing Gate verdict. Force (already checked
 // against settings by the caller) bypasses the gate only: a target with no
 // file path is not eligible under any setting.
 func eligibilityError(lib store.LibraryCacheJobTarget, force bool) error {

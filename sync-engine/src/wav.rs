@@ -77,44 +77,45 @@ impl WavRangeReader {
             path: self.path.clone(),
             message: e.to_string(),
         };
-        self.reader.seek(start).map_err(|e: std::io::Error| SyncError::Io {
-            path: self.path.clone(),
-            message: e.to_string(),
-        })?;
+        self.reader
+            .seek(start)
+            .map_err(|e: std::io::Error| SyncError::Io {
+                path: self.path.clone(),
+                message: e.to_string(),
+            })?;
         let spec = self.reader.spec();
         let want = frames as usize * self.channels;
-        let interleaved: Vec<f32> =
-            match (spec.sample_format, spec.bits_per_sample) {
-                (SampleFormat::Int, 16) => self
-                    .reader
-                    .samples::<i16>()
-                    .take(want)
-                    .map(|s| s.map(|v| v as f32 / 32_768.0).map_err(path_err))
-                    .collect::<Result<Vec<_>, _>>()?,
-                (SampleFormat::Int, 24) => self
-                    .reader
-                    .samples::<i32>()
-                    .take(want)
-                    .map(|s| s.map(|v| v as f32 / 8_388_608.0).map_err(path_err))
-                    .collect::<Result<Vec<_>, _>>()?,
-                (SampleFormat::Int, 32) => self
-                    .reader
-                    .samples::<i32>()
-                    .take(want)
-                    .map(|s| s.map(|v| v as f32 / 2_147_483_648.0).map_err(path_err))
-                    .collect::<Result<Vec<_>, _>>()?,
-                (SampleFormat::Float, 32) => self
-                    .reader
-                    .samples::<f32>()
-                    .take(want)
-                    .map(|s| s.map_err(path_err))
-                    .collect::<Result<Vec<_>, _>>()?,
-                (format, bits) => {
-                    return Err(SyncError::UnsupportedWav(format!(
-                        "{bits}-bit {format:?} samples; expected 16/24/32-bit int or 32-bit float"
-                    )))
-                }
-            };
+        let interleaved: Vec<f32> = match (spec.sample_format, spec.bits_per_sample) {
+            (SampleFormat::Int, 16) => self
+                .reader
+                .samples::<i16>()
+                .take(want)
+                .map(|s| s.map(|v| v as f32 / 32_768.0).map_err(path_err))
+                .collect::<Result<Vec<_>, _>>()?,
+            (SampleFormat::Int, 24) => self
+                .reader
+                .samples::<i32>()
+                .take(want)
+                .map(|s| s.map(|v| v as f32 / 8_388_608.0).map_err(path_err))
+                .collect::<Result<Vec<_>, _>>()?,
+            (SampleFormat::Int, 32) => self
+                .reader
+                .samples::<i32>()
+                .take(want)
+                .map(|s| s.map(|v| v as f32 / 2_147_483_648.0).map_err(path_err))
+                .collect::<Result<Vec<_>, _>>()?,
+            (SampleFormat::Float, 32) => self
+                .reader
+                .samples::<f32>()
+                .take(want)
+                .map(|s| s.map_err(path_err))
+                .collect::<Result<Vec<_>, _>>()?,
+            (format, bits) => {
+                return Err(SyncError::UnsupportedWav(format!(
+                    "{bits}-bit {format:?} samples; expected 16/24/32-bit int or 32-bit float"
+                )))
+            }
+        };
         Ok(mixdown(interleaved, self.channels))
     }
 }

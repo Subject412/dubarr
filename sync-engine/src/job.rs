@@ -59,10 +59,7 @@ pub struct SyncResult {
 /// sample-rate mismatch) still fails before any window is decoded.
 enum SourceAudio {
     File(WavRangeReader),
-    Pcm {
-        sample_rate: u32,
-        samples: Vec<f32>,
-    },
+    Pcm { sample_rate: u32, samples: Vec<f32> },
 }
 
 impl SourceAudio {

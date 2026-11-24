@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::correlation::analyze;
-use crate::wav::read_wav_mono;
-use crate::{Audio, SyncError, DEFAULT_WINDOW_SEC, MIN_SLICE_SAMPLES};
+use crate::wav::WavRangeReader;
+use crate::{SyncError, DEFAULT_WINDOW_SEC, MIN_SLICE_SAMPLES};
 
 /// Inline raw PCM slice used instead of a WAV file.
 #[derive(Debug, Clone, Deserialize)]
@@ -54,42 +54,71 @@ pub struct SyncResult {
     pub analyzed: Analyzed,
 }
 
-fn load_source(source: &Source) -> Result<Audio, SyncError> {
-    match source {
-        Source::Path { path } => read_wav_mono(path),
-        Source::Pcm { pcm } => {
-            if pcm.sample_rate == 0 {
-                return Err(SyncError::InvalidJob(
-                    "PCM sample_rate must be greater than zero".to_string(),
-                ));
-            }
-            if !pcm.samples.iter().all(|s| s.is_finite()) {
-                return Err(SyncError::InvalidJob(
-                    "PCM samples must all be finite numbers".to_string(),
-                ));
-            }
-            Ok(Audio {
-                sample_rate: pcm.sample_rate,
-                samples: pcm.samples.clone(),
-            })
-        }
-    }
+/// A job source opened for one slice: a WAV file read by frame range, or
+/// inline PCM. Opening only reads the header, so a pathological file (or a
+/// sample-rate mismatch) still fails before any window is decoded.
+enum SourceAudio {
+    File(WavRangeReader),
+    Pcm {
+        sample_rate: u32,
+        samples: Vec<f32>,
+    },
 }
 
-fn take_slice(
-    samples: &[f32],
-    start: usize,
-    len: usize,
-    sample_rate: u32,
-) -> Result<Vec<f32>, SyncError> {
-    if start >= samples.len() {
-        return Err(SyncError::SliceOutOfRange {
-            start_sec: start as f64 / sample_rate as f64,
-            duration_sec: samples.len() as f64 / sample_rate as f64,
-        });
+impl SourceAudio {
+    fn open(source: &Source) -> Result<Self, SyncError> {
+        match source {
+            Source::Path { path } => Ok(SourceAudio::File(WavRangeReader::open(path)?)),
+            Source::Pcm { pcm } => {
+                if pcm.sample_rate == 0 {
+                    return Err(SyncError::InvalidJob(
+                        "PCM sample_rate must be greater than zero".to_string(),
+                    ));
+                }
+                if !pcm.samples.iter().all(|s| s.is_finite()) {
+                    return Err(SyncError::InvalidJob(
+                        "PCM samples must all be finite numbers".to_string(),
+                    ));
+                }
+                Ok(SourceAudio::Pcm {
+                    sample_rate: pcm.sample_rate,
+                    samples: pcm.samples.clone(),
+                })
+            }
+        }
     }
-    let end = start.saturating_add(len).min(samples.len());
-    Ok(samples[start..end].to_vec())
+
+    fn sample_rate(&self) -> u32 {
+        match self {
+            SourceAudio::File(reader) => reader.sample_rate(),
+            SourceAudio::Pcm { sample_rate, .. } => *sample_rate,
+        }
+    }
+
+    /// Frames (per-channel samples) in the source.
+    fn frames(&self) -> usize {
+        match self {
+            SourceAudio::File(reader) => reader.duration() as usize,
+            SourceAudio::Pcm { samples, .. } => samples.len(),
+        }
+    }
+
+    /// Slice `len` frames from `start`, truncating at the end of the source
+    /// exactly like the former whole-file `take_slice`.
+    fn slice(&mut self, start: usize, len: usize, sample_rate: u32) -> Result<Vec<f32>, SyncError> {
+        let total = self.frames();
+        if start >= total {
+            return Err(SyncError::SliceOutOfRange {
+                start_sec: start as f64 / sample_rate as f64,
+                duration_sec: total as f64 / sample_rate as f64,
+            });
+        }
+        let end = start.saturating_add(len).min(total);
+        match self {
+            SourceAudio::File(reader) => reader.read_mono(start as u32, (end - start) as u32),
+            SourceAudio::Pcm { samples, .. } => Ok(samples[start..end].to_vec()),
+        }
+    }
 }
 
 fn round_millis(value: f64) -> f64 {
@@ -118,15 +147,15 @@ pub fn run_job(job: &Job) -> Result<SyncResult, SyncError> {
         }
     }
 
-    let target_audio = load_source(&job.target)?;
-    let donor_audio = load_source(&job.donor)?;
-    if target_audio.sample_rate != donor_audio.sample_rate {
+    let mut target_audio = SourceAudio::open(&job.target)?;
+    let mut donor_audio = SourceAudio::open(&job.donor)?;
+    if target_audio.sample_rate() != donor_audio.sample_rate() {
         return Err(SyncError::SampleRateMismatch {
-            target: target_audio.sample_rate,
-            donor: donor_audio.sample_rate,
+            target: target_audio.sample_rate(),
+            donor: donor_audio.sample_rate(),
         });
     }
-    let sample_rate = target_audio.sample_rate;
+    let sample_rate = target_audio.sample_rate();
     if sample_rate == 0 {
         return Err(SyncError::InvalidJob(
             "sample_rate must be greater than zero".to_string(),
@@ -135,8 +164,8 @@ pub fn run_job(job: &Job) -> Result<SyncResult, SyncError> {
 
     let start = (job.slice_start_sec * sample_rate as f64).round() as usize;
     let len = (job.slice_len_sec * sample_rate as f64).round() as usize;
-    let target = take_slice(&target_audio.samples, start, len, sample_rate)?;
-    let donor = take_slice(&donor_audio.samples, start, len, sample_rate)?;
+    let target = target_audio.slice(start, len, sample_rate)?;
+    let donor = donor_audio.slice(start, len, sample_rate)?;
 
     let samples = target.len().min(donor.len());
     if samples < MIN_SLICE_SAMPLES {

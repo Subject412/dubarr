@@ -90,9 +90,8 @@ _Avoid_: unknown track
 The configurable rules deciding which donor tracks are pre-selected and kept: target languages, original language, extra reference languages, commentary exclusion. By default every policy-selected track is exported; keeping tracks beyond the policy requires explicit opt-in.
 _Avoid_: language rules, import policy
 
-**Processing Gate** (formerly **Tdarr Gate**):
-The eligibility check deciding whether a Target may be synced or muxed. It combines a filename-tag criterion with an optional arr-metadata criterion (arr tags and root folders); the two sources are AND-ed. Donor ingestion into the Audio Vault is never gated. "Tdarr Gate" remains a deprecated alias for the filename-tag-only form.
-_Avoid_: tag filter (when meaning the eligibility concept), Tdarr Gate (for the combined check)
+**Processing Gate**:
+The eligibility check deciding whether a Target may be synced, previewed or muxed. It combines a user-configured filename-tag criterion with an optional arr-metadata criterion (arr tags and root folders); the two sources are AND-ed. Donor ingestion into the Audio Vault is never gated (ADR-0005, amended by ADR-0009).
 
 **Eligibility Source**:
 The origin of a Processing Gate criterion: `filename` (tags in the Target's basename), `arr` (Radarr/Sonarr tags and root folders), or `both`.

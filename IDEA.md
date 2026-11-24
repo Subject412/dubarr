@@ -1,5 +1,7 @@
 # Dubarr — Architectural Specification and Implementation Plan (IDEA.md)
 
+> **Authority order:** Normative: `AGENTS.md` rules and `docs/adr/**` decisions, then the working code. `IDEA.md` is historical design narrative; where it disagrees with an ADR or the code, follow the ADR/code and amend either explicitly. This file is retained as design history — see the ADR index in [`docs/adr/`](docs/adr/). Sections known to be superseded carry an inline **Superseded:** marker naming the governing ADR.
+
 > **Document Purpose:** Complete technical specification (v2.0) of **Dubarr** intended for an AI orchestrator and coding agents. This document defines the architecture, responsibility boundaries, security model, database schema, API contracts, workflows, and phased milestones with acceptance criteria.
 
 ---
@@ -14,9 +16,9 @@
 3. **Requires explicit user approval (Approval Queue)** before extracting or copying any files into the permanent repository, while pre-selecting donor audio tracks according to configurable **Language & Export Policy** settings.
 4. **Losslessly extracts selected donor audio tracks (`-c:a copy`)** into a completely separate, **write-once / immutable Audio Vault (`VAULT_DIR`)** as self-describing **Matroska Audio (`.mka`)** files tagged with normalized **ISO 639-1 two-letter language suffixes** (`<media filename>.<lang>.mka`, e.g., `Spirited Away (2001).pl.mka`, `Spirited Away (2001).ja.mka`):
    - Supports exporting **all** non-commentary donor audio tracks OR following configurable rules (**Target Import Languages** + **Original Language** from Radarr/Sonarr + **Extra Reference Languages** such as `en`).
-   - Keeping `VAULT_DIR` strictly separated guarantees that deleting, transcoding, or replacing a video file in Radarr/Sonarr/Tdarr will **never** delete archived `.mka` tracks.
-5. **Respects Tdarr Destination Workflows via Filename Tag Filtering:**
-   - Allows configuring required filename tags on destination media files (e.g., `[TDARR]`, `[AV1]`) so Dubarr **only synchronizes and muxes target files that Tdarr has already processed and tagged** (while still allowing donor ingestion into the Audio Vault at any time).
+   - Keeping `VAULT_DIR` strictly separated guarantees that deleting, transcoding, or replacing a video file in Radarr/Sonarr or any external processing pipeline will **never** delete archived `.mka` tracks.
+5. **Respects External Processing Pipelines via Filename Tag Filtering:**
+   - Allows configuring required filename tags on destination media files (e.g., `[TDARR]`, `[AV1]` — Tdarr is only an example producer) so Dubarr **only synchronizes and muxes target files the operator marked as processed** (while still allowing donor ingestion into the Audio Vault at any time).
 6. **Operates strictly on copies in an isolated Work Directory (`WORK_DIR`):**
    - Files in `VAULT_DIR` are **never** modified, written next to, or processed in place after initial extraction. Every synchronization job, preview slice, tempo adjustment, and mux input copies the needed `.mka` file(s) from `VAULT_DIR` into `WORK_DIR` first.
 7. **Automatically synchronizes the copied `.mka` track** against the target video file using a generalized **Reference Language Resolver**:
@@ -32,7 +34,7 @@
 10. **Stores all configuration and secrets securely in the local App Data folder via WebUI/API**—never using environment variables for app settings or API keys.
 
 ### What Dubarr DOES NOT DO (Strict Boundaries):
-* **Does NOT transcode video** (e.g., to AV1)—an external pipeline (**Tdarr**) handles video transcoding and audio track cleanup. Video streams in target files must always remain untouched (`copy`).
+* **Does NOT transcode video** (e.g., to AV1)—an external pipeline handles video transcoding and audio track cleanup. Video streams in target files must always remain untouched (`copy`).
 * **Does NOT re-encode lossy audio tracks** (AAC, AC3, E-AC3, Opus) unless forced by an FPS/tempo adjustment (in which case only that single incoming track copy is re-encoded) or unless an explicit, user-configured **Transcode Rule** matches (ADR-0010). Transcode Rules apply only to a Work Area copy and never modify the Audio Vault, which remains write-once and lossless.
 * **Does NOT modify or write inside `VAULT_DIR`** after initial atomic import of an `.mka` track.
 * **Does NOT accept application settings or API keys via environment variables.**
@@ -42,17 +44,19 @@
 
 ## 2. Tech Stack
 
-The application runs seamlessly both as a **Docker container (WebUI exposed via `IP:PORT`)** and as a **standalone native app on Windows and Linux** (single local server launching the embedded frontend in a browser / `--app` window).
+The application runs seamlessly both as a **Docker container (WebUI exposed via `IP:PORT`)** and as a **standalone native app on Windows and Linux** (single local server; `--desktop` opens the default browser at the listen address).
 
 | Layer | Technology | Role and Rationale |
 | :--- | :--- | :--- |
-| **Backend Core & API** | **Go (1.23+)** | HTTP server (REST API + WebSockets), auth & AES-256-GCM secret store, job queue, file watcher, Radarr/Sonarr API clients, FFmpeg/MKVToolNix orchestration, embedded frontend via `go:embed`. Minimal RAM usage (~20–40 MB). |
+| **Backend Core & API** | **Go (1.26+)** | HTTP server (REST API + WebSockets), auth & AES-256-GCM secret store, job queue, file watcher, Radarr/Sonarr API clients, FFmpeg/MKVToolNix orchestration, embedded frontend via `go:embed`. Small idle footprint — a design goal, not a strict RAM cap (ADR-0001). |
 | **DSP Engine (Auto-Sync)** | **Rust (CLI `dubarr-sync`)** | Tiny compiled binary invoked by Go. Reads raw/WAV PCM slices and computes fast **FFT Cross-Correlation**. Zero Python/SciPy overhead. |
 | **Database** | **SQLite** (WAL mode, pure-Go driver e.g. `modernc.org/sqlite`) | Single portable database file inside the App Data folder; no external DB server or Redis required. |
 | **Security & Crypto** | **Go `crypto/aes` (GCM), `golang.org/x/crypto/argon2`**, optional OS Keyring | Password hashing (Argon2id), session/API token hashing, AES-256-GCM at-rest encryption for Radarr/Sonarr API keys inside the App Data folder. |
 | **Frontend (WebUI)** | **React + TypeScript + Vite + Tailwind CSS** | Modern, cohesive SPA compiled into static assets and embedded inside the Go binary (`embed.FS`). |
 | **Audio Visualization** | **wavesurfer.js** (Spectrogram plugin) + **Web Audio API** | Renders 60-second audio slices (waveform + spectrogram), supports 1 ms / 10 ms / 100 ms nudging, and performs live synchronized dual-track playback in the browser. |
 | **Media Tools (ext.)** | **`ffmpeg`**, **`ffprobe`**, **`mkvmerge` (MKVToolNix)** | Lossless `-c:a copy` extraction to `.mka`, PCM/preview slicing, audio tempo correction, atomic Matroska muxing. |
+
+> ⚠ **Superseded (resource claim):** the footprint goal is governed qualitatively by ADR-0001 — a small *idle* footprint, not a strict RAM cap; active jobs may exceed it. The “~20–40 MB” figure above is historical.
 
 ---
 
@@ -67,6 +71,8 @@ At startup, the binary requires only minimal bootstrap parameters (with zero-con
 * `--desktop` — Optional flag to open a browser / `--app` window automatically in native mode.
 
 All application settings (`watch_dir`, `vault_dir`, `work_dir`, `media_roots`, language policies, target filename tag filters, Radarr/Sonarr instances, and API keys) are configured exclusively through the **First-Run Setup Wizard / WebUI / REST API** and persisted inside `DATA_DIR`.
+
+> ⚠ **Superseded:** bootstrap flags and logging configuration are governed by ADR-0003 (zero app-config environment variables; only `--data-dir`/`--listen`/`--desktop`) and ADR-0013 (logging via `--log-level`/`--log-file`). The `--app` window wording above is historical; native desktop mode opens the default browser (`xdg-open`), see PLAN.md:23.
 
 ### 3.2. Security Architecture for App Data & API Keys
 Because `DATA_DIR` stores Radarr/Sonarr API keys and Dubarr exposes a full control WebUI/API:
@@ -114,18 +120,20 @@ Dubarr separates five logical storage areas (configured via the Setup Wizard / S
 * Whenever a job (`sync`, `preview`, or `mux`) needs a Vault track, Dubarr copies that `.mka` from `VAULT_DIR` into `{WORK_DIR}/jobs/{job_id}/` first, verifies integrity against `audio_tracks.sha256`, and runs all `ffmpeg` / `dubarr-sync` / `mkvmerge` audio reads strictly against the `WORK_DIR` copy.
 * *(Large target `.mkv` video files in `MEDIA_ROOTS` are opened read-only in place rather than copied into `WORK_DIR`.)*
 
-### 3.5. File Safety, Tdarr Tag Gating, and Atomic Muxing
+### 3.5. File Safety, Processing Gate, and Atomic Muxing
 * **Watch Folder Stability Check:** Ignores partial/temp extensions (`*.!qB`, `*.part`, `*.tmp`, `*.crdownload`, `*.tdarr`). Verifies file size stability (two consecutive checks >= 4 seconds apart must match) before probing with `ffprobe`.
-* **Destination Filename Tag Filtering (Tdarr Gate):**
-  * Settings define `required_filename_tags` (e.g., `["[TDARR]"]`), `tag_match_mode` (`ALL`, `ANY`, or `REGEX`), `tag_case_sensitive`, `excluded_filename_tags`, and `enforce_tag_filter` (boolean, default `true`), plus optional `require_av1_warning` / `require_av1_strict`.
-  * **Import & Vault Archiving:** Never blocked by target tags—you can archive donor tracks into `VAULT_DIR` before Tdarr finishes transcoding.
-  * **Sync & Mux Eligibility:** Target files missing `required_filename_tags` are marked `waiting_for_tags` and **blocked from Sync/Mux** while `enforce_tag_filter` is enabled.
-  * **Tdarr Rename Drift Recovery:** If Tdarr recently renamed a file (e.g., `Movie (2021).mkv` -> `Movie (2021) [TDARR].mkv`) before Radarr/Sonarr refreshed, and `target_file_path` is missing on disk, Dubarr triggers a targeted `RescanMovie`/`RescanSeries` (and checks `media_folder_path`) to refresh the updated filename before evaluating tags.
+* **Destination Filename Tag Filtering (Processing Gate, targets only):**
+  * Settings define `required_filename_tags` (empty by default — ADR-0012; `[TDARR]` is only an example marker), `tag_match_mode` (`ALL`, `ANY`, or `REGEX`), `tag_case_sensitive`, `excluded_filename_tags`, and `enforce_tag_filter` (boolean, default `true`), plus the optional arr criterion of ADR-0009 (`source_mode`, `required_arr_tags`/`excluded_arr_tags`/`root_folder_paths`). Historical `require_av1_warning`/`require_av1_strict` flags are not implemented.
+  * **Import & Vault Archiving:** Never blocked by target tags—you can archive donor tracks into `VAULT_DIR` regardless of any external pipeline's progress.
+  * **Sync & Mux Eligibility:** Target files missing `required_filename_tags` are marked `waiting_for_tags` and **blocked from Sync/Mux** while `enforce_tag_filter` is enabled. Donor ingestion is never gated (ADR-0005).
+  * **External-Pipeline Rename Drift Recovery:** If an external tool recently renamed a file (e.g., `Movie (2021).mkv` -> `Movie (2021) [AV1].mkv`) before Radarr/Sonarr refreshed, and `target_file_path` is missing on disk, Dubarr triggers a targeted `RescanMovie`/`RescanSeries` (and checks `media_folder_path`) to refresh the updated filename before evaluating tags.
 * **Atomic Muxing (Zero Risk of Corrupting Target `.mkv` Files):**
-  1. Re-verify right before muxing that the target file exists, still matches `required_filename_tags`, and has stable mtime/size (no active Tdarr/temp files in the folder).
+  1. Re-verify right before muxing that the target file exists, still matches `required_filename_tags`, and has stable mtime/size (no active external-pipeline/temp files in the folder).
   2. Run `mkvmerge` reading the target `.mkv` read-only and the **copied/adjusted audio track inside `WORK_DIR`**, writing output to `<target>.mkv.dubarr.tmp` in the same directory as `<target>.mkv`.
   3. After exit code `0`, `ffprobe` validates `<target>.mkv.dubarr.tmp` (verifying original video stream, all existing streams, and the newly added stream are intact with matching stream counts/durations).
   4. Atomically replace `<target>.mkv` (`os.Rename`), optionally keeping or cleaning up a `.bak` copy depending on user settings, then clean up `{WORK_DIR}/jobs/{job_id}/`.
+
+> ⚠ **Superseded (gate concept):** this section describes the original filename-tag-only “Tdarr Gate”. The governing concept is the Processing Gate: ADR-0005 (filename criterion, **targets only**; donor ingestion is never tag-gated), amended by ADR-0009 (optional arr criterion: `source_mode` = `filename` | `arr` | `both`, `required_arr_tags`/`excluded_arr_tags`/`root_folder_paths`, sources AND-ed, fail closed) with the neutral empty default from ADR-0012. `required_filename_tags` ships empty.
 
 ---
 
@@ -192,7 +200,7 @@ CREATE TABLE IF NOT EXISTS arr_library_cache (
     season_number INTEGER,
     episode_number INTEGER,
     episode_title TEXT,
-    media_folder_path TEXT,               -- Mapped local folder path (handles Tdarr filename renames)
+    media_folder_path TEXT,               -- Mapped local folder path (handles external-pipeline filename renames)
     target_file_path TEXT,                -- Mapped local path to target video file
     matches_target_tags BOOLEAN NOT NULL DEFAULT 0,
     eligibility_status TEXT NOT NULL DEFAULT 'missing_target'
@@ -314,41 +322,52 @@ CREATE TABLE IF NOT EXISTS sync_mux_jobs (
 5. Synchronization Engine Specification (Go + FFmpeg + Rust CLI)
 5.1. dubarr-sync Binary Contract (Rust)
 
-The CLI accepts two single-channel WAV slices (PCM 16-bit or 32-bit float, 8000 Hz) pre-extracted by FFmpeg into WORK_DIR:
+The engine is a stdin/stdout JSON bridge: it reads one job object from stdin and prints one result object to stdout (exit codes: 0 success, 2 usage error, 3 analysis failure). `--selftest` runs a built-in synthetic check and exits. There are no `--target`/`--donor`/`--max-offset-sec` flags; the settled ±180 s bound lives in `sync.defaults.max_offset_sec`.
+
+A job selects a window from two mono sources (a WAV file path or inline PCM samples) at the same timeline positions on both sides:
+
 Bash
 
-dubarr-sync \
-  --target /work/jobs/42/target_cp1.wav \
-  --donor  /work/jobs/42/donor_cp1.wav \
-  --max-offset-sec 180
+{
+  "target": {"path": "/work/jobs/42/target.wav"},
+  "donor":  {"path": "/work/jobs/42/donor.wav"},
+  "slice_start_sec": 420.0,
+  "slice_len_sec": 190.0,
+  "window_sec": 190.0
+}
+
+`window_sec` bounds the absolute offset search and defaults to 5 s when omitted (`sync-engine/src/lib.rs`).
 
 Algorithm & Sign Convention inside Rust:
 
-    Load samples from both WAV files and normalize amplitudes (DC offset removal + RMS normalization).
+    Load both sources as mono samples (WAV path or inline PCM); reject mismatched sample rates.
+
+    Take the slice [slice_start_sec, slice_start_sec + slice_len_sec) from both sources independently.
 
     Compute fast cross-correlation using FFT (rustfft): IFFT(FFT(target) * conj(FFT(donor))).
 
-    Locate the correlation peak within the allowed search window [-max-offset-sec, +max-offset-sec].
+    Locate the correlation peak within [-window_sec, +window_sec].
 
-    Compute sign-consistent offset (offset_ms = t_target - t_donor):
+    Derive sign-consistent offset (offset_ms = t_target - t_donor):
 
         Positive offset_ms (+1420) means the target event occurs 1420 ms later than the donor -> donor must be delayed (mkvmerge --sync 0:+1420).
 
         Negative offset_ms (-850) means the target event occurs 850 ms earlier than the donor -> donor must be advanced (mkvmerge --sync 0:-850).
 
-    Compute a confidence score (Peak-to-Noise Ratio mapped to 0.0 - 100.0).
+    Score prominence as correlation_quality (peak over the median lag response, 0..1) and report the analysed window actually used.
 
     Output JSON to stdout:
 
 JSON
 
 {
-  "offset_ms": 1420,
-  "confidence": 96.4,
-  "peak_to_noise": 11.8
+  "offset_ms": 1420.0,
+  "correlation_quality": 0.964,
+  "sample_rate": 8000,
+  "analyzed": {"start": 420.0, "len": 190.0}
 }
 
-5.2. Copy-on-Work & Generalized Multi-Point Analysis in Go
+5.2. Copy-on-Work & Multi-Point Analysis in Go
 
 Checking only the start of a movie fails to detect FPS drift or mid-movie edits. Go orchestrates:
 
@@ -364,29 +383,35 @@ Checking only the start of a movie fails to detect FPS drift or mid-movie edits.
 
             Priority 1 (same_lang_reference — Original Language): If arr_library_cache.original_language_iso2 exists in both the donor group and the target MKV (e.g., ja <-> ja), select that pair.
 
-            Priority 2 (same_lang_reference — Other Shared Language): Otherwise, pick any other non-target shared language present in both the donor group and target MKV (e.g., en <-> en, preferring higher channel count/bitrate).
+            Priority 2 (same_lang_reference — Other Shared Language): Otherwise, pick any other non-target shared language present in both the donor group and target MKV (e.g., en <-> en). Implemented tie-break: channel count, then track index (probe.AudioTrack carries no bitrate; documented in reflang.go).
 
             Priority 3 (lowpass_fallback): If no shared reference exists, compare the copied target_track (e.g., pl) directly against the target MKV's Original Language (or en, or first non-commentary) audio stream.
 
-    Multi-Point Window Slicing via FFmpeg:
+    Whole-Movie Decode via FFmpeg (once per side):
 
-        Select 5 to 7 checkpoints along the shorter file's duration (e.g., 10%, 25%, 40%, 55%, 70%, 85%).
-
-        For each checkpoint, FFmpeg reads the target MKV (read-only) and the copied .mka inside WORK_DIR, extracting 150-second windows downsampled to 8000 Hz, mono, pcm_f32le into WORK_DIR:
+        ffmpeg decodes the chosen target stream and the copied donor track once each into whole-movie mono 8 kHz pcm_f32le WAVs ({job_dir}/target.wav and {job_dir}/donor.wav), applying the band-shaping filter:
 
             same_lang_reference: speech band shaping (highpass=f=80,lowpass=f=3500).
 
             lowpass_fallback: aggressive low-pass filter (lowpass=f=200,highpass=f=30) isolating bass, explosions, and score.
 
-    Concurrent Cross-Correlation & Anomaly Classification:
+    Sequential Per-Checkpoint Correlation:
 
-        Go executes dubarr-sync concurrently across checkpoints via worker goroutines.
+        Go walks the configured checkpoint percentages (settled default 10/25/40/55/70/85% of the shorter duration, `sync.defaults.checkpoint_positions_pct`) in order. For each checkpoint it sends the SAME two WAV paths plus slice_start_sec/slice_len_sec/window_sec to a fresh dubarr-sync process; there are no concurrent checkpoint goroutines.
 
-        Constant offset: Spread across valid checkpoints < 40 ms -> final offset is median, speed_mode = 'none'.
+        The analysed slice length is max(checkpoint_window_sec, max_offset_sec + 10 s) — 190 s with the settled 150 s window and ±180 s bound — centred on the checkpoint and clamped into the file; files shorter than the slice are analysed whole.
 
-        Linear drift (FPS mismatch): Linear regression shows significant slope (e.g., 23.976/25.000 or 25.000/23.976, R² > 0.97) -> sets detected_fps_ratio and recommends tempo mode.
+    Anomaly Classification:
 
-        Non-linear jump / mid-movie cut: Step change between checkpoints -> flags ready_for_review with a clear warning for manual inspection in Sync Studio.
+        Constant offset: spread across valid checkpoints < 40 ms -> final offset is median, speed_mode = 'none'.
+
+        Linear drift (FPS mismatch): linear regression shows a significant slope consistent with a FPS ratio (e.g., 23.976/25.000 or 25.000/23.976, R² > 0.97) -> sets detected_fps_ratio and recommends tempo mode.
+
+        Non-linear jump / mid-movie cut: step change between checkpoints -> flags ready_for_review with a clear warning for manual inspection in Sync Studio.
+
+        Verdict precedence: out_of_range (any offset beyond ±max_offset_sec) > unreliable (checkpoint quality below threshold) > drifting > ok.
+
+> **Implementation pointer (issue #24):** this section previously described per-checkpoint `target_cp*.wav`/`donor_cp*.wav` extraction with concurrent goroutines; that design was never implemented. The text above documents the shipped behaviour (whole-movie decode + sequential per-checkpoint engine calls). Bounding the whole-movie decode’s memory/disk cost is a separate performance effort and is intentionally not documented here.
 
 5.3. Final Muxing Rules
 
@@ -439,7 +464,7 @@ Authentication, Setup & Settings
 
     GET /api/auth/tokens / POST /api/auth/tokens / DELETE /api/auth/tokens/{id} — manage hashed automation API tokens.
 
-    GET /api/settings / PUT /api/settings — read/update storage.paths (watch_dir, vault_dir, work_dir, media_roots), languages.policy (target languages, export mode, commentary exclusion), target.tag_filter (required/excluded filename tags, match mode, enforce toggle), mux.options (backup, track title, output mode), audio.options (ordered opt-in Transcode Rules; absent/empty means lossless copy), and sync.defaults.
+    GET /api/settings / PUT /api/settings — read/update storage.paths (watch_dir, vault_dir, work_dir, media_roots), languages.policy (target languages, export mode, commentary exclusion), target.tag_filter (required/excluded filename tags, match mode, case sensitivity, enforce toggle, plus `source_mode` = filename|arr|both and the optional arr criterion `required_arr_tags`/`excluded_arr_tags`/`root_folder_paths` — ADR-0009; empty filename list is the neutral default, ADR-0012), mux.options (backup, track title, output mode), audio.options (ordered opt-in Transcode Rules; absent/empty means lossless copy), and sync.defaults.
 
     GET /api/settings/export — exports sanitized configuration JSON excluding all API keys, hashes, and master keys.
 
@@ -473,11 +498,11 @@ Audio Vault (Catalog Browser)
 
     GET /api/vault/movies / GET /api/vault/series — Radarr/Sonarr-style library view showing:
 
-        target file languages (audio_languages_json), original language, and Tdarr tag eligibility status (eligible, waiting_for_tags, missing_target),
+        target file languages (audio_languages_json), original language, and Processing Gate eligibility status (eligible / waiting_for_tags / missing_target; ADR-0005, ADR-0009),
 
         archived .mka tracks in Vault grouped by donor release (lang_iso2, variant, codec, channels),
 
-        clear status badges (e.g., "Waiting for Tdarr tag [TDARR]", "Vault track ready to sync & mux", "Target already has pl audio").
+        clear status badges (e.g., "Waiting for required tag", "Vault track ready to sync & mux", "Target already has pl audio").
 
     DELETE /api/vault/tracks/{id} — explicitly deletes a .mka file from Vault disk and database (the only user-initiated Vault deletion path).
 
@@ -499,11 +524,11 @@ Real-Time Updates (WebSocket)
 
 7. Frontend Specification (React WebUI)
 
-Dark-mode UI inspired by the *arr ecosystem (Radarr/Sonarr/Tdarr), responsive across desktop and mobile browsers:
+Dark-mode UI inspired by the *arr ecosystem (Radarr/Sonarr and similar), responsive across desktop and mobile browsers:
 
-    First-Run Setup Wizard (/setup): Guided setup for Admin credentials, server directory browser (WATCH_DIR, VAULT_DIR, WORK_DIR, MEDIA_ROOTS), target/export language policy, Tdarr filename tag filter, and Radarr/Sonarr connections.
+    First-Run Setup Wizard (/setup): Guided setup for Admin credentials, server directory browser (WATCH_DIR, VAULT_DIR, WORK_DIR, MEDIA_ROOTS), target/export language policy, Processing Gate filename-tag criterion, and Radarr/Sonarr connections.
 
-    Dashboard / Overview: Storage summary for Audio Vault & Work scratch usage, Tdarr tag waiting queue count, and quick-action cards for eligible tagged target files missing target-language audio that have tracks waiting in Vault.
+    Dashboard / Overview: Storage summary for Audio Vault & Work scratch usage, Processing Gate waiting-for-tags count, and quick-action cards for eligible tagged target files missing target-language audio that have tracks waiting in Vault.
 
     Import / Approval Queue (/imports):
 
@@ -511,7 +536,7 @@ Dark-mode UI inspired by the *arr ecosystem (Radarr/Sonarr/Tdarr), responsive ac
 
         ffprobe audio stream table with checkboxes, ISO-2 language override selector (handling und tracks), variant selector (dubbing, lektor, original, standard, commentary), and auto-selection driven by languages.policy.
 
-    Audio Vault (/vault): Movies and Series/Anime views displaying ISO-2 track badges (PL DUB, JA ORIG, EN), Tdarr target tag eligibility status (Eligible, Waiting for [TDARR]), and "Sync & Mux to Target" actions.
+    Audio Vault (/vault): Movies and Series/Anime views displaying ISO-2 track badges (PL DUB, JA ORIG, EN), Processing Gate eligibility status (eligible / waiting for tags / missing target), and "Sync & Mux to Target" actions.
 
     Sync Studio (/sync/{jobId}):
 
@@ -523,7 +548,7 @@ Dark-mode UI inspired by the *arr ecosystem (Radarr/Sonarr/Tdarr), responsive ac
 
     Settings (/settings):
 
-        Tabs for Storage Paths, Language & Export Flow, Target Tag Filter (Tdarr), Radarr / Sonarr Instances (masked API keys + Test Connection), Security & API Tokens, and System Health (ffmpeg, ffprobe, mkvmerge, dubarr-sync).
+        Tabs for Storage Paths, Language & Export Flow, Processing Gate (filename tags + optional arr criteria), Radarr / Sonarr Instances (masked API keys + Test Connection), Security & API Tokens, and System Health (ffmpeg, ffprobe, mkvmerge, dubarr-sync).
 
 8. Packaging and Deployment (Docker + Native Windows/Linux)
 8.1. Docker (Primary Server Target)
@@ -534,7 +559,7 @@ Dark-mode UI inspired by the *arr ecosystem (Radarr/Sonarr/Tdarr), responsive ac
 
         Stage 2 (rust:1-bookworm or alpine): builds dubarr-sync (cargo build --release).
 
-        Stage 3 (golang:1.23): compiles Go backend with embedded frontend/dist (go:embed).
+        Stage 3 (golang:1.27-alpine): compiles Go backend with embedded frontend/dist (go:embed).
 
         Stage 4 (Minimal runtime, e.g., debian:bookworm-slim or alpine): contains only the dubarr binary, dubarr-sync binary, ffmpeg, mkvtoolnix (mkvmerge), and CA certificates.
 
@@ -548,7 +573,7 @@ Dark-mode UI inspired by the *arr ecosystem (Radarr/Sonarr/Tdarr), responsive ac
 
     Uses the OS Keyring for the master encryption key when available, falling back cleanly to 0600 keyfile storage.
 
-    External binaries (ffmpeg, ffprobe, mkvmerge, dubarr-sync) are resolved first from ./bin/ next to the executable, then from system PATH.
+    External binaries (ffmpeg, ffprobe, mkvmerge, dubarr-sync) are resolved from `PATH` only (`exec.LookPath`; `backend/internal/sync/runner.go:81`, `/api/health`). There is no `./bin/` next-to-executable lookup; ship both binaries in one directory on `PATH` (see `docs/RELEASING.md`).
 
 9. Phased Implementation Plan (For AI Orchestrator)
 
@@ -591,7 +616,7 @@ Milestone 3: Immutable Audio Vault & Lossless ISO-2 Extraction (via WORK_DIR Sta
 
         Extract selected streams via ffmpeg -map 0:<idx> -c:a copy into {WORK_DIR}/extract/{id}/ with Matroska ISO-2 language & title tags, validate via ffprobe, compute SHA-256, and atomically move into {VAULT_DIR} using <media filename>.<lang>.mka (with collision disambiguation before .<lang>.mka).
 
-        Build Audio Vault (/vault) UI displaying ISO-2 track badges, target audio languages, and Tdarr tag eligibility status.
+        Build Audio Vault (/vault) UI displaying ISO-2 track badges, target audio languages, and Processing Gate eligibility status.
 
     Acceptance Criteria: Approving an import creates validated .mka files ending in .{iso2}.mka inside VAULT_DIR, records sha256 hashes in audio_tracks, and leaves zero staging files behind.
 

@@ -283,8 +283,8 @@ func TestProcessOnceRunsRealExecuteMuxRescanChain(t *testing.T) {
 		t.Fatalf("arr rescan bodies = %v, want one Radarr RescanMovie movieId 7", bodies)
 	}
 
-	if _, err := os.Stat(filepath.Join(work, "jobs", fmt.Sprintf("%d", rec.ID))); err != nil {
-		t.Fatalf("staging should be kept on success: %v", err)
+	if _, err := os.Stat(filepath.Join(work, "jobs", fmt.Sprintf("%d", rec.ID))); !os.IsNotExist(err) {
+		t.Fatalf("staging should be removed after a completed job, stat err = %v", err)
 	}
 }
 

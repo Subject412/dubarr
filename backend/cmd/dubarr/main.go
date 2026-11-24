@@ -430,7 +430,7 @@ type scannerWiring struct {
 
 // wireScanner builds the M2 ingest pipeline: watch scanner over the configured
 // watch folder, with a post-record hook that classifies each new candidate via
-// the Tdarr Gate and persists the verdict for GET /api/queue.
+// the Processing Gate and persists the verdict for GET /api/queue.
 //
 // The scanner watches storage.paths.watch_dir (IDEA.md §3.3), the dropzone for
 // incoming donor media; media_roots are the target libraries and are not

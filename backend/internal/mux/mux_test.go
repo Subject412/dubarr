@@ -215,6 +215,58 @@ func TestStaleTempBesideTargetIsFlagged(t *testing.T) {
 	}
 }
 
+// TestMuxCopyOnWorkStagesVerbatimTarget restores the Copy-on-Work integrity
+// assertion lost when issue #23 made Mux remove its own staging: the target is
+// copied byte-for-byte into {WORK_DIR}/jobs/{id}/ before mkvmerge reads it.
+// The copy only exists between MkdirAll and the deferred RemoveAll, so it is
+// observed through the Run hook at the moment mkvmerge is invoked: argv is
+// "-o <temp> --quiet <workCopy> ...", which is the only read of those bytes.
+func TestMuxCopyOnWorkStagesVerbatimTarget(t *testing.T) {
+	h := newHarness(t)
+	originalHash := sha256File(t, h.target)
+	wantCopy := filepath.Join(h.work, "jobs", "42", "target.mkv")
+
+	var observedPath, observedHash string
+	var observedErr error
+	run := func(ctx context.Context, bin string, args ...string) ([]byte, error) {
+		if filepath.Base(bin) == "mkvmerge" {
+			if len(args) < 4 {
+				t.Fatalf("mkvmerge argv too short: %v", args)
+			}
+			observedPath = args[3]
+			observedErr = nil
+			if _, err := os.Stat(observedPath); err != nil {
+				observedErr = err
+			} else {
+				observedHash = sha256File(t, observedPath)
+			}
+		}
+		return execRun(ctx, bin, args...)
+	}
+
+	if _, err := New(Dependencies{Run: run}).Mux(context.Background(), h.job()); err != nil {
+		t.Fatalf("Mux: %v", err)
+	}
+
+	if observedPath == "" {
+		t.Fatal("mkvmerge was never invoked; the staged copy was not observed")
+	}
+	if observedPath != wantCopy {
+		t.Errorf("mkvmerge read %q, want the staged copy at %q", observedPath, wantCopy)
+	}
+	if observedErr != nil {
+		t.Fatalf("staged copy %s at mkvmerge time: %v", observedPath, observedErr)
+	}
+	if observedHash != originalHash {
+		t.Errorf("staged copy sha256 = %s, want the target's %s (Copy-on-Work not verbatim)", observedHash, originalHash)
+	}
+
+	// The observed copy was the transient staging, not a surviving artifact.
+	if _, err := os.Stat(wantCopy); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("staged copy %s still present after Mux returned: %v", wantCopy, err)
+	}
+}
+
 // snapshot records every regular file under dir with its hash.
 func snapshot(t *testing.T, dir string) map[string]string {
 	t.Helper()
@@ -463,10 +515,11 @@ func TestMuxPublishesAtomicallyWithBackup(t *testing.T) {
 		t.Errorf("added codec = %q, want pcm_s16le (copied, never transcoded)", added.CodecName)
 	}
 
-	// The target was copied into the job's Work Area first (Copy-on-Work).
-	workCopy := filepath.Join(h.work, "jobs", "42", "target.mkv")
-	if got := sha256File(t, workCopy); got != beforeTargetHash {
-		t.Errorf("work copy hash = %s, want staged original %s", got, beforeTargetHash)
+	// Issue #23: a completed mux leaves no staging behind. The target was
+	// copied into the job's Work Area (Copy-on-Work) and that copy lived in
+	// the job directory Mux has now removed.
+	if _, err := os.Stat(filepath.Join(h.work, "jobs", "42")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("job staging still present after a publish: %v", err)
 	}
 
 	// Command shape follows IDEA.md:397-403: target as input, then the
@@ -1111,6 +1164,41 @@ func TestOutputDestinationValidation(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestMuxRemovesJobStagingOnReturn pins issue #23: a standalone Mux call owns
+// its staging. Once Mux returns — on success and on a failure that happened
+// after the job directory was created — {WORK_DIR}/jobs/{id} is gone, so a
+// caller that never runs the sync worker leaves no directory behind. Removal
+// is idempotent, so the worker's own cleanup of the same job stays harmless.
+func TestMuxRemovesJobStagingOnReturn(t *testing.T) {
+	staging := func(h *harness) string { return filepath.Join(h.work, "jobs", "42") }
+
+	t.Run("success", func(t *testing.T) {
+		h := newHarness(t)
+		if _, err := New(Dependencies{}).Mux(context.Background(), h.job()); err != nil {
+			t.Fatalf("Mux: %v", err)
+		}
+		if _, err := os.Stat(staging(h)); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("job staging %s still present after a successful mux: %v", staging(h), err)
+		}
+	})
+
+	// A muxer failure happens after the job directory and the work copy exist
+	// (mkvmerge cannot write its output), so this exercises the failure path
+	// that used to leave the directory behind.
+	t.Run("tool failure", func(t *testing.T) {
+		h := newHarness(t)
+		if _, err := New(Dependencies{MKVMergePath: "/bin/false"}).Mux(context.Background(), h.job()); !errors.Is(err, ErrTool) {
+			t.Fatalf("Mux error = %v, want ErrTool", err)
+		}
+		if _, err := os.Stat(staging(h)); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("job staging %s still present after a failed mux: %v", staging(h), err)
+		}
+		if _, err := os.Stat(h.target + ".bak"); !errors.Is(err, os.ErrNotExist) {
+			t.Error(".bak created despite failed mux")
+		}
+	})
 }
 
 // TestArrGateCriteriaBlockAndForceOverride wires ADR-0009 into the mux call

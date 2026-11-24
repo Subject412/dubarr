@@ -9,28 +9,28 @@ source-build instructions, start at the [root README](../README.md).
 - `entrypoint.sh` — remaps the `dubarr` user to `PUID`/`PGID` (default
   1000/1000), fixes `/config` ownership (0700) and drops privileges with
   `gosu`.
-- `docker-compose.yml` — the canonical, all-defaults appliance service.
-- `docker-compose.example.yml` + `.env.example` — copy-ready variant with
-  non-default host values (port `8090`, custom media path, different
-  `PUID`/`PGID`, explicit config bind mount).
+- `docker-compose.yml` — the canonical, self-documenting appliance example. It
+  carries inline `${VAR:-…}` fallbacks for every knob, so `docker compose up`
+  from this directory works with no `.env`; it documents itself in comments and
+  every variable is listed once in the table below.
 
 ## Compose variables
 
-This is the single reference for the variables both compose files use. Both
-files carry inline `${VAR:-…}` fallbacks, so each runs with no `.env`: the
-canonical file falls back to the defaults below, while the example deliberately
-falls back to non-default values (port `8090`, `/srv/media/library`,
-`PUID`/`PGID` `1001`). A `docker/.env` overrides either set.
+This is the single reference for the Compose variables. `docker-compose.yml`
+carries a `${VAR:-…}` fallback for each one, so it runs with no `.env`; the
+defaults below are what it uses. A `docker/.env` overrides any of them.
 
-| Variable | Canonical default | Example fallback | Consumed by | Purpose |
-| --- | --- | --- | --- | --- |
-| `PUID` | `1000` | `1001` | entrypoint, inside the container | uid the `dubarr` process runs as; must own `/config` and be able to read the media mount |
-| `PGID` | `1000` | `1001` | entrypoint, inside the container | gid for the same process |
-| `MEDIA_PATH` | `./media` | `/srv/media/library` | Compose, on the host | host directory bind-mounted read-only at `/media` |
-| `DUBARR_PORT` | `8080` | `8090` | Compose, on the host | published host port for the web UI |
+| Variable | Default | Consumed by | Purpose |
+| --- | --- | --- | --- |
+| `PUID` | `1000` | entrypoint, inside the container | uid the `dubarr` process runs as; must own `/config` and be able to read the media mount |
+| `PGID` | `1000` | entrypoint, inside the container | gid for the same process |
+| `CONFIG_PATH` | `./config` | Compose, on the host | host directory bind-mounted at `/config` for appliance state (database, master keyfile, logs); back it up |
+| `MEDIA_PATH` | `./media` | Compose, on the host | host directory bind-mounted read-only at `/media` |
+| `DUBARR_PORT` | `8080` | Compose, on the host | published host port for the web UI |
 
 `PUID` and `PGID` are the only environment variables the image honours.
-`MEDIA_PATH` and `DUBARR_PORT` never enter the container: `DUBARR_PORT=8090`
+`CONFIG_PATH`, `MEDIA_PATH` and `DUBARR_PORT` never enter the container: Compose
+resolves the first two when it builds the bind mounts, and `DUBARR_PORT=8090`
 publishes `8090:8080` while the process keeps listening on `0.0.0.0:8080`, so
 `entrypoint.sh` and the image need no change.
 
@@ -45,26 +45,22 @@ this directory) or export them in the shell:
 ```sh
 PUID=1000
 PGID=1000
+CONFIG_PATH=./config
 MEDIA_PATH=/srv/media
 DUBARR_PORT=8090
 ```
 
 ## Run
 
-With the defaults:
+From this directory, with the defaults:
 
 ```sh
 cd docker
 docker compose up --build
 ```
 
-With the example values:
-
-```sh
-cd docker
-cp .env.example .env    # edit PUID/PGID and MEDIA_PATH
-docker compose -f docker-compose.example.yml up --build
-```
+`docker/.env` overrides `PUID`, `PGID`, `CONFIG_PATH`, `MEDIA_PATH` and
+`DUBARR_PORT` without touching the compose file.
 
 Or build and run without Compose from the repository root:
 
@@ -74,8 +70,7 @@ docker run -d --name dubarr -p 8080:8080 \
   -e PUID=1000 -e PGID=1000 -v "$PWD/docker/config:/config" dubarr:latest
 ```
 
-The UI is served on the published port (8080 by default, 8090 for the example
-above).
+The UI is served on the published port (8080 by default).
 
 ## Secrets
 

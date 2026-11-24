@@ -50,7 +50,7 @@ func (s *Store) RecordImportCandidate(ctx context.Context, sourcePath, filename 
 	return n == 1, nil
 }
 
-// ImportGateStatus is the Tdarr Gate classification recorded for one import
+// ImportGateStatus is the Processing Gate classification recorded for one import
 // candidate (PLAN.md M2-5).
 //
 // import_queue has no dedicated gate column, and M2-5 is deliberately additive

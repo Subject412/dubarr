@@ -262,8 +262,9 @@ func TestProcessOnceRunsExecuteMuxRescanChain(t *testing.T) {
 	if rec.Status != "completed" {
 		t.Fatalf("status = %q, want completed", rec.Status)
 	}
-	if _, err := os.Stat(filepath.Dir(audio)); err != nil {
-		t.Fatalf("staging should be kept on success: %v", err)
+	// Issue #23: a completed job leaves no staging behind.
+	if _, err := os.Stat(filepath.Dir(audio)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("staging should be removed after a completed job, stat err = %v", err)
 	}
 }
 
@@ -427,7 +428,8 @@ func TestProcessOnceRescanFailureKeepsJobDone(t *testing.T) {
 
 // A shutdown cancellation observed right after the mux returns must not turn an
 // already-published job into a failure: the terminal status write is detached
-// from the drain context, and staging is kept.
+// from the drain context. Staging is still removed for the finished job
+// (issue #23).
 func TestProcessOncePublishedJobSurvivesShutdownCancellation(t *testing.T) {
 	r := newRig(t)
 	jobID := r.newJob(t)
@@ -454,8 +456,35 @@ func TestProcessOncePublishedJobSurvivesShutdownCancellation(t *testing.T) {
 	if rec.Status != "completed" {
 		t.Fatalf("status = %q, want completed after a published mux", rec.Status)
 	}
-	if _, err := os.Stat(filepath.Dir(audio)); err != nil {
-		t.Fatalf("staging should be kept after a published job: %v", err)
+	if _, err := os.Stat(filepath.Dir(audio)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("staging should be removed after a published job, stat err = %v", err)
+	}
+}
+
+// Issue #23: staging left by an interrupted run must not survive boot. Start
+// reaps it before the drain loop runs, mirroring the extraction worker.
+func TestStartReapsStaleSyncStaging(t *testing.T) {
+	r := newRig(t)
+	stale := filepath.Join(r.workDir, "jobs", "999")
+	if err := os.MkdirAll(stale, 0o700); err != nil {
+		t.Fatalf("mkdir stale staging: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(stale, "target.wav"), []byte("wav"), 0o600); err != nil {
+		t.Fatalf("write stale file: %v", err)
+	}
+	old := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(stale, old, old); err != nil {
+		t.Fatalf("age stale staging: %v", err)
+	}
+
+	w := newWorker(t, r, &fakeExecutor{}, &fakeMuxer{}, &fakeRescanner{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w.Start(ctx)
+	w.Stop()
+
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("stale sync staging not reaped (stat err = %v)", err)
 	}
 }
 

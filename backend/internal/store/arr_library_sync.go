@@ -66,7 +66,7 @@ type LibraryCacheItem struct {
 	ArrTagLabels []string
 	// TargetFilePath is the resolved on-disk video, empty when arr has none.
 	TargetFilePath string
-	// MatchesTargetTags is the Tdarr Gate verdict for the target filename.
+	// MatchesTargetTags is the Processing Gate verdict for the target filename.
 	MatchesTargetTags bool
 	// EligibilityStatus is "eligible", "waiting_for_tags" or "missing_target".
 	EligibilityStatus string

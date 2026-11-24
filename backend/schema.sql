@@ -79,7 +79,7 @@ CREATE TABLE IF NOT EXISTS arr_library_cache (
     season_number INTEGER,
     episode_number INTEGER,
     episode_title TEXT,
-    media_folder_path TEXT,               -- Mapped local folder path (handles Tdarr filename renames)
+    media_folder_path TEXT,               -- Mapped local folder path (handles external-pipeline filename renames)
     target_file_path TEXT,                -- Mapped local path to target video file
     matches_target_tags BOOLEAN NOT NULL DEFAULT 0,
     eligibility_status TEXT NOT NULL DEFAULT 'missing_target'

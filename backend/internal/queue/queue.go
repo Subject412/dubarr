@@ -1,5 +1,5 @@
 // Package queue exposes the M2 approval queue: pending donor candidates with
-// their matched arr target, donor pairing and Tdarr Gate verdict, plus the
+// their matched arr target, donor pairing and Processing Gate verdict, plus the
 // approve/reject status transitions.
 //
 // M2 is approval-only: approve marks the row extracting for the M3 extraction
@@ -26,7 +26,7 @@ import (
 
 // defaultDonorPatterns pairs a target with sibling releases whose filename
 // carries the configured dubbing marker. It matches the fixture drop
-// ("Minions ... PL.DUB ... mp4" next to the Tdarr-tagged target).
+// ("Minions ... PL.DUB ... mp4" next to a tag-eligible target).
 var defaultDonorPatterns = []string{"PL.DUB"}
 
 // Dependencies are the collaborators the queue API needs.

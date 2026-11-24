@@ -19,24 +19,34 @@ still change between minor releases. See [docs/RELEASING.md](docs/RELEASING.md).
 
 ## Quick start with Docker
 
-The example stack publishes the UI on **8090** and reads its host-side values
-from `docker/.env`:
+The canonical stack is `docker/docker-compose.yml`. Every value in it has a
+working default, so it starts with no configuration at all:
 
 ```sh
 git clone https://github.com/Subject412/dubarr.git
 cd dubarr/docker
-cp .env.example .env      # edit PUID/PGID and MEDIA_PATH for your host
-docker compose -f docker-compose.example.yml up -d --build
+docker compose up -d --build
 ```
 
-Open <http://localhost:8090> and complete the first-run wizard (administrator
-account, storage paths, and optionally Radarr/Sonarr connections). Follow the
-container logs with `docker logs -f dubarr`.
+This publishes the UI on **8080** and mounts `./media` into the container
+read-only. Open <http://localhost:8080> and complete the first-run wizard
+(administrator account, storage paths, and optionally Radarr/Sonarr
+connections). Follow the container logs with `docker logs -f dubarr`.
 
-`docker/docker-compose.yml` is the canonical all-defaults file: it publishes
-port `8080` and mounts `./media` read-only. The example adds non-default values
-for the host port, media path, uid/gid and an explicit config bind mount.
-`docker/README.md` documents every compose variable once.
+To adapt the stack to your host, put the overrides in `docker/.env` — Compose
+loads it from the `docker/` directory — instead of editing the compose file:
+
+```sh
+PUID=1000
+PGID=1000
+CONFIG_PATH=./config
+MEDIA_PATH=/srv/media
+DUBARR_PORT=8090
+```
+
+`docker/docker-compose.yml` is the single documented example: it is
+self-documenting, carries inline `${VAR:-…}` fallbacks so it also runs without
+a `.env`, and `docker/README.md` documents every compose variable once.
 
 ## Configuration
 
@@ -53,6 +63,7 @@ The only knobs at the Compose level are deployment concerns:
 | Knob | Meaning |
 | --- | --- |
 | `PUID` / `PGID` | uid/gid the container process runs as |
+| `CONFIG_PATH` | host directory bind-mounted at `/config` (database, keyfile, logs); default `./config` |
 | `MEDIA_PATH` | host directory bind-mounted read-only at `/media` |
 | `DUBARR_PORT` | host port published onto the container's fixed `8080` |
 
@@ -83,8 +94,8 @@ command: ["--log-level", "debug", "--log-file"]
 | `separate` | The muxed file is written to the **Mux output folder** (`storage.paths.output_dir`) and the library Target is not touched. |
 
 In `separate` mode the name is derived from the source Target basename plus
-`.dubarr.mkv`: `Movie (2021) [TDARR].mkv` becomes
-`Movie (2021) [TDARR].dubarr.mkv`. The destination is never overwritten and
+`.dubarr.mkv`: `Movie (2021) [TAG].mkv` becomes
+`Movie (2021) [TAG].dubarr.mkv`. The destination is never overwritten and
 never auto-suffixed — a job whose deliverable already exists fails with a clear
 error, so re-running a mux is an explicit decision. The folder is a storage
 root of its own (absolute, symlink-resolved, must exist) and may not be the
@@ -153,7 +164,10 @@ cd backend
 
 Open <http://localhost:8080>, finish the first-run wizard, then add your
 Radarr/Sonarr connections and library roots in **Settings**. The data directory
-is created with `0700` and holds the database, key material and logs.
+is created with `0700` and holds the database, key material and logs. For a
+native desktop deployment, add the optional `--desktop` bootstrap flag
+(`./dubarr --data-dir ../data --desktop`) to open the UI in the default
+browser.
 
 ## Development
 
@@ -165,8 +179,8 @@ cd backend && go build ./cmd/dubarr && go test ./... && go vet ./...
 cd frontend && npm install && npm run dev
 cd frontend && npm run build && npm run lint && npm test
 
-# DSP: build, tests, lint
-cd sync-engine && cargo build && cargo test && cargo clippy
+# DSP: build, tests, fmt, lint
+cd sync-engine && cargo build && cargo test && cargo fmt --check && cargo clippy
 ```
 
 Docker image build: `docker build -f docker/Dockerfile -t dubarr:latest .`
@@ -179,7 +193,7 @@ building locally, set `image: subject928/dubarr:latest` in
 
 ## Documentation
 
-- [IDEA.md](IDEA.md) — product specification and scope boundaries.
+- [IDEA.md](IDEA.md) — historical design narrative (non-normative; see the authority banner at the top).
 - [GLOSSARY.md](GLOSSARY.md) — domain vocabulary (donor, target, vault, gate…).
 - [PLAN.md](PLAN.md) — milestones, defaults and implementation plan.
 - [docs/adr/](docs/adr/) — architecture decision records.

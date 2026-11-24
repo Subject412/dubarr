@@ -150,11 +150,11 @@ func (r Rule) FilenameOnly() Rule {
 // source is active, its arr metadata.
 //
 // With source_mode=filename (and the legacy zero value) eligibility is decided
-// solely by the base filename: ADR-0005 settles that Tdarr writes the
-// processed-tag marker into the name, and container tags stay informational.
-// ADR-0009 supersedes that wording for source_mode=arr/both: the arr criterion
-// (tag labels and root-folder path from arr_library_cache) is AND-ed with the
-// filename criterion, and a target with no arr library row fails closed.
+// solely by the base filename: ADR-0005 makes the filename the authoritative
+// marker location, and container tags stay informational. ADR-0009 amends
+// ADR-0005 for source_mode=arr/both: the arr criterion (tag labels and
+// root-folder path from arr_library_cache) is AND-ed with the filename
+// criterion, and a target with no arr library row fails closed.
 //
 // ANY is satisfied by one required tag, ALL by all of them; REGEX treats each
 // required entry as a regular expression and any match satisfies that source.

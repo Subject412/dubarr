@@ -100,6 +100,10 @@ type AudioTrack struct {
 	// non-matching rather than guessing.
 	BitrateBPS int `json:"bitrate_bps"`
 	SampleRate int `json:"sample_rate"`
+	// Duration is the stream's own duration (ffprobe `duration`, seconds). It
+	// differs from the container duration when donor tracks have unequal
+	// lengths, and extraction validates each output against this value.
+	Duration time.Duration `json:"duration"`
 }
 
 // IsCommentary reports whether the track is commentary: either the muxer set
@@ -300,6 +304,7 @@ type ffprobeDoc struct {
 		// quoted strings, while hand-written fixtures often use bare numbers.
 		BitRate     ffprobeNumber     `json:"bit_rate"`
 		SampleRate  ffprobeNumber     `json:"sample_rate"`
+		Duration    string            `json:"duration"`
 		Tags        map[string]string `json:"tags"`
 		Disposition map[string]int    `json:"disposition"`
 	} `json:"streams"`
@@ -331,6 +336,10 @@ func parseFFprobe(path string, raw []byte) (*MediaInfo, error) {
 		}
 		tags := lowerTags(s.Tags)
 		lang := tags["language"]
+		var trackDuration time.Duration
+		if d, err := strconv.ParseFloat(strings.TrimSpace(s.Duration), 64); err == nil && d > 0 {
+			trackDuration = time.Duration(math.Round(d * float64(time.Second)))
+		}
 		info.Tracks = append(info.Tracks, AudioTrack{
 			Index:         s.Index,
 			Codec:         s.CodecName,
@@ -343,6 +352,7 @@ func parseFFprobe(path string, raw []byte) (*MediaInfo, error) {
 			Disposition:   dispositionFrom(s.Disposition),
 			BitrateBPS:    parsePositiveInt(string(s.BitRate)),
 			SampleRate:    parsePositiveInt(string(s.SampleRate)),
+			Duration:      trackDuration,
 		})
 	}
 	return info, nil

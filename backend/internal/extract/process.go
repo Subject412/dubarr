@@ -102,7 +102,12 @@ func (w *Worker) processJob(ctx context.Context, job store.ImportExtractionJob) 
 		outputs = append(outputs, out)
 		// Validate against this track's own donor duration: donor audio tracks
 		// may differ in length, so the container duration is only a fallback.
-		duration := mkvTracks[pos].Duration
+		// Prefer ffprobe's per-stream duration; mkvmerge's per-track value (when
+		// its JSON reports one) and the container duration follow.
+		duration := track.Duration
+		if duration <= 0 {
+			duration = mkvTracks[pos].Duration
+		}
 		if duration <= 0 {
 			duration = media.Duration
 		}

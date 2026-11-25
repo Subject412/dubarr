@@ -73,9 +73,11 @@ type LibraryListItem struct {
 	SeasonNumber   *int   `json:"season_number,omitempty"`
 	EpisodeNumber  *int   `json:"episode_number,omitempty"`
 	EpisodeTitle   string `json:"episode_title"`
-	// MediaFolderPath is the arr folder; TargetFilePath is the resolved video
-	// (empty while arr has no file).
+	// MediaFolderPath is the arr folder; RootFolderPath is the canonical arr
+	// root containing it (ADR-0009, empty when no configured root matches);
+	// TargetFilePath is the resolved video (empty while arr has no file).
 	MediaFolderPath string `json:"media_folder_path"`
+	RootFolderPath  string `json:"root_folder_path"`
 	TargetFilePath  string `json:"target_file_path"`
 	// MatchesTargetTags is the Processing Gate verdict for the target.
 	MatchesTargetTags bool   `json:"matches_target_tags"`
@@ -149,7 +151,7 @@ func (s *Store) ListLibrary(ctx context.Context, f ListLibraryFilter) (LibraryPa
 		if err := rows.Scan(&item.ID, &item.ArrInstanceID, &item.InstanceName, &item.InstanceType,
 			&item.MediaType, &item.ExternalItemID, &item.SeriesID, &item.TMDBID, &item.TVDBID,
 			&item.IMDBID, &item.Title, &item.OriginalTitle, &item.Year, &season, &episode,
-			&item.EpisodeTitle, &item.MediaFolderPath, &item.TargetFilePath,
+			&item.EpisodeTitle, &item.MediaFolderPath, &item.RootFolderPath, &item.TargetFilePath,
 			&item.MatchesTargetTags, &item.EligibilityStatus, &item.VideoCodec,
 			&item.UpdatedAt, &lastSeen); err != nil {
 			return LibraryPage{}, fmt.Errorf("store: scan library row: %w", err)
@@ -181,7 +183,8 @@ const libraryPageColumns = `
 	       COALESCE(c.tmdb_id, 0), COALESCE(c.tvdb_id, 0), COALESCE(c.imdb_id, ''),
 	       c.title, COALESCE(c.original_title, ''), COALESCE(c.year, 0),
 	       c.season_number, c.episode_number, COALESCE(c.episode_title, ''),
-	       COALESCE(c.media_folder_path, ''), COALESCE(c.target_file_path, ''),
+	       COALESCE(c.media_folder_path, ''), COALESCE(c.root_folder_path, ''),
+	       COALESCE(c.target_file_path, ''),
 	       c.matches_target_tags, c.eligibility_status, COALESCE(c.video_codec, ''),
 	       COALESCE(c.updated_at, ''), c.last_seen_at
 	FROM arr_library_cache c
@@ -232,4 +235,62 @@ func libraryFilterSQL(f ListLibraryFilter) (string, []any, error) {
 		return "", args, nil
 	}
 	return " WHERE " + strings.Join(clauses, " AND "), args, nil
+}
+
+// ArrInstanceHealth is one arr instance's sync health as the Library screen
+// reports it (migration 0005). The Null* fields keep the three "never
+// happened" cases distinguishable from real values: LastAttemptAt NULL means
+// the instance was never attempted, LastOK NULL means never attempted (a
+// failed pass is 0, not NULL), LastSyncAt stays the last SUCCESS even after a
+// failing pass, and LastError is set only by a failure.
+type ArrInstanceHealth struct {
+	// Kind is the arr application: "radarr" or "sonarr".
+	Kind string
+	// Name is the operator's instance label.
+	Name    string
+	Enabled bool
+	// LastSyncAt is the last successful pass (NULL = never succeeded).
+	LastSyncAt sql.NullString
+	// LastAttemptAt is the last attempt, failed or not (NULL = never tried).
+	LastAttemptAt sql.NullString
+	// LastOK is the last attempt's verdict (NULL = never tried).
+	LastOK sql.NullBool
+	// LastError is the scrubbed cause of the last failure, empty on success.
+	LastError sql.NullString
+	// ItemsSeen is how many arr_library_cache rows this instance owns.
+	ItemsSeen int64
+}
+
+// ArrLibraryHealth lists every arr instance with its sync health and cache
+// size, ordered by kind then name so the payload is stable between polls. The
+// second return value is cache_items: the total arr_library_cache row count
+// across all instances (rows whose instance vanished are impossible: the FK
+// cascades on delete, so summing per-instance counts is the whole table).
+func (s *Store) ArrLibraryHealth(ctx context.Context) ([]ArrInstanceHealth, int64, error) {
+	rows, err := s.DB.QueryContext(ctx,
+		`SELECT i.type, i.name, i.enabled, i.last_sync_at, i.last_attempt_at,
+		        i.last_sync_ok, i.last_sync_error,
+		        (SELECT COUNT(*) FROM arr_library_cache c WHERE c.arr_instance_id = i.id)
+		 FROM arr_instances i
+		 ORDER BY i.type, i.name COLLATE NOCASE, i.id`)
+	if err != nil {
+		return nil, 0, fmt.Errorf("store: read arr instance health: %w", err)
+	}
+	defer rows.Close()
+
+	out := []ArrInstanceHealth{}
+	var cacheItems int64
+	for rows.Next() {
+		var h ArrInstanceHealth
+		if err := rows.Scan(&h.Kind, &h.Name, &h.Enabled, &h.LastSyncAt, &h.LastAttemptAt,
+			&h.LastOK, &h.LastError, &h.ItemsSeen); err != nil {
+			return nil, 0, fmt.Errorf("store: scan arr instance health: %w", err)
+		}
+		cacheItems += h.ItemsSeen
+		out = append(out, h)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("store: iterate arr instance health: %w", err)
+	}
+	return out, cacheItems, nil
 }

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/Subject412/dubarr/backend/internal/extract"
+	"github.com/Subject412/dubarr/backend/internal/library"
 	"github.com/Subject412/dubarr/backend/internal/queue"
 	"github.com/Subject412/dubarr/backend/internal/settings"
 	"github.com/Subject412/dubarr/backend/internal/store"
@@ -182,6 +183,61 @@ func TestWireScannerWithoutWatchDirIsDisabled(t *testing.T) {
 	}
 	if logged != 1 {
 		t.Errorf("log calls = %d, want 1", logged)
+	}
+}
+
+// TestWireLibraryRoutes mounts the library group the composition root wires:
+// both read routes answer 200 on an admin-passing mux over a seeded store.
+func TestWireLibraryRoutes(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	st, err := store.Open(dir)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer st.Close()
+
+	res, err := st.DB.ExecContext(ctx,
+		`INSERT INTO arr_instances (name, type, base_url, api_key_enc, api_key_last4)
+		 VALUES ('main', 'radarr', 'http://radarr.invalid', x'00', '0000')`)
+	if err != nil {
+		t.Fatalf("insert arr instance: %v", err)
+	}
+	instanceID, err := res.LastInsertId()
+	if err != nil {
+		t.Fatalf("instance id: %v", err)
+	}
+	if _, err := st.DB.ExecContext(ctx,
+		`INSERT INTO arr_library_cache
+		 (arr_instance_id, media_type, external_item_id, title, root_folder_path,
+		  target_file_path, eligibility_status)
+		 VALUES (?, 'movie', 1, 'Shrek', '/media/movies', '/media/movies/Shrek.mkv', 'eligible')`,
+		instanceID); err != nil {
+		t.Fatalf("insert library cache: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	library.RegisterRoutes(mux, library.Dependencies{
+		DB:           st.DB,
+		RequireAdmin: func(h http.Handler) http.Handler { return h },
+	})
+
+	for path, key := range map[string]string{
+		"/api/library/items":  "items",
+		"/api/library/health": "instances",
+	} {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %s = %d, body %s", path, rec.Code, rec.Body.String())
+		}
+		var body map[string]json.RawMessage
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode %s: %v", path, err)
+		}
+		if _, ok := body[key]; !ok {
+			t.Errorf("GET %s body has no %q key: %s", path, key, rec.Body.String())
+		}
 	}
 }
 

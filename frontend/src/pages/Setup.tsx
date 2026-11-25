@@ -58,8 +58,9 @@ export function SetupPage() {
   // oxlint-enable react/set-state-in-effect
 
   // An already-initialised, signed-in visitor does not belong in the wizard.
-  // `adminCreated` keeps this guard from bouncing the wizard mid-flow once the
-  // setup mutation invalidates the auth-status query.
+  // `adminCreated` is set synchronously right after a successful setup mutation,
+  // before any further awaits, so the auth-status refetch that the mutation
+  // invalidates cannot commit while this guard still believes the wizard is unowned.
   if (!adminCreated && status.data?.initialized && status.data.authenticated) {
     return <Navigate to="/library" replace />
   }
@@ -86,11 +87,22 @@ export function SetupPage() {
     }
     try {
       await setup.mutateAsync({ username: username.trim(), password })
-      // /api/auth/setup sets the session cookie itself; fall back to login if a
-      // deployment ever returns 201 without a session.
-      const probe = await api.authStatus()
-      if (!probe.authenticated) await api.login(username.trim(), password)
+      // Claim the wizard before any further await: the mutation invalidates the
+      // auth-status query, and that refetch is delivered on a later macrotask.
+      // If it landed while `adminCreated` was still false the guard above would
+      // redirect to /library and unmount this wizard mid-flow.
       setAdminCreated(true)
+      // /api/auth/setup sets the session cookie itself; fall back to login if a
+      // deployment ever returns 201 without a session. This is best effort and
+      // must never strand the wizard: the account already exists server-side.
+      try {
+        const probe = await api.authStatus()
+        if (!probe.authenticated) await api.login(username.trim(), password)
+      } catch {
+        // /api/auth/setup sets the session cookie itself. If this best-effort
+        // probe fails the account still exists; continue the wizard rather than
+        // stranding the operator on a form that can no longer be submitted.
+      }
       setStep(1)
     } catch (error) {
       if (error instanceof ApiError && error.status === 409) {

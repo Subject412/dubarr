@@ -12,9 +12,9 @@ Nothing is destructive without an explicit decision: a target must be matched,
 tag-eligible and paired with a donor before it can be approved, and the Audio
 Vault is never written to after its first archive.
 
-Starting with 1.0, the HTTP API, settings schema and on-disk data layout are
-stable: an upgrade within a major version does not require migrating
-configuration or re-importing media.
+Dubarr is pre-1.0: the HTTP API, settings schema and on-disk layout may still
+change between minor releases. Pin an exact tag for production and read the
+release notes before upgrading.
 
 ## What it does
 

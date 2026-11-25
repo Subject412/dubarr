@@ -1,17 +1,20 @@
 # Changelog
 
 All notable changes to Dubarr are recorded here. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
-adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) from 1.0
-onward — see [docs/RELEASING.md](docs/RELEASING.md) for what a major, minor and
-patch release may change.
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project is
+pre-1.0, so it follows the 0.x reading of
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html) — see
+[docs/RELEASING.md](docs/RELEASING.md) for what a minor and patch release may
+change.
 
 ## [Unreleased]
 
-## [1.0.0]
+## [0.3.0]
 
-The first stable release. The HTTP API, settings schema and on-disk data layout
-are now a contract within 1.x.
+Pre-1.0. The HTTP API, settings schema and on-disk layout may still change before
+1.0, which stays reserved for the point at which those are stable. Read the
+upgrade notes before moving from 0.2.0 — two behaviour changes can surprise an
+existing install.
 
 ### Added
 

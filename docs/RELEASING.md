@@ -3,43 +3,42 @@
 Release infrastructure for Dubarr: what a release is, how archives are built, and
 how `dubarr-sync` must be installed next to the `dubarr` binary.
 
-## Semantic versioning
+## Semantic versioning (0.x)
 
-Dubarr follows SemVer from 1.0 onward:
+Dubarr is pre-1.0, so the usual SemVer rules are read as:
 
-- `MAJOR` — a breaking change to the HTTP API, the settings schema, the on-disk
-  data layout (database schema, key material, Audio Vault layout) or the CLI. A
-  major upgrade may require a migration step, and its release notes must say so.
-- `MINOR` — new features and behaviour, backwards compatible within the major
-  version.
-- `PATCH` — backwards-compatible fixes only.
+- `0.MINOR.PATCH` — `MINOR` may contain breaking changes (HTTP API, settings
+  schema, CLI, archive layout). `PATCH` is for backwards-compatible fixes only.
+- While the major version is `0`, do not expect stability between `MINOR` bumps:
+  pin an exact tag for production and read the release notes before upgrading.
+- `1.0.0` is reserved for the point at which the HTTP API, settings schema and
+  on-disk data layout are considered stable.
 
-Within a major version, an upgrade does not require re-importing media or
-rebuilding the Audio Vault. The database schema is migrated forward
-automatically on start, and a migration that cannot complete rolls back rather
-than leaving a half-applied database.
+The next release is `0.3.0`. Being prepared for release is not the same as
+leaving beta: the version number describes how stable the API is, not how ready
+the software is to run.
 
-History: `0.MINOR.PATCH` releases were pre-1.0, where `MINOR` could contain
-breaking changes and `1.0.0` was reserved for the point at which the HTTP API,
-settings schema and on-disk layout were considered stable. That point is 1.0.
-
-Pre-release identifiers (`v1.1.0-rc.1`) are permitted and publish a GitHub
+Pre-release identifiers (`v0.3.0-rc.1`) are permitted and publish a GitHub
 pre-release via the normal tag flow. Build metadata (`+...`) is not used in
 tags.
 
-## What 1.0 promises, and what it does not
+## What every 0.x release guarantees
 
-Promised at 1.0 and maintained within 1.x:
+The version number says how much the API may move. It says nothing about how
+carefully data is treated — these hold in every release, 0.x included:
 
-- The HTTP API, settings schema and on-disk layout do not change in a
-  breaking way between minor releases.
 - No silent destruction: a target must be matched, tag-eligible and paired with
   a donor before it can be approved; a mux is validated with `ffprobe` before it
   replaces anything; the Audio Vault is write-once after first archive.
-- A failed migration leaves the previous database intact.
+- The database schema is migrated forward automatically on start, and a
+  migration that cannot complete rolls back rather than leaving a half-applied
+  database.
+- An upgrade does not require re-importing media or rebuilding the Audio Vault.
 
-Not promised at 1.0:
+What 0.x does **not** promise:
 
+- **API and on-disk stability.** The HTTP API, settings schema and on-disk
+  layout may change between minor releases.
 - **Windows builds.** The code is kept cross-platform, but Windows compilation
   and CI are deferred and untested.
 - **Automatic vault reorganisation** — moving or renaming files inside the
@@ -194,8 +193,8 @@ workflow does not rewrite `Cargo.toml`.
 4. Confirm the working tree is clean and commit with a conventional message.
 5. Create the annotated tag and push it (maintainer, from `main`):
    ```sh
-   git tag -a v1.0.0 -m "dubarr v1.0.0"
-   git push origin v1.0.0
+   git tag -a v0.3.0 -m "dubarr v0.3.0"
+   git push origin v0.3.0
    ```
 6. Watch the `release` workflow; it fails if the tag is malformed or an
    expected archive is missing.
@@ -210,13 +209,13 @@ workflow does not rewrite `Cargo.toml`.
    on the target host and check `/api/health` reports `dubarr-sync`,
    `ffmpeg`, `ffprobe` and `mkvmerge` available.
 
-### Cutting 1.0 specifically
+### Cutting 0.3.0 specifically
 
-Before tagging `v1.0.0`, confirm the promises in "What 1.0 promises, and what it
-does not" still hold, and that the README's stability statement matches this
-document. The 1.0.0 `CHANGELOG.md` entry is the one users will read to decide
-whether to upgrade from `0.x`, so it must name every breaking change since the
-last `0.x` release rather than summarising them.
+Before tagging, confirm the guarantees in "What every 0.x release guarantees" still
+hold. The 0.3.0 `CHANGELOG.md` entry is what users read to decide whether to
+upgrade from 0.2.0, so it must name every breaking change since that release
+rather than summarising them — the approve-eligibility refusal and the Compose
+changes are the two that can surprise an existing install.
 
 ## CI prerequisites
 

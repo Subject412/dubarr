@@ -28,6 +28,11 @@ const DefaultInterval = 300 * time.Second
 // secret store. The pass skips that instance and keeps its cache.
 var ErrMissingAPIKey = errors.New("arrsync: arr instance has no API key")
 
+// syncFailureWriteTimeout bounds the detached health UPDATE: the write runs
+// after a cancelled pass, so it needs its own short deadline instead of an
+// unbounded context.
+const syncFailureWriteTimeout = 5 * time.Second
+
 // tagSource is the /api/v3/tag read both products provide.
 type tagSource interface {
 	Tags(ctx context.Context) ([]arr.Tag, error)
@@ -60,6 +65,11 @@ type LibraryStore interface {
 	ArrInstanceByKind(ctx context.Context, kind string) (store.ArrInstanceSyncRow, bool, error)
 	SaveArrInstance(ctx context.Context, row store.ArrInstanceSyncRow) (int64, error)
 	TouchArrInstanceSync(ctx context.Context, id int64) error
+	// RecordArrInstanceSyncFailure stores why the last attempt failed,
+	// leaving the last successful pass and the cached snapshot alone. The
+	// cause must already be scrubbed of credentials (the arr clients do
+	// that); the store redacts and caps it again before persisting.
+	RecordArrInstanceSyncFailure(ctx context.Context, id int64, cause string) error
 	SyncLibraryCache(ctx context.Context, instanceID int64, items []store.LibraryCacheItem) (store.LibrarySyncStats, error)
 }
 
@@ -196,8 +206,47 @@ func (p *Poller) Sync(ctx context.Context) (Stats, error) {
 }
 
 // syncInstance lists and caches one connection. A panic is contained here so
-// one broken instance cannot abort the pass.
+// one broken instance cannot abort the pass, and any failure is recorded as
+// sync health so the Library screen can show why the last attempt failed
+// without losing the previous snapshot.
 func (p *Poller) syncInstance(ctx context.Context, rule gate.Rule, conn settings.ArrConnection, stats *Stats) (err error) {
+	// Resolve the instance id BEFORE anything that can fail: the most common
+	// failure (a missing or unreadable API key) happens before ensureInstance
+	// runs, and without an id the health write below would be skipped,
+	// leaving a stale green row forever. A missing row or a failed lookup is
+	// not itself a pass error — ensureInstance still reports the real cause —
+	// but it is logged so a silent skip is visible.
+	var instanceID int64
+	if row, ok, lerr := p.store.ArrInstanceByKind(ctx, conn.Kind); lerr != nil {
+		p.logf("arrsync: %s: look up arr instance for health: %v", conn.Kind, lerr)
+	} else if !ok {
+		p.logf("arrsync: %s: no arr_instances row yet, a failure cannot be recorded", conn.Kind)
+	} else {
+		instanceID = row.ID
+	}
+	// Declared before the recover, so it runs after it and sees the final
+	// error (including a recovered panic). Health is written on a context
+	// detached from cancellation, because the pass may already be aborted,
+	// but bounded: a shutting-down process must not hang on the UPDATE.
+	defer func() {
+		if err == nil || instanceID <= 0 {
+			return
+		}
+		// A graceful shutdown cancels ctx mid-pass. That is not a sync
+		// failure, so health stays untouched instead of turning the
+		// instance red until the next pass. A genuine per-request timeout
+		// (context.DeadlineExceeded) is a different sentinel and is still
+		// recorded as a failure.
+		if errors.Is(err, context.Canceled) {
+			p.logf("arrsync: %s: pass cancelled, health left unchanged: %v", conn.Kind, err)
+			return
+		}
+		writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), syncFailureWriteTimeout)
+		defer cancel()
+		if ferr := p.store.RecordArrInstanceSyncFailure(writeCtx, instanceID, err.Error()); ferr != nil {
+			p.logf("arrsync: %s: record sync failure: %v", conn.Kind, ferr)
+		}
+	}()
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("arrsync: %s sync panic: %v", conn.Kind, r)
@@ -212,7 +261,7 @@ func (p *Poller) syncInstance(ctx context.Context, rule gate.Rule, conn settings
 		return fmt.Errorf("arrsync: read %s API key: %w", conn.Kind, err)
 	}
 
-	instanceID, err := p.ensureInstance(ctx, conn, apiKey)
+	instanceID, err = p.ensureInstance(ctx, conn, apiKey)
 	if err != nil {
 		return err
 	}

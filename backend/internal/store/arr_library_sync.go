@@ -24,6 +24,9 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
+
+	"github.com/Subject412/dubarr/backend/internal/logs"
 )
 
 // ErrInvalidLibraryItem reports a cache item the schema would reject (unknown
@@ -152,22 +155,76 @@ func (s *Store) SaveArrInstance(ctx context.Context, row ArrInstanceSyncRow) (in
 	return row.ID, nil
 }
 
-// TouchArrInstanceSync records a completed sync pass on the instance.
+// SyncHealthCauseLimit caps how much of a failure cause is stored in
+// arr_instances.last_sync_error. A pathological error (a dumped response body,
+// a stack trace) must not bloat the row or the Library payload.
+const SyncHealthCauseLimit = 500
+
+// TouchArrInstanceSync records a completed, successful sync pass on the
+// instance: last_sync_at (last success) moves, last_sync_ok becomes 1,
+// last_sync_error is cleared and last_attempt_at is stamped.
 func (s *Store) TouchArrInstanceSync(ctx context.Context, id int64) error {
+	now := time.Now().UTC().Format("2006-01-02 15:04:05")
 	if _, err := s.DB.ExecContext(ctx,
-		`UPDATE arr_instances SET last_sync_at = ? WHERE id = ?`,
-		time.Now().UTC().Format("2006-01-02 15:04:05"), id); err != nil {
+		`UPDATE arr_instances
+		 SET last_sync_at = ?, last_sync_ok = 1, last_sync_error = NULL, last_attempt_at = ?
+		 WHERE id = ?`,
+		now, now, id); err != nil {
 		return fmt.Errorf("store: touch arr instance %d: %w", id, err)
 	}
 	return nil
+}
+
+// RecordArrInstanceSyncFailure records a failed sync attempt without touching
+// the last-good snapshot: last_sync_ok becomes 0, last_sync_error carries the
+// cause and last_attempt_at is stamped, while last_sync_at (the last SUCCESS)
+// and every arr_library_cache row stay as they were. Without this a failing
+// pass is indistinguishable from no pass at all (migration 0005).
+//
+// The cause must already be free of credentials: the arr clients scrub the API
+// key from their errors, and callers pass err.Error() from those. As a second
+// line of defence the text is run through logs.Redact and capped at
+// SyncHealthCauseLimit bytes, so a stray "api_key=..." or an enormous driver
+// message cannot reach the row.
+func (s *Store) RecordArrInstanceSyncFailure(ctx context.Context, id int64, cause string) error {
+	if id <= 0 {
+		return errors.New("store: sync failure needs a positive arr instance id")
+	}
+	msg := truncateCause(logs.Redact(strings.TrimSpace(cause)))
+	if msg == "" {
+		msg = "sync failed"
+	}
+	now := time.Now().UTC().Format("2006-01-02 15:04:05")
+	if _, err := s.DB.ExecContext(ctx,
+		`UPDATE arr_instances
+		 SET last_sync_ok = 0, last_sync_error = ?, last_attempt_at = ?
+		 WHERE id = ?`,
+		msg, now, id); err != nil {
+		return fmt.Errorf("store: record arr instance %d sync failure: %w", id, err)
+	}
+	return nil
+}
+
+// truncateCause caps cause at SyncHealthCauseLimit bytes without splitting a
+// multi-byte rune.
+func truncateCause(cause string) string {
+	if len(cause) <= SyncHealthCauseLimit {
+		return cause
+	}
+	cut := SyncHealthCauseLimit
+	for cut > 0 && !utf8.RuneStart(cause[cut]) {
+		cut--
+	}
+	return cause[:cut]
 }
 
 // SyncLibraryCache applies one complete library snapshot for one instance.
 //
 // The whole snapshot is written in a single transaction: either the cache
 // matches arr or it keeps its previous contents. Rows are matched on
-// (arr_instance_id, external_item_id, media_type); unchanged rows are left
-// untouched so their updated_at (and id) stay stable.
+// (arr_instance_id, external_item_id, media_type); unchanged rows keep their id
+// and updated_at so content-change history stays intact, while every row the
+// pass observed gets last_seen_at stamped (observation, not change).
 func (s *Store) SyncLibraryCache(ctx context.Context, instanceID int64, items []LibraryCacheItem) (LibrarySyncStats, error) {
 	var stats LibrarySyncStats
 	if instanceID <= 0 {
@@ -216,6 +273,13 @@ func (s *Store) SyncLibraryCache(ctx context.Context, instanceID int64, items []
 			}
 			stats.Updated++
 		default:
+			// Unchanged rows keep their id and updated_at (content did not
+			// change) but are still observed by this pass, so last_seen_at
+			// moves. That is what tells a dropped-but-cached row apart from
+			// one that was never seen.
+			if err := stampLibrarySeen(ctx, tx, current.ID, now); err != nil {
+				return LibrarySyncStats{}, err
+			}
 			stats.Unchanged++
 		}
 	}
@@ -310,8 +374,8 @@ func insertLibraryCacheRow(ctx context.Context, tx *sql.Tx, instanceID int64, it
 		  title, original_title, original_language_iso2, year, season_number, episode_number,
 		  episode_title, media_folder_path, root_folder_path, target_file_path,
 		  arr_tag_ids_json, arr_tag_labels_json, matches_target_tags,
-		  eligibility_status, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		  eligibility_status, updated_at, last_seen_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		instanceID, item.MediaType, item.ExternalItemID, nullInt(item.SeriesID),
 		nullInt(item.TMDBID), nullInt(item.TVDBID), item.Title, nullStr(item.OriginalTitle),
 		nullStr(item.OriginalLanguageISO2), nullInt(int64(item.Year)),
@@ -319,7 +383,7 @@ func insertLibraryCacheRow(ctx context.Context, tx *sql.Tx, instanceID int64, it
 		nullStr(item.EpisodeTitle), nullStr(item.MediaFolderPath), nullStr(item.RootFolderPath),
 		nullStr(item.TargetFilePath), encodeArrTagIDs(item.ArrTagIDs),
 		encodeArrTagLabels(item.ArrTagLabels),
-		item.MatchesTargetTags, item.EligibilityStatus, now); err != nil {
+		item.MatchesTargetTags, item.EligibilityStatus, now, now); err != nil {
 		return fmt.Errorf("store: insert library row %s %d: %w", item.MediaType, item.ExternalItemID, err)
 	}
 	return nil
@@ -332,7 +396,7 @@ func updateLibraryCacheRow(ctx context.Context, tx *sql.Tx, id int64, item Libra
 		     original_language_iso2 = ?, year = ?, season_number = ?, episode_number = ?,
 		     episode_title = ?, media_folder_path = ?, root_folder_path = ?, target_file_path = ?,
 		     arr_tag_ids_json = ?, arr_tag_labels_json = ?,
-		     matches_target_tags = ?, eligibility_status = ?, updated_at = ?
+		     matches_target_tags = ?, eligibility_status = ?, updated_at = ?, last_seen_at = ?
 		 WHERE id = ?`,
 		nullInt(item.SeriesID), nullInt(item.TMDBID), nullInt(item.TVDBID), item.Title,
 		nullStr(item.OriginalTitle), nullStr(item.OriginalLanguageISO2), nullInt(int64(item.Year)),
@@ -340,8 +404,19 @@ func updateLibraryCacheRow(ctx context.Context, tx *sql.Tx, id int64, item Libra
 		nullStr(item.EpisodeTitle), nullStr(item.MediaFolderPath), nullStr(item.RootFolderPath),
 		nullStr(item.TargetFilePath), encodeArrTagIDs(item.ArrTagIDs),
 		encodeArrTagLabels(item.ArrTagLabels),
-		item.MatchesTargetTags, item.EligibilityStatus, now, id); err != nil {
+		item.MatchesTargetTags, item.EligibilityStatus, now, now, id); err != nil {
 		return fmt.Errorf("store: update library row %d: %w", id, err)
+	}
+	return nil
+}
+
+// stampLibrarySeen records that a pass observed an unchanged row. Only
+// last_seen_at moves: updated_at tracks content changes, so rewriting it here
+// would erase the "when did this row actually change" signal.
+func stampLibrarySeen(ctx context.Context, tx *sql.Tx, id int64, now string) error {
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE arr_library_cache SET last_seen_at = ? WHERE id = ?`, now, id); err != nil {
+		return fmt.Errorf("store: stamp library row %d last_seen_at: %w", id, err)
 	}
 	return nil
 }

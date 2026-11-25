@@ -29,7 +29,7 @@
 # /config; see docker/README.md for a recommended layout.
 services:
   dubarr:
-    image: subject928/dubarr:latest
+    image: subject928/dubarr:${DUBARR_IMAGE_TAG:-latest}
     container_name: dubarr
     restart: unless-stopped
     ports:

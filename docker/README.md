@@ -30,6 +30,7 @@ defaults below are what it uses. A `docker/.env` overrides any of them.
 | `CONFIG_PATH` | `./config` | Compose, on the host | host directory bind-mounted at `/config` for appliance state (database, master keyfile, logs); back it up |
 | `MEDIA_PATH` | `./media` | Compose, on the host | host directory bind-mounted at `/media` (writable) |
 | `DUBARR_PORT` | `8080` | Compose, on the host | published host port for the web UI |
+| `DUBARR_IMAGE_TAG` | `latest` | Compose, on the host | image tag to pull; set `DUBARR_IMAGE_TAG=0.2.0` to pin a published release instead of tracking `latest` |
 
 `PUID` and `PGID` are the only environment variables the image honours.
 `CONFIG_PATH`, `MEDIA_PATH` and `DUBARR_PORT` never enter the container: Compose
@@ -51,14 +52,17 @@ PGID=1000
 CONFIG_PATH=./config
 MEDIA_PATH=/srv/media
 DUBARR_PORT=8090
+DUBARR_IMAGE_TAG=latest
 ```
 
 ## Run
 
-From this directory, with the defaults:
+From the repository root, with the defaults:
 
 ```sh
 cd docker
+mkdir -p media/download media/vault media/content
+sudo chown -R 1000:1000 media        # PUID:PGID
 docker compose up -d
 ```
 
@@ -66,8 +70,22 @@ This pulls `subject928/dubarr:latest` from Docker Hub — no local build. The sa
 image is published to `ghcr.io/subject412/dubarr:latest`; swap the `image:` line
 in `docker-compose.yml` to use that registry instead.
 
-`docker/.env` overrides `PUID`, `PGID`, `CONFIG_PATH`, `MEDIA_PATH` and
-`DUBARR_PORT` without touching the compose file.
+To pin a published version instead of tracking `latest`, set
+`DUBARR_IMAGE_TAG` (`DUBARR_IMAGE_TAG=0.2.0` in `docker/.env`); the compose
+file needs no edit.
+
+`docker/.env` overrides `PUID`, `PGID`, `CONFIG_PATH`, `MEDIA_PATH`,
+`DUBARR_PORT` and `DUBARR_IMAGE_TAG` without touching the compose file.
+
+### Media ownership
+
+`MEDIA_PATH` must point at a tree owned by `PUID`/`PGID` (default 1000:1000).
+The default `./media` does not exist in a fresh clone and cannot be tracked, so
+Docker would create `docker/media` as `root:root`; `entrypoint.sh` only fixes
+ownership of `/config`. Replace-mode publication writes the muxed file (and an
+optional `.bak`) beside the Target, so a root-owned bind mount makes every
+publish fail with `EACCES`. Create the tree and chown it before the first `up`,
+as in the commands above, and do the same for any other `MEDIA_PATH`.
 
 ### Recommended storage layout
 

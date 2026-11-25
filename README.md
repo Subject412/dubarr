@@ -39,6 +39,11 @@ connections). Follow the container logs with `docker logs -f dubarr`.
 publishes the muxed file beside the Target in its own directory (optionally
 keeping a `.bak`); switch to `separate` mode to leave the library untouched.
 
+`./media` is not tracked, so create it and hand it to `PUID`/`PGID` before the
+first `up` — `mkdir -p media/download media/vault media/content && sudo chown
+-R 1000:1000 media`. Replace-mode publishing writes beside the target, so a
+root-owned bind mount fails with `EACCES`; the entrypoint only fixes `/config`.
+
 To adapt the stack to your host, put the overrides in `docker/.env` — Compose
 loads it from the `docker/` directory — instead of editing the compose file:
 

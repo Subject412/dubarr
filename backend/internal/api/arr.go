@@ -10,12 +10,16 @@ package api
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -377,10 +381,29 @@ func (s *Service) handleTestArr(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), arrTestTimeout)
 	defer cancel()
 	if err := client.Ping(ctx); err != nil {
-		writeError(w, http.StatusBadGateway, arrTestError(err))
+		class, statusCode, host, port := arrTestDiagnostics(err, baseURL)
+		writeJSON(w, http.StatusBadGateway, arrTestFailure{
+			Error:      arrTestError(err),
+			Class:      class,
+			StatusCode: statusCode,
+			Host:       host,
+			Port:       port,
+		})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "kind": kind})
+}
+
+// arrTestFailure is the 502 body of a failed connection test. Error keeps the
+// pre-existing operator message verbatim; Class/StatusCode/Host/Port are the
+// additive diagnostics. The shape carries no credentials and no response-body
+// excerpt: the API key never reaches this struct.
+type arrTestFailure struct {
+	Error      string `json:"error"`
+	Class      string `json:"class"`
+	StatusCode int    `json:"status_code"`
+	Host       string `json:"host"`
+	Port       string `json:"port"`
 }
 
 // arrTestError maps a client failure to an operator-facing message that carries
@@ -398,12 +421,140 @@ func arrTestError(err error) string {
 	}
 }
 
+// arrTestDiagnostics classifies a failed ping into the additive diagnostics
+// payload. It returns the failure class (see the arrFailure* constants), the
+// HTTP status code when a response was received (0 otherwise), and the target
+// host/port parsed from the normalised base URL the ping used (empty when the
+// URL does not parse).
+//
+// It never includes error text, so no credential or response body can leak
+// through it; the client already scrubs the API key from its own messages.
+func arrTestDiagnostics(err error, baseURL string) (class string, statusCode int, host, port string) {
+	host, port = arrTargetHostPort(baseURL)
+
+	var (
+		authErr   *arr.AuthError
+		statusErr *arr.StatusError
+		baseErr   *arrBaseURLError
+	)
+	switch {
+	case errors.As(err, &authErr):
+		return arrFailureAuth, authErr.Code, host, port
+	case errors.As(err, &statusErr):
+		return arrFailureStatus, statusErr.Code, host, port
+	case errors.Is(err, arr.ErrKindMismatch):
+		return arrFailureKindMismatch, 0, host, port
+	case errors.As(err, &baseErr):
+		return arrFailureInvalid, 0, host, port
+	case errors.Is(err, arr.ErrDecode):
+		return arrFailureDecode, 0, host, port
+	case isDNSError(err):
+		// A resolver failure is the more useful diagnosis even when it
+		// self-reports a timeout (IsTimeout) or a missing record (IsNotFound);
+		// checking the deadline cases first would hide which part failed.
+		return arrFailureDNS, 0, host, port
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, os.ErrDeadlineExceeded):
+		// A timeout is also an ErrNetwork; it is the more useful diagnosis.
+		return arrFailureTimeout, 0, host, port
+	case isNetTimeout(err):
+		// Socket-level deadlines (dial/read/write) surface as a net.Error
+		// reporting Timeout() without either deadline sentinel.
+		return arrFailureTimeout, 0, host, port
+	case isTLSError(err):
+		return arrFailureTLS, 0, host, port
+	case errors.Is(err, arr.ErrNetwork):
+		return arrFailureNetwork, 0, host, port
+	default:
+		// Residual transport failure: still unreachable, and still not a
+		// credential-bearing message.
+		return arrFailureNetwork, 0, host, port
+	}
+}
+
+// Failure classes reported in the 502 payload. "network" is the documented
+// fallback for a transport failure that matches none of the narrower classes.
+const (
+	arrFailureAuth         = "auth"
+	arrFailureTimeout      = "timeout"
+	arrFailureDNS          = "dns"
+	arrFailureTLS          = "tls"
+	arrFailureStatus       = "status"
+	arrFailureKindMismatch = "kind_mismatch"
+	arrFailureDecode       = "decode"
+	arrFailureInvalid      = "invalid"
+	arrFailureNetwork      = "network"
+)
+
+// arrTargetHostPort splits the ping target into host and port, defaulting the
+// port by scheme when the URL omits it. Both are empty when baseURL does not
+// parse or has no host. Userinfo is never part of Hostname().
+func arrTargetHostPort(baseURL string) (host, port string) {
+	u, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil || u.Host == "" {
+		return "", ""
+	}
+	host = u.Hostname()
+	port = u.Port()
+	if port == "" {
+		switch u.Scheme {
+		case "http":
+			port = "80"
+		case "https":
+			port = "443"
+		}
+	}
+	return host, port
+}
+
+// isDNSError reports whether a *net.DNSError is anywhere in the chain.
+func isDNSError(err error) bool {
+	var dnsErr *net.DNSError
+	return errors.As(err, &dnsErr)
+}
+
+// isNetTimeout reports whether a net.Error in the chain reports Timeout(). It
+// catches socket-level deadlines (dial/read/write) that carry neither
+// context.DeadlineExceeded nor os.ErrDeadlineExceeded. A *net.DNSError also
+// satisfies net.Error, but isDNSError is checked first.
+func isNetTimeout(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+// isTLSError reports whether a certificate or TLS handshake failure is anywhere
+// in the chain. Types are matched structurally so no message text is needed.
+func isTLSError(err error) bool {
+	var (
+		unknownAuthority x509.UnknownAuthorityError
+		hostname         x509.HostnameError
+		certInvalid      x509.CertificateInvalidError
+		recordHeader     tls.RecordHeaderError
+		verify           *tls.CertificateVerificationError
+	)
+	return errors.As(err, &unknownAuthority) ||
+		errors.As(err, &hostname) ||
+		errors.As(err, &certInvalid) ||
+		errors.As(err, &recordHeader) ||
+		errors.As(err, &verify)
+}
+
 // normalizeArrBaseURL validates and canonicalizes a connection base URL.
+// Credentials embedded in the URL are rejected: the API key belongs in its own
+// secret, never in a URL that ends up in settings, logs and error text.
 func normalizeArrBaseURL(raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
 	u, err := url.Parse(raw)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return "", errors.New("base_url must be an absolute http(s) URL")
+		return "", &arrBaseURLError{msg: "base_url must be an absolute http(s) URL"}
+	}
+	if u.User != nil {
+		return "", &arrBaseURLError{msg: "base_url must not contain credentials"}
 	}
 	return strings.TrimRight(raw, "/"), nil
 }
+
+// arrBaseURLError is a base-URL validation failure. It is a 400 at the HTTP
+// layer and the "invalid" diagnostics class; msg is the operator-facing text.
+type arrBaseURLError struct{ msg string }
+
+func (e *arrBaseURLError) Error() string { return e.msg }

@@ -228,13 +228,13 @@ func (c *core) get(ctx context.Context, path string, out any) error {
 
 	switch {
 	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
-		return fmt.Errorf("%w: GET %s: HTTP %d", ErrAuth, path, resp.StatusCode)
+		return &AuthError{Code: resp.StatusCode, Method: http.MethodGet, Path: path}
 	case resp.StatusCode < 200 || resp.StatusCode > 299:
 		return &StatusError{Code: resp.StatusCode, Method: http.MethodGet, Path: path}
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
-		return fmt.Errorf("arr: decode GET %s response: %w", path, err)
+		return fmt.Errorf("%w: GET %s: %w", ErrDecode, path, err)
 	}
 	return nil
 }
@@ -262,7 +262,7 @@ func (c *core) post(ctx context.Context, path string, payload any) error {
 
 	switch {
 	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
-		return fmt.Errorf("%w: POST %s: HTTP %d", ErrAuth, path, resp.StatusCode)
+		return &AuthError{Code: resp.StatusCode, Method: http.MethodPost, Path: path}
 	case resp.StatusCode < 200 || resp.StatusCode > 299:
 		return &StatusError{Code: resp.StatusCode, Method: http.MethodPost, Path: path}
 	}

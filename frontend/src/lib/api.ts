@@ -390,11 +390,14 @@ export type LogsQuery = {
 
 export class ApiError extends Error {
   readonly status: number
+  /** Parsed JSON error body when the server sent one; otherwise undefined. */
+  readonly payload: unknown
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, payload: unknown = undefined) {
     super(message)
     this.name = 'ApiError'
     this.status = status
+    this.payload = payload
   }
 }
 
@@ -418,16 +421,17 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 
   if (!response.ok) {
     let message = `Request failed (${response.status})`
+    let payload: unknown
     try {
-      const body: unknown = await response.json()
-      if (body && typeof body === 'object' && 'error' in body) {
-        const raw = (body as { error?: unknown }).error
+      payload = await response.json()
+      if (payload && typeof payload === 'object' && 'error' in payload) {
+        const raw = (payload as { error?: unknown }).error
         if (typeof raw === 'string' && raw !== '') message = raw
       }
     } catch {
       // Non-JSON error bodies fall back to the status message.
     }
-    throw new ApiError(response.status, message)
+    throw new ApiError(response.status, message, payload)
   }
 
   if (response.status === 204) return undefined as T

@@ -1,7 +1,8 @@
 import { screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
-import { validateArrBaseUrl } from '../lib/arr-connections'
+import { arrDiagnosticsLine, validateArrBaseUrl } from '../lib/arr-connections'
+import { ApiError } from '../lib/api'
 import { SettingsPage } from '../pages/Settings'
 import { SetupPage } from '../pages/Setup'
 import { isMethod, jsonResponse, renderWithProviders } from '../test/helpers'
@@ -31,6 +32,14 @@ function mockArrFetch({
   saveStatus = 200,
   testStatus = 200,
   listError = 'arr settings are not configured',
+  testBody,
+}: {
+  instances?: ArrInstance[]
+  listStatus?: number
+  saveStatus?: number
+  testStatus?: number
+  listError?: string
+  testBody?: unknown
 } = {}) {
   const state = { instances: [...instances], authenticated: false }
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -84,7 +93,9 @@ function mockArrFetch({
     }
     const test = /\/api\/settings\/arr\/(radarr|sonarr)\/test$/.exec(url)
     if (test && method === 'POST') {
-      if (testStatus !== 200) return jsonResponse({ error: 'arr settings are not configured' }, testStatus)
+      if (testStatus !== 200) {
+        return jsonResponse(testBody ?? { error: 'arr settings are not configured' }, testStatus)
+      }
       return jsonResponse({ ok: true, kind: test[1] })
     }
     if (url === '/api/settings' && method === 'GET') return jsonResponse(settingsPayload())
@@ -137,6 +148,27 @@ describe('arr connection base URL validation', () => {
     expect(validateArrBaseUrl('ftp://radarr.local').ok).toBe(false)
     expect(validateArrBaseUrl('http://').ok).toBe(false)
     expect(validateArrBaseUrl('   ').ok).toBe(false)
+  })
+})
+
+describe('arr diagnostics line', () => {
+  function diagnostics(payload: Record<string, unknown>) {
+    return new ApiError(502, 'connection test failed', payload)
+  }
+
+  it('brackets an IPv6 host so the port stays unambiguous', () => {
+    expect(
+      arrDiagnosticsLine(diagnostics({ class: 'network', host: '::1', port: '7878' })),
+    ).toBe('unreachable · [::1]:7878')
+  })
+
+  it('keeps a plain hostname and an empty target unchanged', () => {
+    expect(
+      arrDiagnosticsLine(diagnostics({ class: 'timeout', host: 'radarr', port: '7878' })),
+    ).toBe('timed out · radarr:7878')
+    expect(arrDiagnosticsLine(diagnostics({ class: 'auth', status_code: 401 }))).toBe(
+      'authentication (HTTP 401)',
+    )
   })
 })
 
@@ -399,6 +431,68 @@ describe('Radarr / Sonarr connections settings section', () => {
 
     expect(await card.findByRole('alert')).toBeInTheDocument()
     expect(screen.queryByText(/accepted the entered connection/)).toBeNull()
+  })
+
+  it('shows a redacted diagnostics line for a rejected key', async () => {
+    const user = userEvent.setup()
+    mockArrFetch({
+      instances: [
+        {
+          kind: 'radarr',
+          base_url: 'http://radarr.local:7878',
+          enabled: true,
+          api_key: '********abcd',
+        },
+      ],
+      testStatus: 502,
+      testBody: {
+        error: 'authentication failed: the API key was rejected',
+        class: 'auth',
+        status_code: 401,
+        host: 'radarr.local',
+        port: '7878',
+      },
+    })
+    renderWithProviders(<SettingsPage />, { route: '/settings' })
+    expect(await screen.findByText('••••abcd')).toBeInTheDocument()
+
+    const card = await radarrCard()
+    await waitFor(() => expect(card.getByLabelText('Base URL')).toHaveValue('http://radarr.local:7878'))
+    await user.click(card.getByRole('button', { name: 'Test entered connection' }))
+
+    // Both lines: the unchanged operator message and the compact class/host line.
+    expect(
+      await card.findByText('authentication (HTTP 401) · radarr.local:7878'),
+    ).toBeInTheDocument()
+    const alert = await card.findByRole('alert')
+    expect(alert).toHaveTextContent('authentication failed: the API key was rejected')
+    expect(alert).not.toHaveTextContent('********abcd')
+  })
+
+  it('keeps the 503 mapping and renders no diagnostics line', async () => {
+    const user = userEvent.setup()
+    mockArrFetch({
+      instances: [
+        {
+          kind: 'radarr',
+          base_url: 'http://radarr.local:7878',
+          enabled: true,
+          api_key: '********abcd',
+        },
+      ],
+      testStatus: 503,
+      testBody: { error: 'arr settings are not configured' },
+    })
+    renderWithProviders(<SettingsPage />, { route: '/settings' })
+    expect(await screen.findByText('••••abcd')).toBeInTheDocument()
+
+    const card = await radarrCard()
+    await waitFor(() => expect(card.getByLabelText('Base URL')).toHaveValue('http://radarr.local:7878'))
+    await user.click(card.getByRole('button', { name: 'Test entered connection' }))
+
+    const alert = await card.findByRole('alert')
+    expect(alert).toHaveTextContent(/^Secrets are not initialised$/)
+    expect(alert.querySelector('span')).toBeNull()
   })
 
   it('removes an existing connection through DELETE and hides the Remove button', async () => {

@@ -93,7 +93,7 @@ export function AppShell() {
 
   return (
     <div className="flex min-h-full bg-ink-950 text-zinc-200">
-      <aside className="hidden w-60 shrink-0 flex-col border-r border-ink-800 bg-ink-900 md:flex">
+      <aside className="hidden w-60 shrink-0 flex-col border-r border-ink-800 bg-ink-900 md:sticky md:top-0 md:h-dvh md:flex md:self-start">
         <div className="flex h-16 items-center gap-2 border-b border-ink-800 px-5">
           <span className="grid h-8 w-8 place-items-center rounded-lg bg-accent-500 font-bold text-ink-950">
             D
@@ -103,7 +103,7 @@ export function AppShell() {
             <p className="text-[11px] uppercase tracking-wider text-zinc-500">dubbing sync</p>
           </div>
         </div>
-        <nav className="flex-1 space-y-1 p-3">
+        <nav className="min-h-0 flex-1 space-y-1 overflow-y-auto p-3">
           {visibleNav.map((item) => {
             const hasChildren = Boolean(item.children?.length)
             const expanded = hasChildren && settingsExpanded

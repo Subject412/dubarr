@@ -11,6 +11,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -104,6 +105,133 @@ type QueueItem struct {
 	// false the UI must ask the operator to pick one via search-library.
 	Matched      bool   `json:"matched"`
 	LibraryTitle string `json:"library_title"`
+	// MatchState is the operator-facing split of Matched: unmatched (no arr
+	// target), matched_no_donor (a target exists but the row is not actionable)
+	// or ready (approvable right now). Invariant: MatchState is
+	// MatchStateUnmatched iff Matched is false.
+	MatchState string `json:"match_state"`
+	// MatchReason is short human prose for the UI explaining MatchState.
+	MatchReason string `json:"match_reason"`
+}
+
+// Match states reported in QueueItem.MatchState.
+const (
+	// MatchStateUnmatched means the release has no arr target at all.
+	MatchStateUnmatched = "unmatched"
+	// MatchStateMatchedNoDonor means a target exists but the row is not
+	// actionable: matched yet not approvable. MatchReason carries the actual
+	// blocker — a missing donor candidate or a Processing Gate verdict that
+	// makes the target ineligible.
+	MatchStateMatchedNoDonor = "matched_no_donor"
+	// MatchStateReady means the row is approvable right now: an arr target
+	// exists, the target is gate-eligible and at least one donor candidate is
+	// available.
+	MatchStateReady = "ready"
+)
+
+// deriveMatchState splits a loaded queue row into the tri-state match state and
+// the reason shown to the operator. It reads only what handleList already has:
+// the arr match flag, the target path, the gate verdict with its recorded tag
+// lists, and the donor listing of this row (with that listing's error) — no
+// extra query.
+//
+// ready means approvable now, so it requires an arr match, a gate-eligible
+// target and at least one donor candidate. That is a superset of the
+// preconditions handleApprove derives from the row (a match, a target path and
+// a paired donor): deriveMatchState is deliberately stricter, because an
+// ineligible target must never be advertised as ready even though approve would
+// accept it. Approve also rejects cases deriveMatchState cannot see from the
+// row — a client-supplied library_cache_id that disagrees with the row's match,
+// and a status race that moves the row out of pending before the transition. A
+// row that is matched but fails either precondition reports matched_no_donor
+// (matched, not actionable) and the reason names the actual blocker. The
+// invariant "unmatched iff !matched" still holds: only the !matched case
+// reports unmatched.
+//
+// The reason never claims a cause the row does not prove. A waiting_for_tags
+// verdict has several causes (a missing required tag, an excluded tag, a
+// missing arr tag, a target outside the root-folder allowlist), and a donor-less
+// row has two (no matching sibling file, or a folder that could not be read at
+// all), so each branch words only what it can see.
+func deriveMatchState(row store.ImportCandidateSummary, donors []DonorCandidate, donorErr error, patterns []string) (state, reason string) {
+	if !row.Matched {
+		return MatchStateUnmatched, "No arr title matched this release."
+	}
+	hasTarget := strings.TrimSpace(row.TargetPath) != ""
+	eligible := hasTarget && row.Eligibility == "eligible"
+	if eligible && len(donors) > 0 {
+		return MatchStateReady, "Ready to approve."
+	}
+	state = MatchStateMatchedNoDonor
+	switch {
+	case !hasTarget:
+		return state, "The matched title has no target file to pair a donor with."
+	case row.Eligibility == "waiting_for_tags":
+		return state, waitingForTagsReason(row)
+	case row.Eligibility == "missing_target":
+		return state, "Target is not eligible for processing (target file is missing)."
+	case !eligible:
+		return state, "Target is not eligible for processing (the gate has not approved it)."
+	case donorErr != nil:
+		// The folder itself is unreadable (unmounted library, permission
+		// denial): don't claim anything about the siblings it would contain.
+		return state, "The target folder could not be read - check the library mount."
+	case !hasDonorPattern(patterns):
+		// Nothing to look for, so a marker claim would be empty prose.
+		return state, "No sibling file is eligible as a donor."
+	default:
+		// Eligible target, readable folder, a configured marker, no match.
+		return state, "No sibling release carries the dubbing marker" + markerHint(patterns) + "."
+	}
+}
+
+// waitingForTagsReason words a waiting_for_tags verdict from the cause the
+// recorded gate verdict proves.
+//
+// A gate-recorded verdict classified the target filename only, so its tag lists
+// are authoritative: recorded MissingTags prove a missing required tag, while a
+// waiting verdict with nothing missing can only come from an excluded tag
+// (excluded tags always win). A row without a gate record took its eligibility
+// from the arr library row, where arrsync writes waiting_for_tags for a missing
+// arr tag or a target outside the root-folder allowlist — none of which the row
+// can tell apart, so the wording stays cause-neutral.
+func waitingForTagsReason(row store.ImportCandidateSummary) string {
+	if !row.HasGate || row.Gate.Status != "waiting_for_tags" {
+		return "The processing gate has not approved this target (waiting for tags)."
+	}
+	if missing := nonBlankValues(row.Gate.MissingTags); len(missing) > 0 {
+		return "Target is not eligible for processing (missing required target tags: " +
+			strings.Join(missing, ", ") + ")."
+	}
+	return "Target is not eligible for processing (the target carries an excluded tag)."
+}
+
+// nonBlankValues drops blank entries so a stray empty pattern or tag never
+// counts as content.
+func nonBlankValues(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
+}
+
+// hasDonorPattern reports whether at least one non-blank donor pattern is
+// configured, i.e. whether a marker claim is meaningful at all.
+func hasDonorPattern(patterns []string) bool {
+	return len(nonBlankValues(patterns)) > 0
+}
+
+// markerHint renders the configured donor patterns for MatchReason, e.g.
+// " (PL.DUB)". It returns "" when no pattern is configured.
+func markerHint(patterns []string) string {
+	names := nonBlankValues(patterns)
+	if len(names) == 0 {
+		return ""
+	}
+	return " (" + strings.Join(names, ", ") + ")"
 }
 
 type listResponse struct {
@@ -128,6 +256,8 @@ func (s *Service) handleList(w http.ResponseWriter, r *http.Request) {
 	patterns := s.donorPatterns(r.Context())
 	items := make([]QueueItem, 0, len(rows))
 	for _, row := range rows {
+		donors, donorErr := pairDonors(row.TargetPath, patterns)
+		matchState, matchReason := deriveMatchState(row, donors, donorErr, patterns)
 		item := QueueItem{
 			ID:               row.ID,
 			SourceFile:       row.SourceFilePath,
@@ -145,9 +275,11 @@ func (s *Service) handleList(w http.ResponseWriter, r *http.Request) {
 			Eligibility:      row.Eligibility,
 			MatchedTags:      row.Gate.MatchedTags,
 			MissingTags:      row.Gate.MissingTags,
-			DonorCandidates:  pairDonors(row.TargetPath, patterns),
+			DonorCandidates:  donors,
 			Matched:          row.Matched,
 			LibraryTitle:     row.LibraryTitle,
+			MatchState:       matchState,
+			MatchReason:      matchReason,
 		}
 		// Post-approval rows leave the list, but when a donor was persisted
 		// (e.g. re-listing before extraction) the card must agree with it.
@@ -261,9 +393,16 @@ func (s *Service) handleApprove(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "matched library target has no target file to pair a donor with")
 		return
 	}
-	donors := pairDonors(target, s.donorPatterns(r.Context()))
+	// Pair the donor exactly as the list endpoint does. The listing error is a
+	// different failure from "no matching sibling": an unreadable folder must
+	// not be reported as a missing donor.
+	donors, donorErr := pairDonors(target, s.donorPatterns(r.Context()))
+	if donorErr != nil {
+		writeError(w, http.StatusConflict, "the target folder could not be read - check the library mount")
+		return
+	}
 	if len(donors) == 0 {
-		writeError(w, http.StatusConflict, "no donor paired: no sibling file matches the donor patterns")
+		writeError(w, http.StatusConflict, "no donor paired: no sibling file is eligible as a donor")
 		return
 	}
 	if err := s.store.SetImportCandidateApproval(r.Context(), id, donors[0].Path, req.LibraryCacheID); err != nil {
@@ -336,15 +475,21 @@ func (s *Service) donorPatterns(ctx context.Context) []string {
 // pairDonors lists regular sibling files of targetPath whose basename matches
 // one of patterns. The first match (name order) is marked selected so the
 // approval card arrives pre-selected.
-func pairDonors(targetPath string, patterns []string) []DonorCandidate {
+//
+// A non-nil error means the containing folder could not be listed at all
+// (unmounted library, permission denial), which is not the same as listing it
+// and finding no matching sibling: callers must word the two cases differently
+// instead of blaming the absence of a donor. An empty target path or an empty
+// pattern list is not an error — there is simply nothing to pair.
+func pairDonors(targetPath string, patterns []string) ([]DonorCandidate, error) {
 	out := []DonorCandidate{}
 	if strings.TrimSpace(targetPath) == "" || len(patterns) == 0 {
-		return out
+		return out, nil
 	}
 	dir := filepath.Dir(targetPath)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return out
+		return out, fmt.Errorf("queue: list donor folder %s: %w", dir, err)
 	}
 	targetName := filepath.Base(targetPath)
 	names := make([]string, 0, len(entries))
@@ -372,7 +517,7 @@ func pairDonors(targetPath string, patterns []string) []DonorCandidate {
 			Selected: i == 0,
 		})
 	}
-	return out
+	return out, nil
 }
 
 // matchesDonorPattern reports whether filename matches any pattern. Matching is

@@ -207,6 +207,12 @@ export type SettingsExport = {
 
 export type QueueEligibility = 'eligible' | 'waiting_for_tags' | 'missing_target'
 
+/**
+ * Tri-state match outcome: no arr target, matched but not actionable, or
+ * approvable now (gate-eligible target plus a donor).
+ */
+export type QueueMatchState = 'unmatched' | 'matched_no_donor' | 'ready'
+
 export type QueueDonorCandidate = {
   filename: string
   path: string
@@ -235,6 +241,10 @@ export type QueueItem = {
   /** Whether the row carries an arr library identity; when false the operator must match it manually. */
   matched: boolean
   library_title: string
+  /** Tri-state match outcome; `unmatched` exactly when `matched` is false. */
+  match_state: QueueMatchState
+  /** Short human sentence explaining `match_state`, shown on the card. */
+  match_reason: string
 }
 
 export type QueueResponse = {

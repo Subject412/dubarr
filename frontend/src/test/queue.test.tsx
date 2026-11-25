@@ -20,6 +20,8 @@ const items = [
     eligibility: 'eligible',
     matched: true,
     library_title: 'Minions and Monsters',
+    match_state: 'ready',
+    match_reason: 'Ready to approve.',
     matched_tags: ['[ArcA310]'],
     missing_tags: [],
     donor_candidates: [
@@ -43,11 +45,13 @@ const items = [
     target_path: '/media/Shrek (2001) [Remux].mkv',
     original_language: 'en',
     audio_languages: ['en'],
-    eligibility: 'waiting_for_tags',
+    eligibility: 'eligible',
     matched: true,
     library_title: 'Shrek',
-    matched_tags: [],
-    missing_tags: ['[ArcA310]'],
+    match_state: 'matched_no_donor',
+    match_reason: 'No sibling release carries the dubbing marker (PL.DUB).',
+    matched_tags: ['[ArcA310]'],
+    missing_tags: [],
     donor_candidates: [],
   },
   {
@@ -64,9 +68,39 @@ const items = [
     eligibility: 'missing_target',
     matched: false,
     library_title: '',
+    match_state: 'unmatched',
+    match_reason: 'No arr title matched this release.',
     matched_tags: [],
     missing_tags: [],
     donor_candidates: [],
+  },
+  {
+    id: 4,
+    source_file_path: '/watch/Shrek 2 2004 PL.DUB.mkv',
+    filename: 'Shrek 2 2004 PL.DUB.mkv',
+    file_size: 384,
+    status: 'pending_approval',
+    title: 'Shrek 2',
+    year: 2004,
+    media_type: 'movie',
+    target_path: '/media/Shrek 2 (2004) [Remux].mkv',
+    original_language: 'en',
+    audio_languages: ['en'],
+    eligibility: 'waiting_for_tags',
+    matched: true,
+    library_title: 'Shrek 2',
+    match_state: 'matched_no_donor',
+    match_reason: 'Target is not eligible for processing (missing required target tags: [ArcA310]).',
+    matched_tags: [],
+    missing_tags: ['[ArcA310]'],
+    donor_candidates: [
+      {
+        filename: 'Shrek 2 2004 PL.DUB.mkv',
+        path: '/media/Shrek 2 2004 PL.DUB.mkv',
+        file_size: 4096,
+        selected: true,
+      },
+    ],
   },
 ]
 
@@ -114,10 +148,83 @@ describe('approval queue page', () => {
     expect(within(eligible).getByText('pre-selected donor')).toBeInTheDocument()
     expect(within(eligible).getByText(/ArcA310/)).toBeInTheDocument()
 
-    const waiting = screen.getByTestId('queue-item-2')
-    expect(within(waiting).getByText('waiting for tags')).toBeInTheDocument()
-    expect(within(waiting).getByText(/Missing filename tags/)).toBeInTheDocument()
-    expect(within(waiting).getByText(/No donor paired/)).toBeInTheDocument()
+    const noDonor = screen.getByTestId('queue-item-2')
+    expect(within(noDonor).getByText('eligible')).toBeInTheDocument()
+    expect(within(noDonor).getByText(/No donor paired/)).toBeInTheDocument()
+
+    const blocked = screen.getByTestId('queue-item-4')
+    expect(within(blocked).getByText('waiting for tags')).toBeInTheDocument()
+    expect(within(blocked).getByText(/Missing filename tags/)).toBeInTheDocument()
+  })
+
+  it('badges a ready release', async () => {
+    vi.stubGlobal('fetch', queueFetch())
+    renderWithProviders(<QueuePage />, { route: '/queue' })
+
+    const card = await screen.findByTestId('queue-item-1')
+    expect(within(card).getByText('Ready')).toBeInTheDocument()
+    expect(within(card).queryByText('Not matched')).not.toBeInTheDocument()
+    expect(within(card).queryByText('Matched, not ready')).not.toBeInTheDocument()
+    expect(within(card).queryByText(/No donor paired/)).not.toBeInTheDocument()
+  })
+
+  it('badges a matched release that has no donor', async () => {
+    vi.stubGlobal('fetch', queueFetch())
+    renderWithProviders(<QueuePage />, { route: '/queue' })
+
+    const card = await screen.findByTestId('queue-item-2')
+    expect(within(card).getByText('Matched, not ready')).toBeInTheDocument()
+    expect(within(card).queryByText('Not matched')).not.toBeInTheDocument()
+  })
+
+  it('badges an ineligible release that has a donor as not ready', async () => {
+    vi.stubGlobal('fetch', queueFetch())
+    renderWithProviders(<QueuePage />, { route: '/queue' })
+
+    const card = await screen.findByTestId('queue-item-4')
+    expect(within(card).getByText('Matched, not ready')).toBeInTheDocument()
+    expect(within(card).queryByText('Ready')).not.toBeInTheDocument()
+    // The reason is visible prose next to the badge, not a title attribute.
+    expect(
+      within(card).getByText(
+        'Target is not eligible for processing (missing required target tags: [ArcA310]).',
+      ),
+    ).toBeInTheDocument()
+  })
+
+  it('badges an unmatched release', async () => {
+    vi.stubGlobal('fetch', queueFetch())
+    renderWithProviders(<QueuePage />, { route: '/queue' })
+
+    const card = await screen.findByTestId('queue-item-3')
+    expect(within(card).getByText('Not matched')).toBeInTheDocument()
+    expect(within(card).queryByText('Matched, not ready')).not.toBeInTheDocument()
+    expect(within(card).getByText('No arr title matched this release.')).toBeInTheDocument()
+    // No target means the "drop a release next to the target" guidance would
+    // point at nothing.
+    expect(within(card).queryByText(/drop a release/i)).not.toBeInTheDocument()
+  })
+
+  it('derives the badge from matched when match_state is missing', async () => {
+    const withoutMatchState: Record<string, unknown> = { ...items[1] }
+    delete withoutMatchState.match_state
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse({ items: [withoutMatchState] })))
+    renderWithProviders(<QueuePage />, { route: '/queue' })
+
+    const card = await screen.findByTestId('queue-item-2')
+    expect(within(card).getByText('Matched, not ready')).toBeInTheDocument()
+    expect(within(card).queryByText('Not matched')).not.toBeInTheDocument()
+  })
+
+  it('shows the match reason as visible prose next to the badge', async () => {
+    vi.stubGlobal('fetch', queueFetch())
+    renderWithProviders(<QueuePage />, { route: '/queue' })
+
+    const card = await screen.findByTestId('queue-item-2')
+    expect(within(card).getByText(/No donor paired/)).toBeInTheDocument()
+    expect(
+      within(card).getByText('No sibling release carries the dubbing marker (PL.DUB).'),
+    ).toBeInTheDocument()
   })
 
   it('approves through the API', async () => {

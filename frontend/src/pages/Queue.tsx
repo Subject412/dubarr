@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import type { LibrarySearchItem, QueueEligibility, QueueItem } from '../lib/api'
+import type { LibrarySearchItem, QueueEligibility, QueueItem, QueueMatchState } from '../lib/api'
 import {
   useApproveQueueItem,
   useDebouncedValue,
@@ -16,6 +16,16 @@ const eligibilityView: Record<
   eligible: { tone: 'success', label: 'eligible' },
   waiting_for_tags: { tone: 'warning', label: 'waiting for tags' },
   missing_target: { tone: 'danger', label: 'missing target' },
+}
+
+/** Distinct treatment per match state so a matched-but-blocked row never looks approvable. */
+const matchStateView: Record<
+  QueueMatchState,
+  { tone: 'success' | 'warning' | 'danger'; label: string }
+> = {
+  unmatched: { tone: 'danger', label: 'Not matched' },
+  matched_no_donor: { tone: 'warning', label: 'Matched, not ready' },
+  ready: { tone: 'success', label: 'Ready' },
 }
 
 function formatBytes(bytes: number): string {
@@ -99,6 +109,11 @@ function LibrarySearchBox({
 }
 
 function DonorLine({ item }: { item: QueueItem }) {
+  // No arr target means there is no folder to drop a sibling release next to,
+  // so the drop guidance would point at nothing.
+  if (item.match_state === 'unmatched') {
+    return <p className="text-sm text-zinc-500">No target to pair a donor with.</p>
+  }
   if (item.donor_candidates.length === 0) {
     return (
       <p className="text-sm text-amber-300/90">
@@ -135,6 +150,12 @@ function QueueCard({
   rejecting: boolean
 }) {
   const view = eligibilityView[item.eligibility] ?? eligibilityView.missing_target
+  // A missing or unexpected match_state must not mislabel a matched row, so the
+  // fallback is derived from `matched` — the field the backend invariant ties
+  // `unmatched` to.
+  const match =
+    matchStateView[item.match_state] ??
+    (item.matched ? matchStateView.matched_no_donor : matchStateView.unmatched)
   const episode = episodeLabel(item)
   const busy = approving || rejecting
   const [manualMatch, setManualMatch] = useState<LibrarySearchItem | null>(null)
@@ -153,9 +174,15 @@ function QueueCard({
             {episode && <span className="ml-2 text-zinc-400">{episode}</span>}
           </p>
         </div>
-        <div className="flex flex-wrap items-center gap-2">
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          <Badge tone={match.tone}>{match.label}</Badge>
           <Badge tone={view.tone}>{view.label}</Badge>
           <Badge tone="neutral">{item.status}</Badge>
+          {/* Visible prose, not a title: a tooltip is neither keyboard nor
+              screen-reader reachable. */}
+          {item.match_reason && (
+            <p className="basis-full text-right text-xs text-zinc-500">{item.match_reason}</p>
+          )}
         </div>
       </div>
 

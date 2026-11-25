@@ -5,7 +5,9 @@
 // a resync updates the row an operator already matched to a donor instead of
 // replacing it: ids are stable for the lifetime of the arr item, and only rows
 // that actually changed are written. Items that vanished from an instance's
-// snapshot are deleted.
+// snapshot are deleted. Since migration 0006 the database enforces that
+// identity with a unique index, and every write of a key goes through the
+// upsert in insertLibraryCacheRow, so a stale read cannot create a twin row.
 //
 // Deletion is safe because no foreign key forbids it: import_queue and
 // sync_jobs reference arr_library_cache with ON DELETE SET NULL, so a vanished
@@ -486,6 +488,24 @@ func scanLibraryCacheRow(row rowScanner) (libraryCacheRow, error) {
 	return out, nil
 }
 
+// insertLibraryCacheRow writes one cache row for the composite identity
+// (arr_instance_id, media_type, external_item_id).
+//
+// It is an upsert, not a plain INSERT, because both callers can reach here
+// holding a read that is already stale: SyncLibraryCache inserts every key its
+// earlier snapshot read did not contain, and the rescan's zero-row fallback in
+// updateLibraryCacheRow inserts when the row it read was deleted before its
+// UPDATE landed. Since migration 0006 the database owns the identity, so the
+// honest outcome for such a write is "this key now holds what I just observed":
+// ON CONFLICT rewrites the surviving row instead of failing the whole
+// transaction. Without it the collision would surface as a 500 on a rescan, and
+// before 0006 it would have created the permanent duplicate the index now
+// forbids.
+//
+// The conflict target covers the key columns, which are never rewritten; every
+// other synced column plus updated_at/last_seen_at is overwritten exactly like
+// updateLibraryCacheRow does. Columns the sync does not own (imdb_id,
+// audio_languages_json, video_codec, raw_metadata_json) keep their values.
 func insertLibraryCacheRow(ctx context.Context, tx *sql.Tx, instanceID int64, item LibraryCacheItem, now string) error {
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO arr_library_cache
@@ -494,7 +514,27 @@ func insertLibraryCacheRow(ctx context.Context, tx *sql.Tx, instanceID int64, it
 		  episode_title, media_folder_path, root_folder_path, target_file_path,
 		  arr_tag_ids_json, arr_tag_labels_json, matches_target_tags,
 		  eligibility_status, updated_at, last_seen_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(arr_instance_id, media_type, external_item_id) DO UPDATE SET
+		     series_id = excluded.series_id,
+		     tmdb_id = excluded.tmdb_id,
+		     tvdb_id = excluded.tvdb_id,
+		     title = excluded.title,
+		     original_title = excluded.original_title,
+		     original_language_iso2 = excluded.original_language_iso2,
+		     year = excluded.year,
+		     season_number = excluded.season_number,
+		     episode_number = excluded.episode_number,
+		     episode_title = excluded.episode_title,
+		     media_folder_path = excluded.media_folder_path,
+		     root_folder_path = excluded.root_folder_path,
+		     target_file_path = excluded.target_file_path,
+		     arr_tag_ids_json = excluded.arr_tag_ids_json,
+		     arr_tag_labels_json = excluded.arr_tag_labels_json,
+		     matches_target_tags = excluded.matches_target_tags,
+		     eligibility_status = excluded.eligibility_status,
+		     updated_at = excluded.updated_at,
+		     last_seen_at = excluded.last_seen_at`,
 		instanceID, item.MediaType, item.ExternalItemID, nullInt(item.SeriesID),
 		nullInt(item.TMDBID), nullInt(item.TVDBID), item.Title, nullStr(item.OriginalTitle),
 		nullStr(item.OriginalLanguageISO2), nullInt(int64(item.Year)),
@@ -541,8 +581,11 @@ func updateLibraryCacheRow(ctx context.Context, tx *sql.Tx, instanceID, id int64
 	}
 	if affected == 0 {
 		// The row vanished between the read and the write (a sync pass
-		// deleted it, or it was never there): insert rather than reporting
-		// a success that changed nothing.
+		// deleted it, or it was never there): upsert rather than reporting
+		// a success that changed nothing. The upsert matters because the
+		// table's unique identity (migration 0006) may already be held by
+		// a row this write never saw, e.g. one the poller inserted after
+		// it deleted the old row.
 		return insertLibraryCacheRow(ctx, tx, instanceID, item, now)
 	}
 	return nil

@@ -130,6 +130,15 @@ type QueueItem struct {
 	MatchState string `json:"match_state"`
 	// MatchReason is short human prose for the UI explaining MatchState.
 	MatchReason string `json:"match_reason"`
+	// MatchBlocker is the machine-readable cause behind MatchReason, one of
+	// the MatchBlocker* values. Clients branch on this and never parse
+	// MatchReason, so rewording the prose cannot change what the UI offers.
+	MatchBlocker string `json:"match_blocker"`
+	// DonorPatterns are the configured donor filename patterns (blank entries
+	// dropped), so the UI can tell "no donor pattern is configured" from "no
+	// sibling matched the pattern" without reading MatchReason. Empty means
+	// nothing is configured.
+	DonorPatterns []string `json:"donor_patterns"`
 }
 
 // Match states reported in QueueItem.MatchState.
@@ -147,6 +156,32 @@ const (
 	MatchStateReady = "ready"
 )
 
+// Blockers reported in QueueItem.MatchBlocker. The set is closed: a cause the
+// derivation cannot prove maps to MatchBlockerUnknown rather than a guess, so a
+// client never has to fall back on the prose in MatchReason.
+const (
+	// MatchBlockerNone means ready: nothing blocks approval.
+	MatchBlockerNone = "none"
+	// MatchBlockerNoMatch means no arr title matched the release.
+	MatchBlockerNoMatch = "no_match"
+	// MatchBlockerNoTarget means the matched title has no target file to pair
+	// a donor with.
+	MatchBlockerNoTarget = "no_target"
+	// MatchBlockerGateTags means the Processing Gate is waiting for required
+	// target tags; MatchReason names them.
+	MatchBlockerGateTags = "gate_tags"
+	// MatchBlockerGateExcluded means an excluded tag blocked the target.
+	MatchBlockerGateExcluded = "gate_excluded"
+	// MatchBlockerMount means the target folder could not be read at all.
+	MatchBlockerMount = "mount"
+	// MatchBlockerNoDonor means the target is gate-eligible and its folder is
+	// readable, but no sibling is a donor.
+	MatchBlockerNoDonor = "no_donor"
+	// MatchBlockerUnknown means a blocker exists that this derivation cannot
+	// classify. Never guess.
+	MatchBlockerUnknown = "unknown"
+)
+
 // deriveMatchState splits a loaded queue row into the tri-state match state and
 // the reason shown to the operator. It reads only what handleList already has:
 // the arr match flag, the target path, the gate verdict with its recorded tag
@@ -154,13 +189,13 @@ const (
 // extra query.
 //
 // ready means approvable now, so it requires an arr match, a gate-eligible
-// target and at least one donor candidate. That is a superset of the
-// preconditions handleApprove derives from the row (a match, a target path and
-// a paired donor): deriveMatchState is deliberately stricter, because an
-// ineligible target must never be advertised as ready even though approve would
-// accept it. Approve also rejects cases deriveMatchState cannot see from the
-// row — a client-supplied library_cache_id that disagrees with the row's match,
-// and a status race that moves the row out of pending before the transition. A
+// target and at least one donor candidate. Those are the same preconditions
+// handleApprove derives from the row (a match, a gate-eligible target, a target
+// path and a paired donor), so a row is never advertised as ready when approve
+// would refuse it, and never merely "not ready" when approve would accept it.
+// Approve additionally rejects cases deriveMatchState cannot see from the row —
+// a client-supplied library_cache_id that disagrees with the row's match, and a
+// status race that moves the row out of pending before the transition. A
 // row that is matched but fails either precondition reports matched_no_donor
 // (matched, not actionable) and the reason names the actual blocker. The
 // invariant "unmatched iff !matched" still holds: only the !matched case
@@ -171,40 +206,65 @@ const (
 // missing arr tag, a target outside the root-folder allowlist), and a donor-less
 // row has two (no matching sibling file, or a folder that could not be read at
 // all), so each branch words only what it can see.
-func deriveMatchState(row store.ImportCandidateSummary, donors []DonorCandidate, donorErr error, patterns []string) (state, reason string) {
+//
+// The blocker is derived on the same branches as the reason, from the same
+// inputs, and is never re-read from the reason text: it is the machine-readable
+// half of the same verdict. A cause these inputs cannot tell apart reports
+// MatchBlockerUnknown instead of guessing, so a client branching on it can never
+// be wrong about what the row proves.
+//
+// forceOverride is the settings escape hatch (ADR-0005, security.options
+// .allow_force_tag_override) and is passed in so the caller reads the setting
+// once. With it ON, approve admits an ineligible target it would otherwise
+// refuse, so an otherwise-ready row (a target file plus a paired donor) whose
+// only blocker is eligibility reports ready: the state must never hide a
+// control the server would accept. With it OFF nothing changes.
+func deriveMatchState(row store.ImportCandidateSummary, donors []DonorCandidate, donorErr error, patterns []string, forceOverride bool) (state, reason, blocker string) {
 	if !row.Matched {
-		return MatchStateUnmatched, "No arr title matched this release."
+		return MatchStateUnmatched, "No arr title matched this release.", MatchBlockerNoMatch
 	}
 	hasTarget := strings.TrimSpace(row.TargetPath) != ""
 	eligible := hasTarget && row.Eligibility == "eligible"
 	if eligible && len(donors) > 0 {
-		return MatchStateReady, "Ready to approve."
+		return MatchStateReady, "Ready to approve.", MatchBlockerNone
+	}
+	// Eligibility is the only remaining blocker when the row has a target file
+	// and a donor: with the force override on, approve accepts exactly this
+	// shape, so the card must offer the same button.
+	if forceOverride && hasTarget && len(donors) > 0 {
+		return MatchStateReady, "Ready to approve under the force tag override.", MatchBlockerNone
 	}
 	state = MatchStateMatchedNoDonor
 	switch {
 	case !hasTarget:
-		return state, "The matched title has no target file to pair a donor with."
+		return state, "The matched title has no target file to pair a donor with.", MatchBlockerNoTarget
 	case row.Eligibility == "waiting_for_tags":
-		return state, waitingForTagsReason(row)
+		reason, blocker := waitingForTagsVerdict(row)
+		return state, reason, blocker
 	case row.Eligibility == "missing_target":
-		return state, "Target is not eligible for processing (target file is missing)."
+		// The matched title has no usable target file: the gate recorded the
+		// file itself missing, which is the same operator-side blocker (and the
+		// same next step) as a row with no target path at all.
+		return state, "Target is not eligible for processing (target file is missing).", MatchBlockerNoTarget
 	case !eligible:
-		return state, "Target is not eligible for processing (the gate has not approved it)."
+		// An eligibility value this row cannot explain further: the reason
+		// stays generic, so the blocker must not claim a cause either.
+		return state, "Target is not eligible for processing (the gate has not approved it).", MatchBlockerUnknown
 	case donorErr != nil:
 		// The folder itself is unreadable (unmounted library, permission
 		// denial): don't claim anything about the siblings it would contain.
-		return state, "The target folder could not be read - check the library mount."
+		return state, "The target folder could not be read - check the library mount.", MatchBlockerMount
 	case !hasDonorPattern(patterns):
 		// Nothing to look for, so a marker claim would be empty prose.
-		return state, "No sibling file is eligible as a donor."
+		return state, "No sibling file is eligible as a donor.", MatchBlockerNoDonor
 	default:
 		// Eligible target, readable folder, a configured marker, no match.
-		return state, "No sibling release carries the dubbing marker" + markerHint(patterns) + "."
+		return state, "No sibling release carries the dubbing marker" + markerHint(patterns) + ".", MatchBlockerNoDonor
 	}
 }
 
-// waitingForTagsReason words a waiting_for_tags verdict from the cause the
-// recorded gate verdict proves.
+// waitingForTagsVerdict words a waiting_for_tags verdict from the cause the
+// recorded gate verdict proves, and classifies that cause for machines.
 //
 // A gate-recorded verdict classified the target filename only, so its tag lists
 // are authoritative: recorded MissingTags prove a missing required tag, while a
@@ -212,16 +272,17 @@ func deriveMatchState(row store.ImportCandidateSummary, donors []DonorCandidate,
 // (excluded tags always win). A row without a gate record took its eligibility
 // from the arr library row, where arrsync writes waiting_for_tags for a missing
 // arr tag or a target outside the root-folder allowlist — none of which the row
-// can tell apart, so the wording stays cause-neutral.
-func waitingForTagsReason(row store.ImportCandidateSummary) string {
+// can tell apart, so the wording stays cause-neutral and the blocker is
+// MatchBlockerUnknown.
+func waitingForTagsVerdict(row store.ImportCandidateSummary) (reason, blocker string) {
 	if !row.HasGate || row.Gate.Status != "waiting_for_tags" {
-		return "The processing gate has not approved this target (waiting for tags)."
+		return "The processing gate has not approved this target (waiting for tags).", MatchBlockerUnknown
 	}
 	if missing := nonBlankValues(row.Gate.MissingTags); len(missing) > 0 {
 		return "Target is not eligible for processing (missing required target tags: " +
-			strings.Join(missing, ", ") + ")."
+			strings.Join(missing, ", ") + ").", MatchBlockerGateTags
 	}
-	return "Target is not eligible for processing (the target carries an excluded tag)."
+	return "Target is not eligible for processing (the target carries an excluded tag).", MatchBlockerGateExcluded
 }
 
 // nonBlankValues drops blank entries so a stray empty pattern or tag never
@@ -288,6 +349,17 @@ type queueDiagnostics struct {
 	// both media kinds: synced but nothing matched shows up as a non-zero count
 	// with an empty queue.
 	CacheItems int64 `json:"cache_items"`
+	// HealthAvailable is false only when the health read itself failed. The
+	// counts above are then zeroed, and a client must not read that as "no
+	// instance is configured": it means nothing about the installation is
+	// known. Additive: a payload without it (older server) asserts nothing.
+	HealthAvailable bool `json:"sync_health_available"`
+	// ForceTagOverride mirrors settings.security.options
+	// .allow_force_tag_override, read through forceTagOverrideAllowed so it
+	// cannot drift from the approval gate it describes. It is a global
+	// setting, not a per-row fact, which is why it lives here rather than on
+	// QueueItem. Additive: a payload without it asserts nothing.
+	ForceTagOverride bool `json:"force_tag_override"`
 }
 
 // syncTimestampLayout is how the store writes arr_instances timestamps
@@ -296,7 +368,9 @@ const syncTimestampLayout = "2006-01-02 15:04:05"
 
 // zeroedQueueDiagnostics is the shape emitted when the health read fails: the
 // queue must stay usable when the library cache is unreadable, so diagnostics
-// degrade to "nothing known" instead of failing the list.
+// degrade to "nothing known" instead of failing the list. HealthAvailable stays
+// false so the UI says it could not read the health rather than asserting that
+// no arr instance is configured.
 func zeroedQueueDiagnostics() queueDiagnostics {
 	return queueDiagnostics{LastPassAt: nil}
 }
@@ -304,7 +378,7 @@ func zeroedQueueDiagnostics() queueDiagnostics {
 // queueDiagnosticsFor derives the diagnostics from the health rows, the
 // reported cache total and the configured connection kinds.
 func queueDiagnosticsFor(rows []store.ArrInstanceHealth, cacheItems int64, configuredKinds []string) queueDiagnostics {
-	diag := queueDiagnostics{CacheItems: cacheItems}
+	diag := queueDiagnostics{CacheItems: cacheItems, HealthAvailable: true}
 	seen := make(map[string]struct{}, len(rows)+len(configuredKinds))
 	// Timestamps compare as text: the store writes one fixed sortable layout.
 	lastPass := ""
@@ -354,14 +428,23 @@ func formatSyncTimestamp(raw string) string {
 // diagnostics reads the sync health of the library cache for the queue list.
 // A store error is logged and zeroed: an unreadable library cache must not
 // make the approval queue unavailable.
-func (s *Service) diagnostics(ctx context.Context) queueDiagnostics {
+//
+// forceOverride is the caller's already-read escape-hatch value (see
+// forceTagOverrideAllowed): it is a settings fact, not a health one, so it is
+// reported even when the health read failed rather than being zeroed with the
+// counts.
+func (s *Service) diagnostics(ctx context.Context, forceOverride bool) queueDiagnostics {
 	rows, cacheItems, err := s.store.ArrLibraryHealth(ctx)
 	if err != nil {
 		slog.Default().Warn("queue list: read arr sync health",
 			"component", "queue", "error", err)
-		return zeroedQueueDiagnostics()
+		diag := zeroedQueueDiagnostics()
+		diag.ForceTagOverride = forceOverride
+		return diag
 	}
-	return queueDiagnosticsFor(rows, cacheItems, s.configuredArrKinds(ctx))
+	diag := queueDiagnosticsFor(rows, cacheItems, s.configuredArrKinds(ctx))
+	diag.ForceTagOverride = forceOverride
+	return diag
 }
 
 // configuredArrKinds returns the arr kinds saved in arr.connections, via the
@@ -399,10 +482,13 @@ func (s *Service) handleList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	patterns := s.donorPatterns(r.Context())
+	// Read the escape hatch once: the derivation needs it per row, the
+	// diagnostics report it once, and one read keeps both on the same value.
+	forceOverride := s.forceTagOverrideAllowed(r.Context())
 	items := make([]QueueItem, 0, len(rows))
 	for _, row := range rows {
 		donors, donorErr := pairDonors(row.TargetPath, patterns)
-		matchState, matchReason := deriveMatchState(row, donors, donorErr, patterns)
+		matchState, matchReason, matchBlocker := deriveMatchState(row, donors, donorErr, patterns, forceOverride)
 		item := QueueItem{
 			ID:               row.ID,
 			SourceFile:       row.SourceFilePath,
@@ -425,6 +511,8 @@ func (s *Service) handleList(w http.ResponseWriter, r *http.Request) {
 			LibraryTitle:     row.LibraryTitle,
 			MatchState:       matchState,
 			MatchReason:      matchReason,
+			MatchBlocker:     matchBlocker,
+			DonorPatterns:    nonBlankValues(patterns),
 		}
 		// Post-approval rows leave the list, but when a donor was persisted
 		// (e.g. re-listing before extraction) the card must agree with it.
@@ -441,7 +529,7 @@ func (s *Service) handleList(w http.ResponseWriter, r *http.Request) {
 		}
 		items = append(items, item)
 	}
-	writeJSON(w, http.StatusOK, listResponse{Items: items, Diagnostics: s.diagnostics(r.Context())})
+	writeJSON(w, http.StatusOK, listResponse{Items: items, Diagnostics: s.diagnostics(r.Context(), forceOverride)})
 }
 
 // handleSearchLibrary serves the manual-match lookup: a case-insensitive title
@@ -550,11 +638,124 @@ func (s *Service) handleApprove(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "no donor paired: no sibling file is eligible as a donor")
 		return
 	}
+	// ADR-0005 (as amended by ADR-0009): an ineligible target is left
+	// completely alone — no sync, no Studio preview, no mux — and the pair is
+	// rejected at sync-job creation. Approving it would leave a row that is
+	// approved and can never run, so the same verdict is enforced here, with
+	// the wording the queue card already shows. Donors are never tag-gated,
+	// but this row is the TARGET of its own pair: the target verdict decides.
+	approveLibraryID := currentMatch
+	if req.LibraryCacheID != 0 {
+		approveLibraryID = req.LibraryCacheID
+	}
+	refusal, err := s.eligibilityRefusal(r.Context(), id, approveLibraryID)
+	if err != nil {
+		writeQueueMutationError(w, err, "could not read the queue item")
+		return
+	}
+	if refusal != "" {
+		writeError(w, http.StatusConflict, refusal)
+		return
+	}
 	if err := s.store.SetImportCandidateApproval(r.Context(), id, donors[0].Path, req.LibraryCacheID); err != nil {
 		writeQueueMutationError(w, err, "could not update the queue item")
 		return
 	}
 	writeJSON(w, http.StatusOK, transitionResponse{ID: id, Status: "extracting"})
+}
+
+// eligibilityRefusal returns the Processing Gate wording that refuses approving
+// this row, or "" when the target approve will use is gate-eligible.
+//
+// The verdict comes from the same two sources the list derivation reads, in the
+// same order: a gate record stored on the row classified that target file, so it
+// wins (scanImportCandidateSummary applies the same precedence); only a row
+// without one falls back to the arr library row of the target approve will use —
+// the read syncjob performs when it creates the job.
+//
+// The settings force override is the one escape hatch (ADR-0005), read through
+// the same key and section syncjob consults, so approving is never stricter than
+// the job creation it anticipates.
+//
+// A store error is returned rather than swallowed: approving on an unknown
+// verdict is exactly the state ADR-0005 forbids.
+func (s *Service) eligibilityRefusal(ctx context.Context, id, libraryCacheID int64) (string, error) {
+	if s.forceTagOverrideAllowed(ctx) {
+		return "", nil
+	}
+	summary, ok, err := s.store.ImportCandidateSummaryByID(ctx, id)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "", store.ErrImportCandidateNotFound
+	}
+	if summary.HasGate && strings.TrimSpace(summary.Gate.Status) != "" {
+		if summary.Gate.Status == "eligible" {
+			return "", nil
+		}
+		return ineligibleTargetReason(summary, summary.Gate.Status), nil
+	}
+	if libraryCacheID <= 0 {
+		return "", nil
+	}
+	lib, ok, err := s.store.LibraryCacheJobTargetByID(ctx, libraryCacheID)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "", nil
+	}
+	// Same fallback syncjob applies: an unclassified arr row still proves its
+	// tag verdict through the matched-target flag.
+	status := strings.TrimSpace(lib.EligibilityStatus)
+	if status == "" {
+		if lib.MatchesTargetTags {
+			status = "eligible"
+		} else {
+			status = "waiting_for_tags"
+		}
+	}
+	if status == "eligible" {
+		return "", nil
+	}
+	return ineligibleTargetReason(summary, status), nil
+}
+
+// ineligibleTargetReason words the refusal with the sentences the queue card
+// already shows, so the operator reads one explanation on both sides. A
+// gate-recorded waiting verdict keeps its recorded cause; anything else stays
+// cause-neutral instead of guessing.
+func ineligibleTargetReason(summary store.ImportCandidateSummary, status string) string {
+	switch status {
+	case "waiting_for_tags":
+		reason, _ := waitingForTagsVerdict(summary)
+		return reason
+	case "missing_target":
+		return "Target is not eligible for processing (target file is missing)."
+	default:
+		return "Target is not eligible for processing (the gate has not approved it)."
+	}
+}
+
+// forceTagOverrideAllowed reports whether security.options.allow_force_tag_override
+// is on. It reads the same settings key and decodes the same section as
+// syncjob's and the sync worker's copies, so the approval gate and the
+// job-creation gate cannot disagree about the escape hatch. A missing or
+// unreadable section means "off", the settled default.
+func (s *Service) forceTagOverrideAllowed(ctx context.Context) bool {
+	if s.settings == nil {
+		return false
+	}
+	raw, ok, err := s.settings.Get(ctx, settings.KeySecurityOptions)
+	if err != nil || !ok {
+		return false
+	}
+	var sec settings.SecurityOptions
+	if err := json.Unmarshal(raw, &sec); err != nil {
+		return false
+	}
+	return sec.AllowForceTagOverride
 }
 
 // writeQueueMutationError maps store sentinels shared by approve and the status

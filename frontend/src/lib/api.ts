@@ -213,6 +213,21 @@ export type QueueEligibility = 'eligible' | 'waiting_for_tags' | 'missing_target
  */
 export type QueueMatchState = 'unmatched' | 'matched_no_donor' | 'ready'
 
+/**
+ * Machine-readable cause behind `match_reason`, so the card never has to read
+ * the human sentence. Mirrors the server's closed set: `none` is the ready row,
+ * and a cause the server cannot prove arrives as `unknown`.
+ */
+export type QueueMatchBlocker =
+  | 'none'
+  | 'no_match'
+  | 'no_target'
+  | 'gate_tags'
+  | 'gate_excluded'
+  | 'mount'
+  | 'no_donor'
+  | 'unknown'
+
 export type QueueDonorCandidate = {
   filename: string
   path: string
@@ -245,10 +260,53 @@ export type QueueItem = {
   match_state: QueueMatchState
   /** Short human sentence explaining `match_state`, shown on the card. */
   match_reason: string
+  /**
+   * Machine-readable blocker behind `match_reason`; the card branches on this
+   * and never parses the prose. Absent on older payloads, in which case the
+   * card falls back to a neutral hint rather than guessing a cause.
+   */
+  match_blocker?: QueueMatchBlocker
+  /**
+   * The configured donor filename patterns (blank entries dropped). Empty means
+   * no donor pattern is configured at all, which is a different next step from
+   * "nothing in the folder matched it". Absent on older payloads, in which case
+   * the card does not claim either cause.
+   */
+  donor_patterns?: string[]
+}
+
+/**
+ * Why an empty approval queue is empty. Mirrors the server's `diagnostics`
+ * object: no arr instance at all, configured but never synced, or synced and
+ * failing. `last_pass_at` is the last SUCCESSFUL pass, so a failure leaves it
+ * untouched. The counters are per-instance facts, so they only describe the
+ * installation when they add up to every configured instance.
+ */
+export type QueueDiagnostics = {
+  instances_configured: number
+  never_synced: number
+  sync_failed: number
+  last_pass_at: string | null
+  cache_items: number
+  /**
+   * False when the server could not read the sync health at all: the counts are
+   * then zeroed and say nothing about the installation. Absent on older
+   * payloads, which assert nothing either way.
+   */
+  sync_health_available?: boolean
+  /**
+   * Whether `security.options.allow_force_tag_override` is on: a global
+   * setting, not a per-row fact. When it is, the server accepts a gate-ineligible
+   * target, so its rows arrive as `match_state: 'ready'` and the card enables
+   * Approve without any separate eligibility rule. Absent on older payloads.
+   */
+  force_tag_override?: boolean
 }
 
 export type QueueResponse = {
   items: QueueItem[]
+  /** Absent on older payloads and in test fixtures; the page then says only that the queue is clear. */
+  diagnostics?: QueueDiagnostics
 }
 
 /** One arr library row arr's parse matched, with a deterministic 0..1 score. */

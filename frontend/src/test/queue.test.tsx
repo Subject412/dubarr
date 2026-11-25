@@ -22,6 +22,7 @@ const items = [
     library_title: 'Minions and Monsters',
     match_state: 'ready',
     match_reason: 'Ready to approve.',
+    match_blocker: 'none',
     matched_tags: ['[ArcA310]'],
     missing_tags: [],
     donor_candidates: [
@@ -50,6 +51,7 @@ const items = [
     library_title: 'Shrek',
     match_state: 'matched_no_donor',
     match_reason: 'No sibling release carries the dubbing marker (PL.DUB).',
+    match_blocker: 'no_donor',
     matched_tags: ['[ArcA310]'],
     missing_tags: [],
     donor_candidates: [],
@@ -70,6 +72,7 @@ const items = [
     library_title: '',
     match_state: 'unmatched',
     match_reason: 'No arr title matched this release.',
+    match_blocker: 'no_match',
     matched_tags: [],
     missing_tags: [],
     donor_candidates: [],
@@ -91,6 +94,7 @@ const items = [
     library_title: 'Shrek 2',
     match_state: 'matched_no_donor',
     match_reason: 'Target is not eligible for processing (missing required target tags: [ArcA310]).',
+    match_blocker: 'gate_tags',
     matched_tags: [],
     missing_tags: ['[ArcA310]'],
     donor_candidates: [
@@ -195,6 +199,7 @@ function identifyFetch(
               library_title: 'Kraina Lodu',
               match_state: 'matched_no_donor',
               match_reason: 'No sibling release carries the dubbing marker (PL.DUB).',
+              match_blocker: 'no_donor',
             }
           : item,
       )
@@ -210,6 +215,19 @@ function identifyFetch(
     }
     if (url.includes('/api/imports/search-library')) {
       return jsonResponse({ items: libraryResults })
+    }
+    return jsonResponse({ error: 'unexpected' }, 404)
+  })
+}
+
+function emptyQueueFetch(diagnostics?: Record<string, unknown>) {
+  return vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input)
+    if (url.endsWith('/api/queue') && isMethod(init, 'GET')) {
+      return jsonResponse(diagnostics ? { items: [], diagnostics } : { items: [] })
+    }
+    if (url.includes('/api/library/refresh')) {
+      return jsonResponse({ accepted: true, kind: 'all' }, 202)
     }
     return jsonResponse({ error: 'unexpected' }, 404)
   })
@@ -340,7 +358,7 @@ describe('approval queue page', () => {
     })
   })
 
-  it('matches an unmatched item against the arr library and approves with it', async () => {
+  it('approves an unmatched item with a manual pick while the row is still unmatched', async () => {
     const fetchMock = queueFetch()
     vi.stubGlobal('fetch', fetchMock)
     const user = userEvent.setup()
@@ -359,6 +377,11 @@ describe('approval queue page', () => {
     await user.click(option)
 
     expect(within(card).getByText(/Matched to Kraina Lodu \(2013\)/)).toBeInTheDocument()
+    // The local pick only unblocks the control while the server still reports
+    // the row unmatched: handleApprove accepts a client-supplied
+    // library_cache_id for exactly that state. Once a refetch reports the row
+    // matched, its own verdict decides again.
+    expect(within(card).getByText('Not matched')).toBeInTheDocument()
     await user.click(within(card).getByRole('button', { name: /approve/i }))
 
     await waitFor(() => {
@@ -368,6 +391,68 @@ describe('approval queue page', () => {
       expect(call).toBeTruthy()
       expect(JSON.parse(String(call?.[1]?.body))).toEqual({ library_cache_id: 7 })
     })
+  })
+
+  it('keeps approve disabled after a manual pick that yields no donor', async () => {
+    // The dead end this pins: the pick unblocked Approve, the refetch then
+    // reported the row as matched without a donor, and approve answered 409 —
+    // leaving an enabled control that could only fail. The local pick must not
+    // outlive the server's verdict.
+    let matched = false
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.endsWith('/api/queue') && isMethod(init, 'GET')) {
+        const list = items.map((item) =>
+          item.id === 3 && matched
+            ? {
+                ...item,
+                title: 'Kraina Lodu',
+                year: 2013,
+                media_type: 'movie',
+                matched: true,
+                library_title: 'Kraina Lodu',
+                match_state: 'matched_no_donor',
+                match_reason: 'No sibling release carries the dubbing marker (PL.DUB).',
+                match_blocker: 'no_donor',
+              }
+            : item,
+        )
+        return jsonResponse({ items: list })
+      }
+      if (url.includes('/api/imports/search-library')) {
+        return jsonResponse({ items: libraryResults })
+      }
+      return jsonResponse({ error: 'unexpected' }, 404)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    renderWithProviders(<QueuePage />, { route: '/queue' })
+
+    const card = await screen.findByTestId('queue-item-3')
+    await user.type(within(card).getByPlaceholderText(/search the arr library/i), 'kraina')
+    const option = await within(card).findByRole(
+      'button',
+      { name: /Kraina Lodu \(2013\)/i },
+      { timeout: 2000 },
+    )
+    await user.click(option)
+    expect(within(card).getByText(/Matched to Kraina Lodu \(2013\)/)).toBeInTheDocument()
+
+    // The server has the match now, so a refresh reports the row as matched
+    // without a donor: the row's own verdict decides, not the local pick.
+    matched = true
+    await user.click(screen.getByRole('button', { name: 'Refresh' }))
+
+    await waitFor(() => {
+      expect(within(card).getByText('Matched, not ready')).toBeInTheDocument()
+    })
+    expect(within(card).getByRole('button', { name: /approve/i })).toBeDisabled()
+    expect(within(card).getByTestId('approve-blocked')).toHaveTextContent(
+      'No sibling release carries the dubbing marker (PL.DUB).',
+    )
+    expect(
+      fetchMock.mock.calls.some(([url]) => String(url).includes('/approve')),
+    ).toBe(false)
   })
 
   it('identifies an unmatched release and shows candidates', async () => {
@@ -471,5 +556,401 @@ describe('approval queue page', () => {
     renderWithProviders(<QueuePage />, { route: '/queue' })
     expect(await screen.findByText('Queue is clear')).toBeInTheDocument()
     expect(screen.getByText('0 pending')).toBeInTheDocument()
+  })
+
+  it('gives each match state its own instruction and controls', async () => {
+    vi.stubGlobal('fetch', queueFetch())
+    renderWithProviders(<QueuePage />, { route: '/queue' })
+
+    // Not identified: identify (or pick manually) is the only way forward.
+    const unmatched = await screen.findByTestId('queue-item-3')
+    expect(within(unmatched).getByTestId('queue-instruction')).toHaveTextContent(
+      'Not identified — identify this release, or match it manually.',
+    )
+    expect(
+      within(unmatched).getByRole('button', { name: /identify with arr/i }),
+    ).toBeInTheDocument()
+    expect(within(unmatched).getByPlaceholderText(/search the arr library/i)).toBeInTheDocument()
+    expect(within(unmatched).getByRole('button', { name: /approve/i })).toBeDisabled()
+
+    // Matched without a donor: the reason is the instruction, and the next step
+    // points at the donor drop. Identify would be a dead control here.
+    const blocked = screen.getByTestId('queue-item-2')
+    const blockedInstruction = within(blocked).getByTestId('queue-instruction')
+    expect(blockedInstruction).toHaveTextContent(
+      'No sibling release carries the dubbing marker (PL.DUB).',
+    )
+    expect(blockedInstruction).toHaveTextContent(/watch folder/i)
+    expect(within(blocked).queryByRole('button', { name: /identify/i })).not.toBeInTheDocument()
+    expect(within(blocked).queryByPlaceholderText(/search the arr library/i)).not.toBeInTheDocument()
+    expect(within(blocked).getByRole('button', { name: /approve/i })).toBeDisabled()
+
+    // Ready: instruction and a live approve, nothing else.
+    const ready = screen.getByTestId('queue-item-1')
+    expect(within(ready).getByTestId('queue-instruction')).toHaveTextContent('Ready to approve.')
+    expect(within(ready).getByRole('button', { name: /approve/i })).toBeEnabled()
+    expect(within(ready).queryByRole('button', { name: /identify/i })).not.toBeInTheDocument()
+  })
+
+  it('gives the excluded tag and a missing donor pattern their own next step', async () => {
+    // gate_excluded is not a missing tag: telling the operator to ADD a tag
+    // sends them the wrong way, so the exclusion gets its own sentence.
+    const excluded = {
+      ...items[3],
+      id: 41,
+      match_reason: 'Target is not eligible for processing (the target carries an excluded tag).',
+      match_blocker: 'gate_excluded',
+    }
+    // No donor pattern configured at all: pointing at the watch folder would
+    // send the operator to a folder nothing ever scans. The payload proves it
+    // with an empty list.
+    const noPattern = { ...items[1], id: 42, donor_patterns: [] }
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => jsonResponse({ items: [excluded, noPattern] })),
+    )
+    renderWithProviders(<QueuePage />, { route: '/queue' })
+
+    const excludedCard = await screen.findByTestId('queue-item-41')
+    expect(within(excludedCard).getByTestId('queue-instruction')).toHaveTextContent(
+      /remove the excluded filename tag/i,
+    )
+    expect(within(excludedCard).getByTestId('queue-instruction')).not.toHaveTextContent(
+      /add the required filename tag/i,
+    )
+
+    const noPatternCard = screen.getByTestId('queue-item-42')
+    expect(within(noPatternCard).getByTestId('queue-instruction')).toHaveTextContent(
+      /configure the donor filename pattern/i,
+    )
+    expect(within(noPatternCard).getByTestId('queue-instruction')).not.toHaveTextContent(
+      /watch folder/i,
+    )
+  })
+
+  it('takes the next step from match_blocker, not from the reason prose', async () => {
+    // Same prose on both rows, and neither sentence mentions a mount: only the
+    // machine-readable field can tell the mount row apart. If the card were
+    // still string-matching `match_reason`, these two would get identical hints.
+    const reason = 'The target folder is unavailable.'
+    const mountBlocked = { ...items[1], match_reason: reason, match_blocker: 'mount' }
+    const unclassified: Record<string, unknown> = { ...items[1], id: 22, match_reason: reason }
+    delete unclassified.match_blocker
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => jsonResponse({ items: [mountBlocked, unclassified] })),
+    )
+    renderWithProviders(<QueuePage />, { route: '/queue' })
+
+    const mount = await screen.findByTestId('queue-item-2')
+    const mountHint = within(mount).getByTestId('queue-instruction')
+    expect(mountHint).toHaveTextContent(reason)
+    expect(mountHint).toHaveTextContent(/library mount is reachable/i)
+    expect(mountHint).not.toHaveTextContent(/watch folder/i)
+
+    // A row with no blocker field falls back to the neutral hint, never to the
+    // donor guidance it cannot justify.
+    const neutral = screen.getByTestId('queue-item-22')
+    const neutralHint = within(neutral).getByTestId('queue-instruction')
+    expect(neutralHint).not.toHaveTextContent(/watch folder/i)
+    expect(neutralHint).not.toHaveTextContent(/library mount is reachable/i)
+    expect(neutralHint).toHaveTextContent(/Processing Gate verdict/i)
+  })
+
+  it('disables approve and says why when the row is not ready', async () => {
+    vi.stubGlobal('fetch', queueFetch())
+    renderWithProviders(<QueuePage />, { route: '/queue' })
+
+    const ready = await screen.findByTestId('queue-item-1')
+    expect(within(ready).getByRole('button', { name: /approve/i })).toBeEnabled()
+    expect(within(ready).queryByTestId('approve-blocked')).not.toBeInTheDocument()
+
+    // A donor-less row: the blocked reason is the server's reason, verbatim,
+    // and the control is described by it rather than by a title tooltip (which
+    // never fires on a disabled button).
+    const noDonor = screen.getByTestId('queue-item-2')
+    const noDonorApprove = within(noDonor).getByRole('button', { name: /approve/i })
+    expect(noDonorApprove).toBeDisabled()
+    expect(within(noDonor).getByTestId('approve-blocked')).toHaveTextContent(
+      'No sibling release carries the dubbing marker (PL.DUB).',
+    )
+    expect(noDonorApprove).toHaveAttribute(
+      'aria-describedby',
+      within(noDonor).getByTestId('approve-blocked').id,
+    )
+    expect(noDonorApprove).not.toHaveAttribute('title')
+
+    // A gate-blocked target: the same control, the gate's reason, and a next
+    // step aimed at the target's tags rather than the donor.
+    const gated = screen.getByTestId('queue-item-4')
+    expect(within(gated).getByRole('button', { name: /approve/i })).toBeDisabled()
+    expect(within(gated).getByTestId('approve-blocked')).toHaveTextContent(
+      'Target is not eligible for processing (missing required target tags: [ArcA310]).',
+    )
+    expect(within(gated).getByTestId('queue-instruction')).toHaveTextContent(
+      /add the required filename tag/i,
+    )
+
+    // Not matched at all: nothing to approve until a library target is picked.
+    const unmatched = screen.getByTestId('queue-item-3')
+    expect(within(unmatched).getByRole('button', { name: /approve/i })).toBeDisabled()
+    expect(within(unmatched).getByTestId('approve-blocked')).toHaveTextContent(
+      'Match this release to an arr library item first.',
+    )
+  })
+
+  it('enables approve when the force override makes the row ready', async () => {
+    // The same gate-blocked shape as queue-item-4, but the server now reports
+    // the row ready because the force override makes approve accept it. The
+    // card must follow match_state, never the eligibility badge, or the
+    // operator loses a control the server would honour.
+    const overridden = {
+      ...items[3],
+      id: 5,
+      source_file_path: '/watch/Shrek 3 2007 PL.DUB.mkv',
+      filename: 'Shrek 3 2007 PL.DUB.mkv',
+      title: 'Shrek 3',
+      match_state: 'ready',
+      match_reason: 'Ready to approve under the force tag override.',
+      match_blocker: 'none',
+    }
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input)
+        if (url.endsWith('/api/queue') && isMethod(init, 'GET')) {
+          return jsonResponse({
+            items: [...items, overridden],
+            diagnostics: {
+              instances_configured: 1,
+              never_synced: 0,
+              sync_failed: 0,
+              last_pass_at: null,
+              cache_items: items.length + 1,
+              sync_health_available: true,
+              force_tag_override: true,
+            },
+          })
+        }
+        if (url.includes('/api/queue/5/approve')) {
+          return jsonResponse({ id: 5, status: 'extracting' })
+        }
+        return jsonResponse({ error: 'unexpected' }, 404)
+      }),
+    )
+    renderWithProviders(<QueuePage />, { route: '/queue' })
+
+    const forced = await screen.findByTestId('queue-item-5')
+    expect(forced).toHaveTextContent('waiting for tags')
+    expect(within(forced).getByRole('button', { name: /approve/i })).toBeEnabled()
+    expect(within(forced).queryByTestId('approve-blocked')).not.toBeInTheDocument()
+    expect(within(forced).getByTestId('queue-instruction')).toHaveTextContent('Ready to approve.')
+
+    // The neighbouring gate-blocked row keeps its disabled control: the
+    // override is an installation-wide setting, the verdict still per row.
+    const gated = screen.getByTestId('queue-item-4')
+    expect(within(gated).getByRole('button', { name: /approve/i })).toBeDisabled()
+  })
+
+  it('explains an empty queue with no instances configured', async () => {
+    vi.stubGlobal(
+      'fetch',
+      emptyQueueFetch({
+        instances_configured: 0,
+        never_synced: 0,
+        sync_failed: 0,
+        last_pass_at: null,
+        cache_items: 0,
+      }),
+    )
+    renderWithProviders(<QueuePage />, { route: '/queue' })
+
+    const empty = await screen.findByTestId('queue-empty')
+    expect(empty).toHaveAttribute('data-empty-case', 'no_instance')
+    expect(within(empty).getByText('No arr instance is configured yet.')).toBeInTheDocument()
+    expect(within(empty).getByRole('link', { name: /settings/i })).toHaveAttribute(
+      'href',
+      '/settings?section=arr.connections',
+    )
+    // No sync control: there is nothing to sync yet.
+    expect(within(empty).queryByRole('button', { name: /refresh now/i })).not.toBeInTheDocument()
+  })
+
+  it('explains an empty queue that was never synced', async () => {
+    const fetchMock = emptyQueueFetch({
+      instances_configured: 1,
+      never_synced: 1,
+      sync_failed: 0,
+      last_pass_at: null,
+      cache_items: 0,
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    renderWithProviders(<QueuePage />, { route: '/queue' })
+
+    const empty = await screen.findByTestId('queue-empty')
+    expect(empty).toHaveAttribute('data-empty-case', 'never_synced')
+    expect(within(empty).getByText('The library has not been synced yet.')).toBeInTheDocument()
+
+    // The Library page's refresh call, reused rather than reinvented.
+    await user.click(within(empty).getByRole('button', { name: /refresh now/i }))
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find(
+        ([url, init]) =>
+          String(url).includes('/api/library/refresh') && isMethod(init, 'POST'),
+      )
+      expect(call).toBeTruthy()
+      expect(JSON.parse(String(call?.[1]?.body))).toEqual({ kind: '' })
+    })
+  })
+
+  it('explains an empty queue whose last sync failed', async () => {
+    vi.stubGlobal(
+      'fetch',
+      emptyQueueFetch({
+        instances_configured: 1,
+        never_synced: 0,
+        sync_failed: 1,
+        last_pass_at: '2026-11-20T10:00:00Z',
+        cache_items: 4,
+      }),
+    )
+    renderWithProviders(<QueuePage />, { route: '/queue' })
+
+    const empty = await screen.findByTestId('queue-empty')
+    expect(empty).toHaveAttribute('data-empty-case', 'sync_failed')
+    expect(within(empty).getByText('The last sync failed.')).toBeInTheDocument()
+    // A failure is not a pass, so the last success is shown as its own fact.
+    expect(within(empty).getByText(/Last successful sync:/)).toBeInTheDocument()
+    expect(within(empty).getByRole('link', { name: /library page/i })).toHaveAttribute(
+      'href',
+      '/library',
+    )
+  })
+
+  it('explains a genuinely empty queue', async () => {
+    vi.stubGlobal(
+      'fetch',
+      emptyQueueFetch({
+        instances_configured: 1,
+        never_synced: 0,
+        sync_failed: 0,
+        last_pass_at: '2026-11-24T10:00:00Z',
+        cache_items: 12,
+      }),
+    )
+    renderWithProviders(<QueuePage />, { route: '/queue' })
+
+    const empty = await screen.findByTestId('queue-empty')
+    expect(empty).toHaveAttribute('data-empty-case', 'clear')
+    expect(within(empty).getByText('Queue is clear')).toBeInTheDocument()
+    expect(within(empty).getByText(/Nothing is waiting for approval/)).toBeInTheDocument()
+    expect(within(empty).queryByRole('link')).not.toBeInTheDocument()
+    expect(within(empty).queryByRole('button', { name: /refresh now/i })).not.toBeInTheDocument()
+  })
+
+  it('counts a partly synced installation instead of claiming a global state', async () => {
+    // Radarr synced, Sonarr never attempted: two per-instance counters, but the
+    // library is not "not synced yet" — half of it is right here.
+    vi.stubGlobal(
+      'fetch',
+      emptyQueueFetch({
+        instances_configured: 2,
+        never_synced: 1,
+        sync_failed: 0,
+        last_pass_at: '2026-11-24T10:00:00Z',
+        cache_items: 40,
+      }),
+    )
+    renderWithProviders(<QueuePage />, { route: '/queue' })
+
+    const empty = await screen.findByTestId('queue-empty')
+    expect(empty).toHaveAttribute('data-empty-case', 'mixed')
+    expect(within(empty).getByText(/1 of 2 instances has not synced yet/)).toBeInTheDocument()
+    // Neither absolute verdict may appear: one instance did sync, just now.
+    expect(within(empty).queryByText('The library has not been synced yet.')).not.toBeInTheDocument()
+    expect(within(empty).queryByText('The last sync failed.')).not.toBeInTheDocument()
+    expect(within(empty).queryByText(/Last successful sync:/)).not.toBeInTheDocument()
+  })
+
+  it('counts a partly failing installation instead of claiming the sync failed', async () => {
+    // Healthy Radarr + failing Sonarr must not print "the last sync failed"
+    // above a fresh last_pass_at.
+    vi.stubGlobal(
+      'fetch',
+      emptyQueueFetch({
+        instances_configured: 2,
+        never_synced: 0,
+        sync_failed: 1,
+        last_pass_at: '2026-11-24T10:00:00Z',
+        cache_items: 40,
+      }),
+    )
+    renderWithProviders(<QueuePage />, { route: '/queue' })
+
+    const empty = await screen.findByTestId('queue-empty')
+    expect(empty).toHaveAttribute('data-empty-case', 'mixed')
+    expect(within(empty).getByText(/1 of 2 instances failed its last sync/)).toBeInTheDocument()
+    expect(within(empty).queryByText('The last sync failed.')).not.toBeInTheDocument()
+    // The remaining instance is healthy, so the copy says so rather than
+    // asserting that nothing can be matched.
+    expect(within(empty).getByText(/the rest are healthy/)).toBeInTheDocument()
+  })
+
+  it('points at the Library page when the synced library is empty', async () => {
+    // The exact unusable state from issue #30: the sync works, the cache is
+    // genuinely empty, so "drop a donor video" would never match anything.
+    vi.stubGlobal(
+      'fetch',
+      emptyQueueFetch({
+        instances_configured: 1,
+        never_synced: 0,
+        sync_failed: 0,
+        last_pass_at: '2026-11-24T10:00:00Z',
+        cache_items: 0,
+      }),
+    )
+    renderWithProviders(<QueuePage />, { route: '/queue' })
+
+    const empty = await screen.findByTestId('queue-empty')
+    expect(empty).toHaveAttribute('data-empty-case', 'empty_library')
+    expect(within(empty).getByText('The arr library is empty.')).toBeInTheDocument()
+    expect(within(empty).getByRole('link', { name: /library page/i })).toHaveAttribute(
+      'href',
+      '/library',
+    )
+    expect(within(empty).queryByText(/Drop a donor video/)).not.toBeInTheDocument()
+  })
+
+  it('says it could not read sync health instead of claiming no instance', async () => {
+    vi.stubGlobal(
+      'fetch',
+      emptyQueueFetch({
+        instances_configured: 0,
+        never_synced: 0,
+        sync_failed: 0,
+        last_pass_at: null,
+        cache_items: 0,
+        sync_health_available: false,
+      }),
+    )
+    renderWithProviders(<QueuePage />, { route: '/queue' })
+
+    const empty = await screen.findByTestId('queue-empty')
+    expect(empty).toHaveAttribute('data-empty-case', 'health_unavailable')
+    expect(within(empty).getByText('Could not read sync health.')).toBeInTheDocument()
+    // Zeroed counts are not proof that nothing is configured.
+    expect(within(empty).queryByText('No arr instance is configured yet.')).not.toBeInTheDocument()
+    expect(within(empty).queryByRole('link', { name: /settings/i })).not.toBeInTheDocument()
+  })
+
+  it('no longer claims extraction waits for M2', async () => {
+    vi.stubGlobal('fetch', queueFetch())
+    renderWithProviders(<QueuePage />, { route: '/queue' })
+    await screen.findByTestId('queue-item-1')
+
+    expect(screen.queryByText(/no extraction happens/i)).not.toBeInTheDocument()
+    expect(screen.queryByText(/M2/)).not.toBeInTheDocument()
+    expect(screen.getByText(/every card says what is still blocking it/i)).toBeInTheDocument()
   })
 })

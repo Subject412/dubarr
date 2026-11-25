@@ -257,7 +257,7 @@ func (s *Service) handleMatch(w http.ResponseWriter, r *http.Request) {
 	}
 	patterns := s.donorPatterns(ctx)
 	donors, donorErr := pairDonors(row.TargetPath, patterns)
-	state, _ := deriveMatchState(row, donors, donorErr, patterns)
+	state, _, _ := deriveMatchState(row, donors, donorErr, patterns, s.forceTagOverrideAllowed(ctx))
 	writeJSON(w, http.StatusOK, matchResponse{MatchState: state})
 }
 

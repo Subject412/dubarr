@@ -1,5 +1,10 @@
 import { useEffect, useRef, useState } from 'react'
-import type { ArrConnection, ArrConnectionKind, ArrConnectionPayload } from '../lib/api'
+import type {
+  ArrConnection,
+  ArrConnectionKind,
+  ArrConnectionPayload,
+  ArrConnectionTestPayload,
+} from '../lib/api'
 import {
   arrErrorMessage,
   arrKindLabel,
@@ -95,10 +100,20 @@ function ArrConnectionCard({
       return
     }
     setBaseUrlError('')
-    test.mutate(kind, {
-      onSuccess: () => setNotice({ tone: 'success', text: `${label} responded to the connection test.` }),
-      onError: (error) => setNotice({ tone: 'danger', text: arrErrorMessage(error) }),
-    })
+    // Test the draft, not the saved config: the form values are sent as the
+    // ping target and the server persists none of them. A blank (or
+    // whitespace-only) key field omits `api_key`, which tells the server to use
+    // the stored key.
+    const payload: ArrConnectionTestPayload = { base_url: baseUrl.trim() }
+    if (apiKey.trim() !== '') payload.api_key = apiKey
+    test.mutate(
+      { kind, payload },
+      {
+        onSuccess: () =>
+          setNotice({ tone: 'success', text: `${label} accepted the entered connection.` }),
+        onError: (error) => setNotice({ tone: 'danger', text: arrErrorMessage(error) }),
+      },
+    )
   }
 
   const onRemove = () => {
@@ -188,6 +203,8 @@ function ArrConnectionCard({
 
       {notice && <Alert tone={notice.tone}>{notice.text}</Alert>}
 
+      <p className="text-right text-xs text-zinc-500">Tests the values above; saving is separate.</p>
+
       <div className="flex flex-wrap justify-end gap-2">
         <Button
           type="button"
@@ -196,7 +213,7 @@ function ArrConnectionCard({
           onClick={onTest}
           disabled={test.isPending || baseUrl.trim() === ''}
         >
-          {test.isPending ? 'Testing…' : 'Test connection'}
+          {test.isPending ? 'Testing…' : 'Test entered connection'}
         </Button>
         {connection && (
           <Button type="button" variant="danger" size="sm" onClick={onRemove} disabled={remove.isPending}>

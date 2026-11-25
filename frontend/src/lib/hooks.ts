@@ -14,6 +14,7 @@ import {
   type ArrConnectionKind,
   type ArrConnectionPayload,
   type ArrConnectionsResponse,
+  type ArrConnectionTestPayload,
   type ArrConnectionTestResult,
   type AuthStatus,
   type BrowseResponse,
@@ -113,18 +114,25 @@ export function useDeleteArrConnection(): UseMutationResult<void, Error, ArrConn
   })
 }
 
+/**
+ * Variables for the connection test: a bare kind (test the saved connection) or
+ * an object carrying the draft values typed into the form. The request never
+ * persists anything, so no list invalidation is needed.
+ */
+export type ArrTestConnectionVariables =
+  | ArrConnectionKind
+  | { kind: ArrConnectionKind; payload?: ArrConnectionTestPayload }
+
 export function useTestArrConnection(): UseMutationResult<
   ArrConnectionTestResult,
   Error,
-  ArrConnectionKind
+  ArrTestConnectionVariables
 > {
-  const client = useQueryClient()
   return useMutation({
-    mutationFn: (kind) => api.testArrConnection(kind),
-    onSuccess: () => {
-      // A successful ping reflects the saved connection, so refresh the list.
-      void client.invalidateQueries({ queryKey: queryKeys.arrConnections })
-    },
+    mutationFn: (variables) =>
+      typeof variables === 'string'
+        ? api.testArrConnection(variables)
+        : api.testArrConnection(variables.kind, variables.payload),
   })
 }
 

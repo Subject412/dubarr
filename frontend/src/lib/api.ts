@@ -176,6 +176,16 @@ export type ArrConnectionTestResult = {
   kind: ArrConnectionKind
 }
 
+/**
+ * POST /api/settings/arr/{kind}/test body: the draft values from the form.
+ * An omitted or blank `api_key` tests with the stored key, and an omitted
+ * `base_url` tests the saved connection. The test never persists anything.
+ */
+export type ArrConnectionTestPayload = {
+  base_url?: string
+  api_key?: string
+}
+
 /** Sibling filenames that mark a dropped file as a donor dub. */
 export type ImportsOptions = {
   donor_patterns: string[]
@@ -458,8 +468,13 @@ export const api = {
     }),
   deleteArrConnection: (kind: ArrConnectionKind) =>
     request<void>(`/api/settings/arr/${kind}`, { method: 'DELETE' }),
-  testArrConnection: (kind: ArrConnectionKind) =>
-    request<ArrConnectionTestResult>(`/api/settings/arr/${kind}/test`, { method: 'POST' }),
+  testArrConnection: (kind: ArrConnectionKind, payload?: ArrConnectionTestPayload) =>
+    request<ArrConnectionTestResult>(`/api/settings/arr/${kind}/test`, {
+      method: 'POST',
+      // No body at all when there is nothing to send, so a caller that only
+      // knows the kind still tests the saved connection.
+      ...(payload ? { body: JSON.stringify(payload) } : {}),
+    }),
   browse: (path: string) =>
     request<BrowseResponse>(`/api/system/browse?path=${encodeURIComponent(path)}`),
   health: () => request<Health>('/api/health'),

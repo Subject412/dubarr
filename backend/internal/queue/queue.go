@@ -37,6 +37,13 @@ var defaultDonorPatterns = []string{"PL.DUB"}
 type Dependencies struct {
 	DB       *sql.DB
 	Settings *settings.Store
+	// Secrets decrypts arr_instances.api_key_enc for the identify route. Nil
+	// (no secret store wired) makes that route answer 409 "not_configured"
+	// rather than parsing unauthenticated.
+	Secrets Decrypter
+	// IdentifyTimeout bounds one /api/v3/parse call. Zero uses identifyTimeout
+	// (30 s); tests wire a short one.
+	IdentifyTimeout time.Duration
 	// RequireAdmin wraps every route. When nil the API answers 503 rather than
 	// running unauthenticated.
 	RequireAdmin func(http.Handler) http.Handler
@@ -44,9 +51,11 @@ type Dependencies struct {
 
 // Service holds the resolved dependencies for the registered handlers.
 type Service struct {
-	store        *store.Store
-	settings     *settings.Store
-	requireAdmin func(http.Handler) http.Handler
+	store           *store.Store
+	settings        *settings.Store
+	secrets         Decrypter
+	identifyTimeout time.Duration
+	requireAdmin    func(http.Handler) http.Handler
 }
 
 // RegisterRoutes mounts:
@@ -55,11 +64,15 @@ type Service struct {
 //	GET  /api/imports/search-library  manual arr_library_cache search
 //	POST /api/queue/{id}/approve    pending_approval -> extracting
 //	POST /api/queue/{id}/reject     pending_approval -> ignored
+//	POST /api/queue/{id}/identify   parse the release with arr, list candidates
+//	POST /api/queue/{id}/match      persist the operator's library pick
 func RegisterRoutes(mux *http.ServeMux, deps Dependencies) *Service {
 	svc := &Service{
-		store:        &store.Store{DB: deps.DB},
-		settings:     deps.Settings,
-		requireAdmin: deps.RequireAdmin,
+		store:           &store.Store{DB: deps.DB},
+		settings:        deps.Settings,
+		secrets:         deps.Secrets,
+		identifyTimeout: deps.IdentifyTimeout,
+		requireAdmin:    deps.RequireAdmin,
 	}
 	admin := func(h http.HandlerFunc) http.Handler {
 		if svc.requireAdmin == nil {
@@ -73,6 +86,8 @@ func RegisterRoutes(mux *http.ServeMux, deps Dependencies) *Service {
 	mux.Handle("GET /api/imports/search-library", admin(svc.handleSearchLibrary))
 	mux.Handle("POST /api/queue/{id}/approve", admin(svc.handleApprove))
 	mux.Handle("POST /api/queue/{id}/reject", admin(svc.handleReject))
+	mux.Handle("POST /api/queue/{id}/identify", admin(svc.handleIdentify))
+	mux.Handle("POST /api/queue/{id}/match", admin(svc.handleMatch))
 	return svc
 }
 

@@ -1,9 +1,19 @@
 import { useState } from 'react'
-import type { LibrarySearchItem, QueueEligibility, QueueItem, QueueMatchState } from '../lib/api'
+import {
+  ApiError,
+  type LibrarySearchItem,
+  type QueueEligibility,
+  type QueueIdentifyCandidate,
+  type QueueIdentifyResponse,
+  type QueueItem,
+  type QueueMatchState,
+} from '../lib/api'
 import {
   useApproveQueueItem,
   useDebouncedValue,
+  useIdentifyQueueItem,
   useLibrarySearch,
+  useMatchQueueItem,
   useQueue,
   useRejectQueueItem,
 } from '../lib/hooks'
@@ -136,18 +146,103 @@ function DonorLine({ item }: { item: QueueItem }) {
   )
 }
 
+/** Explains an identify failure in the operator's terms, not arr's. */
+function IdentifyFailure({ error }: { error: Error }) {
+  const notConfigured = error instanceof ApiError && error.code === 'not_configured'
+  if (notConfigured) {
+    return (
+      <p className="mt-2 text-xs text-amber-300/90">
+        arr is not configured for this release — add the instance under Settings → Connections.{' '}
+        <span className="text-zinc-500">({error.message})</span>
+      </p>
+    )
+  }
+  return <p className="mt-2 text-xs text-red-400">Identify failed: {error.message}</p>
+}
+
+/**
+ * The identify result: what arr thought of the release name and the library rows
+ * it matched. The server never pre-picks — the operator does.
+ */
+function IdentifyResult({
+  result,
+  pickingId,
+  onPick,
+  pickError,
+}: {
+  result: QueueIdentifyResponse
+  pickingId: number | null
+  onPick: (candidate: QueueIdentifyCandidate) => void
+  pickError: Error | null
+}) {
+  return (
+    <div className="mt-2" data-testid="identify-result">
+      {result.parse.parsed ? (
+        <p className="text-xs text-zinc-400">
+          arr parsed{' '}
+          <span className="font-medium text-zinc-200">
+            {result.parse.title}
+            {result.parse.year ? ` (${result.parse.year})` : ''}
+          </span>
+          {result.parse.quality ? ` · ${result.parse.quality}` : ''}
+          {result.parse.confidence ? ` · ${Math.round(result.parse.confidence * 100)}%` : ''}
+        </p>
+      ) : (
+        // An unparsable release is not an empty library: say which one it is.
+        <p className="text-xs text-amber-300/90" data-testid="identify-unparsable">
+          arr could not parse this release name. Enter a title and try again.
+        </p>
+      )}
+      {!result.parse.parsed ? null : result.candidates.length === 0 ? (
+        <p className="mt-1 text-xs text-zinc-500">
+          No library candidates — sync the arr library, or search it manually below.
+        </p>
+      ) : (
+        <ul className="mt-2 space-y-1">
+          {result.candidates.map((candidate) => (
+            <li key={candidate.library_cache_id}>
+              <button
+                type="button"
+                onClick={() => onPick(candidate)}
+                disabled={pickingId !== null}
+                className="flex w-full items-center justify-between gap-2 rounded-md border border-ink-700 bg-ink-950/60 px-3 py-1.5 text-left text-sm text-zinc-200 hover:border-accent-500 hover:bg-ink-800 disabled:opacity-60"
+              >
+                <span className="truncate">
+                  {candidate.year ? `${candidate.title} (${candidate.year})` : candidate.title}
+                </span>
+                <span className="shrink-0 text-xs text-zinc-500">
+                  {pickingId === candidate.library_cache_id
+                    ? 'matching…'
+                    : `${Math.round(candidate.confidence * 100)}% · ${candidate.media_type}`}
+                </span>
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+      {pickError && <p className="mt-1 text-xs text-red-400">Could not match: {pickError.message}</p>}
+    </div>
+  )
+}
+
 function QueueCard({
   item,
   onApprove,
   onReject,
+  onIdentify,
+  onMatch,
   approving,
   rejecting,
+  identifying,
 }: {
   item: QueueItem
   onApprove: (id: number, libraryCacheId?: number) => void
   onReject: (id: number) => void
+  onIdentify: (id: number) => Promise<QueueIdentifyResponse>
+  onMatch: (id: number, candidate: QueueIdentifyCandidate) => Promise<unknown>
   approving: boolean
   rejecting: boolean
+  identifying: boolean
 }) {
   const view = eligibilityView[item.eligibility] ?? eligibilityView.missing_target
   // A missing or unexpected match_state must not mislabel a matched row, so the
@@ -159,7 +254,27 @@ function QueueCard({
   const episode = episodeLabel(item)
   const busy = approving || rejecting
   const [manualMatch, setManualMatch] = useState<LibrarySearchItem | null>(null)
+  const [identified, setIdentified] = useState<QueueIdentifyResponse | null>(null)
+  const [identifyError, setIdentifyError] = useState<Error | null>(null)
+  const [pickingId, setPickingId] = useState<number | null>(null)
+  const [pickError, setPickError] = useState<Error | null>(null)
   const needsMatch = !item.matched && manualMatch === null
+
+  const runIdentify = () => {
+    setIdentifyError(null)
+    setPickError(null)
+    onIdentify(item.id)
+      .then(setIdentified)
+      .catch(setIdentifyError)
+  }
+
+  const pickCandidate = (candidate: QueueIdentifyCandidate) => {
+    setPickError(null)
+    setPickingId(candidate.library_cache_id)
+    onMatch(item.id, candidate)
+      .catch(setPickError)
+      .finally(() => setPickingId(null))
+  }
 
   return (
     <div data-testid={`queue-item-${item.id}`}>
@@ -197,6 +312,20 @@ function QueueCard({
               <p className="text-xs font-medium text-amber-300/90">
                 No arr library match — identify this release to approve it.
               </p>
+              <div className="mt-2 flex flex-wrap items-center gap-2">
+                <Button variant="secondary" size="sm" disabled={identifying} onClick={runIdentify}>
+                  {identifying ? 'Identifying…' : 'Identify with arr'}
+                </Button>
+              </div>
+              {identifyError && <IdentifyFailure error={identifyError} />}
+              {identified && (
+                <IdentifyResult
+                  result={identified}
+                  pickingId={pickingId}
+                  onPick={pickCandidate}
+                  pickError={pickError}
+                />
+              )}
               {manualMatch ? (
                 <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
                   <span className="text-sm text-zinc-200">
@@ -270,6 +399,8 @@ export function QueuePage() {
   const queue = useQueue()
   const approve = useApproveQueueItem()
   const reject = useRejectQueueItem()
+  const identify = useIdentifyQueueItem()
+  const match = useMatchQueueItem()
   const items = queue.data?.items ?? []
   const actionError = approve.error ?? reject.error
 
@@ -315,8 +446,17 @@ export function QueuePage() {
             item={item}
             onApprove={(id, libraryCacheId) => approve.mutate({ id, libraryCacheId })}
             onReject={(id) => reject.mutate(id)}
+            onIdentify={(id) => identify.mutateAsync(id)}
+            onMatch={(id, candidate) =>
+              match.mutateAsync({
+                id,
+                libraryCacheId: candidate.library_cache_id,
+                confidence: candidate.confidence,
+              })
+            }
             approving={approve.isPending && approve.variables?.id === item.id}
             rejecting={reject.isPending && reject.variables === item.id}
+            identifying={identify.isPending && identify.variables === item.id}
           />
         ))}
       </div>

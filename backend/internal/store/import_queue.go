@@ -26,6 +26,17 @@ var (
 	// ErrImportCandidateMatchMismatch reports an approve that supplies a
 	// library id different from the one already matched on the row.
 	ErrImportCandidateMatchMismatch = errors.New("store: import candidate is matched to a different library target")
+	// ErrImportCandidateKindMismatch reports a manual match whose cache row
+	// serves a different media kind than the queue row, e.g. a movie release
+	// matched to a Sonarr episode.
+	ErrImportCandidateKindMismatch = errors.New("store: import candidate media kind does not match the library target")
+	// ErrImportCandidateInstanceMismatch reports a manual match whose cache row
+	// belongs to a different arr instance than the queue row's resolved
+	// instance, e.g. a release linked to the Sonarr instance matched to a row
+	// the Radarr instance synced. It is defense in depth: one instance per kind
+	// is a settings guarantee, not a schema UNIQUE, so the store never trusts
+	// the kind test alone.
+	ErrImportCandidateInstanceMismatch = errors.New("store: import candidate arr instance does not match the library target")
 )
 
 // RecordImportCandidate inserts a newly discovered donor file into the
@@ -381,6 +392,98 @@ type ImportCandidateSummary struct {
 	LibraryTitle string
 }
 
+// importCandidateSummarySelect is the column list and joins both summary reads
+// use, so a single row and the pending list can never disagree about what a
+// summary contains.
+const importCandidateSummarySelect = `
+		SELECT iq.id, iq.source_file_path, iq.filename, iq.file_size, iq.status,
+		       iq.parsed_raw_json, iq.matched_library_cache_id,
+		       alc.title, alc.media_type, alc.year, alc.season_number, alc.episode_number,
+		       alc.target_file_path, alc.original_language_iso2,
+		       alc.audio_languages_json, alc.eligibility_status
+		FROM import_queue iq
+		LEFT JOIN arr_library_cache alc ON alc.id = iq.matched_library_cache_id`
+
+// scanImportCandidateSummary decodes one summary row, resolving the gate and
+// donor members the row keeps inside parsed_raw_json.
+func scanImportCandidateSummary(row rowScanner) (ImportCandidateSummary, error) {
+	var (
+		c                  ImportCandidateSummary
+		raw                sql.NullString
+		matchedID          sql.NullInt64
+		title, mediaType   sql.NullString
+		year               sql.NullInt64
+		season, episode    sql.NullInt64
+		target, origLang   sql.NullString
+		audioLangs, eligib sql.NullString
+	)
+	if err := row.Scan(&c.ID, &c.SourceFilePath, &c.Filename, &c.FileSize, &c.Status,
+		&raw, &matchedID, &title, &mediaType, &year, &season, &episode,
+		&target, &origLang, &audioLangs, &eligib); err != nil {
+		return ImportCandidateSummary{}, err
+	}
+	c.Matched = matchedID.Valid
+	c.LibraryTitle = title.String
+	c.Title = title.String
+	c.MediaType = mediaType.String
+	c.Year = int(year.Int64)
+	if season.Valid {
+		v := int(season.Int64)
+		c.SeasonNumber = &v
+	}
+	if episode.Valid {
+		v := int(episode.Int64)
+		c.EpisodeNumber = &v
+	}
+	c.TargetPath = target.String
+	c.OriginalLanguage = origLang.String
+	c.AudioLanguages = audioLangs.String
+	c.Eligibility = eligib.String
+	if raw.Valid && strings.TrimSpace(raw.String) != "" {
+		var doc map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(raw.String), &doc); err != nil {
+			return ImportCandidateSummary{}, fmt.Errorf("import candidate %d: parsed_raw_json is not an object: %w", c.ID, err)
+		}
+		if blob, ok := doc[gateJSONKey]; ok {
+			if err := json.Unmarshal(blob, &c.Gate); err != nil {
+				return ImportCandidateSummary{}, fmt.Errorf("decode import candidate %d gate: %w", c.ID, err)
+			}
+			c.HasGate = true
+			if c.Gate.TargetPath != "" {
+				c.TargetPath = c.Gate.TargetPath
+			}
+			if c.Gate.Status != "" {
+				c.Eligibility = c.Gate.Status
+			}
+		}
+		if blob, ok := doc[donorJSONKey]; ok {
+			if err := json.Unmarshal(blob, &c.DonorPath); err != nil {
+				return ImportCandidateSummary{}, fmt.Errorf("decode import candidate %d donor: %w", c.ID, err)
+			}
+		}
+	}
+	if c.Eligibility == "" {
+		c.Eligibility = "missing_target"
+	}
+	return c, nil
+}
+
+// ImportCandidateSummaryByID reads one queue row in the same shape the list
+// serves, so a route that changed a row can report the match state the list
+// would show for it without re-deriving it. ok is false for an unknown id.
+func (s *Store) ImportCandidateSummaryByID(ctx context.Context, id int64) (ImportCandidateSummary, bool, error) {
+	row := s.DB.QueryRowContext(ctx, importCandidateSummarySelect+`
+		WHERE iq.id = ?`, id)
+	summary, err := scanImportCandidateSummary(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ImportCandidateSummary{}, false, nil
+	}
+	if err != nil {
+		return ImportCandidateSummary{}, false, fmt.Errorf("store: read import candidate %d: %w", id, err)
+	}
+	return summary, true, nil
+}
+
 // ListPendingImportCandidates returns every donor awaiting approval, newest
 // queue id last, with the matched target and gate verdict attached.
 //
@@ -388,14 +491,7 @@ type ImportCandidateSummary struct {
 // candidate was never classified, Eligibility falls back to the arr library
 // row's eligibility_status, and finally to "missing_target".
 func (s *Store) ListPendingImportCandidates(ctx context.Context) ([]ImportCandidateSummary, error) {
-	rows, err := s.DB.QueryContext(ctx, `
-		SELECT iq.id, iq.source_file_path, iq.filename, iq.file_size, iq.status,
-		       iq.parsed_raw_json, iq.matched_library_cache_id,
-		       alc.title, alc.media_type, alc.year, alc.season_number, alc.episode_number,
-		       alc.target_file_path, alc.original_language_iso2,
-		       alc.audio_languages_json, alc.eligibility_status
-		FROM import_queue iq
-		LEFT JOIN arr_library_cache alc ON alc.id = iq.matched_library_cache_id
+	rows, err := s.DB.QueryContext(ctx, importCandidateSummarySelect+`
 		WHERE iq.status = 'pending_approval'
 		ORDER BY iq.created_at, iq.id`)
 	if err != nil {
@@ -405,63 +501,9 @@ func (s *Store) ListPendingImportCandidates(ctx context.Context) ([]ImportCandid
 
 	out := []ImportCandidateSummary{}
 	for rows.Next() {
-		var (
-			c                  ImportCandidateSummary
-			raw                sql.NullString
-			matchedID          sql.NullInt64
-			title, mediaType   sql.NullString
-			year               sql.NullInt64
-			season, episode    sql.NullInt64
-			target, origLang   sql.NullString
-			audioLangs, eligib sql.NullString
-		)
-		if err := rows.Scan(&c.ID, &c.SourceFilePath, &c.Filename, &c.FileSize, &c.Status,
-			&raw, &matchedID, &title, &mediaType, &year, &season, &episode,
-			&target, &origLang, &audioLangs, &eligib); err != nil {
+		c, err := scanImportCandidateSummary(rows)
+		if err != nil {
 			return nil, fmt.Errorf("store: scan pending import candidate: %w", err)
-		}
-		c.Matched = matchedID.Valid
-		c.LibraryTitle = title.String
-		c.Title = title.String
-		c.MediaType = mediaType.String
-		c.Year = int(year.Int64)
-		if season.Valid {
-			v := int(season.Int64)
-			c.SeasonNumber = &v
-		}
-		if episode.Valid {
-			v := int(episode.Int64)
-			c.EpisodeNumber = &v
-		}
-		c.TargetPath = target.String
-		c.OriginalLanguage = origLang.String
-		c.AudioLanguages = audioLangs.String
-		c.Eligibility = eligib.String
-		if raw.Valid && strings.TrimSpace(raw.String) != "" {
-			var doc map[string]json.RawMessage
-			if err := json.Unmarshal([]byte(raw.String), &doc); err != nil {
-				return nil, fmt.Errorf("store: import candidate %d: parsed_raw_json is not an object: %w", c.ID, err)
-			}
-			if blob, ok := doc[gateJSONKey]; ok {
-				if err := json.Unmarshal(blob, &c.Gate); err != nil {
-					return nil, fmt.Errorf("store: decode import candidate %d gate: %w", c.ID, err)
-				}
-				c.HasGate = true
-				if c.Gate.TargetPath != "" {
-					c.TargetPath = c.Gate.TargetPath
-				}
-				if c.Gate.Status != "" {
-					c.Eligibility = c.Gate.Status
-				}
-			}
-			if blob, ok := doc[donorJSONKey]; ok {
-				if err := json.Unmarshal(blob, &c.DonorPath); err != nil {
-					return nil, fmt.Errorf("store: decode import candidate %d donor: %w", c.ID, err)
-				}
-			}
-		}
-		if c.Eligibility == "" {
-			c.Eligibility = "missing_target"
 		}
 		out = append(out, c)
 	}

@@ -309,6 +309,7 @@ func newServerWithSecrets(cfg Config, secOpts secrets.Options) (*server, error) 
 	queue.RegisterRoutes(mux, queue.Dependencies{
 		DB:           st.DB,
 		Settings:     settingsStore,
+		Secrets:      sec,
 		RequireAdmin: authSvc.RequireAdmin,
 	})
 

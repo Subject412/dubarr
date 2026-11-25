@@ -136,6 +136,85 @@ function queueFetch() {
   })
 }
 
+// identifiedRelease is what arr's parser and the cache lookup return for the
+// unmatched Kraina Lodu drop: a clean parse and two ranked candidates.
+const identifiedRelease = {
+  parse: { parsed: true, title: 'Kraina Lodu', year: 2013, quality: 'Bluray-1080p', confidence: 1 },
+  candidates: [
+    {
+      library_cache_id: 7,
+      title: 'Kraina Lodu',
+      year: 2013,
+      media_type: 'movie',
+      external_item_id: 812,
+      confidence: 1,
+      matched_by: 'parse',
+    },
+    {
+      library_cache_id: 8,
+      title: 'Kraina Lodu 2',
+      year: 2019,
+      media_type: 'movie',
+      external_item_id: 330457,
+      confidence: 0.5,
+      matched_by: 'parse',
+    },
+  ],
+}
+
+// unparsableRelease is what an instance answers for a release name it cannot
+// read: no title, no confidence, and no candidate scan behind it.
+const unparsableRelease = {
+  parse: { parsed: false, title: '', year: 0, quality: '', confidence: 0 },
+  candidates: [],
+}
+
+/**
+ * Identify-aware queue fetch. `identifyFailure` makes the identify route answer
+ * 502 with that body; `identifyResult` overrides the 200 verdict the route
+ * returns (default: a clean parse with two candidates). Once a match is
+ * persisted the list reports the row as matched, so the invalidated query
+ * observes the change.
+ */
+function identifyFetch(
+  identifyFailure?: Record<string, unknown>,
+  identifyResult: Record<string, unknown> = identifiedRelease,
+) {
+  let matched = false
+  return vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input)
+    if (url.endsWith('/api/queue') && isMethod(init, 'GET')) {
+      const list = items.map((item) =>
+        item.id === 3 && matched
+          ? {
+              ...item,
+              title: 'Kraina Lodu',
+              year: 2013,
+              media_type: 'movie',
+              matched: true,
+              library_title: 'Kraina Lodu',
+              match_state: 'matched_no_donor',
+              match_reason: 'No sibling release carries the dubbing marker (PL.DUB).',
+            }
+          : item,
+      )
+      return jsonResponse({ items: list })
+    }
+    if (url.includes('/api/queue/3/identify')) {
+      if (identifyFailure) return jsonResponse(identifyFailure, 502)
+      return jsonResponse(identifyResult)
+    }
+    if (url.includes('/api/queue/3/match')) {
+      matched = true
+      return jsonResponse({ match_state: 'matched_no_donor' })
+    }
+    if (url.includes('/api/imports/search-library')) {
+      return jsonResponse({ items: libraryResults })
+    }
+    return jsonResponse({ error: 'unexpected' }, 404)
+  })
+}
+
 describe('approval queue page', () => {
   it('renders pre-selected cards with gate badges, languages and donor pairing', async () => {
     vi.stubGlobal('fetch', queueFetch())
@@ -289,6 +368,99 @@ describe('approval queue page', () => {
       expect(call).toBeTruthy()
       expect(JSON.parse(String(call?.[1]?.body))).toEqual({ library_cache_id: 7 })
     })
+  })
+
+  it('identifies an unmatched release and shows candidates', async () => {
+    const fetchMock = identifyFetch()
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    renderWithProviders(<QueuePage />, { route: '/queue' })
+
+    const card = await screen.findByTestId('queue-item-3')
+    await user.click(within(card).getByRole('button', { name: /identify with arr/i }))
+
+    const result = await within(card).findByTestId('identify-result')
+    // The operator sees what arr thought of the release name.
+    expect(within(result).getByText(/Bluray-1080p/)).toBeInTheDocument()
+    expect(within(result).getByText(/arr parsed/)).toBeInTheDocument()
+    // Both library rows are offered, best first, with their confidence.
+    const exact = within(result).getByRole('button', { name: /Kraina Lodu \(2013\)/ })
+    expect(exact).toHaveTextContent('100%')
+    expect(within(result).getByRole('button', { name: /Kraina Lodu 2 \(2019\)/ })).toHaveTextContent(
+      '50%',
+    )
+
+    expect(
+      fetchMock.mock.calls.some(
+        ([url, init]) =>
+          String(url).includes('/api/queue/3/identify') && isMethod(init, 'POST'),
+      ),
+    ).toBe(true)
+  })
+
+  it('shows an unparsable message instead of an empty candidate list', async () => {
+    vi.stubGlobal('fetch', identifyFetch(undefined, unparsableRelease))
+    const user = userEvent.setup()
+    renderWithProviders(<QueuePage />, { route: '/queue' })
+
+    const card = await screen.findByTestId('queue-item-3')
+    await user.click(within(card).getByRole('button', { name: /identify with arr/i }))
+
+    const result = await within(card).findByTestId('identify-result')
+    // An unparsable release is named as such, not shown as an empty library.
+    expect(
+      within(result).getByText(/arr could not parse this release name/i),
+    ).toBeInTheDocument()
+    expect(within(result).queryByText(/No library candidates/i)).not.toBeInTheDocument()
+    expect(within(result).queryByText(/arr parsed/i)).not.toBeInTheDocument()
+    // The manual path stays usable so the operator can act on the message.
+    expect(within(card).getByPlaceholderText(/search the arr library/i)).toBeInTheDocument()
+  })
+
+  it('picking a candidate persists the match and refreshes the card', async () => {
+    const fetchMock = identifyFetch()
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    renderWithProviders(<QueuePage />, { route: '/queue' })
+
+    const card = await screen.findByTestId('queue-item-3')
+    await user.click(within(card).getByRole('button', { name: /identify with arr/i }))
+    const result = await within(card).findByTestId('identify-result')
+    await user.click(within(result).getByRole('button', { name: /Kraina Lodu \(2013\)/ }))
+
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find(
+        ([url, init]) => String(url).includes('/api/queue/3/match') && isMethod(init, 'POST'),
+      )
+      expect(call).toBeTruthy()
+      expect(JSON.parse(String(call?.[1]?.body))).toEqual({ library_cache_id: 7, confidence: 1 })
+    })
+
+    // The queue query is invalidated, so the card flips to the matched state.
+    await waitFor(() => {
+      expect(within(card).getByText('Matched, not ready')).toBeInTheDocument()
+    })
+    expect(within(card).queryByTestId('identify-result')).not.toBeInTheDocument()
+  })
+
+  it('surfaces an identify failure with its diagnostic', async () => {
+    vi.stubGlobal(
+      'fetch',
+      identifyFetch({
+        error: 'the instance did not answer the parse request in time',
+        code: 'identify_failed',
+        class: 'timeout',
+      }),
+    )
+    const user = userEvent.setup()
+    renderWithProviders(<QueuePage />, { route: '/queue' })
+
+    const card = await screen.findByTestId('queue-item-3')
+    await user.click(within(card).getByRole('button', { name: /identify with arr/i }))
+
+    expect(
+      await within(card).findByText(/did not answer the parse request in time/),
+    ).toBeInTheDocument()
   })
 
   it('shows a clear empty state', async () => {

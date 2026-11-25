@@ -51,6 +51,9 @@ type Radarr interface {
 	// only accepts path/downloadClientId/importMode and cannot target a
 	// single movie.
 	RescanMovie(ctx context.Context, movieID int) error
+	// Parse asks Radarr's own parser to identify one release name
+	// (POST /api/v3/parse), normalised onto ParseResult.
+	Parse(ctx context.Context, title string) (ParseResult, error)
 }
 
 // Sonarr is the Sonarr-specific client surface.
@@ -63,6 +66,9 @@ type Sonarr interface {
 	SeriesByID(ctx context.Context, seriesID int) (Series, error)
 	// RescanSeries asks Sonarr to rescan one series (command RescanSeries).
 	RescanSeries(ctx context.Context, seriesID int) error
+	// Parse asks Sonarr's own parser to identify one release name
+	// (POST /api/v3/parse), normalised onto ParseResult.
+	Parse(ctx context.Context, title string) (ParseResult, error)
 }
 
 // core performs authenticated JSON GETs against one base URL.
@@ -265,6 +271,13 @@ func (c *core) get(ctx context.Context, path string, out any) error {
 // post performs one authenticated JSON POST. A 2xx response is success; the
 // body is discarded. Errors are scrubbed of the API key and response body.
 func (c *core) post(ctx context.Context, path string, payload any) error {
+	return c.postJSON(ctx, path, payload, nil)
+}
+
+// postJSON is post plus an optional 2xx response body decoded into out (nil
+// discards it). Both products answer /api/v3/parse with a payload, so the
+// decode shares this one request/error path instead of copying it.
+func (c *core) postJSON(ctx context.Context, path string, payload any, out any) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("arr: encode POST %s body: %w", path, err)
@@ -288,6 +301,12 @@ func (c *core) post(ctx context.Context, path string, payload any) error {
 		return fmt.Errorf("%w: POST %s: HTTP %d", ErrAuth, path, resp.StatusCode)
 	case resp.StatusCode < 200 || resp.StatusCode > 299:
 		return &StatusError{Code: resp.StatusCode, Method: http.MethodPost, Path: path}
+	}
+	if out == nil {
+		return nil
+	}
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		return fmt.Errorf("arr: decode POST %s response: %w", path, err)
 	}
 	return nil
 }

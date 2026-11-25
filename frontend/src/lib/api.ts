@@ -251,6 +251,37 @@ export type QueueResponse = {
   items: QueueItem[]
 }
 
+/** One arr library row arr's parse matched, with a deterministic 0..1 score. */
+export type QueueIdentifyCandidate = {
+  library_cache_id: number
+  title: string
+  year: number
+  media_type: string
+  external_item_id: number
+  confidence: number
+  matched_by: string
+}
+
+/** What arr's own parser made of the release name. `parsed` is false when the
+ * instance recognised no title at all — an unparsable release, which is not the
+ * same thing as a library with no matching rows. */
+export type QueueIdentifyParse = {
+  parsed: boolean
+  title: string
+  year: number
+  quality: string
+  confidence: number
+}
+
+export type QueueIdentifyResponse = {
+  parse: QueueIdentifyParse
+  candidates: QueueIdentifyCandidate[]
+}
+
+export type QueueMatchResponse = {
+  match_state: QueueMatchState
+}
+
 export type LibrarySearchItem = {
   id: number
   title: string
@@ -390,11 +421,14 @@ export type LogsQuery = {
 
 export class ApiError extends Error {
   readonly status: number
+  /** Machine-readable reason from the error body, when the route sends one. */
+  readonly code?: string
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, code?: string) {
     super(message)
     this.name = 'ApiError'
     this.status = status
+    this.code = code
   }
 }
 
@@ -418,16 +452,23 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 
   if (!response.ok) {
     let message = `Request failed (${response.status})`
+    let code: string | undefined
     try {
       const body: unknown = await response.json()
-      if (body && typeof body === 'object' && 'error' in body) {
-        const raw = (body as { error?: unknown }).error
-        if (typeof raw === 'string' && raw !== '') message = raw
+      if (body && typeof body === 'object') {
+        if ('error' in body) {
+          const raw = (body as { error?: unknown }).error
+          if (typeof raw === 'string' && raw !== '') message = raw
+        }
+        if ('code' in body) {
+          const raw = (body as { code?: unknown }).code
+          if (typeof raw === 'string' && raw !== '') code = raw
+        }
       }
     } catch {
       // Non-JSON error bodies fall back to the status message.
     }
-    throw new ApiError(response.status, message)
+    throw new ApiError(response.status, message, code)
   }
 
   if (response.status === 204) return undefined as T
@@ -490,8 +531,23 @@ export const api = {
       body:
         libraryCacheId == null ? undefined : JSON.stringify({ library_cache_id: libraryCacheId }),
     }),
-  rejectQueueItem: (id: number) =>
-    request<QueueTransition>(`/api/queue/${id}/reject`, { method: 'POST' }),
+  rejectQueueItem: (id: number) => request<QueueTransition>(`/api/queue/${id}/reject`, { method: 'POST' }),
+  /** Asks arr's own parser to identify the release; title overrides the filename stem. */
+  identifyQueueItem: (id: number, title?: string) =>
+    request<QueueIdentifyResponse>(`/api/queue/${id}/identify`, {
+      method: 'POST',
+      body: title ? JSON.stringify({ title }) : undefined,
+    }),
+  /** Persists the operator's pick; the server reports the resulting match state. */
+  matchQueueItem: (id: number, libraryCacheId: number, confidence?: number) =>
+    request<QueueMatchResponse>(`/api/queue/${id}/match`, {
+      method: 'POST',
+      body: JSON.stringify(
+        confidence == null
+          ? { library_cache_id: libraryCacheId }
+          : { library_cache_id: libraryCacheId, confidence },
+      ),
+    }),
   tokens: () => request<ApiTokensResponse>('/api/auth/tokens'),
   createToken: (name: string) =>
     request<ApiTokenCreated>('/api/auth/tokens', {

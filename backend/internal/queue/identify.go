@@ -57,8 +57,7 @@ type identifyRequest struct {
 
 // matchRequest is the match body. Confidence is accepted so an existing client
 // can keep sending the identify score, but it never reaches parse_confidence: a
-// human pick is not a parse, so the store always records the highest non-exact
-// label ("ambiguous").
+// human pick is not a parse, so the store always records it as "manual".
 type matchRequest struct {
 	LibraryCacheID int64   `json:"library_cache_id"`
 	Confidence     float64 `json:"confidence"`
@@ -239,10 +238,10 @@ func (s *Service) handleMatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// A human pick is never an exact parse, so the label handed to the store is
-	// the highest non-exact one. req.Confidence only says how well the pick
-	// scored during identify; it must not claim a parse happened.
-	if err := s.store.SetImportCandidateLibraryMatch(ctx, id, req.LibraryCacheID, "ambiguous"); err != nil {
+	// A human pick is not a parse, so the store records it as "manual".
+	// req.Confidence only says how well the pick scored during identify; it must
+	// not claim a parse happened.
+	if err := s.store.SetImportCandidateLibraryMatch(ctx, id, req.LibraryCacheID); err != nil {
 		writeMatchError(w, err)
 		return
 	}

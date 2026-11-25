@@ -265,16 +265,19 @@ func mediaTypeForArrKind(kind string) string {
 // Re-picking the id the row is already matched to is idempotent (it rewrites the
 // same values), so a retried identify does not have to fail.
 //
-// confidence is accepted for call-site compatibility and deliberately ignored: a
-// human pick is never an exact parse, so the row is always stored with the
-// schema's highest non-exact label, "ambiguous" (the parse_confidence
-// vocabulary is exact | ambiguous | unmatched).
-func (s *Store) SetImportCandidateLibraryMatch(ctx context.Context, queueID, cacheID int64, confidence string) error {
+// A human pick is stored with parse_confidence = "manual": the row records that
+// a PERSON chose the match, which is neither an exact nor an ambiguous parse.
+// The parse_confidence vocabulary is exact | ambiguous | manual | unmatched.
+//
+// The schema comment still lists only exact | ambiguous | unmatched: it is
+// frozen in the applied migration 0001_initial.sql, which schema.sql mirrors
+// byte-for-byte, so the word cannot be added there without a migration. "manual"
+// needs none — the column is a plain TEXT with no CHECK constraint.
+func (s *Store) SetImportCandidateLibraryMatch(ctx context.Context, queueID, cacheID int64) error {
 	if cacheID <= 0 {
 		return fmt.Errorf("store: import candidate %d: library cache id must be positive", queueID)
 	}
-	_ = confidence
-	const label = "ambiguous"
+	const label = "manual"
 
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {

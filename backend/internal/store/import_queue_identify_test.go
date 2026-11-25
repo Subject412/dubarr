@@ -80,33 +80,38 @@ func (f identifyFixture) matchRow(t *testing.T) (matchedID sql.NullInt64, confid
 
 // TestSetImportCandidateLibraryMatchPersists pins the operator pick: the match
 // id and the parse confidence are written while the row stays pending_approval.
-// A human pick is never an exact parse, so even an "exact" argument is stored as
-// the highest non-exact label.
+// A human pick is recorded as "manual", never as "ambiguous" (that label would
+// claim the release name parsed ambiguously, which is not what happened).
 func TestSetImportCandidateLibraryMatchPersists(t *testing.T) {
 	f := newIdentifyFixture(t, "radarr", "movie")
 
-	if err := f.store.SetImportCandidateLibraryMatch(f.ctx, f.queue, f.cache, "exact"); err != nil {
+	if err := f.store.SetImportCandidateLibraryMatch(f.ctx, f.queue, f.cache); err != nil {
 		t.Fatalf("SetImportCandidateLibraryMatch: %v", err)
 	}
 	matched, confidence, status := f.matchRow(t)
 	if !matched.Valid || matched.Int64 != f.cache {
 		t.Errorf("matched_library_cache_id = %+v, want %d", matched, f.cache)
 	}
-	if !confidence.Valid || confidence.String != "ambiguous" {
-		t.Errorf("parse_confidence = %+v, want ambiguous (a pick is not a parse)", confidence)
+	if !confidence.Valid || confidence.String != "manual" {
+		t.Errorf("parse_confidence = %+v, want manual (a human pick is not a parse)", confidence)
+	}
+	// A regression back to the old "ambiguous" label must fail loudly: it means
+	// the store stopped distinguishing a human pick from an ambiguous parse.
+	if confidence.String == "ambiguous" {
+		t.Errorf("parse_confidence = %q, want manual, not ambiguous", confidence.String)
 	}
 	if status != "pending_approval" {
 		t.Errorf("status = %q, want pending_approval", status)
 	}
 
-	// Re-picking the same id is idempotent, and an unrecognised label degrades
-	// to the schema's "ambiguous" rather than inventing a new value.
-	if err := f.store.SetImportCandidateLibraryMatch(f.ctx, f.queue, f.cache, "made-up"); err != nil {
+	// Re-picking the same id is idempotent and stores the same "manual" label:
+	// the store records what happened, not a caller-supplied value.
+	if err := f.store.SetImportCandidateLibraryMatch(f.ctx, f.queue, f.cache); err != nil {
 		t.Fatalf("re-pick: %v", err)
 	}
 	_, confidence, _ = f.matchRow(t)
-	if confidence.String != "ambiguous" {
-		t.Errorf("parse_confidence after re-pick = %q, want ambiguous", confidence.String)
+	if confidence.String != "manual" {
+		t.Errorf("parse_confidence after re-pick = %q, want manual", confidence.String)
 	}
 }
 
@@ -115,7 +120,7 @@ func TestSetImportCandidateLibraryMatchPersists(t *testing.T) {
 func TestSetImportCandidateLibraryMatchKindMismatch(t *testing.T) {
 	f := newIdentifyFixture(t, "radarr", "episode")
 
-	err := f.store.SetImportCandidateLibraryMatch(f.ctx, f.queue, f.cache, "exact")
+	err := f.store.SetImportCandidateLibraryMatch(f.ctx, f.queue, f.cache)
 	if !errors.Is(err, ErrImportCandidateKindMismatch) {
 		t.Fatalf("error = %v, want ErrImportCandidateKindMismatch", err)
 	}
@@ -131,7 +136,7 @@ func TestSetImportCandidateLibraryMatchKindMismatch(t *testing.T) {
 // TestSetImportCandidateLibraryMatchUnknownQueueRow pins the 404 mapping.
 func TestSetImportCandidateLibraryMatchUnknownQueueRow(t *testing.T) {
 	f := newIdentifyFixture(t, "radarr", "movie")
-	err := f.store.SetImportCandidateLibraryMatch(f.ctx, f.queue+999, f.cache, "exact")
+	err := f.store.SetImportCandidateLibraryMatch(f.ctx, f.queue+999, f.cache)
 	if !errors.Is(err, ErrImportCandidateNotFound) {
 		t.Fatalf("error = %v, want ErrImportCandidateNotFound", err)
 	}
@@ -140,7 +145,7 @@ func TestSetImportCandidateLibraryMatchUnknownQueueRow(t *testing.T) {
 // TestSetImportCandidateLibraryMatchUnknownCacheRow pins the other 404 mapping.
 func TestSetImportCandidateLibraryMatchUnknownCacheRow(t *testing.T) {
 	f := newIdentifyFixture(t, "radarr", "movie")
-	err := f.store.SetImportCandidateLibraryMatch(f.ctx, f.queue, f.cache+999, "exact")
+	err := f.store.SetImportCandidateLibraryMatch(f.ctx, f.queue, f.cache+999)
 	if !errors.Is(err, ErrLibraryCacheNotFound) {
 		t.Fatalf("error = %v, want ErrLibraryCacheNotFound", err)
 	}
@@ -155,7 +160,7 @@ func TestSetImportCandidateLibraryMatchDoesNotChangeStatus(t *testing.T) {
 	if err := f.store.TransitionImportCandidate(f.ctx, f.queue, "ignored"); err != nil {
 		t.Fatalf("TransitionImportCandidate: %v", err)
 	}
-	err := f.store.SetImportCandidateLibraryMatch(f.ctx, f.queue, f.cache, "exact")
+	err := f.store.SetImportCandidateLibraryMatch(f.ctx, f.queue, f.cache)
 	if !errors.Is(err, ErrImportCandidateState) {
 		t.Fatalf("error = %v, want ErrImportCandidateState", err)
 	}
@@ -172,7 +177,7 @@ func TestSetImportCandidateLibraryMatchDoesNotChangeStatus(t *testing.T) {
 // report the same match_state the list would show.
 func TestImportCandidateSummaryByID(t *testing.T) {
 	f := newIdentifyFixture(t, "radarr", "movie")
-	if err := f.store.SetImportCandidateLibraryMatch(f.ctx, f.queue, f.cache, "exact"); err != nil {
+	if err := f.store.SetImportCandidateLibraryMatch(f.ctx, f.queue, f.cache); err != nil {
 		t.Fatalf("SetImportCandidateLibraryMatch: %v", err)
 	}
 
@@ -314,7 +319,7 @@ func TestSetImportCandidateLibraryMatchInstanceMismatch(t *testing.T) {
 	other := f.addInstance(t, "radarr")
 	otherCache := f.addCache(t, other, "movie", "Kraina Lodu", 2013, 1)
 
-	err := f.store.SetImportCandidateLibraryMatch(f.ctx, f.queue, otherCache, "ambiguous")
+	err := f.store.SetImportCandidateLibraryMatch(f.ctx, f.queue, otherCache)
 	if !errors.Is(err, ErrImportCandidateInstanceMismatch) {
 		t.Fatalf("error = %v, want ErrImportCandidateInstanceMismatch", err)
 	}
@@ -327,7 +332,7 @@ func TestSetImportCandidateLibraryMatchInstanceMismatch(t *testing.T) {
 	}
 
 	// The row's own instance stays matchable.
-	if err := f.store.SetImportCandidateLibraryMatch(f.ctx, f.queue, f.cache, "ambiguous"); err != nil {
+	if err := f.store.SetImportCandidateLibraryMatch(f.ctx, f.queue, f.cache); err != nil {
 		t.Fatalf("match on the row's own instance: %v", err)
 	}
 }
@@ -339,11 +344,11 @@ func TestSetImportCandidateLibraryMatchRejectsLostUpdate(t *testing.T) {
 	f := newIdentifyFixture(t, "radarr", "movie")
 	second := f.addCache(t, f.instance, "movie", "Kraina Lodu 2", 2019, 2)
 
-	if err := f.store.SetImportCandidateLibraryMatch(f.ctx, f.queue, f.cache, "ambiguous"); err != nil {
+	if err := f.store.SetImportCandidateLibraryMatch(f.ctx, f.queue, f.cache); err != nil {
 		t.Fatalf("first pick: %v", err)
 	}
 
-	err := f.store.SetImportCandidateLibraryMatch(f.ctx, f.queue, second, "ambiguous")
+	err := f.store.SetImportCandidateLibraryMatch(f.ctx, f.queue, second)
 	if !errors.Is(err, ErrImportCandidateMatchMismatch) {
 		t.Fatalf("second pick error = %v, want ErrImportCandidateMatchMismatch", err)
 	}
@@ -351,15 +356,18 @@ func TestSetImportCandidateLibraryMatchRejectsLostUpdate(t *testing.T) {
 	if !matched.Valid || matched.Int64 != f.cache {
 		t.Errorf("matched_library_cache_id = %+v, want the first pick %d", matched, f.cache)
 	}
-	if !confidence.Valid || confidence.String != "ambiguous" {
-		t.Errorf("parse_confidence = %+v, want ambiguous", confidence)
+	if !confidence.Valid || confidence.String != "manual" {
+		t.Errorf("parse_confidence = %+v, want manual", confidence)
+	}
+	if confidence.String == "ambiguous" {
+		t.Errorf("parse_confidence = %q, want manual, not ambiguous", confidence.String)
 	}
 	if status != "pending_approval" {
 		t.Errorf("status = %q, want pending_approval", status)
 	}
 
 	// Re-picking the winning id is still idempotent.
-	if err := f.store.SetImportCandidateLibraryMatch(f.ctx, f.queue, f.cache, "ambiguous"); err != nil {
+	if err := f.store.SetImportCandidateLibraryMatch(f.ctx, f.queue, f.cache); err != nil {
 		t.Errorf("re-pick of the winning id: %v", err)
 	}
 }

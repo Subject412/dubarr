@@ -404,8 +404,11 @@ func TestIdentifyPersistsPick(t *testing.T) {
 	if !storedID.Valid || storedID.Int64 != cacheID {
 		t.Errorf("matched_library_cache_id = %+v, want %d", storedID, cacheID)
 	}
-	if !confidence.Valid || confidence.String != "ambiguous" {
-		t.Errorf("parse_confidence = %+v, want ambiguous (a human pick is not an exact parse)", confidence)
+	if !confidence.Valid || confidence.String != "manual" {
+		t.Errorf("parse_confidence = %+v, want manual (a human pick is not an exact parse)", confidence)
+	}
+	if confidence.String == "ambiguous" {
+		t.Errorf("parse_confidence = %q, want manual, not ambiguous", confidence.String)
 	}
 	if status != "pending_approval" {
 		t.Errorf("status = %q, want pending_approval (matching must not approve)", status)

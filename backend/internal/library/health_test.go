@@ -57,6 +57,7 @@ type healthPayload struct {
 		ItemsSeen     int64   `json:"items_seen"`
 	} `json:"instances"`
 	CacheItems int64 `json:"cache_items"`
+	ManualSync bool  `json:"manual_sync"`
 }
 
 // healthRaw decodes the health payload and also returns the raw body so a test
@@ -297,6 +298,31 @@ func TestLibraryHealthMergesWithoutDuplicating(t *testing.T) {
 	}
 	if body.CacheItems != 1 {
 		t.Errorf("cache_items = %d, want 1", body.CacheItems)
+	}
+}
+
+// TestLibraryHealthReportsManualSync pins the additive manual_sync flag: it
+// defaults to true when the section is absent (as the poller reads it) and
+// follows arr.options.manual_sync when the operator turns it off.
+func TestLibraryHealthReportsManualSync(t *testing.T) {
+	h := newHarness(t)
+
+	body := h.health(t)
+	if !body.ManualSync {
+		t.Error("manual_sync = false, want true: an absent section means the seeded default")
+	}
+
+	raw, err := json.Marshal(settings.ArrOptions{PollIntervalSec: 300, ManualSync: false})
+	if err != nil {
+		t.Fatalf("marshal arr options: %v", err)
+	}
+	if err := h.settings.Set(context.Background(), settings.KeyArrOptions, raw); err != nil {
+		t.Fatalf("write arr options: %v", err)
+	}
+
+	body = h.health(t)
+	if body.ManualSync {
+		t.Error("manual_sync = true, want the configured false")
 	}
 }
 

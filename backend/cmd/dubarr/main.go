@@ -252,6 +252,44 @@ func newServerWithSecrets(cfg Config, secOpts secrets.Options) (*server, error) 
 	}
 	logger.Logger().Info("dubarr starting", "component", "main", "version", version)
 
+	// Built here and mounted last as the catch-all, so this is the last boot
+	// step that can fail. Every worker context below is created after it, so
+	// no error return can skip a cancel func and leak a context.
+	spa, err := newSPAHandler(web.FS)
+	if err != nil {
+		_ = st.Close()
+		_ = logger.Close()
+		return nil, fmt.Errorf("mount SPA: %w", err)
+	}
+
+	// M6-1: poll Radarr/Sonarr and refresh arr_library_cache so the manual
+	// search bridge and approvals always see the current library. Disabled
+	// (no instances, or a non-positive interval) rather than fatal.
+	//
+	// Built before the routes so POST /api/library/refresh shares this one
+	// poller (and therefore its single pass slot) with the scheduled loop.
+	libraryCtx, libraryCancel := context.WithCancel(context.Background())
+	libraryPoller, libraryErr := wireArrSync(libraryCtx, arrSyncWiring{
+		Settings: settingsStore,
+		Store:    st,
+		Secrets:  sec,
+		Logf:     logger.Logf("arrsync"),
+	})
+	if libraryErr != nil {
+		logger.Logger().Warn("arr library sync disabled", "component", "arrsync", "error", libraryErr)
+		libraryCancel()
+		libraryCancel = nil
+	} else if libraryPoller == nil {
+		libraryCancel()
+		libraryCancel = nil
+	}
+	// A typed nil *arrsync.Poller would satisfy the interface and panic on the
+	// first trigger, so the "disabled" case stays a nil interface.
+	var libraryRefresher library.Refresher
+	if libraryPoller != nil {
+		libraryRefresher = libraryPoller
+	}
+
 	mux := http.NewServeMux()
 
 	authSvc := auth.RegisterRoutes(mux, auth.Dependencies{
@@ -277,6 +315,7 @@ func newServerWithSecrets(cfg Config, secOpts secrets.Options) (*server, error) 
 	library.RegisterRoutes(mux, library.Dependencies{
 		DB:           st.DB,
 		Settings:     settingsStore,
+		Refresher:    libraryRefresher,
 		RequireAdmin: authSvc.RequireAdmin,
 	})
 
@@ -313,12 +352,6 @@ func newServerWithSecrets(cfg Config, secOpts secrets.Options) (*server, error) 
 		},
 	})
 
-	spa, err := newSPAHandler(web.FS)
-	if err != nil {
-		_ = st.Close()
-		_ = logger.Close()
-		return nil, fmt.Errorf("mount SPA: %w", err)
-	}
 	mux.Handle("/", spa)
 
 	scanCtx, scanCancel := context.WithCancel(context.Background())
@@ -379,25 +412,10 @@ func newServerWithSecrets(cfg Config, secOpts secrets.Options) (*server, error) 
 		syncCancel = nil
 	}
 
-	// M6-1: poll Radarr/Sonarr and refresh arr_library_cache so the manual
-	// search bridge and approvals always see the current library. Disabled
-	// (no instances, or a non-positive interval) rather than fatal.
-	libraryCtx, libraryCancel := context.WithCancel(context.Background())
-	libraryPoller, libraryErr := wireArrSync(libraryCtx, arrSyncWiring{
-		Settings: settingsStore,
-		Store:    st,
-		Secrets:  sec,
-		Logf:     logger.Logf("arrsync"),
-	})
-	if libraryErr != nil {
-		logger.Logger().Warn("arr library sync disabled", "component", "arrsync", "error", libraryErr)
-		libraryCancel()
-		libraryCancel = nil
-	} else if libraryPoller != nil {
+	// Start the arr loop only after every route is mounted: a boot failure
+	// before this point must not leave a polling goroutine behind.
+	if libraryPoller != nil {
 		libraryPoller.Start(libraryCtx)
-	} else {
-		libraryCancel()
-		libraryCancel = nil
 	}
 
 	s := &server{

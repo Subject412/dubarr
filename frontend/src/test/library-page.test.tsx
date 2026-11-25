@@ -60,19 +60,28 @@ function pageOf(items: LibraryItem[], url: URL, total = items.length) {
 function mockLibrary({
   instances,
   cacheItems = 0,
+  manualSync = true,
   items,
+  refresh,
 }: {
   instances: LibraryHealthInstance[]
   cacheItems?: number
+  /** arr.options.manual_sync, as GET /api/library/health reports it. */
+  manualSync?: boolean
   items: ItemsHandler
+  /** POST /api/library/refresh response; defaults to an accepted pass. */
+  refresh?: () => Response | Promise<Response>
 }) {
-  const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+  const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input), 'http://localhost')
     if (url.pathname === '/api/library/health') {
-      return jsonResponse({ instances, cache_items: cacheItems })
+      return jsonResponse({ instances, cache_items: cacheItems, manual_sync: manualSync })
     }
     if (url.pathname === '/api/library/items') {
       return jsonResponse(items(url))
+    }
+    if (url.pathname === '/api/library/refresh' && (init?.method ?? 'GET').toUpperCase() === 'POST') {
+      return refresh ? await refresh() : jsonResponse({ accepted: true, kind: 'all' }, 202)
     }
     return jsonResponse({ error: 'unexpected' }, 404)
   })
@@ -435,5 +444,91 @@ describe('library page filters and paging (#29)', () => {
     )
     expect(await screen.findByText('Showing 51-100 of 120')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Previous' })).toBeEnabled()
+  })
+})
+
+describe('library page manual refresh (#29)', () => {
+  it('refresh now posts the instance kind and shows a syncing state', async () => {
+    const user = userEvent.setup()
+    let release!: (value: Response) => void
+    const refresh = vi.fn(() => new Promise<Response>((resolve) => (release = resolve)))
+    const fetchMock = mockLibrary({
+      instances: [instance()],
+      items: (url) => pageOf([movie()], url),
+      refresh,
+    })
+    renderWithProviders(<LibraryPage />, { route: '/library' })
+
+    expect(await screen.findByText('Arrival')).toBeInTheDocument()
+
+    const healthReads = () =>
+      fetchMock.mock.calls.filter(
+        ([input]) => new URL(String(input), 'http://localhost').pathname === '/api/library/health',
+      ).length
+    const readsBefore = healthReads()
+
+    await user.click(screen.getByRole('button', { name: 'Refresh now' }))
+
+    // While the request is in flight the control says so and cannot be used.
+    expect(await screen.findByRole('button', { name: 'Syncing...' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Refresh all' })).toBeDisabled()
+
+    const posts = fetchMock.mock.calls.filter(
+      ([input, init]) =>
+        new URL(String(input), 'http://localhost').pathname === '/api/library/refresh' &&
+        (init?.method ?? 'GET').toUpperCase() === 'POST',
+    )
+    expect(posts).toHaveLength(1)
+    expect(JSON.parse(String(posts[0][1]?.body))).toEqual({ kind: 'radarr' })
+
+    release(jsonResponse({ accepted: true, kind: 'radarr' }, 202))
+
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Refresh now' })).toBeEnabled(),
+    )
+    // The 202 invalidates health so the strip shows the landed pass.
+    await waitFor(() => expect(healthReads()).toBeGreaterThan(readsBefore))
+  })
+
+  it('surfaces a busy conflict without breaking the page', async () => {
+    const user = userEvent.setup()
+    mockLibrary({
+      instances: [instance()],
+      items: (url) => pageOf([movie()], url),
+      refresh: () => jsonResponse({ error: 'a sync pass is already running', code: 'busy' }, 409),
+    })
+    renderWithProviders(<LibraryPage />, { route: '/library' })
+
+    expect(await screen.findByText('Arrival')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Refresh all' }))
+
+    expect(await screen.findByText('A sync pass is already running.')).toBeInTheDocument()
+    // Still usable: the operator can retry once the running pass lands.
+    expect(screen.getByRole('button', { name: 'Refresh all' })).toBeEnabled()
+    expect(screen.getByText('Arrival')).toBeInTheDocument()
+  })
+
+  it('disables the controls from the health payload when manual sync is off', async () => {
+    mockLibrary({
+      instances: [instance()],
+      items: (url) => pageOf([], url),
+      manualSync: false,
+    })
+    renderWithProviders(<LibraryPage />, { route: '/library' })
+
+    // The server state is authoritative: no request is needed to disable them.
+    expect(await screen.findByRole('button', { name: 'Refresh now' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Refresh all' })).toBeDisabled()
+  })
+
+  it('keeps the controls usable when the health payload reports manual sync on', async () => {
+    mockLibrary({
+      instances: [instance()],
+      items: (url) => pageOf([], url),
+    })
+    renderWithProviders(<LibraryPage />, { route: '/library' })
+
+    expect(await screen.findByRole('button', { name: 'Refresh now' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Refresh all' })).toBeEnabled()
   })
 })

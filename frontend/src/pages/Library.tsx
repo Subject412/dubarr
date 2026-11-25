@@ -1,5 +1,5 @@
-import { useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useEffect, useRef, useState } from 'react'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Alert, Badge, Button, Card, Input, PageHeader, Select, Spinner } from '../components/ui'
 import { cn } from '../lib/cn'
 import { useDebouncedValue } from '../lib/hooks'
@@ -17,6 +17,8 @@ import {
   libraryKindOptions,
   libraryTypeLabel,
   LIBRARY_PAGE_SIZE,
+  LibraryRefreshError,
+  refreshLibrary,
   relativeTime,
   scopedInstances,
   type LibraryEligibility,
@@ -29,7 +31,17 @@ import {
 } from '../lib/library'
 
 /** One instance's last-sync state; a disabled connection stays visible but muted. */
-function HealthCard({ instance }: { instance: LibraryHealthInstance }) {
+function HealthCard({
+  instance,
+  onRefresh,
+  syncing,
+  disabled,
+}: {
+  instance: LibraryHealthInstance
+  onRefresh: () => void
+  syncing: boolean
+  disabled: boolean
+}) {
   const state = healthState(instance)
   const failed = instance.last_ok === false
 
@@ -63,6 +75,15 @@ function HealthCard({ instance }: { instance: LibraryHealthInstance }) {
           {instance.last_error}
         </p>
       )}
+      <Button
+        variant="secondary"
+        size="sm"
+        className="mt-3"
+        disabled={disabled || syncing}
+        onClick={onRefresh}
+      >
+        {syncing ? 'Syncing...' : 'Refresh now'}
+      </Button>
     </div>
   )
 }
@@ -70,9 +91,18 @@ function HealthCard({ instance }: { instance: LibraryHealthInstance }) {
 function HealthStrip({
   health,
   error,
+  onRefresh,
+  pendingKind,
+  disabled,
+  note,
 }: {
   health: LibraryHealthResponse | undefined
   error: Error | null
+  onRefresh: (kind: LibraryKind | '') => void
+  /** The kind whose refresh is in flight; '' = all, null = nothing pending. */
+  pendingKind: LibraryKind | '' | null
+  disabled: boolean
+  note: string | null
 }) {
   if (error) return <Alert>Could not read arr sync health: {error.message}</Alert>
   if (!health) return <Spinner label="Loading sync health" />
@@ -81,10 +111,25 @@ function HealthStrip({
     <section aria-label="Arr sync health" className="mb-6">
       <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
         <h2 className="text-[11px] uppercase tracking-wider text-zinc-500">Sync health</h2>
-        <p className="text-xs text-zinc-400">
-          {health.cache_items} {health.cache_items === 1 ? 'title' : 'titles'} cached
-        </p>
+        <div className="flex items-center gap-3">
+          <p className="text-xs text-zinc-400">
+            {health.cache_items} {health.cache_items === 1 ? 'title' : 'titles'} cached
+          </p>
+          <Button
+            variant="secondary"
+            size="sm"
+            disabled={disabled || pendingKind !== null}
+            onClick={() => onRefresh('')}
+          >
+            {pendingKind === '' ? 'Syncing...' : 'Refresh all'}
+          </Button>
+        </div>
       </div>
+      {note && (
+        <p role="status" className="mb-2 text-xs text-amber-300">
+          {note}
+        </p>
+      )}
       {health.instances.length === 0 ? (
         <p className="rounded-xl border border-ink-800 bg-ink-900 px-4 py-3 text-sm text-zinc-400">
           No Radarr or Sonarr connection is configured. Add one under Settings to start syncing.
@@ -92,7 +137,13 @@ function HealthStrip({
       ) : (
         <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
           {health.instances.map((instance) => (
-            <HealthCard key={`${instance.kind}-${instance.name}`} instance={instance} />
+            <HealthCard
+              key={`${instance.kind}-${instance.name}`}
+              instance={instance}
+              syncing={pendingKind === instance.kind}
+              disabled={disabled}
+              onRefresh={() => onRefresh(instance.kind)}
+            />
           ))}
         </div>
       )}
@@ -229,6 +280,89 @@ export function LibraryPage() {
     staleTime: 5_000,
   })
 
+  const queryClient = useQueryClient()
+  const [pendingRefresh, setPendingRefresh] = useState<LibraryKind | '' | null>(null)
+  const [refreshNote, setRefreshNote] = useState<string | null>(null)
+  const pollTimers = useRef<number[]>([])
+  // A 202 can land after unmount; scheduling a poll then would outlive the
+  // cleanup that already ran, so the effect below gates every new timer.
+  const mountedRef = useRef(true)
+
+  // A pass lands after the 202, not with it: health and items are re-read a
+  // couple of times (~3 s apart) so the strip updates when the pass finishes
+  // and then polling stops. Nothing here outlives the page.
+  const clearRefreshPolls = () => {
+    for (const timer of pollTimers.current) window.clearTimeout(timer)
+    pollTimers.current = []
+  }
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+      clearRefreshPolls()
+    }
+  }, [])
+
+  const manualSyncOff = health.data?.manual_sync === false
+
+  const startRefresh = async (kind: LibraryKind | '') => {
+    if (pendingRefresh !== null || manualSyncOff) return
+    setPendingRefresh(kind)
+    setRefreshNote(null)
+    try {
+      await refreshLibrary(kind)
+      if (!mountedRef.current) return
+      clearRefreshPolls()
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['library', 'health'] }),
+        queryClient.invalidateQueries({ queryKey: ['library', 'items'] }),
+      ])
+      // The awaits above may have outlived the page: a timer scheduled now
+      // would never be cleared, so drop anything created in that window.
+      if (!mountedRef.current) {
+        clearRefreshPolls()
+        return
+      }
+      for (const delay of [3000, 6000]) {
+        pollTimers.current.push(
+          window.setTimeout(() => {
+            void queryClient.invalidateQueries({ queryKey: ['library', 'health'] })
+            void queryClient.invalidateQueries({ queryKey: ['library', 'items'] })
+          }, delay),
+        )
+      }
+    } catch (error) {
+      // A 409 is a decision, not a failure to retry: name the reason inline.
+      if (error instanceof LibraryRefreshError) {
+        switch (error.code) {
+          case 'busy':
+            setRefreshNote('A sync pass is already running.')
+            break
+          case 'manual_sync_disabled':
+            // The health payload said manual sync was on, so it is stale:
+            // re-read it and the controls disable themselves from it.
+            setRefreshNote('Manual sync is disabled in settings.')
+            void queryClient.invalidateQueries({ queryKey: ['library', 'health'] })
+            break
+          case 'not_configured':
+            setRefreshNote('No arr instance is configured yet.')
+            break
+          case 'stopped':
+            setRefreshNote('The sync poller is stopping. Try again in a moment.')
+            break
+          default:
+            setRefreshNote(`Could not start a sync: ${error.message}`)
+        }
+      } else {
+        setRefreshNote(
+          `Could not start a sync: ${error instanceof Error ? error.message : 'unknown error'}`,
+        )
+      }
+    } finally {
+      setPendingRefresh(null)
+    }
+  }
+
   const rows = items.data?.items ?? []
   const total = items.data?.total ?? 0
   const instances = health.data?.instances ?? []
@@ -259,7 +393,14 @@ export function LibraryPage() {
         description="Browse titles, inspect tracks and start a sync job."
       />
 
-      <HealthStrip health={health.data} error={health.error ?? null} />
+      <HealthStrip
+        health={health.data}
+        error={health.error ?? null}
+        onRefresh={(kind) => void startRefresh(kind)}
+        pendingKind={pendingRefresh}
+        disabled={manualSyncOff}
+        note={refreshNote}
+      />
 
       <div className="mb-4 flex flex-wrap items-end gap-3">
         <div className="min-w-56 flex-1">

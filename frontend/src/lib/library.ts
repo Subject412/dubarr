@@ -57,6 +57,12 @@ export type LibraryHealthInstance = {
 export type LibraryHealthResponse = {
   instances: LibraryHealthInstance[]
   cache_items: number
+  /**
+   * arr.options.manual_sync, as the server reads it. The refresh controls are
+   * disabled from this value, so flipping the setting in Settings takes effect
+   * on the next health read instead of latching a client-side flag.
+   */
+  manual_sync: boolean
 }
 
 export type LibraryItemsQuery = {
@@ -254,4 +260,64 @@ export function fetchLibraryItems(query: LibraryItemsQuery = {}): Promise<Librar
 
 export function fetchLibraryHealth(): Promise<LibraryHealthResponse> {
   return getJSON<LibraryHealthResponse>('/api/library/health')
+}
+
+/** Machine-readable reasons POST /api/library/refresh refuses a request. */
+export type LibraryRefreshCode = 'busy' | 'manual_sync_disabled' | 'not_configured' | 'stopped'
+
+export type LibraryRefreshResponse = {
+  accepted: boolean
+  /** The requested kind, or `all` when the pass covers every instance. */
+  kind: LibraryKind | 'all'
+}
+
+/**
+ * A refused refresh. The 409 responses carry `code`, so the page can react to
+ * the exact reason instead of matching the human message.
+ */
+export class LibraryRefreshError extends ApiError {
+  readonly code: LibraryRefreshCode | ''
+
+  constructor(status: number, message: string, code: LibraryRefreshCode | '') {
+    super(status, message)
+    this.name = 'LibraryRefreshError'
+    this.code = code
+  }
+}
+
+/**
+ * Starts one manual sync pass (`''` = every instance) and resolves as soon as
+ * the server accepts it (202); the pass itself lands later, which is why the
+ * caller invalidates health and items afterwards.
+ */
+export async function refreshLibrary(
+  kind: LibraryKind | '' = '',
+): Promise<LibraryRefreshResponse> {
+  const response = await fetch('/api/library/refresh', {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ kind }),
+  })
+  if (response.status === 401) {
+    window.dispatchEvent(new Event(UNAUTHORIZED_EVENT))
+  }
+  if (!response.ok) {
+    let message = `Request failed (${response.status})`
+    let code: LibraryRefreshCode | '' = ''
+    try {
+      const body: unknown = await response.json()
+      if (body && typeof body === 'object') {
+        const raw = body as { error?: unknown; code?: unknown }
+        if (typeof raw.error === 'string' && raw.error !== '') message = raw.error
+        if (raw.code === 'busy' || raw.code === 'manual_sync_disabled' || raw.code === 'not_configured' || raw.code === 'stopped') {
+          code = raw.code
+        }
+      }
+    } catch {
+      // Non-JSON error bodies fall back to the status message.
+    }
+    throw new LibraryRefreshError(response.status, message, code)
+  }
+  return (await response.json()) as LibraryRefreshResponse
 }

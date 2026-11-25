@@ -42,6 +42,134 @@ func tableExists(t *testing.T, db *sql.DB, name string) bool {
 	return n == 1
 }
 
+// columnExists reports whether table has a column named column (PRAGMA
+// table_info is the only portable way SQLite exposes a column list).
+func columnExists(t *testing.T, db *sql.DB, table, column string) bool {
+	t.Helper()
+	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		t.Fatalf("pragma table_info(%s): %v", table, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			cid        int
+			name, typ  string
+			notNull    int
+			defaultVal sql.NullString
+			pk         int
+		)
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultVal, &pk); err != nil {
+			t.Fatalf("scan table_info(%s): %v", table, err)
+		}
+		if name == column {
+			return true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate table_info(%s): %v", table, err)
+	}
+	return false
+}
+
+// TestMigration0005Additive applies 0005 to a COPY of an existing database, so
+// the pre-migration fixture stays untouched, and pins that the revision is
+// purely additive (four new columns) and that re-running it is a no-op.
+func TestMigration0005Additive(t *testing.T) {
+	dir := t.TempDir()
+	livePath := filepath.Join(dir, "live.db")
+
+	all, err := loadMigrations(embeddedMigrations)
+	if err != nil {
+		t.Fatalf("load migrations: %v", err)
+	}
+
+	// Build the pre-0005 database: every revision below 5, none of 5+.
+	live, err := sql.Open("sqlite", dsn(livePath))
+	if err != nil {
+		t.Fatalf("open live db: %v", err)
+	}
+	live.SetMaxOpenConns(1)
+	if _, err := live.Exec(schemaMigrationsDDL); err != nil {
+		_ = live.Close()
+		t.Fatalf("create schema_migrations: %v", err)
+	}
+	for _, m := range all {
+		if m.Version >= 5 {
+			continue
+		}
+		if err := applyMigration(live, m); err != nil {
+			t.Fatalf("apply migration %d (%s): %v", m.Version, m.Name, err)
+		}
+	}
+	if columnExists(t, live, "arr_instances", "last_sync_ok") {
+		t.Fatal("live fixture already has last_sync_ok; it was not built pre-0005")
+	}
+
+	// Copy the database and migrate the copy — never the source.
+	copyPath := filepath.Join(dir, "copy.db")
+	if _, err := live.Exec(`VACUUM INTO ?`, copyPath); err != nil {
+		_ = live.Close()
+		t.Fatalf("copy database: %v", err)
+	}
+	if err := live.Close(); err != nil {
+		t.Fatalf("close live db: %v", err)
+	}
+
+	copied, err := sql.Open("sqlite", dsn(copyPath))
+	if err != nil {
+		t.Fatalf("open copied db: %v", err)
+	}
+	defer copied.Close()
+	copied.SetMaxOpenConns(1)
+
+	latest, err := migrate(copied, embeddedMigrations)
+	if err != nil {
+		t.Fatalf("migrate copy: %v", err)
+	}
+	if latest != 5 {
+		t.Fatalf("migrated copy version = %d, want 5", latest)
+	}
+
+	for _, tc := range []struct{ table, column string }{
+		{"arr_instances", "last_sync_ok"},
+		{"arr_instances", "last_sync_error"},
+		{"arr_instances", "last_attempt_at"},
+		{"arr_library_cache", "last_seen_at"},
+	} {
+		if !columnExists(t, copied, tc.table, tc.column) {
+			t.Errorf("%s.%s missing after 0005", tc.table, tc.column)
+		}
+	}
+
+	// Idempotent: a second pass records nothing and adds no duplicate column.
+	again, err := migrate(copied, embeddedMigrations)
+	if err != nil {
+		t.Fatalf("migrate copy (second pass): %v", err)
+	}
+	if again != latest {
+		t.Errorf("second pass version = %d, want %d", again, latest)
+	}
+	var recorded int
+	if err := copied.QueryRow(`SELECT count(*) FROM schema_migrations`).Scan(&recorded); err != nil {
+		t.Fatalf("count migrations: %v", err)
+	}
+	if recorded != len(all) {
+		t.Errorf("schema_migrations rows = %d, want %d", recorded, len(all))
+	}
+
+	// The source database never saw 0005.
+	untouched, err := sql.Open("sqlite", dsn(livePath))
+	if err != nil {
+		t.Fatalf("reopen live db: %v", err)
+	}
+	defer untouched.Close()
+	untouched.SetMaxOpenConns(1)
+	if columnExists(t, untouched, "arr_library_cache", "last_seen_at") {
+		t.Error("live database was migrated; migrations must run on a copy")
+	}
+}
+
 // TestMigrateRollsBackFailedMigration pins the atomicity guarantee: a migration
 // that fails halfway must leave neither its bookkeeping row nor any table it
 // created before the failing statement.

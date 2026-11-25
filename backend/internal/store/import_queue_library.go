@@ -12,6 +12,32 @@ import (
 // search returns (IDEA.md §4 GET /api/imports/search-library).
 const LibrarySearchLimit = 20
 
+// likeEscapeChar is the single-character ESCAPE used by every LIKE in the
+// store. It is a backslash, so the escaping below and the SQL clause must
+// always be used together (likeContainsPattern + likeEscapeSQL).
+const likeEscapeChar = `\`
+
+// likeEscapeSQL is appended to a LIKE predicate so the backslash escapes
+// rendered by likeContainsPattern are interpreted instead of compared.
+const likeEscapeSQL = ` ESCAPE '\'`
+
+// likeEscaper turns LIKE metacharacters in operator input into literals.
+var likeEscaper = strings.NewReplacer(
+	likeEscapeChar, likeEscapeChar+likeEscapeChar,
+	"%", likeEscapeChar+"%",
+	"_", likeEscapeChar+"_",
+)
+
+// escapeLikeTerm escapes %, _ and the escape character itself so a literal
+// "%" typed by an operator is matched as text, never as "everything".
+func escapeLikeTerm(term string) string { return likeEscaper.Replace(term) }
+
+// likeContainsPattern renders the "%term%" pattern for a case-insensitive
+// substring match. It is the single place both library searches escape their
+// input, so ListLibrarySearch and ListLibrary cannot drift apart; pair it with
+// likeEscapeSQL in the query.
+func likeContainsPattern(term string) string { return "%" + escapeLikeTerm(term) + "%" }
+
 // LibrarySearchItem is one cached arr library row offered to the operator when
 // the automatic parse could not identify a dropped file (e.g. a localized
 // release name such as Kraina.Lodu.2013.PL.mkv).
@@ -37,14 +63,14 @@ func (s *Store) ListLibrarySearch(ctx context.Context, q string) ([]LibrarySearc
 	if term == "" {
 		return []LibrarySearchItem{}, nil
 	}
-	escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(term)
+	pattern := likeContainsPattern(term)
 	rows, err := s.DB.QueryContext(ctx, `
 		SELECT id, title, COALESCE(year, 0), media_type, season_number, episode_number,
 		       COALESCE(original_language_iso2, '')
 		FROM arr_library_cache
-		WHERE title LIKE ? ESCAPE '\'
+		WHERE title LIKE ?`+likeEscapeSQL+`
 		ORDER BY title COLLATE NOCASE, year, season_number, episode_number, id
-		LIMIT ?`, "%"+escaped+"%", LibrarySearchLimit)
+		LIMIT ?`, pattern, LibrarySearchLimit)
 	if err != nil {
 		return nil, fmt.Errorf("store: search library: %w", err)
 	}

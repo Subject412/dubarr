@@ -9,10 +9,13 @@ source-build instructions, start at the [root README](../README.md).
 - `entrypoint.sh` — remaps the `dubarr` user to `PUID`/`PGID` (default
   1000/1000), fixes `/config` ownership (0700) and drops privileges with
   `gosu`.
-- `docker-compose.yml` — the canonical, self-documenting appliance example. It
-  carries inline `${VAR:-…}` fallbacks for every knob, so `docker compose up`
-  from this directory works with no `.env`; it documents itself in comments and
-  every variable is listed once in the table below.
+- `docker-compose.yml` — the canonical pull-based appliance service: it runs
+  `subject928/dubarr:latest` (no local build), carries inline `${VAR:-…}`
+  fallbacks for every knob, so `docker compose up` from this directory works
+  with no `.env`; it documents itself in comments and every variable is listed
+  once in the table below. The image is published to Docker Hub
+  (`subject928/dubarr`) and GHCR (`ghcr.io/subject412/dubarr`) with tags
+  `X.Y.Z`, `X.Y` and `latest` by the tag-triggered Docker Release workflow.
 
 ## Compose variables
 
@@ -22,10 +25,10 @@ defaults below are what it uses. A `docker/.env` overrides any of them.
 
 | Variable | Default | Consumed by | Purpose |
 | --- | --- | --- | --- |
-| `PUID` | `1000` | entrypoint, inside the container | uid the `dubarr` process runs as; must own `/config` and be able to read the media mount |
+| `PUID` | `1000` | entrypoint, inside the container | uid the `dubarr` process runs as; must own `/config` and be able to read and write the media mount |
 | `PGID` | `1000` | entrypoint, inside the container | gid for the same process |
 | `CONFIG_PATH` | `./config` | Compose, on the host | host directory bind-mounted at `/config` for appliance state (database, master keyfile, logs); back it up |
-| `MEDIA_PATH` | `./media` | Compose, on the host | host directory bind-mounted read-only at `/media` |
+| `MEDIA_PATH` | `./media` | Compose, on the host | host directory bind-mounted at `/media` (writable) |
 | `DUBARR_PORT` | `8080` | Compose, on the host | published host port for the web UI |
 
 `PUID` and `PGID` are the only environment variables the image honours.
@@ -56,18 +59,40 @@ From this directory, with the defaults:
 
 ```sh
 cd docker
-docker compose up --build
+docker compose up -d
 ```
+
+This pulls `subject928/dubarr:latest` from Docker Hub — no local build. The same
+image is published to `ghcr.io/subject412/dubarr:latest`; swap the `image:` line
+in `docker-compose.yml` to use that registry instead.
 
 `docker/.env` overrides `PUID`, `PGID`, `CONFIG_PATH`, `MEDIA_PATH` and
 `DUBARR_PORT` without touching the compose file.
+
+### Recommended storage layout
+
+The storage roots are independent settings under **Settings → Storage**: keep
+each on its own directory, never inside another. For a single combined bind
+(`MEDIA_PATH` mounted at `/media`) use:
+
+| Setting | Value |
+| --- | --- |
+| `storage.paths.watch_dir` | `/media/download` |
+| `storage.paths.vault_dir` | `/media/vault` |
+| `storage.paths.media_roots` | `/media/content` |
+| `storage.paths.work_dir` | `/config/work` |
+
+`/config/work` is also the default when `work_dir` is left unset
+(`<DATA_DIR>/work`). `storage.paths.output_dir` is only used when
+`mux.options.output_mode=separate`, and it must not sit inside the vault.
 
 Or build and run without Compose from the repository root:
 
 ```sh
 docker build -f docker/Dockerfile -t dubarr:latest .
 docker run -d --name dubarr -p 8080:8080 \
-  -e PUID=1000 -e PGID=1000 -v "$PWD/docker/config:/config" dubarr:latest
+  -e PUID=1000 -e PGID=1000 \
+  -v "$PWD/docker/config:/config" -v "$PWD/docker/media:/media" dubarr:latest
 ```
 
 The UI is served on the published port (8080 by default).

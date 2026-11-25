@@ -133,6 +133,10 @@ _Avoid_: reason, error code
 An operator-initiated lookup that asks the card's own arr instance to parse the release name and returns ranked library candidates. Identify only suggests; a separate explicit pick persists the match, and the server never chooses on the operator's behalf.
 _Avoid_: auto-match, guess
 
+**Parse Confidence**:
+How a queue row's library match was established. The only value recorded today is `manual` — an operator chose the item by hand — and that is deliberately distinct from a parser-derived match. The other values the schema reserves (`exact`, `ambiguous`, `unmatched`) name parser outcomes and no code path writes them yet.
+_Avoid_: score, match percent
+
 ### Output and processing
 
 **Output Mode**:

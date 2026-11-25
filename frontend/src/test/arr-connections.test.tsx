@@ -99,9 +99,19 @@ async function radarrCard() {
   return within(await screen.findByRole('group', { name: 'Radarr connection' }))
 }
 
+async function sonarrCard() {
+  return within(await screen.findByRole('group', { name: 'Sonarr connection' }))
+}
+
 function putsTo(fetchMock: ReturnType<typeof vi.fn>, path: string) {
   return fetchMock.mock.calls.filter(
     ([input, init]) => String(input) === path && isMethod(init, 'PUT'),
+  )
+}
+
+function postsTo(fetchMock: ReturnType<typeof vi.fn>, path: string) {
+  return fetchMock.mock.calls.filter(
+    ([input, init]) => String(input) === path && isMethod(init, 'POST'),
   )
 }
 
@@ -245,7 +255,7 @@ describe('Radarr / Sonarr connections settings section', () => {
     expect(body.api_key).toBeUndefined()
   })
 
-  it('calls the test endpoint when Test connection is clicked', async () => {
+  it('omits a whitespace-only api_key from the test payload', async () => {
     const user = userEvent.setup()
     const fetchMock = mockArrFetch({
       instances: [
@@ -261,16 +271,134 @@ describe('Radarr / Sonarr connections settings section', () => {
     expect(await screen.findByText('••••abcd')).toBeInTheDocument()
 
     const card = await radarrCard()
-    await user.click(card.getByRole('button', { name: 'Test connection' }))
+    await user.type(card.getByLabelText('API key'), '   ')
+    await user.click(card.getByRole('button', { name: 'Test entered connection' }))
 
-    await waitFor(() => {
-      const call = fetchMock.mock.calls.find(
-        ([input, init]) =>
-          String(input) === '/api/settings/arr/radarr/test' && isMethod(init, 'POST'),
-      )
-      expect(call).toBeDefined()
+    await waitFor(() => expect(postsTo(fetchMock, '/api/settings/arr/radarr/test')).toHaveLength(1))
+    const body = JSON.parse(
+      String(postsTo(fetchMock, '/api/settings/arr/radarr/test')[0][1]?.body),
+    )
+    // Whitespace is not a key: omitting the field makes the server use the
+    // stored secret instead of pinging with an empty header.
+    expect(body).toEqual({ base_url: 'http://192.168.1.5:7878' })
+  })
+
+  it('tests the entered draft values without saving them', async () => {
+    const user = userEvent.setup()
+    const fetchMock = mockArrFetch({
+      instances: [
+        {
+          kind: 'radarr',
+          base_url: 'http://192.168.1.5:7878',
+          enabled: true,
+          api_key: '********abcd',
+        },
+      ],
     })
-    expect(await screen.findByText(/Radarr responded/)).toBeInTheDocument()
+    renderWithProviders(<SettingsPage />, { route: '/settings' })
+    expect(await screen.findByText('••••abcd')).toBeInTheDocument()
+
+    const card = await radarrCard()
+    const baseUrl = card.getByLabelText('Base URL')
+    await waitFor(() => expect(baseUrl).toHaveValue('http://192.168.1.5:7878'))
+    await user.clear(baseUrl)
+    await user.type(baseUrl, 'http://192.168.1.99:7878')
+    await user.type(card.getByLabelText('API key'), 'draft-key-1234')
+    await user.click(card.getByRole('button', { name: 'Test entered connection' }))
+
+    await waitFor(() => expect(postsTo(fetchMock, '/api/settings/arr/radarr/test')).toHaveLength(1))
+    const body = JSON.parse(
+      String(postsTo(fetchMock, '/api/settings/arr/radarr/test')[0][1]?.body),
+    )
+    // The draft, not the saved config, is what gets pinged.
+    expect(body).toEqual({ base_url: 'http://192.168.1.99:7878', api_key: 'draft-key-1234' })
+    // Testing is not saving.
+    expect(putsTo(fetchMock, '/api/settings/arr/radarr')).toHaveLength(0)
+    expect(putsTo(fetchMock, '/api/settings')).toHaveLength(0)
+    expect(await screen.findByText('Radarr accepted the entered connection.')).toBeInTheDocument()
+  })
+
+  it('omits api_key from the test payload when the key field is blank', async () => {
+    const user = userEvent.setup()
+    const fetchMock = mockArrFetch({
+      instances: [
+        {
+          kind: 'radarr',
+          base_url: 'http://192.168.1.5:7878',
+          enabled: true,
+          api_key: '********abcd',
+        },
+      ],
+    })
+    renderWithProviders(<SettingsPage />, { route: '/settings' })
+    expect(await screen.findByText('••••abcd')).toBeInTheDocument()
+
+    const card = await radarrCard()
+    await waitFor(() => expect(card.getByLabelText('Base URL')).toHaveValue('http://192.168.1.5:7878'))
+    await user.click(card.getByRole('button', { name: 'Test entered connection' }))
+
+    await waitFor(() => expect(postsTo(fetchMock, '/api/settings/arr/radarr/test')).toHaveLength(1))
+    const body = JSON.parse(
+      String(postsTo(fetchMock, '/api/settings/arr/radarr/test')[0][1]?.body),
+    ) as { base_url?: string; api_key?: string }
+    // A blank field means "use the stored key", so the field is left out.
+    expect(body.api_key).toBeUndefined()
+    expect(body.base_url).toBe('http://192.168.1.5:7878')
+  })
+
+  it('labels the test button with its draft scope', async () => {
+    mockArrFetch()
+    renderWithProviders(<SettingsPage />, { route: '/settings' })
+
+    const card = await radarrCard()
+    expect(card.getByRole('button', { name: 'Test entered connection' })).toBeInTheDocument()
+    expect(card.getByText('Tests the values above; saving is separate.')).toBeInTheDocument()
+  })
+
+  it('names the product in the test success message', async () => {
+    const user = userEvent.setup()
+    mockArrFetch({
+      instances: [
+        {
+          kind: 'sonarr',
+          base_url: 'http://192.168.1.6:8989',
+          enabled: true,
+          api_key: '********wxyz',
+        },
+      ],
+    })
+    renderWithProviders(<SettingsPage />, { route: '/settings' })
+    expect(await screen.findByText('••••wxyz')).toBeInTheDocument()
+
+    const card = await sonarrCard()
+    await waitFor(() => expect(card.getByLabelText('Base URL')).toHaveValue('http://192.168.1.6:8989'))
+    await user.click(card.getByRole('button', { name: 'Test entered connection' }))
+
+    expect(await screen.findByText('Sonarr accepted the entered connection.')).toBeInTheDocument()
+  })
+
+  it('maps a failing draft test to the arr error message', async () => {
+    const user = userEvent.setup()
+    mockArrFetch({
+      instances: [
+        {
+          kind: 'radarr',
+          base_url: 'http://192.168.1.5:7878',
+          enabled: true,
+          api_key: '********abcd',
+        },
+      ],
+      testStatus: 502,
+    })
+    renderWithProviders(<SettingsPage />, { route: '/settings' })
+    expect(await screen.findByText('••••abcd')).toBeInTheDocument()
+
+    const card = await radarrCard()
+    await waitFor(() => expect(card.getByLabelText('Base URL')).toHaveValue('http://192.168.1.5:7878'))
+    await user.click(card.getByRole('button', { name: 'Test entered connection' }))
+
+    expect(await card.findByRole('alert')).toBeInTheDocument()
+    expect(screen.queryByText(/accepted the entered connection/)).toBeNull()
   })
 
   it('removes an existing connection through DELETE and hides the Remove button', async () => {

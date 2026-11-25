@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -61,6 +62,15 @@ type arrUpsertRequest struct {
 	BaseURL string `json:"base_url"`
 	APIKey  string `json:"api_key"`
 	Enabled *bool  `json:"enabled"`
+}
+
+// arrTestRequest is the optional body of POST /api/settings/arr/{kind}/test.
+// Both fields are drafts: an absent or blank field falls back to the saved
+// connection value, so an empty body keeps the "test what is saved" behaviour.
+// Nothing here is ever persisted.
+type arrTestRequest struct {
+	BaseURL string `json:"base_url"`
+	APIKey  string `json:"api_key"`
 }
 
 // arrSecretKey names the encrypted secret for one instance kind.
@@ -277,6 +287,11 @@ func (s *Service) handleDeleteArr(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// handleTestArr pings an *arr instance. The optional JSON body
+// ({base_url?, api_key?}) carries the values typed in the form so an operator
+// can test before saving; absent or blank fields fall back to the saved
+// connection and its stored key. Nothing is persisted: the section and the
+// secret are read-only here, so a failing draft test leaves both untouched.
 func (s *Service) handleTestArr(w http.ResponseWriter, r *http.Request) {
 	if !s.arrReady() {
 		writeError(w, http.StatusServiceUnavailable, "arr settings are not configured")
@@ -287,33 +302,67 @@ func (s *Service) handleTestArr(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "unknown arr kind")
 		return
 	}
-	conns, err := s.loadArrConnections(r.Context())
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "could not read arr connections")
-		return
-	}
-	var baseURL string
-	for _, c := range conns.Instances {
-		if c.Kind == kind {
-			baseURL = c.BaseURL
-			break
-		}
-	}
-	if baseURL == "" {
-		writeError(w, http.StatusNotFound, "arr connection not found")
-		return
-	}
-	apiKey, err := s.secrets.Get(arrSecretKey(kind))
-	if err != nil {
-		if errors.Is(err, secrets.ErrNotFound) {
-			writeError(w, http.StatusBadRequest, "api_key is not configured")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "could not read arr credentials")
+
+	// The body is optional and carries drafts only: the operator may test the
+	// values typed in the form before saving them. An empty body (or `{}`)
+	// keeps the original behaviour of testing the saved connection.
+	var req arrTestRequest
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	var client arr.Client
+	// A draft base URL is validated exactly like an upsert, so a typo is a 400
+	// on both paths instead of a 502 from the client constructor.
+	var baseURL string
+	if draft := strings.TrimSpace(req.BaseURL); draft != "" {
+		normalized, err := normalizeArrBaseURL(draft)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		baseURL = normalized
+	} else {
+		conns, err := s.loadArrConnections(r.Context())
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "could not read arr connections")
+			return
+		}
+		for _, c := range conns.Instances {
+			if c.Kind == kind {
+				baseURL = c.BaseURL
+				break
+			}
+		}
+		if baseURL == "" {
+			writeError(w, http.StatusNotFound, "arr connection not found")
+			return
+		}
+	}
+
+	// A blank (or whitespace-only) draft key means "use the stored one"; neither
+	// branch writes. The key is trimmed so `"   "` cannot override the stored
+	// secret with an empty X-Api-Key.
+	apiKey := strings.TrimSpace(req.APIKey)
+	if apiKey == "" {
+		stored, err := s.secrets.Get(arrSecretKey(kind))
+		if err != nil {
+			if errors.Is(err, secrets.ErrNotFound) {
+				writeError(w, http.StatusBadRequest, "api_key is not configured")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, "could not read arr credentials")
+			return
+		}
+		apiKey = stored
+	}
+
+	var (
+		client arr.Client
+		err    error
+	)
 	switch kind {
 	case "radarr":
 		client, err = arr.NewRadarrClient(baseURL, apiKey, arrTestTimeout)

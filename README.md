@@ -19,19 +19,30 @@ still change between minor releases. See [docs/RELEASING.md](docs/RELEASING.md).
 
 ## Quick start with Docker
 
-The canonical stack is `docker/docker-compose.yml`. Every value in it has a
-working default, so it starts with no configuration at all:
+The canonical stack is `docker/docker-compose.yml`, which pulls the published
+image. Every value in it has a working default, so it starts with no
+configuration at all:
 
 ```sh
 git clone https://github.com/Subject412/dubarr.git
 cd dubarr/docker
-docker compose up -d --build
+docker compose up -d
 ```
 
-This publishes the UI on **8080** and mounts `./media` into the container
-read-only. Open <http://localhost:8080> and complete the first-run wizard
+This pulls the published image (`subject928/dubarr:latest`) — no local build —
+publishes the UI on **8080** and mounts `./media` into the container
+read-write. Open <http://localhost:8080> and complete the first-run wizard
 (administrator account, storage paths, and optionally Radarr/Sonarr
 connections). Follow the container logs with `docker logs -f dubarr`.
+
+`/media` is writable because the default `mux.options.output_mode=replace`
+publishes the muxed file beside the Target in its own directory (optionally
+keeping a `.bak`); switch to `separate` mode to leave the library untouched.
+
+`./media` is not tracked, so create it and hand it to `PUID`/`PGID` before the
+first `up` — `mkdir -p media/download media/vault media/content && sudo chown
+-R 1000:1000 media`. Replace-mode publishing writes beside the target, so a
+root-owned bind mount fails with `EACCES`; the entrypoint only fixes `/config`.
 
 To adapt the stack to your host, put the overrides in `docker/.env` — Compose
 loads it from the `docker/` directory — instead of editing the compose file:
@@ -45,8 +56,9 @@ DUBARR_PORT=8090
 ```
 
 `docker/docker-compose.yml` is the single documented example: it is
-self-documenting, carries inline `${VAR:-…}` fallbacks so it also runs without
-a `.env`, and `docker/README.md` documents every compose variable once.
+self-documenting and pull-based (no local build), carries inline `${VAR:-…}`
+fallbacks so it also runs without a `.env`, and `docker/README.md` documents
+every compose variable once.
 
 ## Configuration
 
@@ -64,7 +76,7 @@ The only knobs at the Compose level are deployment concerns:
 | --- | --- |
 | `PUID` / `PGID` | uid/gid the container process runs as |
 | `CONFIG_PATH` | host directory bind-mounted at `/config` (database, keyfile, logs); default `./config` |
-| `MEDIA_PATH` | host directory bind-mounted read-only at `/media` |
+| `MEDIA_PATH` | host directory bind-mounted at `/media` (writable; required for the default replace-mode publication) |
 | `DUBARR_PORT` | host port published onto the container's fixed `8080` |
 
 The full variable reference lives in [docker/README.md](docker/README.md).
@@ -187,9 +199,10 @@ Docker image build: `docker build -f docker/Dockerfile -t dubarr:latest .`
 
 Published multi-arch images (`linux/amd64`, `linux/arm64`) are pushed to GHCR
 (`ghcr.io/subject412/dubarr`) and Docker Hub (`subject928/dubarr`) on every
-release tag; see [docs/RELEASING.md](docs/RELEASING.md). To use one instead of
-building locally, set `image: subject928/dubarr:latest` in
-`docker/docker-compose.yml` and remove the `build:` block.
+release tag; see [docs/RELEASING.md](docs/RELEASING.md). `docker/docker-compose.yml`
+already pulls `subject928/dubarr:latest`, so no local build is needed to run the
+appliance; use the `docker build` line above only when testing changes to the
+image itself.
 
 ## Documentation
 

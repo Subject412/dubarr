@@ -321,3 +321,58 @@ export async function refreshLibrary(
   }
   return (await response.json()) as LibraryRefreshResponse
 }
+
+/** Machine-readable reasons POST .../rescan refuses a request. */
+export type LibraryRescanCode = 'not_configured' | 'rescan_failed'
+
+export type LibraryRescanResponse = {
+  accepted: boolean
+  /**
+   * Whether the cache row was refreshed from arr. A failed re-read still means
+   * the rescan was accepted — the command is queued in arr either way.
+   */
+  reread: 'ok' | 'failed'
+  /** Scrubbed cause, present only when `reread` is `failed`. */
+  reread_error?: string
+}
+
+/** A refused rescan (400/404/409/502). */
+export class LibraryRescanError extends ApiError {
+  readonly code: LibraryRescanCode | ''
+
+  constructor(status: number, message: string, code: LibraryRescanCode | '') {
+    super(status, message)
+    this.name = 'LibraryRescanError'
+    this.code = code
+  }
+}
+
+/**
+ * Asks arr to rescan one cached item and re-read it. Resolves on 202 with the
+ * honest re-read verdict; a 502 means the command itself was never accepted.
+ */
+export async function rescanLibraryItem(id: number): Promise<LibraryRescanResponse> {
+  const response = await fetch(`/api/library/items/${id}/rescan`, {
+    method: 'POST',
+    credentials: 'include',
+  })
+  if (response.status === 401) {
+    window.dispatchEvent(new Event(UNAUTHORIZED_EVENT))
+  }
+  if (!response.ok) {
+    let message = `Request failed (${response.status})`
+    let code: LibraryRescanCode | '' = ''
+    try {
+      const body: unknown = await response.json()
+      if (body && typeof body === 'object') {
+        const raw = body as { error?: unknown; code?: unknown }
+        if (typeof raw.error === 'string' && raw.error !== '') message = raw.error
+        if (raw.code === 'not_configured' || raw.code === 'rescan_failed') code = raw.code
+      }
+    } catch {
+      // Non-JSON error bodies fall back to the status message.
+    }
+    throw new LibraryRescanError(response.status, message, code)
+  }
+  return (await response.json()) as LibraryRescanResponse
+}

@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -37,6 +38,7 @@ type Language struct {
 type Movie struct {
 	ID               int        `json:"id"`
 	Title            string     `json:"title"`
+	OriginalTitle    string     `json:"originalTitle,omitempty"`
 	Year             int        `json:"year"`
 	TmdbID           int        `json:"tmdbId"`
 	Path             string     `json:"path"`
@@ -53,6 +55,7 @@ type Movie struct {
 type Series struct {
 	ID               int      `json:"id"`
 	Title            string   `json:"title"`
+	OriginalTitle    string   `json:"originalTitle,omitempty"`
 	Year             int      `json:"year"`
 	TvdbID           int      `json:"tvdbId"`
 	Path             string   `json:"path"`
@@ -177,10 +180,12 @@ func New(kind Kind, apiKey string, fx Fixtures) *Server {
 		mux.HandleFunc("/api/v3/movie", s.handle(func(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusOK, nonNil(fx.Movies))
 		}))
+		mux.HandleFunc("/api/v3/movie/{id}", s.handle(serveByID("movie", fx.Movies, func(m Movie) int { return m.ID })))
 	case Sonarr:
 		mux.HandleFunc("/api/v3/series", s.handle(func(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusOK, nonNil(fx.Series))
 		}))
+		mux.HandleFunc("/api/v3/series/{id}", s.handle(serveByID("series", fx.Series, func(sv Series) int { return sv.ID })))
 		mux.HandleFunc("/api/v3/episode", s.serveEpisodes(fx.Episodes))
 	}
 
@@ -249,6 +254,29 @@ func (s *Server) handle(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		next(w, r)
+	}
+}
+
+// serveByID answers GET /api/v3/movie/{id} or /api/v3/series/{id} from the
+// fixture slice: the matching element, or a 404 like a real instance.
+func serveByID[T any](kind string, items []T, id func(T) int) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"message": "method not allowed"})
+			return
+		}
+		wanted, err := strconv.Atoi(r.PathValue("id"))
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"message": kind + " id must be an integer"})
+			return
+		}
+		for _, item := range items {
+			if id(item) == wanted {
+				writeJSON(w, http.StatusOK, item)
+				return
+			}
+		}
+		writeJSON(w, http.StatusNotFound, map[string]string{"message": kind + " not found"})
 	}
 }
 

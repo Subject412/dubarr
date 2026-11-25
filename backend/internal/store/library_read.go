@@ -142,35 +142,73 @@ func (s *Store) ListLibrary(ctx context.Context, f ListLibraryFilter) (LibraryPa
 	defer rows.Close()
 
 	for rows.Next() {
-		var (
-			item     LibraryListItem
-			season   sql.NullInt64
-			episode  sql.NullInt64
-			lastSeen sql.NullString
-		)
-		if err := rows.Scan(&item.ID, &item.ArrInstanceID, &item.InstanceName, &item.InstanceType,
-			&item.MediaType, &item.ExternalItemID, &item.SeriesID, &item.TMDBID, &item.TVDBID,
-			&item.IMDBID, &item.Title, &item.OriginalTitle, &item.Year, &season, &episode,
-			&item.EpisodeTitle, &item.MediaFolderPath, &item.RootFolderPath, &item.TargetFilePath,
-			&item.MatchesTargetTags, &item.EligibilityStatus, &item.VideoCodec,
-			&item.UpdatedAt, &lastSeen); err != nil {
+		item, err := libraryItemScan(rows)
+		if err != nil {
 			return LibraryPage{}, fmt.Errorf("store: scan library row: %w", err)
 		}
-		if season.Valid {
-			v := int(season.Int64)
-			item.SeasonNumber = &v
-		}
-		if episode.Valid {
-			v := int(episode.Int64)
-			item.EpisodeNumber = &v
-		}
-		item.LastSeenAt = lastSeen.String
 		page.Items = append(page.Items, item)
 	}
 	if err := rows.Err(); err != nil {
 		return LibraryPage{}, fmt.Errorf("store: iterate library rows: %w", err)
 	}
 	return page, nil
+}
+
+// ErrLibraryItemNotFound reports a cache row the caller named by id that does
+// not exist (for example a row the last snapshot sync deleted).
+var ErrLibraryItemNotFound = errors.New("store: library item not found")
+
+// LibraryItemByID reads one cache row with exactly the page projection
+// ListLibrary uses, so a caller acting on a single row sees the same columns.
+// A missing row is ErrLibraryItemNotFound.
+func (s *Store) LibraryItemByID(ctx context.Context, id int64) (LibraryListItem, error) {
+	if id <= 0 {
+		return LibraryListItem{}, ErrLibraryItemNotFound
+	}
+	rows, err := s.DB.QueryContext(ctx, libraryPageColumns+` WHERE c.id = ?`, id)
+	if err != nil {
+		return LibraryListItem{}, fmt.Errorf("store: read library item %d: %w", id, err)
+	}
+	defer rows.Close()
+
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return LibraryListItem{}, fmt.Errorf("store: read library item %d: %w", id, err)
+		}
+		return LibraryListItem{}, fmt.Errorf("%w: %d", ErrLibraryItemNotFound, id)
+	}
+	item, err := libraryItemScan(rows)
+	if err != nil {
+		return LibraryListItem{}, fmt.Errorf("store: scan library item %d: %w", id, err)
+	}
+	return item, nil
+}
+
+func libraryItemScan(rows *sql.Rows) (LibraryListItem, error) {
+	var (
+		item     LibraryListItem
+		season   sql.NullInt64
+		episode  sql.NullInt64
+		lastSeen sql.NullString
+	)
+	if err := rows.Scan(&item.ID, &item.ArrInstanceID, &item.InstanceName, &item.InstanceType,
+		&item.MediaType, &item.ExternalItemID, &item.SeriesID, &item.TMDBID, &item.TVDBID,
+		&item.IMDBID, &item.Title, &item.OriginalTitle, &item.Year, &season, &episode,
+		&item.EpisodeTitle, &item.MediaFolderPath, &item.RootFolderPath, &item.TargetFilePath,
+		&item.MatchesTargetTags, &item.EligibilityStatus, &item.VideoCodec,
+		&item.UpdatedAt, &lastSeen); err != nil {
+		return LibraryListItem{}, err
+	}
+	if season.Valid {
+		v := int(season.Int64)
+		item.SeasonNumber = &v
+	}
+	if episode.Valid {
+		v := int(episode.Int64)
+		item.EpisodeNumber = &v
+	}
+	item.LastSeenAt = lastSeen.String
+	return item, nil
 }
 
 // libraryPageColumns is the page projection. The JSON blob columns are

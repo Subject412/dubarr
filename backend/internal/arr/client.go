@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -41,6 +42,10 @@ type Radarr interface {
 	Client
 	// Movies lists the Radarr library.
 	Movies(ctx context.Context) ([]Movie, error)
+	// MovieByID reads one movie (GET /api/v3/movie/{id}). It is the read
+	// half of a per-item rescan: the command is accepted asynchronously, so
+	// the caller re-reads the item to see what arr now holds.
+	MovieByID(ctx context.Context, movieID int) (Movie, error)
 	// RescanMovie asks Radarr to rescan one movie's files (command
 	// RescanMovie). It is the movieId-scoped rescan: DownloadedMoviesScan
 	// only accepts path/downloadClientId/importMode and cannot target a
@@ -53,6 +58,9 @@ type Sonarr interface {
 	Client
 	// Series lists the Sonarr library.
 	Series(ctx context.Context) ([]Series, error)
+	// SeriesByID reads one series (GET /api/v3/series/{id}). It is the read
+	// half of a per-item rescan for an episode row.
+	SeriesByID(ctx context.Context, seriesID int) (Series, error)
 	// RescanSeries asks Sonarr to rescan one series (command RescanSeries).
 	RescanSeries(ctx context.Context, seriesID int) error
 }
@@ -188,6 +196,21 @@ func (c *RadarrClient) Movies(ctx context.Context) ([]Movie, error) {
 func (c *SonarrClient) Series(ctx context.Context) ([]Series, error) {
 	out := []Series{}
 	err := c.get(ctx, "/api/v3/series", &out)
+	return out, err
+}
+
+// MovieByID implements Radarr. A missing movie is a 404 from arr, which the
+// shared error model reports as a StatusError.
+func (c *RadarrClient) MovieByID(ctx context.Context, movieID int) (Movie, error) {
+	var out Movie
+	err := c.get(ctx, "/api/v3/movie/"+strconv.Itoa(movieID), &out)
+	return out, err
+}
+
+// SeriesByID implements Sonarr.
+func (c *SonarrClient) SeriesByID(ctx context.Context, seriesID int) (Series, error) {
+	var out Series
+	err := c.get(ctx, "/api/v3/series/"+strconv.Itoa(seriesID), &out)
 	return out, err
 }
 

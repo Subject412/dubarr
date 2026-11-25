@@ -218,6 +218,27 @@ func truncateCause(cause string) string {
 	return cause[:cut]
 }
 
+// ArrInstanceByID finds one instance row by its id, with the same projection
+// ArrInstanceByKind returns. It is the lookup a row-scoped action uses, since
+// arr_library_cache points at an instance by id rather than by kind.
+func (s *Store) ArrInstanceByID(ctx context.Context, id int64) (ArrInstanceSyncRow, bool, error) {
+	var row ArrInstanceSyncRow
+	if id <= 0 {
+		return ArrInstanceSyncRow{}, false, nil
+	}
+	err := s.DB.QueryRowContext(ctx,
+		`SELECT id, name, type, base_url, api_key_enc, api_key_last4, enabled
+		 FROM arr_instances WHERE id = ?`, id).
+		Scan(&row.ID, &row.Name, &row.Kind, &row.BaseURL, &row.APIKeyEnc, &row.APIKeyLast4, &row.Enabled)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ArrInstanceSyncRow{}, false, nil
+	}
+	if err != nil {
+		return ArrInstanceSyncRow{}, false, fmt.Errorf("store: read arr instance %d: %w", id, err)
+	}
+	return row, true, nil
+}
+
 // SyncLibraryCache applies one complete library snapshot for one instance.
 //
 // The whole snapshot is written in a single transaction: either the cache
@@ -268,7 +289,7 @@ func (s *Store) SyncLibraryCache(ctx context.Context, instanceID int64, items []
 			}
 			stats.Inserted++
 		case !libraryItemEqual(current, item):
-			if err := updateLibraryCacheRow(ctx, tx, current.ID, item, now); err != nil {
+			if err := updateLibraryCacheRow(ctx, tx, instanceID, current.ID, item, now); err != nil {
 				return LibrarySyncStats{}, err
 			}
 			stats.Updated++
@@ -300,6 +321,60 @@ func (s *Store) SyncLibraryCache(ctx context.Context, instanceID int64, items []
 	return stats, nil
 }
 
+// UpdateLibraryCacheItem upserts exactly ONE row of arr_library_cache, matched
+// on (arr_instance_id, external_item_id, media_type), and never deletes or
+// touches any other row.
+//
+// This is the deliberate difference from SyncLibraryCache: that method applies a
+// complete snapshot, so a row it did not see is treated as vanished from arr and
+// DELETED. Here the caller observed one item (a per-item re-read after a
+// rescan), and the rest of the instance's cache is simply not part of the
+// observation — deleting it would wipe the library.
+//
+// Change tracking matches the snapshot sync: a row whose synced fields changed
+// gets updated_at and last_seen_at stamped, an unchanged row only moves
+// last_seen_at (so "when did this actually change" survives a no-op re-read).
+func (s *Store) UpdateLibraryCacheItem(ctx context.Context, instanceID int64, item LibraryCacheItem) error {
+	if instanceID <= 0 {
+		return errors.New("store: library item update needs an arr instance id")
+	}
+	if err := validateLibraryItem(item); err != nil {
+		return err
+	}
+	item = normalizeArrTagSnapshot(item)
+
+	current, ok, err := s.libraryCacheRowByKey(ctx, instanceID, item.MediaType, item.ExternalItemID)
+	if err != nil {
+		return err
+	}
+
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("store: begin library item update: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	now := time.Now().UTC().Format("2006-01-02 15:04:05")
+	switch {
+	case !ok:
+		if err := insertLibraryCacheRow(ctx, tx, instanceID, item, now); err != nil {
+			return err
+		}
+	case !libraryItemEqual(current, item):
+		if err := updateLibraryCacheRow(ctx, tx, instanceID, current.ID, item, now); err != nil {
+			return err
+		}
+	default:
+		if err := stampLibrarySeen(ctx, tx, current.ID, now); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("store: commit library item update: %w", err)
+	}
+	return nil
+}
+
 // libraryKey is the cache identity: arr instance is implied by the query scope.
 type libraryKey struct {
 	mediaType  string
@@ -313,16 +388,7 @@ type libraryCacheRow struct {
 }
 
 func (s *Store) libraryCacheRows(ctx context.Context, instanceID int64) (map[libraryKey]libraryCacheRow, error) {
-	rows, err := s.DB.QueryContext(ctx,
-		`SELECT id, media_type, external_item_id, COALESCE(series_id, 0),
-		        COALESCE(tmdb_id, 0), COALESCE(tvdb_id, 0), title,
-		        COALESCE(original_title, ''), COALESCE(original_language_iso2, ''),
-		        COALESCE(year, 0), season_number, episode_number,
-		        COALESCE(episode_title, ''), COALESCE(media_folder_path, ''),
-		        COALESCE(target_file_path, ''), matches_target_tags, eligibility_status,
-		        COALESCE(arr_tag_ids_json, '[]'), COALESCE(arr_tag_labels_json, '[]'),
-		        COALESCE(root_folder_path, '')
-		 FROM arr_library_cache WHERE arr_instance_id = ?`, instanceID)
+	rows, err := s.DB.QueryContext(ctx, libraryCacheRowColumns+` WHERE arr_instance_id = ?`, instanceID)
 	if err != nil {
 		return nil, fmt.Errorf("store: read library cache: %w", err)
 	}
@@ -330,39 +396,92 @@ func (s *Store) libraryCacheRows(ctx context.Context, instanceID int64) (map[lib
 
 	out := make(map[libraryKey]libraryCacheRow)
 	for rows.Next() {
-		var (
-			row      libraryCacheRow
-			season   sql.NullInt64
-			episode  sql.NullInt64
-			media    string
-			external int64
-			idsJSON  string
-			lblJSON  string
-		)
-		if err := rows.Scan(&row.ID, &media, &external, &row.SeriesID, &row.TMDBID, &row.TVDBID,
-			&row.Title, &row.OriginalTitle, &row.OriginalLanguageISO2, &row.Year,
-			&season, &episode, &row.EpisodeTitle, &row.MediaFolderPath, &row.TargetFilePath,
-			&row.MatchesTargetTags, &row.EligibilityStatus, &idsJSON, &lblJSON,
-			&row.RootFolderPath); err != nil {
-			return nil, fmt.Errorf("store: scan library cache row: %w", err)
-		}
-		if err := decodeArrTagSnapshot(idsJSON, lblJSON, &row.LibraryCacheItem); err != nil {
+		row, err := scanLibraryCacheRow(rows)
+		if err != nil {
 			return nil, err
 		}
-		row.MediaType = media
-		row.ExternalItemID = external
-		if season.Valid {
-			v := int(season.Int64)
-			row.SeasonNumber = &v
-		}
-		if episode.Valid {
-			v := int(episode.Int64)
-			row.EpisodeNumber = &v
-		}
-		out[libraryKey{mediaType: media, externalID: external}] = row
+		out[libraryKey{mediaType: row.MediaType, externalID: row.ExternalItemID}] = row
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("store: iterate library cache: %w", err)
+	}
+	return out, nil
+}
+
+// libraryCacheRowByKey reads the ONE row with this composite identity. A single
+// item re-read does not need the instance's whole cache, and on a library of
+// 100k+ rows the instance-wide scan is pure waste: the lookup goes straight to
+// the key the update is matched on.
+func (s *Store) libraryCacheRowByKey(ctx context.Context, instanceID int64, mediaType string, externalID int64) (libraryCacheRow, bool, error) {
+	rows, err := s.DB.QueryContext(ctx, libraryCacheRowColumns+
+		` WHERE arr_instance_id = ? AND external_item_id = ? AND media_type = ?`,
+		instanceID, externalID, mediaType)
+	if err != nil {
+		return libraryCacheRow{}, false, fmt.Errorf("store: read library cache row: %w", err)
+	}
+	defer rows.Close()
+
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return libraryCacheRow{}, false, fmt.Errorf("store: read library cache row: %w", err)
+		}
+		return libraryCacheRow{}, false, nil
+	}
+	row, err := scanLibraryCacheRow(rows)
+	if err != nil {
+		return libraryCacheRow{}, false, err
+	}
+	return row, true, nil
+}
+
+// libraryCacheRowColumns is the diff projection. The instance-wide scan and the
+// single-key lookup share it, so the two can never compare against different
+// data.
+const libraryCacheRowColumns = `SELECT id, media_type, external_item_id, COALESCE(series_id, 0),
+	        COALESCE(tmdb_id, 0), COALESCE(tvdb_id, 0), title,
+	        COALESCE(original_title, ''), COALESCE(original_language_iso2, ''),
+	        COALESCE(year, 0), season_number, episode_number,
+	        COALESCE(episode_title, ''), COALESCE(media_folder_path, ''),
+	        COALESCE(target_file_path, ''), matches_target_tags, eligibility_status,
+	        COALESCE(arr_tag_ids_json, '[]'), COALESCE(arr_tag_labels_json, '[]'),
+	        COALESCE(root_folder_path, '')
+	 FROM arr_library_cache`
+
+// rowScanner is what *sql.Rows and *sql.Row both implement.
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+// scanLibraryCacheRow reads one row of libraryCacheRowColumns.
+func scanLibraryCacheRow(row rowScanner) (libraryCacheRow, error) {
+	var (
+		out      libraryCacheRow
+		season   sql.NullInt64
+		episode  sql.NullInt64
+		media    string
+		external int64
+		idsJSON  string
+		lblJSON  string
+	)
+	if err := row.Scan(&out.ID, &media, &external, &out.SeriesID, &out.TMDBID, &out.TVDBID,
+		&out.Title, &out.OriginalTitle, &out.OriginalLanguageISO2, &out.Year,
+		&season, &episode, &out.EpisodeTitle, &out.MediaFolderPath, &out.TargetFilePath,
+		&out.MatchesTargetTags, &out.EligibilityStatus, &idsJSON, &lblJSON,
+		&out.RootFolderPath); err != nil {
+		return libraryCacheRow{}, fmt.Errorf("store: scan library cache row: %w", err)
+	}
+	if err := decodeArrTagSnapshot(idsJSON, lblJSON, &out.LibraryCacheItem); err != nil {
+		return libraryCacheRow{}, err
+	}
+	out.MediaType = media
+	out.ExternalItemID = external
+	if season.Valid {
+		v := int(season.Int64)
+		out.SeasonNumber = &v
+	}
+	if episode.Valid {
+		v := int(episode.Int64)
+		out.EpisodeNumber = &v
 	}
 	return out, nil
 }
@@ -389,8 +508,16 @@ func insertLibraryCacheRow(ctx context.Context, tx *sql.Tx, instanceID int64, it
 	return nil
 }
 
-func updateLibraryCacheRow(ctx context.Context, tx *sql.Tx, id int64, item LibraryCacheItem, now string) error {
-	if _, err := tx.ExecContext(ctx,
+// updateLibraryCacheRow overwrites the synced fields of one row and stamps it as
+// changed.
+//
+// An UPDATE that matches no row is not success: the poller can delete the row
+// between the caller's read and this write (a snapshot pass no longer saw the
+// item), and a silently discarded observation would leave the route reporting
+// "reread":"ok" having written nothing. When zero rows matched, the row is
+// inserted instead, so the caller's observation always lands.
+func updateLibraryCacheRow(ctx context.Context, tx *sql.Tx, instanceID, id int64, item LibraryCacheItem, now string) error {
+	res, err := tx.ExecContext(ctx,
 		`UPDATE arr_library_cache
 		 SET series_id = ?, tmdb_id = ?, tvdb_id = ?, title = ?, original_title = ?,
 		     original_language_iso2 = ?, year = ?, season_number = ?, episode_number = ?,
@@ -404,8 +531,19 @@ func updateLibraryCacheRow(ctx context.Context, tx *sql.Tx, id int64, item Libra
 		nullStr(item.EpisodeTitle), nullStr(item.MediaFolderPath), nullStr(item.RootFolderPath),
 		nullStr(item.TargetFilePath), encodeArrTagIDs(item.ArrTagIDs),
 		encodeArrTagLabels(item.ArrTagLabels),
-		item.MatchesTargetTags, item.EligibilityStatus, now, now, id); err != nil {
+		item.MatchesTargetTags, item.EligibilityStatus, now, now, id)
+	if err != nil {
 		return fmt.Errorf("store: update library row %d: %w", id, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: update library row %d rows affected: %w", id, err)
+	}
+	if affected == 0 {
+		// The row vanished between the read and the write (a sync pass
+		// deleted it, or it was never there): insert rather than reporting
+		// a success that changed nothing.
+		return insertLibraryCacheRow(ctx, tx, instanceID, item, now)
 	}
 	return nil
 }

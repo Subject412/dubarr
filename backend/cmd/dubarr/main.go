@@ -316,6 +316,7 @@ func newServerWithSecrets(cfg Config, secOpts secrets.Options) (*server, error) 
 		DB:           st.DB,
 		Settings:     settingsStore,
 		Refresher:    libraryRefresher,
+		Secrets:      sec,
 		RequireAdmin: authSvc.RequireAdmin,
 	})
 

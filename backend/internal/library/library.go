@@ -6,7 +6,9 @@
 // arr_instances through the store's Library read surface; health additionally
 // reads the arr.connections settings section to report configured-but-never-
 // synced instances. Only POST /api/library/refresh acts, and it only asks the
-// poller to run a pass — it never writes the cache itself.
+// poller to run a pass — it never writes the cache itself. POST
+// /api/library/items/{id}/rescan is the one route that both commands arr and
+// writes a single cache row (see rescan.go).
 package library
 
 import (
@@ -29,6 +31,10 @@ type Dependencies struct {
 	// configured, so no poller was built) makes the refresh route answer 409
 	// with code "not_configured" instead of panicking.
 	Refresher Refresher
+	// Secrets decrypts arr_instances.api_key_enc for the per-item rescan. Nil
+	// makes that route answer 409 "not_configured" rather than rescanning
+	// unauthenticated.
+	Secrets Decrypter
 	// RequireAdmin wraps every route. When nil the API answers 503 rather than
 	// running unauthenticated (same contract as the queue API).
 	RequireAdmin func(http.Handler) http.Handler
@@ -39,19 +45,22 @@ type Service struct {
 	store        *store.Store
 	settings     *settings.Store
 	refresher    Refresher
+	secrets      Decrypter
 	requireAdmin func(http.Handler) http.Handler
 }
 
 // RegisterRoutes mounts:
 //
-//	GET  /api/library/items    paged, filtered arr_library_cache listing
-//	GET  /api/library/health   per-instance arr sync health + cache size
-//	POST /api/library/refresh  start one manual sync pass for one kind or all
+//	GET  /api/library/items              paged, filtered arr_library_cache listing
+//	GET  /api/library/health             per-instance arr sync health + cache size
+//	POST /api/library/refresh            start one manual sync pass for one kind or all
+//	POST /api/library/items/{id}/rescan  rescan one arr item and re-read it
 func RegisterRoutes(mux *http.ServeMux, deps Dependencies) *Service {
 	svc := &Service{
 		store:        &store.Store{DB: deps.DB},
 		settings:     deps.Settings,
 		refresher:    deps.Refresher,
+		secrets:      deps.Secrets,
 		requireAdmin: deps.RequireAdmin,
 	}
 	admin := func(h http.HandlerFunc) http.Handler {
@@ -65,6 +74,7 @@ func RegisterRoutes(mux *http.ServeMux, deps Dependencies) *Service {
 	mux.Handle("GET /api/library/items", admin(svc.handleItems))
 	mux.Handle("GET /api/library/health", admin(svc.handleHealth))
 	mux.Handle("POST /api/library/refresh", admin(svc.handleRefresh))
+	mux.Handle("POST /api/library/items/{id}/rescan", admin(svc.handleRescan))
 	return svc
 }
 

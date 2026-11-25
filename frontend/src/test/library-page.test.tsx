@@ -56,13 +56,14 @@ function pageOf(items: LibraryItem[], url: URL, total = items.length) {
   }
 }
 
-/** Fetch mock for the two library endpoints; anything else is a 404. */
+/** Fetch mock for the library endpoints; anything else is a 404. */
 function mockLibrary({
   instances,
   cacheItems = 0,
   manualSync = true,
   items,
   refresh,
+  rescan,
 }: {
   instances: LibraryHealthInstance[]
   cacheItems?: number
@@ -71,6 +72,8 @@ function mockLibrary({
   items: ItemsHandler
   /** POST /api/library/refresh response; defaults to an accepted pass. */
   refresh?: () => Response | Promise<Response>
+  /** POST /api/library/items/{id}/rescan response; defaults to accepted + reread ok. */
+  rescan?: (id: string) => Response | Promise<Response>
 }) {
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input), 'http://localhost')
@@ -82,6 +85,12 @@ function mockLibrary({
     }
     if (url.pathname === '/api/library/refresh' && (init?.method ?? 'GET').toUpperCase() === 'POST') {
       return refresh ? await refresh() : jsonResponse({ accepted: true, kind: 'all' }, 202)
+    }
+    const rescanMatch = /^\/api\/library\/items\/(\d+)\/rescan$/.exec(url.pathname)
+    if (rescanMatch && (init?.method ?? 'GET').toUpperCase() === 'POST') {
+      return rescan
+        ? await rescan(rescanMatch[1])
+        : jsonResponse({ accepted: true, reread: 'ok' }, 202)
     }
     return jsonResponse({ error: 'unexpected' }, 404)
   })
@@ -530,5 +539,131 @@ describe('library page manual refresh (#29)', () => {
 
     expect(await screen.findByRole('button', { name: 'Refresh now' })).toBeEnabled()
     expect(screen.getByRole('button', { name: 'Refresh all' })).toBeEnabled()
+  })
+})
+
+describe('library page per-item rescan (#29)', () => {
+  /** The table row holding a title, so assertions stay scoped to one item. */
+  function rowFor(title: string): HTMLElement {
+    const cell = screen.getByText(title)
+    const row = cell.closest('tr')
+    if (!row) throw new Error(`no row for ${title}`)
+    return row
+  }
+
+  it('rescan posts for the row and reports a successful re-read', async () => {
+    const user = userEvent.setup()
+    const fetchMock = mockLibrary({
+      instances: [instance()],
+      items: (url) =>
+        pageOf(
+          [
+            movie({ id: 1, title: 'Arrival' }),
+            movie({
+              id: 2,
+              title: 'Dune',
+              target_file_path: '/media/movies/Dune (2021)/Dune.2021.mkv',
+            }),
+          ],
+          url,
+        ),
+    })
+    renderWithProviders(<LibraryPage />, { route: '/library' })
+
+    expect(await screen.findByText('Dune')).toBeInTheDocument()
+    await user.click(within(rowFor('Dune')).getByRole('button', { name: 'Rescan' }))
+
+    await waitFor(() =>
+      expect(
+        wasCalled(
+          fetchMock,
+          (url) => url.pathname === '/api/library/items/2/rescan',
+        ),
+      ).toBe(true),
+    )
+    const posts = fetchMock.mock.calls.filter(
+      ([input, init]) =>
+        new URL(String(input), 'http://localhost').pathname === '/api/library/items/2/rescan' &&
+        (init?.method ?? 'GET').toUpperCase() === 'POST',
+    )
+    expect(posts).toHaveLength(1)
+    // Accepted and re-read: no inline note, and the row settles back to idle.
+    await waitFor(() =>
+      expect(within(rowFor('Dune')).getByRole('button', { name: 'Rescan' })).toBeEnabled(),
+    )
+    expect(
+      screen.queryByText(/The rescan was accepted, but re-reading the item failed/),
+    ).not.toBeInTheDocument()
+    expect(screen.queryByText(/Could not rescan/)).not.toBeInTheDocument()
+  })
+
+  it('reports an accepted rescan whose re-read failed', async () => {
+    const user = userEvent.setup()
+    mockLibrary({
+      instances: [instance()],
+      items: (url) => pageOf([movie({ id: 1, title: 'Arrival' })], url),
+      rescan: () =>
+        jsonResponse(
+          {
+            accepted: true,
+            reread: 'failed',
+            reread_error: 'arr: unexpected HTTP status 500 from GET /api/v3/movie/1',
+          },
+          202,
+        ),
+    })
+    renderWithProviders(<LibraryPage />, { route: '/library' })
+
+    expect(await screen.findByText('Arrival')).toBeInTheDocument()
+    await user.click(within(rowFor('Arrival')).getByRole('button', { name: 'Rescan' }))
+
+    // The command was accepted, so the page says so and names the cause.
+    expect(
+      await screen.findByText(
+        'The rescan was accepted, but re-reading the item failed: arr: unexpected HTTP status 500 from GET /api/v3/movie/1',
+      ),
+    ).toBeInTheDocument()
+    expect(within(rowFor('Arrival')).getByRole('button', { name: 'Rescan' })).toBeEnabled()
+    expect(screen.getByText('Arrival')).toBeInTheDocument()
+  })
+
+  it('disables only the clicked row while rescanning', async () => {
+    const user = userEvent.setup()
+    let release: ((response: Response) => void) | undefined
+    const pending = new Promise<Response>((resolve) => {
+      release = resolve
+    })
+    mockLibrary({
+      instances: [instance()],
+      items: (url) =>
+        pageOf(
+          [
+            movie({ id: 1, title: 'Arrival' }),
+            movie({
+              id: 2,
+              title: 'Dune',
+              target_file_path: '/media/movies/Dune (2021)/Dune.2021.mkv',
+            }),
+          ],
+          url,
+        ),
+      rescan: () => pending,
+    })
+    renderWithProviders(<LibraryPage />, { route: '/library' })
+
+    expect(await screen.findByText('Arrival')).toBeInTheDocument()
+    await user.click(within(rowFor('Arrival')).getByRole('button', { name: 'Rescan' }))
+
+    await waitFor(() =>
+      expect(within(rowFor('Arrival')).getByRole('button', { name: 'Rescanning...' })).toBeDisabled(),
+    )
+    // The other row is untouched: one slow instance must not block the list.
+    expect(within(rowFor('Dune')).getByRole('button', { name: 'Rescan' })).toBeEnabled()
+
+    release?.(jsonResponse({ accepted: true, reread: 'ok' }, 202))
+
+    await waitFor(() =>
+      expect(within(rowFor('Arrival')).getByRole('button', { name: 'Rescan' })).toBeEnabled(),
+    )
   })
 })

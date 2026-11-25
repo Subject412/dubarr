@@ -18,8 +18,10 @@ import {
   libraryTypeLabel,
   LIBRARY_PAGE_SIZE,
   LibraryRefreshError,
+  LibraryRescanError,
   refreshLibrary,
   relativeTime,
+  rescanLibraryItem,
   scopedInstances,
   type LibraryEligibility,
   type LibraryEmptyState,
@@ -216,7 +218,17 @@ function EmptyState({
   )
 }
 
-function ItemRow({ item }: { item: LibraryItem }) {
+function ItemRow({
+  item,
+  onRescan,
+  rescanning,
+  note,
+}: {
+  item: LibraryItem
+  onRescan?: () => void
+  rescanning?: boolean
+  note?: string
+}) {
   const target = basename(item.target_file_path)
 
   return (
@@ -240,6 +252,21 @@ function ItemRow({ item }: { item: LibraryItem }) {
         </span>
       </td>
       <td className="px-4 py-3 text-xs text-zinc-400">{item.instance_name}</td>
+      <td className="px-4 py-3">
+        <Button
+          variant="secondary"
+          size="sm"
+          disabled={rescanning}
+          onClick={onRescan}
+        >
+          {rescanning ? 'Rescanning...' : 'Rescan'}
+        </Button>
+        {note && (
+          <p role="status" className="mt-1 max-w-64 text-xs text-amber-300">
+            {note}
+          </p>
+        )}
+      </td>
     </tr>
   )
 }
@@ -360,6 +387,54 @@ export function LibraryPage() {
       }
     } finally {
       setPendingRefresh(null)
+    }
+  }
+
+  // Per-row rescan: which rows are in flight, and the inline verdict per row.
+  // Rows are independent — one slow instance must not block rescanning another.
+  const [rescanning, setRescanning] = useState<ReadonlySet<number>>(() => new Set())
+  const [rescanNotes, setRescanNotes] = useState<Record<number, string>>({})
+
+  const startRescan = async (item: LibraryItem) => {
+    if (rescanning.has(item.id)) return
+    setRescanning((prev) => new Set(prev).add(item.id))
+    setRescanNotes((prev) => {
+      if (!(item.id in prev)) return prev
+      const next = { ...prev }
+      delete next[item.id]
+      return next
+    })
+    try {
+      const result = await rescanLibraryItem(item.id)
+      // Accepted or not, what the page shows may now be stale: arr was asked to
+      // look at the item again, so re-read both queries either way.
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['library', 'health'] }),
+        queryClient.invalidateQueries({ queryKey: ['library', 'items'] }),
+      ])
+      if (!mountedRef.current) return
+      if (result.reread === 'failed') {
+        const cause = result.reread_error || 'unknown error'
+        setRescanNotes((prev) => ({
+          ...prev,
+          [item.id]: `The rescan was accepted, but re-reading the item failed: ${cause}`,
+        }))
+      }
+    } catch (error) {
+      if (!mountedRef.current) return
+      const message =
+        error instanceof LibraryRescanError || error instanceof Error
+          ? error.message
+          : 'unknown error'
+      setRescanNotes((prev) => ({ ...prev, [item.id]: `Could not rescan: ${message}` }))
+    } finally {
+      if (mountedRef.current) {
+        setRescanning((prev) => {
+          const next = new Set(prev)
+          next.delete(item.id)
+          return next
+        })
+      }
     }
   }
 
@@ -491,11 +566,20 @@ export function LibraryPage() {
                   <th scope="col" className="px-4 pb-2 font-medium">
                     Instance
                   </th>
+                  <th scope="col" className="px-4 pb-2 font-medium">
+                    <span className="sr-only">Actions</span>
+                  </th>
                 </tr>
               </thead>
               <tbody>
                 {rows.map((item) => (
-                  <ItemRow key={item.id} item={item} />
+                  <ItemRow
+                    key={item.id}
+                    item={item}
+                    rescanning={rescanning.has(item.id)}
+                    note={rescanNotes[item.id]}
+                    onRescan={() => void startRescan(item)}
+                  />
                 ))}
               </tbody>
             </table>

@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path"
@@ -20,7 +21,9 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/Subject412/dubarr/backend/internal/arr"
 	"github.com/Subject412/dubarr/backend/internal/settings"
 	"github.com/Subject412/dubarr/backend/internal/store"
 )
@@ -236,6 +239,133 @@ func markerHint(patterns []string) string {
 
 type listResponse struct {
 	Items []QueueItem `json:"items"`
+	// Diagnostics explains an empty list: whether any arr instance is
+	// configured at all, whether it has ever been synced and whether the last
+	// pass failed. Existing fields stay untouched; this is a sibling key.
+	Diagnostics queueDiagnostics `json:"diagnostics"`
+}
+
+// queueDiagnostics tells an empty approval queue apart from an unconfigured,
+// never-synced or failing appliance.
+//
+// Every value comes from ONE ArrLibraryHealth read — the same store read the
+// library health endpoint uses — plus the arr.connections union the library
+// endpoint also applies, so the queue issues no HTTP call to arr and no extra
+// query per field. A freshly saved connection only gets its arr_instances row
+// on the first poll (arrsync.ensureInstance), so without that union "configured
+// but never synced" would be indistinguishable from "no instances configured".
+type queueDiagnostics struct {
+	// InstancesConfigured counts the merged arr instances: arr_instances rows
+	// plus configured arr.connections entries not yet polled, deduped by kind
+	// like the library health payload.
+	InstancesConfigured int64 `json:"instances_configured"`
+	// NeverSynced counts instances with no recorded attempt (last_attempt_at
+	// NULL): configured, but no sync pass has ever run.
+	NeverSynced int64 `json:"never_synced"`
+	// SyncFailed counts instances whose last attempt failed (last_sync_ok 0).
+	SyncFailed int64 `json:"sync_failed"`
+	// LastPassAt is the most recent SUCCESSFUL sync attempt across instances,
+	// RFC 3339 UTC, or null when nothing has ever succeeded. A failed attempt
+	// is not a pass, and a failure leaves last_sync_at (the last success)
+	// untouched, so an instance that only ever failed leaves this null.
+	LastPassAt *string `json:"last_pass_at"`
+	// CacheItems is the total cached arr library rows across all instances and
+	// both media kinds: synced but nothing matched shows up as a non-zero count
+	// with an empty queue.
+	CacheItems int64 `json:"cache_items"`
+}
+
+// syncTimestampLayout is how the store writes arr_instances timestamps
+// (arr_library_sync.go): UTC, second precision, sortable as plain text.
+const syncTimestampLayout = "2006-01-02 15:04:05"
+
+// zeroedQueueDiagnostics is the shape emitted when the health read fails: the
+// queue must stay usable when the library cache is unreadable, so diagnostics
+// degrade to "nothing known" instead of failing the list.
+func zeroedQueueDiagnostics() queueDiagnostics {
+	return queueDiagnostics{LastPassAt: nil}
+}
+
+// queueDiagnosticsFor derives the diagnostics from the health rows, the
+// reported cache total and the configured connection kinds.
+func queueDiagnosticsFor(rows []store.ArrInstanceHealth, cacheItems int64, configuredKinds []string) queueDiagnostics {
+	diag := queueDiagnostics{CacheItems: cacheItems}
+	seen := make(map[string]struct{}, len(rows)+len(configuredKinds))
+	// Timestamps compare as text: the store writes one fixed sortable layout.
+	lastPass := ""
+	for _, row := range rows {
+		seen[row.Kind] = struct{}{}
+		diag.InstancesConfigured++
+		switch {
+		case !row.LastAttemptAt.Valid:
+			diag.NeverSynced++
+		case row.LastOK.Valid && !row.LastOK.Bool:
+			// A failure is not a pass: last_sync_at still holds the last
+			// success (or NULL when there never was one).
+			diag.SyncFailed++
+		}
+		if row.LastSyncAt.Valid && row.LastSyncAt.String > lastPass {
+			lastPass = row.LastSyncAt.String
+		}
+	}
+	// Configured-but-unpolled connections: no arr_instances row yet, so no
+	// attempt and nothing cached — the never-synced shape.
+	for _, kind := range configuredKinds {
+		if _, ok := seen[kind]; ok {
+			continue
+		}
+		seen[kind] = struct{}{}
+		diag.InstancesConfigured++
+		diag.NeverSynced++
+	}
+	if lastPass != "" {
+		formatted := formatSyncTimestamp(lastPass)
+		diag.LastPassAt = &formatted
+	}
+	return diag
+}
+
+// formatSyncTimestamp renders a stored timestamp as RFC 3339 UTC so the UI can
+// parse it as a time. A value in an unexpected layout is passed through rather
+// than dropped, so no history is invented or lost.
+func formatSyncTimestamp(raw string) string {
+	ts, err := time.ParseInLocation(syncTimestampLayout, raw, time.UTC)
+	if err != nil {
+		return raw
+	}
+	return ts.UTC().Format(time.RFC3339)
+}
+
+// diagnostics reads the sync health of the library cache for the queue list.
+// A store error is logged and zeroed: an unreadable library cache must not
+// make the approval queue unavailable.
+func (s *Service) diagnostics(ctx context.Context) queueDiagnostics {
+	rows, cacheItems, err := s.store.ArrLibraryHealth(ctx)
+	if err != nil {
+		slog.Default().Warn("queue list: read arr sync health",
+			"component", "queue", "error", err)
+		return zeroedQueueDiagnostics()
+	}
+	return queueDiagnosticsFor(rows, cacheItems, s.configuredArrKinds(ctx))
+}
+
+// configuredArrKinds returns the arr kinds saved in arr.connections, via the
+// same union the library health endpoint applies (arr.ConfiguredConnections),
+// so "configured" cannot mean two different things on two screens. A read or
+// decode failure is logged and swallowed for the same reason as a health read
+// failure: diagnostics are never allowed to break the queue.
+func (s *Service) configuredArrKinds(ctx context.Context) []string {
+	conns, err := arr.ConfiguredConnections(ctx, s.settings)
+	if err != nil {
+		slog.Default().Warn("queue list: read arr connections",
+			"component", "queue", "error", err)
+		return nil
+	}
+	kinds := make([]string, 0, len(conns))
+	for _, conn := range conns {
+		kinds = append(kinds, conn.Kind)
+	}
+	return kinds
 }
 
 type transitionResponse struct {
@@ -296,7 +426,7 @@ func (s *Service) handleList(w http.ResponseWriter, r *http.Request) {
 		}
 		items = append(items, item)
 	}
-	writeJSON(w, http.StatusOK, listResponse{Items: items})
+	writeJSON(w, http.StatusOK, listResponse{Items: items, Diagnostics: s.diagnostics(r.Context())})
 }
 
 // handleSearchLibrary serves the manual-match lookup: a case-insensitive title

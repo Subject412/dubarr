@@ -4,12 +4,12 @@ package library
 
 import (
 	"context"
-	"encoding/json"
 	"log/slog"
 	"net/http"
 	"sort"
 	"strings"
 
+	"github.com/Subject412/dubarr/backend/internal/arr"
 	"github.com/Subject412/dubarr/backend/internal/arrsync"
 	"github.com/Subject412/dubarr/backend/internal/settings"
 )
@@ -141,38 +141,18 @@ func (s *Service) manualSyncEnabled(ctx context.Context) bool {
 }
 
 // configuredConnections returns the arr.connections entries, or nil when no
-// settings store is wired or the section is absent. A read or decode failure is
-// logged and swallowed: health must stay available even when settings cannot
-// be read, so the caller falls back to the store-derived instances.
+// settings store is wired or the section is absent. The union itself is owned
+// by arr.ConfiguredConnections so this view and the queue diagnostics cannot
+// disagree. A read or decode failure is logged and swallowed: health must stay
+// available even when settings cannot be read, so the caller falls back to the
+// store-derived instances.
 func (s *Service) configuredConnections(ctx context.Context) []settings.ArrConnection {
-	if s.settings == nil {
-		return nil
-	}
-	raw, ok, err := s.settings.Get(ctx, settings.KeyArrConnections)
+	conns, err := arr.ConfiguredConnections(ctx, s.settings)
 	if err != nil {
 		slog.Default().Warn("library health: read arr connections",
 			"component", "library", "error", err)
-		return nil
 	}
-	if !ok {
-		return nil
-	}
-	var conns settings.ArrConnections
-	if err := json.Unmarshal(raw, &conns); err != nil {
-		slog.Default().Warn("library health: decode arr connections",
-			"component", "library", "error", err)
-		return nil
-	}
-	out := make([]settings.ArrConnection, 0, len(conns.Instances))
-	for _, conn := range conns.Instances {
-		// Validation guarantees radarr/sonarr, but a malformed legacy row must
-		// not add a nameless entry to the panel.
-		if conn.Kind == "" {
-			continue
-		}
-		out = append(out, conn)
-	}
-	return out
+	return conns
 }
 
 // connectionDisplayName mirrors arrsync's displayName for a kind, so the entry

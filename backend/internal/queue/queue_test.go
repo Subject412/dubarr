@@ -892,6 +892,175 @@ func onlyMatchItem(t *testing.T, items []queueMatchItem) queueMatchItem {
 	return items[0]
 }
 
+// queueDiagnosticsBody is the diagnostics slice of GET /api/queue. LastPassAt
+// is a pointer so JSON null and a real timestamp stay distinguishable.
+type queueDiagnosticsBody struct {
+	Diagnostics struct {
+		InstancesConfigured int64   `json:"instances_configured"`
+		NeverSynced         int64   `json:"never_synced"`
+		SyncFailed          int64   `json:"sync_failed"`
+		LastPassAt          *string `json:"last_pass_at"`
+		CacheItems          int64   `json:"cache_items"`
+	} `json:"diagnostics"`
+}
+
+// listDiagnostics reads the diagnostics object alongside the (possibly empty)
+// item list and asserts the envelope still answers 200.
+func (h *harness) listDiagnostics(t *testing.T) queueDiagnosticsBody {
+	t.Helper()
+	rec := h.request(http.MethodGet, "/api/queue")
+	if rec.Code != http.StatusOK {
+		h.t.Fatalf("GET /api/queue = %d, body %s", rec.Code, rec.Body.String())
+	}
+	var body queueDiagnosticsBody
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		h.t.Fatalf("decode: %v", err)
+	}
+	return body
+}
+
+// seedArrInstance inserts an arr_instances row with no recorded attempt, the
+// state of a configured instance the sync layer has not polled yet.
+func (h *harness) seedArrInstance(t *testing.T, kind string) int64 {
+	t.Helper()
+	res, err := h.db.ExecContext(context.Background(),
+		`INSERT INTO arr_instances (name, type, base_url, api_key_enc, api_key_last4)
+		 VALUES (?, ?, 'http://arr.invalid', x'00', '0000')`, kind, kind)
+	if err != nil {
+		t.Fatalf("insert arr instance: %v", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		t.Fatalf("arr instance id: %v", err)
+	}
+	return id
+}
+
+// TestQueueDiagnosticsNoInstances pins the "no instances configured" shape:
+// nothing configured means nothing to count and no pass time.
+func TestQueueDiagnosticsNoInstances(t *testing.T) {
+	h := newHarness(t)
+
+	diag := h.listDiagnostics(t).Diagnostics
+	if diag.InstancesConfigured != 0 {
+		t.Errorf("instances_configured = %d, want 0", diag.InstancesConfigured)
+	}
+	if diag.NeverSynced != 0 || diag.SyncFailed != 0 || diag.CacheItems != 0 {
+		t.Errorf("never_synced=%d sync_failed=%d cache_items=%d, want all 0",
+			diag.NeverSynced, diag.SyncFailed, diag.CacheItems)
+	}
+	if diag.LastPassAt != nil {
+		t.Errorf("last_pass_at = %q, want null", *diag.LastPassAt)
+	}
+}
+
+// TestQueueDiagnosticsNeverSynced pins "configured but never attempted": one
+// instance with no recorded attempt, so no pass time exists.
+func TestQueueDiagnosticsNeverSynced(t *testing.T) {
+	h := newHarness(t)
+	h.seedArrInstance(t, "radarr")
+
+	diag := h.listDiagnostics(t).Diagnostics
+	if diag.InstancesConfigured != 1 {
+		t.Errorf("instances_configured = %d, want 1", diag.InstancesConfigured)
+	}
+	if diag.NeverSynced != 1 {
+		t.Errorf("never_synced = %d, want 1", diag.NeverSynced)
+	}
+	if diag.SyncFailed != 0 {
+		t.Errorf("sync_failed = %d, want 0", diag.SyncFailed)
+	}
+	if diag.LastPassAt != nil {
+		t.Errorf("last_pass_at = %q, want null", *diag.LastPassAt)
+	}
+}
+
+// TestQueueDiagnosticsSyncFailed pins the failed-pass shape. RecordArrInstanceSyncFailure
+// stamps last_attempt_at and clears last_sync_ok but deliberately leaves
+// last_sync_at (the last SUCCESS) untouched, so with no earlier success the
+// attempt exists yet there is still no pass: last_pass_at stays null.
+func TestQueueDiagnosticsSyncFailed(t *testing.T) {
+	h := newHarness(t)
+	id := h.seedArrInstance(t, "radarr")
+	st := &store.Store{DB: h.db}
+	if err := st.RecordArrInstanceSyncFailure(context.Background(), id, "connection refused"); err != nil {
+		t.Fatalf("RecordArrInstanceSyncFailure: %v", err)
+	}
+
+	diag := h.listDiagnostics(t).Diagnostics
+	if diag.SyncFailed != 1 {
+		t.Errorf("sync_failed = %d, want 1", diag.SyncFailed)
+	}
+	if diag.NeverSynced != 0 {
+		t.Errorf("never_synced = %d, want 0 (the attempt happened)", diag.NeverSynced)
+	}
+	if diag.InstancesConfigured != 1 {
+		t.Errorf("instances_configured = %d, want 1", diag.InstancesConfigured)
+	}
+	if diag.LastPassAt != nil {
+		t.Errorf("last_pass_at = %q, want null: a failure is not a pass", *diag.LastPassAt)
+	}
+}
+
+// TestQueueDiagnosticsCountsCacheItems pins that a synced-but-empty queue still
+// reports how much of the library is cached (all kinds, all instances).
+func TestQueueDiagnosticsCountsCacheItems(t *testing.T) {
+	h := newHarness(t)
+	h.seedLibraryRow(t, "Kraina Lodu", 2013)
+	h.seedLibraryRow(t, "Shrek", 2001)
+
+	diag := h.listDiagnostics(t).Diagnostics
+	if diag.CacheItems != 2 {
+		t.Errorf("cache_items = %d, want 2", diag.CacheItems)
+	}
+	if diag.InstancesConfigured != 2 {
+		t.Errorf("instances_configured = %d, want 2", diag.InstancesConfigured)
+	}
+}
+
+// TestQueueDiagnosticsSurvivesStoreError pins that an unreadable library cache
+// cannot take the approval queue down: the list still answers 200 with its
+// rows and zeroed diagnostics.
+func TestQueueDiagnosticsSurvivesStoreError(t *testing.T) {
+	h := newHarness(t)
+	h.seedCandidate(t, "Target [ArcA310].mkv", "eligible", `["en"]`)
+	// Simulate the health projection being unreadable while the approval
+	// queue itself stays intact (arr_instances is not part of the list query,
+	// so the queue rows still load).
+	if _, err := h.db.Exec(`ALTER TABLE arr_instances RENAME TO arr_instances_unreadable`); err != nil {
+		t.Fatalf("rename arr_instances: %v", err)
+	}
+
+	rec := h.request(http.MethodGet, "/api/queue")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/queue with unreadable health = %d, want 200, body %s",
+			rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Items       []json.RawMessage `json:"items"`
+		Diagnostics struct {
+			InstancesConfigured int64   `json:"instances_configured"`
+			NeverSynced         int64   `json:"never_synced"`
+			SyncFailed          int64   `json:"sync_failed"`
+			LastPassAt          *string `json:"last_pass_at"`
+			CacheItems          int64   `json:"cache_items"`
+		} `json:"diagnostics"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(body.Items) != 1 {
+		t.Errorf("items = %d, want the queue rows intact", len(body.Items))
+	}
+	diag := body.Diagnostics
+	if diag.InstancesConfigured != 0 || diag.NeverSynced != 0 || diag.SyncFailed != 0 || diag.CacheItems != 0 {
+		t.Errorf("diagnostics = %+v, want zeroed", diag)
+	}
+	if diag.LastPassAt != nil {
+		t.Errorf("last_pass_at = %q, want null", *diag.LastPassAt)
+	}
+}
+
 func TestSearchLibraryEndpoint(t *testing.T) {
 	h := newHarness(t)
 	want, _ := h.seedLibraryRow(t, "Kraina Lodu", 2013)

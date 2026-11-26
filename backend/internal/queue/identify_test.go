@@ -31,14 +31,21 @@ func (f fakeDecrypter) DecryptString(blob []byte) (string, error) {
 	return key, nil
 }
 
-// identifyHarness is a queue API wired to one in-process arr fake.
+// identifyHarness is a queue API wired to one in-process arr fake of each kind.
 type identifyHarness struct {
 	t      *testing.T
 	db     *sql.DB
 	mux    *http.ServeMux
 	media  string
 	srv    *arrmock.Server
+	sonarr *arrmock.Server
 	instID int64
+	// sonarrID is the Sonarr instance row, so an episode cache row can be
+	// synced by the instance that actually serves it.
+	sonarrID int64
+	// settings is kept so a test can declare which libraries are enabled: the
+	// route's ambiguity is a property of arr.connections, not of the mocks.
+	settings *settings.Store
 }
 
 func newIdentifyHarness(t *testing.T, fx arrmock.Fixtures, timeout time.Duration) *identifyHarness {
@@ -58,29 +65,111 @@ func newIdentifyHarness(t *testing.T, fx arrmock.Fixtures, timeout time.Duration
 	srv := arrmock.New(arrmock.Radarr, "", fx)
 	t.Cleanup(srv.Close)
 
-	blob := "blob-1"
-	res, err := st.DB.ExecContext(context.Background(),
-		`INSERT INTO arr_instances (name, type, base_url, api_key_enc, api_key_last4)
-		 VALUES ('main', 'radarr', ?, ?, '0000')`, srv.URL, []byte(blob))
-	if err != nil {
-		t.Fatalf("insert arr instance: %v", err)
+	// The Sonarr fake answers the same release in its own shape, so one fixture
+	// serves both kinds: a test asks for a title, not for a product payload.
+	sonarrTitle := fx.Parse.SeriesTitle
+	if sonarrTitle == "" {
+		sonarrTitle = fx.Parse.Title
 	}
-	instID, err := res.LastInsertId()
-	if err != nil {
-		t.Fatalf("instance id: %v", err)
+	sonarrYear := fx.Parse.SeriesYear
+	if sonarrYear == 0 {
+		sonarrYear = fx.Parse.Year
 	}
+	sonarrSrv := arrmock.New(arrmock.Sonarr, "", arrmock.Fixtures{
+		Parse: arrmock.ParseResponse{SeriesTitle: sonarrTitle, SeriesYear: sonarrYear, Quality: fx.Parse.Quality},
+	})
+	t.Cleanup(sonarrSrv.Close)
+
+	blob := []byte("blob-1")
+	sonarrBlob := []byte("blob-2")
+	instID := insertArrInstance(t, st.DB, "main", "radarr", srv.URL, blob)
+	sonarrID := insertArrInstance(t, st.DB, "tv", "sonarr", sonarrSrv.URL, sonarrBlob)
 
 	mux := http.NewServeMux()
 	RegisterRoutes(mux, Dependencies{
-		DB:              st.DB,
-		Settings:        settingsStore,
-		Secrets:         fakeDecrypter{blob: srv.APIKey()},
+		DB:       st.DB,
+		Settings: settingsStore,
+		Secrets: fakeDecrypter{
+			string(blob):       srv.APIKey(),
+			string(sonarrBlob): sonarrSrv.APIKey(),
+		},
 		IdentifyTimeout: timeout,
 		RequireAdmin: func(h http.Handler) http.Handler {
 			return h
 		},
 	})
-	return &identifyHarness{t: t, db: st.DB, mux: mux, media: t.TempDir(), srv: srv, instID: instID}
+	return &identifyHarness{
+		t:        t,
+		db:       st.DB,
+		mux:      mux,
+		media:    t.TempDir(),
+		srv:      srv,
+		sonarr:   sonarrSrv,
+		instID:   instID,
+		sonarrID: sonarrID,
+		settings: settingsStore,
+	}
+}
+
+// insertArrInstance records one arr instance row and returns its id.
+func insertArrInstance(t *testing.T, db *sql.DB, name, kind, baseURL string, blob []byte) int64 {
+	t.Helper()
+	res, err := db.ExecContext(context.Background(),
+		`INSERT INTO arr_instances (name, type, base_url, api_key_enc, api_key_last4)
+		 VALUES (?, ?, ?, ?, '0000')`, name, kind, baseURL, blob)
+	if err != nil {
+		t.Fatalf("insert arr instance %s: %v", name, err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		t.Fatalf("%s instance id: %v", name, err)
+	}
+	return id
+}
+
+// enableArrConnections declares which libraries the appliance has enabled.
+// Called with nothing, the section stays empty: no library is configured.
+func (h *identifyHarness) enableArrConnections(t *testing.T, conns ...settings.ArrConnection) {
+	t.Helper()
+	if conns == nil {
+		conns = []settings.ArrConnection{}
+	}
+	raw, err := json.Marshal(settings.ArrConnections{Instances: conns})
+	if err != nil {
+		t.Fatalf("marshal arr connections: %v", err)
+	}
+	if err := h.settings.Set(context.Background(), settings.KeyArrConnections, raw); err != nil {
+		t.Fatalf("set arr connections: %v", err)
+	}
+}
+
+// seedUnmatchedCandidate records a pending queue row with no arr instance and
+// no library link: it proves no kind, exactly like the live unmatched release
+// Identify was built for.
+func (h *identifyHarness) seedUnmatchedCandidate(t *testing.T, filename string) int64 {
+	t.Helper()
+	source := filepath.Join(t.TempDir(), filename)
+	st := &store.Store{DB: h.db}
+	created, err := st.RecordImportCandidate(context.Background(), source, filename, 42)
+	if err != nil || !created {
+		t.Fatalf("RecordImportCandidate: created=%v err=%v", created, err)
+	}
+	var id int64
+	if err := h.db.QueryRowContext(context.Background(),
+		`SELECT id FROM import_queue WHERE source_file_path = ?`, source).Scan(&id); err != nil {
+		t.Fatalf("candidate id: %v", err)
+	}
+	return id
+}
+
+// linkCandidate points a queue row at one library cache row, which is what
+// makes the release prove a media kind.
+func (h *identifyHarness) linkCandidate(t *testing.T, queueID, cacheID int64) {
+	t.Helper()
+	if _, err := h.db.ExecContext(context.Background(),
+		`UPDATE import_queue SET matched_library_cache_id = ? WHERE id = ?`, cacheID, queueID); err != nil {
+		t.Fatalf("link candidate %d to cache %d: %v", queueID, cacheID, err)
+	}
 }
 
 // seedCandidateWithTarget records a pending queue row linked to the harness
@@ -107,19 +196,24 @@ func (h *identifyHarness) seedCandidateWithTarget(t *testing.T, filename string)
 
 // seedCacheRow inserts one arr_library_cache row of the harness instance and
 // returns its id. The target file is created so the donor pairing reads a real
-// (empty) folder.
+// (empty) folder. An episode row belongs to the Sonarr instance, a movie row to
+// the Radarr one.
 func (h *identifyHarness) seedCacheRow(t *testing.T, mediaType, title string, year int, externalID int64) int64 {
 	t.Helper()
 	targetPath := filepath.Join(h.media, title+".mkv")
 	if err := os.WriteFile(targetPath, []byte("target"), 0o644); err != nil {
 		t.Fatalf("write target: %v", err)
 	}
+	instanceID := h.instID
+	if mediaType == "episode" {
+		instanceID = h.sonarrID
+	}
 	res, err := h.db.ExecContext(context.Background(),
 		`INSERT INTO arr_library_cache
 		 (arr_instance_id, media_type, external_item_id, title, original_language_iso2, year,
 		  target_file_path, audio_languages_json, eligibility_status)
 		 VALUES (?, ?, ?, ?, 'en', ?, ?, '["en"]', 'eligible')`,
-		h.instID, mediaType, externalID, title, year, targetPath)
+		instanceID, mediaType, externalID, title, year, targetPath)
 	if err != nil {
 		t.Fatalf("insert library cache: %v", err)
 	}
@@ -159,9 +253,10 @@ type identifyBody struct {
 }
 
 type errorBody struct {
-	Error string `json:"error"`
-	Code  string `json:"code"`
-	Class string `json:"class"`
+	Error string   `json:"error"`
+	Code  string   `json:"code"`
+	Class string   `json:"class"`
+	Kinds []string `json:"kinds"`
 }
 
 func decodeIdentify(t *testing.T, rec *httptest.ResponseRecorder) identifyBody {
@@ -551,6 +646,204 @@ func TestIdentifyNotConfigured(t *testing.T) {
 	}
 	if body := decodeErrorBody(t, rec); body.Code != "not_configured" {
 		t.Errorf("code = %q, want not_configured", body.Code)
+	}
+}
+
+// TestIdentifyAmbiguousKindOffersChoice pins the live defect: with both
+// libraries enabled, an unmatched release is a choice, not an absence. The
+// route answers 409 ambiguous_kind carrying both kinds in a fixed order, and it
+// asks neither instance anything — no library was chosen, so no parse may run.
+func TestIdentifyAmbiguousKindOffersChoice(t *testing.T) {
+	h := newIdentifyHarness(t, arrmock.Fixtures{
+		Parse: arrmock.ParseResponse{Title: "Shrek", Year: 2001, Quality: "WEBDL-1080p"},
+	}, 2*time.Second)
+	h.enableArrConnections(t,
+		settings.ArrConnection{Kind: "radarr", BaseURL: h.srv.URL, Enabled: true},
+		settings.ArrConnection{Kind: "sonarr", BaseURL: h.sonarr.URL, Enabled: true},
+	)
+	id := h.seedUnmatchedCandidate(t, "Shrek.2001.1080p.SKST.WEB-DL.PL.KIFR.mkv")
+
+	rec := h.post("/api/queue/"+itoa(id)+"/identify", "")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("identify = %d, body %s (an ambiguous appliance is not an unconfigured one)", rec.Code, rec.Body.String())
+	}
+	body := decodeErrorBody(t, rec)
+	if body.Code != "ambiguous_kind" {
+		t.Fatalf("code = %q, want ambiguous_kind (body %s)", body.Code, rec.Body.String())
+	}
+	if len(body.Kinds) != 2 || body.Kinds[0] != "radarr" || body.Kinds[1] != "sonarr" {
+		t.Errorf("kinds = %v, want [radarr sonarr]", body.Kinds)
+	}
+	for _, kind := range []string{"radarr", "sonarr"} {
+		if !strings.Contains(body.Error, kind) {
+			t.Errorf("message %q does not name %s", body.Error, kind)
+		}
+	}
+
+	// The choice is the answer: nothing may be parsed before the operator picks.
+	if posted := h.srv.ParseRequests(); len(posted) != 0 {
+		t.Errorf("radarr parses = %v, want none", posted)
+	}
+	if posted := h.sonarr.ParseRequests(); len(posted) != 0 {
+		t.Errorf("sonarr parses = %v, want none", posted)
+	}
+}
+
+// TestIdentifyChosenKindParsesThatLibrary pins the way forward the 409 offers:
+// the operator's kind decides which instance parses the release, and the pool is
+// narrowed to that library's media kind.
+func TestIdentifyChosenKindParsesThatLibrary(t *testing.T) {
+	h := newIdentifyHarness(t, arrmock.Fixtures{
+		Parse: arrmock.ParseResponse{Title: "Kraina Lodu", Year: 2013, Quality: "WEBDL-1080p"},
+	}, 2*time.Second)
+	h.enableArrConnections(t,
+		settings.ArrConnection{Kind: "radarr", BaseURL: h.srv.URL, Enabled: true},
+		settings.ArrConnection{Kind: "sonarr", BaseURL: h.sonarr.URL, Enabled: true},
+	)
+	h.seedCacheRow(t, "movie", "Kraina Lodu", 2013, 1)
+	episode := h.seedCacheRow(t, "episode", "Kraina Lodu", 2013, 2)
+	id := h.seedUnmatchedCandidate(t, "Kraina.Lodu.2013.PL.mkv")
+
+	rec := h.post("/api/queue/"+itoa(id)+"/identify", `{"kind":"sonarr"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("identify = %d, body %s", rec.Code, rec.Body.String())
+	}
+	body := decodeIdentify(t, rec)
+	if len(body.Candidates) != 1 || body.Candidates[0].LibraryCacheID != episode {
+		t.Fatalf("candidates = %+v, want only the episode row %d", body.Candidates, episode)
+	}
+	if body.Candidates[0].MediaType != "episode" {
+		t.Errorf("candidate media_type = %q, want episode", body.Candidates[0].MediaType)
+	}
+
+	posted := h.sonarr.ParseRequests()
+	if len(posted) != 1 || posted[0] != "Kraina.Lodu.2013.PL" {
+		t.Errorf("sonarr parses = %v, want the filename stem once", posted)
+	}
+	if posted := h.srv.ParseRequests(); len(posted) != 0 {
+		t.Errorf("radarr parses = %v, want none: the operator chose sonarr", posted)
+	}
+}
+
+// TestIdentifySingleEnabledKindAutoSelects pins that one enabled library needs
+// no body kind: the appliance has nothing to choose between.
+func TestIdentifySingleEnabledKindAutoSelects(t *testing.T) {
+	h := newIdentifyHarness(t, arrmock.Fixtures{
+		Parse: arrmock.ParseResponse{Title: "Kraina Lodu", Year: 2013, Quality: "WEBDL-1080p"},
+	}, 2*time.Second)
+	h.enableArrConnections(t,
+		settings.ArrConnection{Kind: "sonarr", BaseURL: h.sonarr.URL, Enabled: true},
+	)
+	episode := h.seedCacheRow(t, "episode", "Kraina Lodu", 2013, 2)
+	id := h.seedUnmatchedCandidate(t, "Kraina.Lodu.2013.PL.mkv")
+
+	rec := h.post("/api/queue/"+itoa(id)+"/identify", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("identify = %d, body %s", rec.Code, rec.Body.String())
+	}
+	body := decodeIdentify(t, rec)
+	if len(body.Candidates) != 1 || body.Candidates[0].LibraryCacheID != episode {
+		t.Errorf("candidates = %+v, want the episode row %d", body.Candidates, episode)
+	}
+	if posted := h.sonarr.ParseRequests(); len(posted) != 1 {
+		t.Errorf("sonarr parses = %v, want exactly one", posted)
+	}
+	if posted := h.srv.ParseRequests(); len(posted) != 0 {
+		t.Errorf("radarr parses = %v, want none (radarr is not enabled)", posted)
+	}
+}
+
+// TestIdentifyNoEnabledKindIsNotConfigured keeps not_configured for genuine
+// absence: a secret store is wired and instances exist, but nothing is enabled.
+func TestIdentifyNoEnabledKindIsNotConfigured(t *testing.T) {
+	h := newIdentifyHarness(t, arrmock.Fixtures{}, 2*time.Second)
+	id := h.seedUnmatchedCandidate(t, "Shrek.2001.1080p.SKST.WEB-DL.PL.KIFR.mkv")
+
+	rec := h.post("/api/queue/"+itoa(id)+"/identify", "")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("identify = %d, body %s", rec.Code, rec.Body.String())
+	}
+	body := decodeErrorBody(t, rec)
+	if body.Code != "not_configured" {
+		t.Errorf("code = %q, want not_configured", body.Code)
+	}
+	if body.Error != "no arr instance is configured for this release" {
+		t.Errorf("message = %q, want the not_configured message", body.Error)
+	}
+	if len(body.Kinds) != 0 {
+		t.Errorf("kinds = %v, want none: nothing is configured, so nothing is offered", body.Kinds)
+	}
+}
+
+// TestIdentifyKindConflictIsRefused pins that the operator's kind is never
+// silently overridden: a release the row already proves to be a film cannot be
+// identified as a series, and nothing is parsed on the way to saying so.
+func TestIdentifyKindConflictIsRefused(t *testing.T) {
+	h := newIdentifyHarness(t, arrmock.Fixtures{
+		Parse: arrmock.ParseResponse{Title: "Kraina Lodu", Year: 2013, Quality: "Bluray-1080p"},
+	}, 2*time.Second)
+	movie := h.seedCacheRow(t, "movie", "Kraina Lodu", 2013, 1)
+	id := h.seedCandidateWithTarget(t, "Kraina.Lodu.2013.PL.mkv")
+	h.linkCandidate(t, id, movie)
+
+	rec := h.post("/api/queue/"+itoa(id)+"/identify", `{"kind":"sonarr"}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("identify = %d, body %s", rec.Code, rec.Body.String())
+	}
+	body := decodeErrorBody(t, rec)
+	if body.Code != "kind_conflict" {
+		t.Fatalf("code = %q, want kind_conflict (body %s)", body.Code, rec.Body.String())
+	}
+	if !strings.Contains(body.Error, "radarr") || !strings.Contains(body.Error, "sonarr") {
+		t.Errorf("message %q does not name both kinds", body.Error)
+	}
+	if posted := h.srv.ParseRequests(); len(posted) != 0 {
+		t.Errorf("radarr parses = %v, want none", posted)
+	}
+	if posted := h.sonarr.ParseRequests(); len(posted) != 0 {
+		t.Errorf("sonarr parses = %v, want none", posted)
+	}
+}
+
+// TestIdentifyRejectsUnknownKind pins the 400: a body kind outside the two
+// served libraries is a bad request, never a silently ignored field.
+func TestIdentifyRejectsUnknownKind(t *testing.T) {
+	h := newIdentifyHarness(t, arrmock.Fixtures{
+		Parse: arrmock.ParseResponse{Title: "Kraina Lodu", Year: 2013, Quality: "Bluray-1080p"},
+	}, 2*time.Second)
+	id := h.seedCandidateWithTarget(t, "Kraina.Lodu.2013.PL.mkv")
+
+	rec := h.post("/api/queue/"+itoa(id)+"/identify", `{"kind":"plex"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("identify = %d, body %s", rec.Code, rec.Body.String())
+	}
+	if body := decodeErrorBody(t, rec); body.Code != "invalid_kind" {
+		t.Errorf("code = %q, want invalid_kind", body.Code)
+	}
+	if posted := h.srv.ParseRequests(); len(posted) != 0 {
+		t.Errorf("parses = %v, want none for a rejected body", posted)
+	}
+}
+
+// TestIdentifySettingsReadFailureIsNotAbsence pins the 500: a configuration
+// that could not be read must never be reported as "nothing configured", which
+// would send the operator to add an instance that already exists.
+func TestIdentifySettingsReadFailureIsNotAbsence(t *testing.T) {
+	h := newIdentifyHarness(t, arrmock.Fixtures{}, 2*time.Second)
+	id := h.seedUnmatchedCandidate(t, "Shrek.2001.1080p.SKST.WEB-DL.PL.KIFR.mkv")
+
+	// A row the settings decoder cannot read: the read fails, nothing is known.
+	if _, err := h.db.ExecContext(context.Background(),
+		`UPDATE settings SET value = '{not json' WHERE key = 'arr.connections'`); err != nil {
+		t.Fatalf("corrupt arr.connections: %v", err)
+	}
+
+	rec := h.post("/api/queue/"+itoa(id)+"/identify", "")
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("identify = %d, body %s (a failed read is not an empty configuration)", rec.Code, rec.Body.String())
+	}
+	if body := decodeErrorBody(t, rec); body.Code == "not_configured" {
+		t.Errorf("code = %q, want a server fault, not not_configured", body.Code)
 	}
 }
 

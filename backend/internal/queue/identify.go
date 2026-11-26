@@ -50,9 +50,12 @@ type parser interface {
 }
 
 // identifyRequest is the optional identify body: an operator-supplied release
-// name overriding the row's filename stem.
+// name overriding the row's filename stem, and — for a release the row itself
+// cannot place — the arr library to parse it in. Kind is additive: a client
+// that sends only title keeps the old behaviour.
 type identifyRequest struct {
 	Title string `json:"title"`
+	Kind  string `json:"kind"`
 }
 
 // matchRequest is the match body. Confidence is accepted so an existing client
@@ -103,6 +106,10 @@ type apiError struct {
 	// Class is the arr failure class: timeout, auth, network, status or
 	// unknown. Empty for every non-arr failure.
 	Class string `json:"class,omitempty"`
+	// Kinds names the arr libraries the operator must choose between. Only
+	// code "ambiguous_kind" carries it, in a fixed order (radarr, sonarr) so
+	// the UI can render a stable choice instead of a shuffled one.
+	Kinds []string `json:"kinds,omitempty"`
 }
 
 // writeAPIError writes one error envelope.
@@ -110,19 +117,34 @@ func writeAPIError(w http.ResponseWriter, status int, message, code, class strin
 	writeJSON(w, status, apiError{Error: message, Code: code, Class: class})
 }
 
+// writeAPIKindsError writes an error envelope that also names the arr libraries
+// the request has to choose between.
+func writeAPIKindsError(w http.ResponseWriter, status int, message, code string, kinds []string) {
+	writeJSON(w, status, apiError{Error: message, Code: code, Kinds: kinds})
+}
+
 // handleIdentify parses the release with arr and returns the ranked candidates.
 //
 //	200 {"parse": {...}, "candidates": [...]}
-//	400 the {id} is not a positive integer, the body is malformed, or there is
-//	    no release name to parse
+//	400 the {id} is not a positive integer, the body is malformed, code
+//	    "invalid_kind" the body kind is not radarr|sonarr, or there is no
+//	    release name to parse
 //	404 the id names no queue row
-//	409 code "not_configured"  no instance, key or secret store for this row
+//	409 code "kind_conflict"  the body kind contradicts the kind the release proves
+//	409 code "ambiguous_kind" the release proves no kind and both libraries are
+//	    enabled: kinds carries ["radarr","sonarr"] and the operator chooses
+//	409 code "not_configured" no secret store, no enabled instance at all, or the
+//	    chosen kind has no enabled instance or key
+//	500 the arr configuration could not be read
 //	502 code "identify_failed" arr refused or could not answer; class says why
 //
 // An empty library cache is not an error: the parse verdict is still worth
 // showing, and candidates come back as an empty array. A release arr could not
 // parse is reported as parse.parsed=false with an empty candidate array and no
 // library read at all, so "unparsable" is never mistaken for "nothing matched".
+// An ambiguous appliance is reported as a choice, never as absence: the route
+// asks which library before it parses anything, and resolves nothing from the
+// filename.
 func (s *Service) handleIdentify(w http.ResponseWriter, r *http.Request) {
 	if s.store == nil || s.store.DB == nil {
 		writeError(w, http.StatusServiceUnavailable, "queue store is not configured")
@@ -158,8 +180,31 @@ func (s *Service) handleIdentify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	kind := s.identifyKind(ctx, row)
+	// The body kind is the operator's own choice, so a typo is a bad request
+	// rather than something to ignore.
+	requested := strings.TrimSpace(req.Kind)
+	if requested != "" && !isIdentifyKind(requested) {
+		writeAPIError(w, http.StatusBadRequest, "kind must be radarr or sonarr", "invalid_kind", "")
+		return
+	}
+
+	kind, choices, err := s.resolveIdentifyKind(ctx, row, requested)
+	if err != nil {
+		if errors.Is(err, errIdentifyKindConflict) {
+			writeAPIError(w, http.StatusConflict, fmt.Sprintf("the release belongs to the %s library, not %s", provenIdentifyKind(row), requested), "kind_conflict", "")
+			return
+		}
+		// A configuration that could not be read is not an empty one: 500, so
+		// the operator fixes the settings read instead of adding an instance
+		// that already exists.
+		writeError(w, http.StatusInternalServerError, "could not read the arr configuration")
+		return
+	}
 	if kind == "" {
+		if len(choices) > 1 {
+			writeAPIKindsError(w, http.StatusConflict, "this release is unmatched: choose the arr library to identify it in ("+strings.Join(choices, " or ")+")", "ambiguous_kind", choices)
+			return
+		}
 		writeAPIError(w, http.StatusConflict, "no arr instance is configured for this release", "not_configured", "")
 		return
 	}
@@ -319,12 +364,72 @@ func decodeMatchBody(r *http.Request) (matchRequest, error) {
 	return req, err
 }
 
-// identifyKind resolves the arr kind for a queue row: the kind its matched
-// library row proves, the instance it was linked to, or — when the appliance
-// has exactly one enabled connection — that instance. An unmatched row with two
-// configured instances has no provable kind, and the route answers 409 instead
-// of guessing one.
-func (s *Service) identifyKind(ctx context.Context, row store.IdentifyCandidate) string {
+// errIdentifyKindConflict reports a body kind that contradicts the kind the
+// release already proves. The operator's choice is refused, never silently
+// dropped: ignoring it would be the same defect as guessing one.
+var errIdentifyKindConflict = errors.New("identify: the body kind contradicts the kind the release proves")
+
+// identifyKindOrder is the only order the two libraries are ever named in. The
+// choice list a 409 carries is built from this array, never from map iteration,
+// so one install always shows the same order.
+var identifyKindOrder = [...]string{string(arr.KindRadarr), string(arr.KindSonarr)}
+
+// resolveIdentifyKind decides which arr library parses the release. The order is
+// explicit and one-pass, strongest evidence first:
+//
+//  1. the media type of the library row the release is matched to — a movie row
+//     and an episode row are proof, not a guess;
+//  2. the kind of the arr instance the row was linked to;
+//  3. the operator's body kind;
+//  4. the only enabled connection, when the appliance has exactly one.
+//
+// A body kind that contradicts what the row proves is errIdentifyKindConflict.
+// When the row proves nothing and two libraries are enabled, no kind is chosen:
+// candidates carries both, in identifyKindOrder, so the caller can offer the
+// choice. There is no filename heuristic here — a release that looks like a film
+// is still the operator's call.
+//
+// No kind, no candidates means genuine absence: nothing is enabled. A settings
+// read failure is returned as err so the caller can answer 500; failing to read
+// is never "nothing configured".
+func (s *Service) resolveIdentifyKind(ctx context.Context, row store.IdentifyCandidate, requested string) (string, []string, error) {
+	proven := provenIdentifyKind(row)
+	if proven != "" {
+		if requested != "" && requested != proven {
+			return "", nil, errIdentifyKindConflict
+		}
+		return proven, nil, nil
+	}
+	if requested != "" {
+		return requested, nil, nil
+	}
+	conns, err := arr.ConfiguredConnections(ctx, s.settings)
+	if err != nil {
+		return "", nil, err
+	}
+	choices := make([]string, 0, len(identifyKindOrder))
+	for _, kind := range identifyKindOrder {
+		for _, conn := range conns {
+			if conn.Enabled && conn.Kind == kind {
+				choices = append(choices, kind)
+				break
+			}
+		}
+	}
+	switch len(choices) {
+	case 0:
+		return "", nil, nil
+	case 1:
+		return choices[0], nil, nil
+	default:
+		return "", choices, nil
+	}
+}
+
+// provenIdentifyKind is the kind the release itself proves: the media type of
+// the library row it is matched to, or the arr kind of the instance it was
+// linked to. Empty means an unmatched release that proves nothing.
+func provenIdentifyKind(row store.IdentifyCandidate) string {
 	if kind := arrKindForMediaType(row.MediaType); kind != "" {
 		return kind
 	}
@@ -332,20 +437,17 @@ func (s *Service) identifyKind(ctx context.Context, row store.IdentifyCandidate)
 	case arr.KindRadarr, arr.KindSonarr:
 		return row.Kind
 	}
-	conns, err := arr.ConfiguredConnections(ctx, s.settings)
-	if err != nil {
-		return ""
-	}
-	kinds := make([]string, 0, 1)
-	for _, conn := range conns {
-		if conn.Enabled {
-			kinds = append(kinds, conn.Kind)
-		}
-	}
-	if len(kinds) == 1 {
-		return kinds[0]
-	}
 	return ""
+}
+
+// isIdentifyKind reports whether kind names a library this appliance serves.
+func isIdentifyKind(kind string) bool {
+	switch arr.Kind(kind) {
+	case arr.KindRadarr, arr.KindSonarr:
+		return true
+	default:
+		return false
+	}
 }
 
 // identifyMediaType is the media kind the candidate pool is limited to, empty

@@ -65,6 +65,8 @@ type Service struct {
 //	POST /api/queue/{id}/approve    pending_approval -> extracting
 //	POST /api/queue/{id}/reject     pending_approval -> ignored
 //	POST /api/queue/{id}/identify   parse the release with arr, list candidates
+//	                                (body kind picks the library when the
+//	                                release proves none)
 //	POST /api/queue/{id}/match      persist the operator's library pick
 func RegisterRoutes(mux *http.ServeMux, deps Dependencies) *Service {
 	svc := &Service{

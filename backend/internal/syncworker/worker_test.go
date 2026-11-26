@@ -883,3 +883,47 @@ func TestProcessOnceTranscodeVerificationFailureFailsJob(t *testing.T) {
 		t.Fatalf("staging should be cleaned after a failure: %v", err)
 	}
 }
+
+// TestProcessOnceContainerRefusalIsTerminalFailure pins the failure policy for
+// mux.ErrUnsupportedContainer: a target or destination that is not Matroska is
+// a terminal `failed` status whose message names the container, and the job is
+// never retried (one executor call, one mux attempt, no queued row left).
+func TestProcessOnceContainerRefusalIsTerminalFailure(t *testing.T) {
+	r := newRig(t)
+	jobID := r.newJob(t)
+	audio := r.stage(t, jobID)
+
+	ex := &fakeExecutor{report: stableReport()}
+	mx := &fakeMuxer{err: fmt.Errorf("%w: %s is not a Matroska container (.mkv or .mka)",
+		mux.ErrUnsupportedContainer, r.target)}
+	w := newWorker(t, r, ex, mx, &fakeRescanner{})
+
+	processed, err := w.ProcessOnce(context.Background())
+	if err != nil || !processed {
+		t.Fatalf("ProcessOnce = %v/%v, want true/nil", processed, err)
+	}
+	if len(ex.calls) != 1 {
+		t.Fatalf("executor called %d times, want exactly 1 (no retry)", len(ex.calls))
+	}
+	if len(mx.jobs) != 1 {
+		t.Fatalf("Mux called %d times, want exactly 1 (no retry)", len(mx.jobs))
+	}
+	rec, _, _ := r.store.SyncJobByID(context.Background(), jobID)
+	if rec.Status != statusFailed {
+		t.Fatalf("status = %q, want %q", rec.Status, statusFailed)
+	}
+	if !strings.Contains(rec.ErrorMessage, "container") {
+		t.Fatalf("error_message = %q, want it to mention the container", rec.ErrorMessage)
+	}
+	if _, err := os.Stat(filepath.Dir(audio)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("staging should be cleaned after a terminal failure: %v", err)
+	}
+
+	// Terminal means the row is not requeued: a second pass finds no work.
+	if again, err := w.ProcessOnce(context.Background()); err != nil || again {
+		t.Fatalf("second ProcessOnce = %v/%v, want false/nil (job must not be retried)", again, err)
+	}
+	if len(ex.calls) != 1 || len(mx.jobs) != 1 {
+		t.Fatalf("job was retried: executor %d, mux %d calls", len(ex.calls), len(mx.jobs))
+	}
+}

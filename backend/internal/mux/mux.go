@@ -395,13 +395,32 @@ func (m *Muxer) publish(temp, dest string) error {
 	return nil
 }
 
+// requireMatroska refuses a path whose extension cannot hold Matroska output.
+//
+// mkvmerge only ever writes Matroska, so publishing its bytes under any other
+// extension (an .mp4 target in replace mode, for instance) would silently
+// corrupt the file. Only .mkv and .mka are accepted, case-insensitively. The
+// check runs with destination resolution, before any write.
+func requireMatroska(path string) error {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".mkv", ".mka":
+		return nil
+	}
+	return fmt.Errorf("%w: %s is not a Matroska container (.mkv or .mka)", ErrUnsupportedContainer, path)
+}
+
 // resolveDestination maps Job.OutputMode onto a publish path.
 //
 // replace (the zero value) publishes over the Target. separate canonicalizes
 // Job.OutputDir with EvalSymlinks, requires it to be an existing directory,
 // derives "<basename>.dubarr.mkv" from the Target and fails when that file
-// already exists: no silent overwrite, no auto-suffixing (ADR-0011).
+// already exists: no silent overwrite, no auto-suffixing (ADR-0011). Both
+// modes first refuse a target or destination that is not Matroska, so a
+// refusal happens before any write.
 func resolveDestination(target string, job Job) (mode, dest string, err error) {
+	if err := requireMatroska(target); err != nil {
+		return "", "", err
+	}
 	switch strings.ToLower(strings.TrimSpace(job.OutputMode)) {
 	case "", OutputModeReplace:
 		return OutputModeReplace, target, nil
@@ -426,6 +445,11 @@ func resolveDestination(target string, job Job) (mode, dest string, err error) {
 	}
 	base := strings.TrimSuffix(filepath.Base(target), filepath.Ext(target))
 	dest = filepath.Join(dir, base+SeparateSuffix)
+	// The naming rule already yields a .mkv, but the resolved destination is
+	// what this call publishes into, so it is the path the guard vouches for.
+	if err := requireMatroska(dest); err != nil {
+		return "", "", err
+	}
 	if _, err := os.Lstat(dest); err == nil {
 		return "", "", fmt.Errorf("%w: %s", ErrOutputExists, dest)
 	} else if !errors.Is(err, os.ErrNotExist) {

@@ -1237,3 +1237,99 @@ func TestArrGateCriteriaBlockAndForceOverride(t *testing.T) {
 		t.Fatalf("forced Mux with no arr row: %v", err)
 	}
 }
+
+// TestMuxContainerGuardRefusesNonMatroska pins the container guard: mkvmerge
+// only ever writes Matroska, so a target (replace) or destination (separate)
+// that is not .mkv/.mka is refused before the work copy exists. A refusal must
+// leave the target byte-identical, no temp and no .bak behind, and the
+// caller-owned staging untouched. The check is extension-based and
+// case-insensitive on purpose.
+func TestMuxContainerGuardRefusesNonMatroska(t *testing.T) {
+	for _, mode := range []string{OutputModeReplace, OutputModeSeparate} {
+		for _, ext := range []string{".mp4", ".MP4", ".avi", ".m2ts"} {
+			t.Run(mode+"/"+ext, func(t *testing.T) {
+				h := newHarness(t)
+				// The fixture bytes are Matroska; only the name is foreign, which
+				// is exactly what a mux into an .mp4 target would publish over.
+				h.target = copyFixture(t, fixtureTarget, h.dir, "Movie (2021) [TDARR]"+ext)
+				job := h.job()
+				if mode == OutputModeSeparate {
+					job.OutputMode = OutputModeSeparate
+					job.OutputDir = filepath.Join(h.dir, "output")
+					if err := os.MkdirAll(job.OutputDir, 0o755); err != nil {
+						t.Fatalf("mkdir output: %v", err)
+					}
+				}
+
+				targetHash := sha256File(t, h.target)
+				jobDir := filepath.Join(h.work, "jobs", "42")
+				stagingBefore := snapshot(t, jobDir)
+
+				_, err := New(Dependencies{}).Mux(context.Background(), job)
+				if !errors.Is(err, ErrUnsupportedContainer) {
+					t.Fatalf("Mux error = %v, want ErrUnsupportedContainer", err)
+				}
+				if !strings.Contains(err.Error(), filepath.Base(h.target)) {
+					t.Errorf("error %q should name the offending path %s", err, h.target)
+				}
+
+				if got := sha256File(t, h.target); got != targetHash {
+					t.Errorf("target hash = %s, want unchanged %s", got, targetHash)
+				}
+				if leftovers, err := tempLeftovers(h.target); err != nil {
+					t.Fatalf("list temps: %v", err)
+				} else if len(leftovers) > 0 {
+					t.Errorf("temp files left after a container refusal: %v", leftovers)
+				}
+				if _, err := os.Stat(h.target + ".bak"); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf(".bak created by a refused mux: %v", err)
+				}
+				// No work copy: the refusal happens before Copy-on-Work.
+				if _, err := os.Stat(filepath.Join(jobDir, "target"+filepath.Ext(h.target))); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("work copy staged for a refused mux: %v", err)
+				}
+				// The staging directory belongs to the caller (the sync worker
+				// removes it); a pre-write refusal leaves it byte-identical.
+				if got := snapshot(t, jobDir); !reflect.DeepEqual(got, stagingBefore) {
+					t.Errorf("caller staging changed on a refused mux:\n got %v\nwant %v", got, stagingBefore)
+				}
+				if mode == OutputModeSeparate {
+					entries, err := os.ReadDir(job.OutputDir)
+					if err != nil {
+						t.Fatalf("read output dir: %v", err)
+					}
+					if len(entries) != 0 {
+						t.Errorf("output dir entries = %v, want none", entries)
+					}
+				}
+			})
+		}
+	}
+}
+
+// TestMuxContainerGuardAcceptsMatroska is the positive half: .mkv, .MKV and
+// .mka targets still publish, and the guard never blocks a legitimate mux.
+func TestMuxContainerGuardAcceptsMatroska(t *testing.T) {
+	for _, ext := range []string{".mkv", ".MKV", ".mka"} {
+		t.Run(ext, func(t *testing.T) {
+			h := newHarness(t)
+			h.target = copyFixture(t, fixtureTarget, h.dir, "Movie (2021) [TDARR]"+ext)
+			beforeHash := sha256File(t, h.target)
+
+			res, err := New(Dependencies{}).Mux(context.Background(), h.job())
+			if err != nil {
+				t.Fatalf("Mux: %v", err)
+			}
+			if res.OutputPath != h.target {
+				t.Fatalf("OutputPath = %q, want %q", res.OutputPath, h.target)
+			}
+			if got := sha256File(t, h.target); got == beforeHash {
+				t.Error("target content unchanged, mux did not publish")
+			}
+			if got := sha256File(t, h.target+".bak"); got != beforeHash {
+				t.Errorf(".bak hash = %s, want original %s", got, beforeHash)
+			}
+			noTempsLeft(t, h.target)
+		})
+	}
+}

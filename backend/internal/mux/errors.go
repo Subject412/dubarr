@@ -41,4 +41,9 @@ var (
 	// deliberately no copy+delete fallback: it would lose atomicity
 	// (ADR-0011).
 	ErrCrossDevice = errors.New("mux: cannot publish across filesystems")
+	// ErrUnsupportedContainer reports a target or destination whose
+	// extension is not Matroska (.mkv/.mka). mkvmerge always writes
+	// Matroska, so publishing into any other container would corrupt it. It
+	// is checked with the destination, before any write.
+	ErrUnsupportedContainer = errors.New("mux: target container cannot hold the muxed output")
 )

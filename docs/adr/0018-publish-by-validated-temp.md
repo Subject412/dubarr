@@ -33,6 +33,36 @@ overwritten by design on each publish — it is the previous good copy, not a
 history. With automatic re-application (ADR-0017) a `.bak` would be created on
 every arr upgrade, so it defaults to off.
 
+### Where it would live, and why that is a problem
+
+`<target>.mkv.bak` sits **in the media library, beside the film**. That breaks the
+rule the rest of the setup depends on: the library folder belongs to Radarr and
+Sonarr, and nothing else writes files there. arr ignores unknown extensions when
+scanning, so it will not import the `.bak`, but it is still a stray file in a
+directory dubarr does not own — and the surrounding pipeline (a transcoder
+watching the library, a cleaner that removes "trash" files) has every right to
+delete it, making it a backup that quietly disappears.
+
+Neither Radarr nor Sonarr keeps a backup of a replaced file; they move the old
+one to their own recycle bin, or drop it. **Proposed: remove `.bak` entirely.**
+Validation before the rename is the safety mechanism, the Audio Vault already
+holds the audio, and a copy beside the target is storage cost in a directory
+dubarr does not own. Pending confirmation before the option is deleted.
+
+## Staleness check before publish
+
+A mux takes minutes, and the media manager does not wait for it. If arr replaces
+the target mid-mux — an upgrade lands while dubarr is working — the file on disk
+at publish time is **not** the file that was copied into `WORK_DIR`. Renaming the
+temp over it would overwrite a brand-new release with a mux built from the old
+one: the upgrade would be destroyed, and it would look like a successful mux.
+
+So the target's identity is re-read immediately before the rename — size, mtime
+and inode, compared against what was captured when the copy was taken. If it
+moved, the temp is discarded, nothing is published, and the target is re-queued
+against the new file. The window between the check and the rename is
+unavoidable; it is microseconds, where the mux itself is minutes.
+
 ## Crash safety
 
 Every failure removes only the temp files that call created and leaves the

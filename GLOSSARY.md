@@ -189,3 +189,12 @@ _Avoid_: recycle bin, deleted
 Applying the vault naming scheme to files already archived — a previewed plan of source-to-destination moves, applied only on approval. Planned (issue #47), not implemented.
 _Avoid_: rename job, cleanup
 
+**Pipeline Tag**:
+A tag in the target's filename that marks a stage of the operator's own pipeline
+rather than a property of the match — in the reference setup, "this file has been
+through the upstream video pipeline". Muxing before that stage is wasted work,
+because the pipeline later cleans the container and drops the added track. Treat
+the Processing Gate as an ordering constraint, not just an eligibility check
+(ADR-0005, ADR-0017).
+_Avoid_: quality tag, match tag
+

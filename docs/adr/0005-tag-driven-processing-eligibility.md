@@ -14,6 +14,12 @@ An empty required-tag list is neutral (ADR-0012): nothing is blocked until the o
 
 We accept that eligibility depends on metadata another tool writes, rather than owning that processing step. Filename tags keep the gate dependency-free and testable, and they let any external pipeline drive eligibility by renaming, without Dubarr importing another product's API.
 
-Status: accepted
+Status: accepted.
+
+Note: the tag is not only a match filter. In the reference deployment it is a
+**pipeline-stage marker** — it means the upstream video pipeline has finished
+with the file — and muxing before that stage loses the work when the pipeline
+replaces the container (ADR-0017). Treat the gate as an ordering constraint, not
+just an eligibility check.
 
 Supersedes: ADR-0005's original title and framing ("Tdarr eligibility via filename tags, not a Tdarr API", "the marker must be something Tdarr actually writes"). Amended by ADR-0009.

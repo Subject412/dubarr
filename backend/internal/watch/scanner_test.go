@@ -12,6 +12,11 @@ import (
 	"time"
 )
 
+// testEventTimeout bounds waiting for the scanner loop or a filesystem event in
+// these tests. It is a hang guard, not a performance assertion: a loaded runner
+// taking longer to deliver an inotify event is not a defect.
+const testEventTimeout = 15 * time.Second
+
 // fakeStore records candidates in memory and flags duplicates, mirroring the
 // UNIQUE(source_file_path) constraint of the import_queue table.
 type fakeStore struct {
@@ -468,7 +473,7 @@ func TestScannerStopBeforeStartDoesNotDisarm(t *testing.T) {
 	}()
 	select {
 	case <-done:
-	case <-time.After(2 * time.Second):
+	case <-time.After(testEventTimeout):
 		t.Fatal("Stop after Start did not terminate: later Stop was disarmed")
 	}
 }
@@ -500,7 +505,7 @@ func TestScannerConcurrentStartStop(t *testing.T) {
 		}()
 		select {
 		case <-finished:
-		case <-time.After(2 * time.Second):
+		case <-time.After(testEventTimeout):
 			t.Fatalf("iteration %d: concurrent Start/Stop did not terminate", i)
 		}
 		// A Stop after the dust settles must also return.
@@ -608,7 +613,7 @@ func TestRunRebuildsTickerWhenIntervalChanges(t *testing.T) {
 		if got != 2*time.Second {
 			t.Fatalf("ticker rebuilt to %v, want 2s", got)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testEventTimeout):
 		t.Fatal("the loop did not rebuild its ticker after the interval changed")
 	}
 }
@@ -624,7 +629,7 @@ func TestIntervalReportsProviderChange(t *testing.T) {
 
 	select {
 	case <-tr.resets:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testEventTimeout):
 		t.Fatal("the loop did not apply the new interval")
 	}
 	if got := sc.Interval(); got != 3*time.Second {

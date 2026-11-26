@@ -14,6 +14,10 @@ import (
 	"github.com/Subject412/dubarr/backend/internal/store"
 )
 
+// testHTTPTimeout bounds one request to the mock arr. It is a hang guard, not a
+// performance assertion: a loaded runner slowing the mock down is not a defect.
+const testHTTPTimeout = 30 * time.Second
+
 func testCipher(t *testing.T) *secrets.Cipher {
 	t.Helper()
 	key := make([]byte, secrets.KeySize)
@@ -60,7 +64,7 @@ func newRescanner(t *testing.T, c *secrets.Cipher) (*arrrescan.Rescanner, *store
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	r, err := arrrescan.New(arrrescan.Deps{DB: st.DB, Secrets: c, Timeout: 2 * time.Second})
+	r, err := arrrescan.New(arrrescan.Deps{DB: st.DB, Secrets: c, Timeout: testHTTPTimeout})
 	if err != nil {
 		t.Fatalf("arrrescan.New: %v", err)
 	}

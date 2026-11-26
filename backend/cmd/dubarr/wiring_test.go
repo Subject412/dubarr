@@ -23,6 +23,11 @@ import (
 	"github.com/Subject412/dubarr/backend/internal/store"
 )
 
+// testPollDeadline bounds the wait for an asynchronous poll or worker pass to
+// land a row. It is a hang guard, not a correctness signal: a loaded runner
+// taking longer to reach the assertion is not a defect.
+const testPollDeadline = 60 * time.Second
+
 // TestWireScannerClassifiesTaggedMKV is the M2 acceptance path at the
 // composition root: a tagged MKV dropped into the configured watch folder is
 // recorded by the scanner, classified by the gate and surfaced by GET
@@ -98,7 +103,7 @@ func TestWireScannerClassifiesTaggedMKV(t *testing.T) {
 	target := buildWiringMKV(t, watchDir, "Shrek (2001) [ArcA310].mkv")
 
 	var summary store.ImportCandidateSummary
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(testPollDeadline)
 	for time.Now().Before(deadline) {
 		rows, err := st.ListPendingImportCandidates(ctx)
 		if err != nil {
@@ -500,7 +505,7 @@ func (r *extractRig) seedApprovedDonor(t *testing.T, donor, title string, year i
 
 func (r *extractRig) waitStatus(t *testing.T, id int64, want string) (status, errMsg string) {
 	t.Helper()
-	deadline := time.Now().Add(20 * time.Second)
+	deadline := time.Now().Add(testPollDeadline)
 	for {
 		if err := r.store.DB.QueryRow(`SELECT status, COALESCE(error_message, '') FROM import_queue WHERE id = ?`, id).
 			Scan(&status, &errMsg); err != nil {

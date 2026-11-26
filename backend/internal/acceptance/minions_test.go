@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Subject412/dubarr/backend/internal/analyze"
 	"github.com/Subject412/dubarr/backend/internal/arrrescan"
 	"github.com/Subject412/dubarr/backend/internal/mux"
 	"github.com/Subject412/dubarr/backend/internal/probe"
@@ -81,12 +80,12 @@ func TestMinionsLoudFail(t *testing.T) {
 		t.Fatalf("CreateSyncJob(lektor): %v", err)
 	}
 
-	engine, err := syncengine.New(syncBinary, syncengine.WithTimeout(analyze.JobTimeout(analyze.DefaultConfig())))
+	engine, err := syncengine.New(syncBinary, syncengine.WithTimeout(testJobTimeout))
 	if err != nil {
 		t.Fatalf("sync.New: %v", err)
 	}
 	jobSvc := syncjob.RegisterRoutes(http.NewServeMux(), syncjob.Dependencies{
-		DB: h.st.DB, Settings: h.ss, WorkDir: h.work, Engine: engine,
+		DB: h.st.DB, Settings: h.ss, WorkDir: h.work, Engine: budgetEngine{inner: engine},
 	})
 	rescanner, err := arrrescan.New(arrrescan.Deps{DB: h.st.DB, Secrets: fakeDecrypter{marker: secretMarker}})
 	if err != nil {

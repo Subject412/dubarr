@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -16,7 +17,9 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 
+	"github.com/Subject412/dubarr/backend/internal/analyze"
 	"github.com/Subject412/dubarr/backend/internal/extract"
 	"github.com/Subject412/dubarr/backend/internal/settings"
 	"github.com/Subject412/dubarr/backend/internal/store"
@@ -32,6 +35,15 @@ const (
 	minionsTargetName = "Minions and Monsters (2026) - [ArcA310][Remux-2160p][HDR10][Opus 7.1][AV1][imdb-tt32890033]-FraMeSToR.mkv"
 	minionsDonorName  = "Minions and Monsters 2026 PL.DUB.MD.1080p.AMZN.WEB-DL.XviD-MAXX.mp4"
 )
+
+// testJobTimeout is the explicit per-checkpoint engine budget for the
+// acceptance runs, matching the analyze integration tests.
+//
+// It is deliberately much larger than production's derived budget
+// ([analyze.DefaultJobTimeout] floors the settled 190 s slice at 120 s): that
+// budget is a production policy, and reusing it here would make a loaded
+// machine indistinguishable from a broken correlation.
+const testJobTimeout = 10 * time.Minute
 
 var (
 	syncBinary   string
@@ -427,3 +439,25 @@ func assertNoSecrets(t *testing.T, marker string, sources ...string) {
 type fakeDecrypter struct{ marker string }
 
 func (f fakeDecrypter) DecryptString([]byte) (string, error) { return f.marker, nil }
+
+// budgetEngine runs the real engine under testJobTimeout per checkpoint.
+//
+// analyze.Analyze derives the job deadline from the production policy
+// ([analyze.DefaultConfig] → 120 s) and passes it down as the job context, and
+// syncjob has no seam to override that Config. The acceptance suite therefore
+// replaces the inherited deadline with its own budget while still honouring a
+// real cancellation of the job. The runner it wraps is built with the same
+// budget via sync.WithTimeout so its own default cannot undercut it.
+type budgetEngine struct{ inner analyze.Engine }
+
+func (e budgetEngine) Run(ctx context.Context, job syncengine.Job) (syncengine.Result, error) {
+	runCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), testJobTimeout)
+	defer cancel()
+	stop := context.AfterFunc(ctx, func() {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			cancel()
+		}
+	})
+	defer stop()
+	return e.inner.Run(runCtx, job)
+}

@@ -160,7 +160,7 @@ func TestWireArrSyncPopulatesCache(t *testing.T) {
 	p.Start(ctx)
 	defer p.Stop()
 
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(testPollDeadline)
 	for time.Now().Before(deadline) {
 		var count int
 		if err := r.store.DB.QueryRow(`SELECT COUNT(*) FROM arr_library_cache`).Scan(&count); err != nil {

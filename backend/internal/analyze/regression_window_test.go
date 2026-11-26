@@ -36,7 +36,7 @@ func TestRangedReadsMatchWholeFileSlices(t *testing.T) {
 	req.DonorPath = donorPath
 	req.DurationSec = dur
 
-	report, err := Analyze(context.Background(), eng, DefaultConfig(), req)
+	report, err := Analyze(context.Background(), eng, testJobConfig(), req)
 	if err != nil {
 		t.Fatalf("Analyze: %v", err)
 	}

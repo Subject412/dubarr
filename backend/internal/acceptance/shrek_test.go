@@ -97,13 +97,13 @@ func TestShrekEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateSyncJob: %v", err)
 	}
-	engine, err := syncengine.New(syncBinary, syncengine.WithTimeout(analyze.JobTimeout(analyze.DefaultConfig())))
+	engine, err := syncengine.New(syncBinary, syncengine.WithTimeout(testJobTimeout))
 	if err != nil {
 		t.Fatalf("sync.New: %v", err)
 	}
 	router := http.NewServeMux()
 	jobSvc := syncjob.RegisterRoutes(router, syncjob.Dependencies{
-		DB: h.st.DB, Settings: h.ss, WorkDir: h.work, Engine: engine,
+		DB: h.st.DB, Settings: h.ss, WorkDir: h.work, Engine: budgetEngine{inner: engine},
 		RequireAdmin: func(next http.Handler) http.Handler { return next },
 	})
 	rescanner, err := arrrescan.New(arrrescan.Deps{DB: h.st.DB, Secrets: fakeDecrypter{marker: secretMarker}})

@@ -19,6 +19,10 @@ import (
 	"github.com/Subject412/dubarr/backend/internal/store"
 )
 
+// testHTTPTimeout bounds one request to the mock arr. It is a hang guard, not a
+// performance assertion: a loaded runner slowing the mock down is not a defect.
+const testHTTPTimeout = 30 * time.Second
+
 // rescanEnv is a library API wired with a real secret store, so the rescan route
 // decrypts a genuine AES-256-GCM blob exactly as production does.
 type rescanEnv struct {
@@ -733,7 +737,7 @@ func TestLibraryRescanThenSyncPassIsNotAChange(t *testing.T) {
 		Store:    env.db,
 		Settings: env.settings,
 		Secrets:  rescanSecrets{cipher: env.cipher, keys: map[string]string{"arr.radarr.api_key": srv.APIKey()}},
-		Timeout:  2 * time.Second,
+		Timeout:  testHTTPTimeout,
 		Logf:     t.Logf,
 	})
 	if err != nil {

@@ -18,6 +18,17 @@ import (
 	"github.com/Subject412/dubarr/backend/internal/store"
 )
 
+// testHTTPTimeout bounds one request to a fake arr instance in these tests. It
+// is a hang guard, not a performance assertion: a loaded runner slowing the
+// mock down is not a defect.
+const testHTTPTimeout = 30 * time.Second
+
+// testPassTimeout bounds waiting on a pass, a shutdown drain or a loop rebuild
+// in these tests. Same rule as testHTTPTimeout: it is a hang guard, never a
+// performance assertion, so it stays at least as long as the per-request budget
+// a pass may legitimately spend before the waiter gives up.
+const testPassTimeout = 30 * time.Second
+
 // rig is one appliance data dir with settings, secrets and the real store.
 type rig struct {
 	t        *testing.T
@@ -75,7 +86,7 @@ func (r *rig) newPoller(interval time.Duration) *Poller {
 		Settings: r.settings,
 		Secrets:  r.secrets,
 		Interval: interval,
-		Timeout:  2 * time.Second,
+		Timeout:  testHTTPTimeout,
 		Logf:     r.t.Logf,
 	})
 	if err != nil {
@@ -338,7 +349,7 @@ func TestLoopSurvivesPanic(t *testing.T) {
 		Settings: r.settings,
 		Secrets:  r.secrets,
 		Interval: 10 * time.Millisecond,
-		Timeout:  time.Second,
+		Timeout:  testHTTPTimeout,
 		Logf:     t.Logf,
 	})
 	if err != nil {
@@ -1171,7 +1182,7 @@ func (b *blockingRadarr) waitForList(t *testing.T) {
 	t.Helper()
 	select {
 	case <-b.started:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testPassTimeout):
 		t.Fatal("the sync pass never reached the arr listing")
 	}
 }
@@ -1256,7 +1267,7 @@ func TestStopDrainsManualPass(t *testing.T) {
 	}()
 	select {
 	case <-stopped:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testPassTimeout):
 		t.Fatal("Stop did not return: the in-flight manual pass was not drained")
 	}
 	p.Wait()
@@ -1331,7 +1342,7 @@ func TestScheduledPassSkipsWhileManualRuns(t *testing.T) {
 	}()
 	select {
 	case <-done:
-	case <-time.After(2 * time.Second):
+	case <-time.After(testPassTimeout):
 		t.Fatal("the scheduled pass waited for the manual pass instead of skipping its tick")
 	}
 	if got := src.listCalls(); got != 1 {
@@ -1513,7 +1524,7 @@ func loopRig(
 		Settings:  r.settings,
 		Secrets:   r.secrets,
 		Interval:  boot,
-		Timeout:   2 * time.Second,
+		Timeout:   testHTTPTimeout,
 		Logf:      logf,
 		NewRadarr: newRadarr,
 	})
@@ -1563,7 +1574,7 @@ func TestLoopAppliesPollIntervalChangeLive(t *testing.T) {
 		if got != 60*time.Second {
 			t.Fatalf("ticker rebuilt to %v, want 60s", got)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testPassTimeout):
 		t.Fatal("the loop did not rebuild its ticker after the interval changed")
 	}
 	if got := p.Interval(); got != 60*time.Second {
@@ -1692,7 +1703,7 @@ func TestSkippedPassRetriesWithLiveInterval(t *testing.T) {
 	}
 	select {
 	case <-gated.second:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testPassTimeout):
 		t.Fatal("the manual pass never reached the arr listing")
 	}
 

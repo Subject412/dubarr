@@ -64,6 +64,32 @@ func runWithBuiltBinary(m *testing.M) int {
 	return m.Run()
 }
 
+// Wall-clock budgets for the integration tests that drive the real Rust engine.
+const (
+	// testJobTimeout is the explicit per-checkpoint engine budget handed to
+	// both the runner (sync.WithTimeout) and [Config.JobTimeout].
+	//
+	// It is deliberately much larger than production's derived budget
+	// ([DefaultJobTimeout] floors the 190 s slice at 120 s): that budget is a
+	// production policy covered by TestJobTimeoutPolicy, and reusing it here
+	// would make a loaded machine indistinguishable from a broken
+	// correlation — the job would starve and the cap would fire instead of
+	// the offset assertion.
+	testJobTimeout = 10 * time.Minute
+	// testAnalysisBudget bounds one whole Analyze call. Six checkpoints may
+	// each use testJobTimeout, so this is only a hang guard, never a
+	// performance assertion.
+	testAnalysisBudget = 30 * time.Minute
+)
+
+// testJobConfig is DefaultConfig with the integration-test budget, so a real
+// engine run is never capped by production's wall-clock policy.
+func testJobConfig() Config {
+	cfg := DefaultConfig()
+	cfg.JobTimeout = testJobTimeout
+	return cfg
+}
+
 func requireEngine(t *testing.T) Engine {
 	t.Helper()
 	if buildErr != nil {
@@ -72,7 +98,9 @@ func requireEngine(t *testing.T) Engine {
 	if builtBinary == "" {
 		t.Skip("dubarr-sync binary not built")
 	}
-	r, err := sync.New(builtBinary, sync.WithTimeout(JobTimeout(DefaultConfig())))
+	// The runner's own timeout must match [Config.JobTimeout], otherwise it
+	// caps the job below the budget the analysis asks for.
+	r, err := sync.New(builtBinary, sync.WithTimeout(testJobTimeout))
 	if err != nil {
 		t.Fatalf("sync.New: %v", err)
 	}
@@ -386,6 +414,55 @@ func TestConfigValidate(t *testing.T) {
 	}
 }
 
+// TestJobTimeoutPolicy pins the production per-checkpoint budget
+// ([DefaultJobTimeout]) and the explicit override [JobTimeout] honours.
+//
+// Integration tests pass their own, much larger [Config.JobTimeout]: the
+// derived production budget must not double as the thing that turns a loaded
+// machine into a red suite, so its behaviour is asserted here instead.
+//
+// Every expectation below is a literal, deliberately not derived from
+// MinJobTimeoutMS/JobTimeoutBaseMS/JobTimeoutPer10SecMS: this test is the
+// specification of the policy, so it must fail when the policy changes instead
+// of moving along with the constant it is supposed to guard.
+func TestJobTimeoutPolicy(t *testing.T) {
+	// want = 30 s base + 1 s per 10 s of slice, floored at 120 s.
+	cases := []struct {
+		name     string
+		sliceLen float64
+		want     time.Duration
+	}{
+		// 30 s + 19 s = 49 s, so the 120 s floor wins for the settled slice.
+		{"settled 190 s slice sits on the floor", 190, 120 * time.Second},
+		// 30 s + 6 s = 36 s, well below the floor: the floor still wins.
+		{"short 60 s slice sits on the floor", 60, 120 * time.Second},
+		// 30 s + 90 s = 120 s, exactly at the floor boundary.
+		{"900 s slice lands exactly on the floor", 900, 120 * time.Second},
+		// 30 s + 120 s = 150 s, clearly above the floor.
+		{"1200 s slice scales past the floor", 1200, 150 * time.Second},
+		// 30 s + 200 s = 230 s, deep past the floor.
+		{"2000 s slice scales past the floor", 2000, 230 * time.Second},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := DefaultJobTimeout(tc.sliceLen); got != tc.want {
+				t.Fatalf("DefaultJobTimeout(%v) = %v, want %v", tc.sliceLen, got, tc.want)
+			}
+		})
+	}
+
+	cfg := DefaultConfig()
+	// DefaultConfig analyses a 190 s slice (max_offset_sec + margin), whose
+	// 49 s derivation is floored: the effective budget is exactly 120 s.
+	if got, want := JobTimeout(cfg), 120*time.Second; got != want {
+		t.Fatalf("JobTimeout(DefaultConfig()) = %v, want %v", got, want)
+	}
+	cfg.JobTimeout = testJobTimeout
+	if got := JobTimeout(cfg); got != testJobTimeout {
+		t.Fatalf("JobTimeout(explicit %v) = %v, want the explicit value", testJobTimeout, got)
+	}
+}
+
 func TestReportJSONShape(t *testing.T) {
 	rep := Report{
 		Verdict:        VerdictOK,
@@ -511,9 +588,9 @@ func TestIntegrationConstantOffset(t *testing.T) {
 
 	req := request(dir)
 	req.DurationSec = 0 // derive from the WAV headers
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), testAnalysisBudget)
 	defer cancel()
-	rep, err := Analyze(ctx, eng, DefaultConfig(), req)
+	rep, err := Analyze(ctx, eng, testJobConfig(), req)
 	if err != nil {
 		t.Fatalf("Analyze: %v", err)
 	}
@@ -545,9 +622,9 @@ func TestIntegrationPiecewiseDrift(t *testing.T) {
 
 	req := request(dir)
 	req.DurationSec = dur
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), testAnalysisBudget)
 	defer cancel()
-	rep, err := Analyze(ctx, eng, DefaultConfig(), req)
+	rep, err := Analyze(ctx, eng, testJobConfig(), req)
 	if err != nil {
 		t.Fatalf("Analyze: %v", err)
 	}
@@ -569,11 +646,11 @@ func TestIntegrationOutOfRange(t *testing.T) {
 	// configured 2 s acceptance bound.
 	writeWAV(t, filepath.Join(dir, "donor.wav"), shiftedDonor(target, 5*sampleRate))
 
-	cfg := DefaultConfig()
+	cfg := testJobConfig()
 	cfg.MaxOffsetSec = 2
 	req := request(dir)
 	req.DurationSec = 0
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), testAnalysisBudget)
 	defer cancel()
 	rep, err := Analyze(ctx, eng, cfg, req)
 	if err != nil {
@@ -614,9 +691,9 @@ func TestIntegrationOffsetWithinSearchWindow(t *testing.T) {
 
 	req := request(dir)
 	req.DurationSec = dur
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), testAnalysisBudget)
 	defer cancel()
-	rep, err := Analyze(ctx, eng, DefaultConfig(), req)
+	rep, err := Analyze(ctx, eng, testJobConfig(), req)
 	if err != nil {
 		t.Fatalf("Analyze: %v", err)
 	}

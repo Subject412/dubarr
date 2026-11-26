@@ -468,6 +468,10 @@ describe('setup wizard tag filter step', () => {
     expect(await screen.findByRole('heading', { name: 'Languages & tags' })).toBeInTheDocument()
     expect(screen.queryByText(/Tdarr/i)).not.toBeInTheDocument()
     expect(screen.getByLabelText('Add required tag')).toHaveAttribute('placeholder', '[TAG]')
+    // The wizard only offers the filename criterion: nothing applies arr tags.
+    expect(screen.queryByLabelText('Tag source')).toBeNull()
+    expect(screen.queryByLabelText('Add required *arr tag')).toBeNull()
+    expect(screen.queryByLabelText('Add excluded *arr tag')).toBeNull()
 
     const select = screen.getByLabelText('Tag match mode') as HTMLSelectElement
     expect(Array.from(select.options).map((option) => option.value)).toEqual(['ANY', 'ALL', 'REGEX'])
@@ -626,13 +630,23 @@ describe('processing filter (issue #9)', () => {
     const card = filterCard()
     expect(
       within(card).getByText(
-        'Only files that carry a required tag are processed. Add tags found in filenames, or require tags from Radarr/Sonarr.',
+        'Only files that carry a required tag in the filename are processed. Radarr/Sonarr criteria are stored but not applied yet.',
       ),
     ).toBeInTheDocument()
     expect(within(card).queryByText(/Tdarr/i)).toBeNull()
     expect(within(card).queryByText(/ArcA310/)).toBeNull()
 
-    expect(screen.getByLabelText('Tag source')).toHaveValue('filename')
+    // ADR-0017: only the filename source exists — nothing feeds the arr
+    // criterion, so the other modes and their inputs are not offered.
+    const source = screen.getByLabelText('Tag source') as HTMLSelectElement
+    expect(Array.from(source.options).map((option) => option.value)).toEqual(['filename'])
+    expect(source).toHaveValue('filename')
+    expect(source).toBeDisabled()
+    expect(within(card).queryByLabelText('Add required *arr tag')).toBeNull()
+    expect(within(card).queryByLabelText('Add excluded *arr tag')).toBeNull()
+    expect(within(card).queryByRole('button', { name: 'Add folder…' })).toBeNull()
+    expect(within(card).queryByText(/Radarr\/Sonarr root folders/i)).toBeNull()
+
     expect(screen.getByLabelText('Add required tag')).toHaveAttribute('placeholder', '[TAG]')
 
     expect(DEFAULT_SETTINGS['target.tag_filter']).toEqual({
@@ -648,45 +662,76 @@ describe('processing filter (issue #9)', () => {
     })
   })
 
-  it('saves a both-source filter with arr tag labels and a root folder', async () => {
+  it('shows stored arr criteria read-only and sends them back unchanged on save', async () => {
     const user = userEvent.setup()
-    const fetchMock = mockFilterFetch()
+    const stored = {
+      ...storedFilter,
+      source_mode: 'both',
+      required_arr_tags: ['dub'],
+      excluded_arr_tags: ['cam'],
+      root_folder_paths: ['/media/movies'],
+    }
+    const fetchMock = mockFilterFetch(stored)
     renderWithProviders(<SettingsPage />, { route: '/settings' })
     expect(
       await screen.findByRole('heading', { name: 'Process only files tagged as …' }),
     ).toBeInTheDocument()
 
-    const source = screen.getByLabelText('Tag source') as HTMLSelectElement
-    expect(Array.from(source.options).map((option) => option.value)).toEqual([
-      'filename',
-      'arr',
-      'both',
-    ])
-    await user.selectOptions(source, 'both')
-
-    await user.type(screen.getByLabelText('Add required *arr tag'), 'dub{Enter}')
-    await user.type(screen.getByLabelText('Add excluded *arr tag'), 'cam{Enter}')
-
     const card = filterCard()
-    await user.click(within(card).getByRole('button', { name: 'Add folder…' }))
-    const dialog = await screen.findByRole('dialog', { name: 'Add Radarr/Sonarr root folders' })
-    await user.click(within(dialog).getByRole('button', { name: 'Select this folder' }))
+    // The stored mode stays visible in the control — nothing is silently
+    // rewritten — but it cannot be changed back to an arr source.
+    const source = within(card).getByLabelText('Tag source') as HTMLSelectElement
+    expect(Array.from(source.options).map((option) => option.value)).toEqual(['both'])
+    expect(source).toHaveValue('both')
+    expect(source).toBeDisabled()
+    const note = within(card).getByRole('note', { name: 'Stored tag source' })
+    expect(note).toHaveTextContent('Stored tag source: Filename and Radarr/Sonarr tags')
+    expect(note).toHaveTextContent(/not applied yet/i)
+    expect(note).toHaveTextContent('dub')
+    expect(note).toHaveTextContent('cam')
+    expect(note).toHaveTextContent('/media/movies')
+    expect(within(card).queryByLabelText('Add required *arr tag')).toBeNull()
+    expect(within(card).queryByLabelText('Add excluded *arr tag')).toBeNull()
+    expect(within(card).queryByRole('button', { name: 'Add folder…' })).toBeNull()
 
+    // Editing a rendered field proves the save payload is the whole stored
+    // section, not a rebuild from the controls on screen: the invisible arr
+    // values must survive.
+    await user.type(screen.getByLabelText('Add required tag'), 'PL{Enter}')
     await user.click(screen.getByLabelText('Save Process only files tagged as …'))
     await waitFor(() => {
       expect(fetchMock.mock.calls.some(([, init]) => isMethod(init, 'PUT'))).toBe(true)
     })
 
     expect(savedFilter(fetchMock)).toEqual({
-      ...storedFilter,
-      source_mode: 'both',
-      required_arr_tags: ['dub'],
-      excluded_arr_tags: ['cam'],
-      root_folder_paths: ['/media/movies'],
+      ...stored,
+      required_filename_tags: ['[TAG]', 'PL'],
     })
   })
 
-  it('applies the one match-mode control to filename and arr tags', async () => {
+  it('round-trips an arr source mode the operator can no longer pick', async () => {
+    const user = userEvent.setup()
+    const stored = { ...storedFilter, source_mode: 'arr', required_arr_tags: ['pl'] }
+    const fetchMock = mockFilterFetch(stored)
+    renderWithProviders(<SettingsPage />, { route: '/settings' })
+    expect(
+      await screen.findByRole('heading', { name: 'Process only files tagged as …' }),
+    ).toBeInTheDocument()
+
+    const card = filterCard()
+    expect(within(card).getByLabelText('Tag source')).toHaveValue('arr')
+    expect(within(card).getByRole('note', { name: 'Stored tag source' })).toHaveTextContent(
+      'Stored tag source: Radarr/Sonarr tags',
+    )
+
+    await user.click(screen.getByLabelText('Save Process only files tagged as …'))
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([, init]) => isMethod(init, 'PUT'))).toBe(true)
+    })
+    expect(savedFilter(fetchMock)).toEqual(stored)
+  })
+
+  it('applies the match-mode control to the filename tags', async () => {
     const user = userEvent.setup()
     const fetchMock = mockFilterFetch()
     renderWithProviders(<SettingsPage />, { route: '/settings' })

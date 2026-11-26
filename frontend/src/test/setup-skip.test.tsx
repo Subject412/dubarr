@@ -66,7 +66,7 @@ const skipButton = () => screen.queryByRole('button', { name: 'Set up later' })
 /** Walks the rest of the wizard without persisting anything meaningful. */
 async function reachFinishStep(user: ReturnType<typeof userEvent.setup>) {
   await user.type(screen.getByLabelText('Watch folder'), '/media/watch')
-  await user.type(screen.getByLabelText('Vault folder'), '/media/vault')
+  await user.type(screen.getByLabelText('Audio Vault'), '/media/vault')
   await user.click(screen.getByRole('button', { name: /save & continue/i }))
   expect(await screen.findByRole('heading', { name: 'Languages & tags' })).toBeInTheDocument()
   await user.click(screen.getByRole('button', { name: /save & continue/i }))

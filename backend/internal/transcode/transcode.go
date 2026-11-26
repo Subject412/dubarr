@@ -75,8 +75,8 @@ func New(deps Dependencies) *Transcoder {
 	return t
 }
 
-// Request is one Work-Area encode. Input must already be the verified
-// Copy-on-Work artifact; Output must live inside the job's Work Area directory
+// Request is one encode of a copy in the temp folder. Input must already be the
+// verified Copy-on-Work artifact; Output must live inside the job's temp folder
 // (the caller enforces that, ADR-0002).
 type Request struct {
 	Input  string
@@ -159,7 +159,7 @@ func (t *Transcoder) Transcode(ctx context.Context, req Request) (Result, error)
 	if channels == 0 {
 		channels = src.Channels
 	}
-	// Prefer the freshly probed input duration: the Work Area copy is the
+	// Prefer the freshly probed input duration: the temp folder copy is the
 	// artifact ffmpeg actually reads, so a stale legacy audio_tracks.duration_ms
 	// must not fail verification.
 	durationMS := src.DurationMS

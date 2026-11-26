@@ -47,7 +47,7 @@ var (
 	// is checked with the destination, before any write.
 	ErrUnsupportedContainer = errors.New("mux: target container cannot hold the muxed output")
 	// ErrTargetChanged reports a target that is no longer the file this call
-	// copied into the Work Area: size, mtime or inode moved while mkvmerge
+	// copied into the temp folder: size, mtime or inode moved while mkvmerge
 	// ran, so publishing the temp would overwrite a newer release with output
 	// built from the old one (ADR-0018). Nothing is published and the target
 	// is left untouched.

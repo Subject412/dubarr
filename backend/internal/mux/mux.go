@@ -56,7 +56,7 @@ type Candidate struct {
 type Job struct {
 	// ID names {WORK_DIR}/jobs/{id}/ and is the sync_mux_jobs row id.
 	ID int64
-	// WorkDir is storage.paths.work_dir (the Work Area root), not the job dir.
+	// WorkDir is storage.paths.work_dir (the temp folder root), not the job dir.
 	WorkDir string
 	// TargetPath is the library MKV to publish into. Only the Processing Gate and
 	// the copy read it; it is never edited in place.
@@ -184,7 +184,7 @@ func New(deps Dependencies) *Muxer {
 //
 // Order is deliberate: verdict, ambiguity and the Processing Gate are all resolved
 // read-only before the first write, so an abort leaves the target directory and
-// the Work Area untouched. The destination (ADR-0011) is resolved next: replace
+// the temp folder untouched. The destination (ADR-0011) is resolved next: replace
 // mode publishes over the Target, separate mode publishes
 // <basename>.dubarr.mkv in Job.OutputDir and refuses to overwrite an existing
 // file. The target is then copied into {WORK_DIR}/jobs/{id}/, mkvmerge writes a

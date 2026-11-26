@@ -506,7 +506,7 @@ func TestMuxPublishesAtomically(t *testing.T) {
 	}
 
 	// Issue #23: a completed mux leaves no staging behind. The target was
-	// copied into the job's Work Area (Copy-on-Work) and that copy lived in
+	// copied into the job's temp folder (Copy-on-Work) and that copy lived in
 	// the job directory Mux has now removed.
 	if _, err := os.Stat(filepath.Join(h.work, "jobs", "42")); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("job staging still present after a publish: %v", err)

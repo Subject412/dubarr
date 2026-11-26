@@ -185,7 +185,7 @@ describe('first-run wizard arr step (optional)', () => {
     expect(await screen.findByRole('heading', { name: 'Storage paths' })).toBeInTheDocument()
 
     await user.type(screen.getByLabelText('Watch folder'), '/watch')
-    await user.type(screen.getByLabelText('Vault folder'), '/vault')
+    await user.type(screen.getByLabelText('Audio Vault'), '/vault')
     await user.click(screen.getByRole('button', { name: /save & continue/i }))
     expect(await screen.findByRole('heading', { name: 'Languages & tags' })).toBeInTheDocument()
 

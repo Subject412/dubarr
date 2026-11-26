@@ -106,8 +106,8 @@ type Transcoder interface {
 	// EncoderAvailable is the pre-job check: a missing libopus must surface
 	// as ErrEncoderUnavailable before any work happens.
 	EncoderAvailable(ctx context.Context, encoder string) (bool, string)
-	// Transcode performs one ffmpeg pass on the Work Area copy and verifies
-	// the result.
+	// Transcode performs one ffmpeg pass on the copy in the temp folder and
+	// verifies the result.
 	Transcode(ctx context.Context, req transcode.Request) (transcode.Result, error)
 }
 
@@ -129,7 +129,7 @@ type Dependencies struct {
 	// builds the ffmpeg-backed transcoder, so the composition root needs no
 	// extra wiring and a host without ffmpeg fails only the affected job.
 	Transcoder Transcoder
-	// WorkDir is storage.paths.work_dir (the Work Area root). Required.
+	// WorkDir is storage.paths.work_dir (the temp folder root). Required.
 	WorkDir string
 	// Interval is the idle cadence; 0 selects DefaultInterval.
 	Interval time.Duration

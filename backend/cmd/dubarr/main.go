@@ -184,23 +184,13 @@ type server struct {
 	store    *store.Store
 	secrets  *secrets.Service
 	settings *settings.Store
-	scanner  *watch.Scanner
-	extract  *extract.Worker
-	sync     *syncworker.Worker
-	library  *arrsync.Poller
-	mux      *http.ServeMux
-	http     *http.Server
+	// sup owns the pipeline subsystems, including the ones it starts after a
+	// settings save when boot found their settings empty (#53).
+	sup  *subsystemSupervisor
+	mux  *http.ServeMux
+	http *http.Server
 	// logs owns the central slog logger, its ring and optional file sink.
 	logs *logs.Logger
-
-	// scannerCancel stops the watch loop; nil when no scanner was started.
-	scannerCancel context.CancelFunc
-	// extractCancel stops the approval-to-vault worker; nil when disabled.
-	extractCancel context.CancelFunc
-	// syncCancel stops the Execute→mux→rescan worker; nil when disabled.
-	syncCancel context.CancelFunc
-	// libraryCancel stops the arr library poller; nil when disabled.
-	libraryCancel context.CancelFunc
 
 	closeOnce sync.Once
 	closeErr  error
@@ -313,7 +303,7 @@ func newServerWithSecrets(cfg Config, secOpts secrets.Options) (*server, error) 
 		RequireAdmin: authSvc.RequireAdmin,
 	})
 
-	library.RegisterRoutes(mux, library.Dependencies{
+	libraryService := library.RegisterRoutes(mux, library.Dependencies{
 		DB:           st.DB,
 		Settings:     settingsStore,
 		Refresher:    libraryRefresher,
@@ -367,8 +357,14 @@ func newServerWithSecrets(cfg Config, secOpts secrets.Options) (*server, error) 
 		// can still fix storage.paths in the UI and restart.
 		logger.Logger().Warn("watch scanner disabled", "component", "watch", "error", scanErr)
 		scanCancel()
+		scanCancel = nil
 	} else if watchScanner != nil {
 		watchScanner.Start(scanCtx)
+	} else {
+		// No watch_dir yet: release the loop context until the supervisor
+		// builds the scanner after a settings save (#53).
+		scanCancel()
+		scanCancel = nil
 	}
 
 	// M3-4: approval → extraction → vault. The worker consumes rows the user
@@ -420,21 +416,41 @@ func newServerWithSecrets(cfg Config, secOpts secrets.Options) (*server, error) 
 		libraryPoller.Start(libraryCtx)
 	}
 
+	// Issue #53: boot sees the settings the first-run wizard has not written
+	// yet, so a subsystem with an empty setting stays disabled here. The
+	// supervisor re-reads the settings after every successful save and starts
+	// only what is still missing, reusing the same wire* constructors. It
+	// never stops a running subsystem: a path change is a restart, not a swap.
+	sup := newSubsystemSupervisor(supervisorWiring{
+		Settings:      settingsStore,
+		Store:         st,
+		Secrets:       sec,
+		DataDir:       cfg.DataDir,
+		Logger:        logger,
+		AttachLibrary: libraryService.SetRefresher,
+	})
+	sup.adoptBoot(context.Background(), bootSubsystems{
+		Scanner:     watchScanner,
+		ScannerStop: scanCancel,
+		Extract:     extractWorker,
+		ExtractStop: extractCancel,
+		Sync:        syncWorker,
+		SyncStop:    syncCancel,
+		Library:     libraryPoller,
+		LibraryStop: libraryCancel,
+	})
+	// The wizard and the settings editor both go through the settings store,
+	// so one hook covers both save paths.
+	settingsStore.OnWrite(sup.HandleSettingsWrite)
+
 	s := &server{
-		cfg:           cfg,
-		store:         st,
-		secrets:       sec,
-		settings:      settingsStore,
-		scanner:       watchScanner,
-		extract:       extractWorker,
-		sync:          syncWorker,
-		library:       libraryPoller,
-		scannerCancel: scanCancel,
-		extractCancel: extractCancel,
-		syncCancel:    syncCancel,
-		libraryCancel: libraryCancel,
-		mux:           mux,
-		logs:          logger,
+		cfg:      cfg,
+		store:    st,
+		secrets:  sec,
+		settings: settingsStore,
+		sup:      sup,
+		mux:      mux,
+		logs:     logger,
 	}
 	s.http = &http.Server{
 		Addr:              cfg.Listen,
@@ -911,29 +927,8 @@ func (s *server) Handler() http.Handler { return s.mux }
 // call more than once.
 func (s *server) Close() error {
 	s.closeOnce.Do(func() {
-		if s.scannerCancel != nil {
-			s.scannerCancel()
-		}
-		if s.scanner != nil {
-			s.scanner.Stop()
-		}
-		if s.extractCancel != nil {
-			s.extractCancel()
-		}
-		if s.extract != nil {
-			s.extract.Stop()
-		}
-		if s.syncCancel != nil {
-			s.syncCancel()
-		}
-		if s.sync != nil {
-			s.sync.Stop()
-		}
-		if s.libraryCancel != nil {
-			s.libraryCancel()
-		}
-		if s.library != nil {
-			s.library.Stop()
+		if s.sup != nil {
+			s.sup.Stop()
 		}
 		if s.logs != nil {
 			if err := s.logs.Close(); err != nil && s.closeErr == nil {

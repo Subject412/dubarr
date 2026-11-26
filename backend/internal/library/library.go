@@ -15,6 +15,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"net/http"
+	"sync"
 
 	"github.com/Subject412/dubarr/backend/internal/settings"
 	"github.com/Subject412/dubarr/backend/internal/store"
@@ -42,8 +43,11 @@ type Dependencies struct {
 
 // Service holds the resolved dependencies for the registered handlers.
 type Service struct {
-	store        *store.Store
-	settings     *settings.Store
+	store    *store.Store
+	settings *settings.Store
+	// refMu guards refresher: cmd/dubarr publishes a poller built after boot
+	// (#53) while handlers read it.
+	refMu        sync.RWMutex
 	refresher    Refresher
 	secrets      Decrypter
 	requireAdmin func(http.Handler) http.Handler
@@ -76,6 +80,28 @@ func RegisterRoutes(mux *http.ServeMux, deps Dependencies) *Service {
 	mux.Handle("POST /api/library/refresh", admin(svc.handleRefresh))
 	mux.Handle("POST /api/library/items/{id}/rescan", admin(svc.handleRescan))
 	return svc
+}
+
+// SetRefresher publishes a poller built after boot (#53), when no poller
+// existed at route registration. An already-wired refresher is never replaced,
+// so a settings save cannot swap the poller under a live request. A nil
+// argument is ignored.
+func (s *Service) SetRefresher(r Refresher) {
+	if r == nil {
+		return
+	}
+	s.refMu.Lock()
+	if s.refresher == nil {
+		s.refresher = r
+	}
+	s.refMu.Unlock()
+}
+
+// refresherRef returns the currently wired refresher, nil when none exists.
+func (s *Service) refresherRef() Refresher {
+	s.refMu.RLock()
+	defer s.refMu.RUnlock()
+	return s.refresher
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

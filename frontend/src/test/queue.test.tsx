@@ -1,4 +1,4 @@
-import { screen, waitFor, within } from '@testing-library/react'
+import { act, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 import { QueuePage } from '../pages/Queue'
@@ -173,18 +173,29 @@ const unparsableRelease = {
   candidates: [],
 }
 
+// ambiguousEnvelope is the 409 envelope the server sends when both libraries are
+// enabled and the release proves no kind: it names the choice it will accept.
+const ambiguousEnvelope = {
+  error: 'this release is unmatched: choose the arr library to identify it in (radarr or sonarr)',
+  code: 'ambiguous_kind',
+  kinds: ['radarr', 'sonarr'],
+}
+
 /**
- * Identify-aware queue fetch. `identifyFailure` makes the identify route answer
- * 502 with that body; `identifyResult` overrides the 200 verdict the route
- * returns (default: a clean parse with two candidates). Once a match is
- * persisted the list reports the row as matched, so the invalidated query
- * observes the change.
+ * Identify-aware queue fetch. `identifyFailure` makes the FIRST identify
+ * request answer `identifyFailureStatus` (default 502) with that body, so a 409
+ * envelope can be stubbed and a kind-carrying retry can still succeed;
+ * `identifyResult` overrides the 200 verdict the route returns (default: a clean
+ * parse with two candidates). Once a match is persisted the list reports the row
+ * as matched, so the invalidated query observes the change.
  */
 function identifyFetch(
   identifyFailure?: Record<string, unknown>,
   identifyResult: Record<string, unknown> = identifiedRelease,
+  identifyFailureStatus = 502,
 ) {
   let matched = false
+  let identifyRequests = 0
   return vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input)
     if (url.endsWith('/api/queue') && isMethod(init, 'GET')) {
@@ -206,7 +217,10 @@ function identifyFetch(
       return jsonResponse({ items: list })
     }
     if (url.includes('/api/queue/3/identify')) {
-      if (identifyFailure) return jsonResponse(identifyFailure, 502)
+      identifyRequests += 1
+      if (identifyFailure && identifyRequests === 1) {
+        return jsonResponse(identifyFailure, identifyFailureStatus)
+      }
       return jsonResponse(identifyResult)
     }
     if (url.includes('/api/queue/3/match')) {
@@ -218,6 +232,15 @@ function identifyFetch(
     }
     return jsonResponse({ error: 'unexpected' }, 404)
   })
+}
+
+/** The identify POSTs the page actually sent, in order. */
+function identifyCalls(fetchMock: { mock: { calls: unknown[][] } }) {
+  return fetchMock.mock.calls.filter(
+    ([url, init]) =>
+      String(url).includes('/api/queue/3/identify') &&
+      isMethod(init as RequestInit | undefined, 'POST'),
+  )
 }
 
 function emptyQueueFetch(diagnostics?: Record<string, unknown>) {
@@ -546,6 +569,176 @@ describe('approval queue page', () => {
     expect(
       await within(card).findByText(/did not answer the parse request in time/),
     ).toBeInTheDocument()
+  })
+
+  it('offers exactly the libraries the server named and asks once', async () => {
+    // Both libraries are enabled, so the server refuses to guess: it answers
+    // 409 ambiguous_kind naming the choice. The panel must offer exactly those
+    // two, and it must not fire a retry of its own — the operator chooses.
+    const fetchMock = identifyFetch(ambiguousEnvelope, undefined, 409)
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    renderWithProviders(<QueuePage />, { route: '/queue' })
+
+    const card = await screen.findByTestId('queue-item-3')
+    await user.click(within(card).getByRole('button', { name: /identify with arr/i }))
+
+    const panel = await within(card).findByTestId('identify-ambiguous')
+    const buttons = within(panel).getAllByRole('button')
+    expect(buttons.map((button) => button.textContent)).toEqual(['Radarr', 'Sonarr'])
+    // The server's own sentence, so the operator knows why they were asked.
+    expect(within(panel).getByText(/choose the arr library/i)).toBeInTheDocument()
+
+    // One request only: nothing re-asks in the background.
+    expect(identifyCalls(fetchMock)).toHaveLength(1)
+  })
+
+  it('sends the chosen library once and renders the result it gets back', async () => {
+    let releaseIdentify: (() => void) | undefined
+    let identifyRequests = 0
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.endsWith('/api/queue') && isMethod(init, 'GET')) {
+        return jsonResponse({ items })
+      }
+      if (url.includes('/api/queue/3/identify')) {
+        identifyRequests += 1
+        if (identifyRequests === 1) return jsonResponse(ambiguousEnvelope, 409)
+        await new Promise<void>((resolve) => {
+          releaseIdentify = resolve
+        })
+        return jsonResponse(identifiedRelease)
+      }
+      if (url.includes('/api/imports/search-library')) {
+        return jsonResponse({ items: libraryResults })
+      }
+      return jsonResponse({ error: 'unexpected' }, 404)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    renderWithProviders(<QueuePage />, { route: '/queue' })
+
+    const card = await screen.findByTestId('queue-item-3')
+    await user.click(within(card).getByRole('button', { name: /identify with arr/i }))
+    const panel = await within(card).findByTestId('identify-ambiguous')
+    await user.click(within(panel).getByRole('button', { name: 'Sonarr' }))
+
+    // The panel names the library it is parsing in while the request runs.
+    const inFlight = await within(panel).findByTestId('identify-kind-in-flight')
+    expect(inFlight).toHaveTextContent('Identifying against Sonarr…')
+    expect(within(panel).getByRole('button', { name: 'Sonarr' })).toBeDisabled()
+    expect(releaseIdentify).toBeDefined()
+
+    await act(async () => {
+      releaseIdentify?.()
+    })
+
+    // The choice collapses the panel and the verdict renders as it always does.
+    const result = await within(card).findByTestId('identify-result')
+    expect(within(result).getByRole('button', { name: /Kraina Lodu \(2013\)/ })).toBeInTheDocument()
+    expect(within(card).queryByTestId('identify-ambiguous')).not.toBeInTheDocument()
+
+    const calls = identifyCalls(fetchMock)
+    expect(calls).toHaveLength(2)
+    const [, second] = calls
+    expect(JSON.parse(String((second?.[1] as RequestInit | undefined)?.body))).toEqual({
+      kind: 'sonarr',
+    })
+  })
+
+  it('keeps the not_configured guidance and offers no choice', async () => {
+    // An unconfigured appliance is absence, not a choice: the copy stays and no
+    // library button may appear.
+    vi.stubGlobal(
+      'fetch',
+      identifyFetch(
+        { error: 'no arr instance is configured for this release', code: 'not_configured' },
+        undefined,
+        409,
+      ),
+    )
+    const user = userEvent.setup()
+    renderWithProviders(<QueuePage />, { route: '/queue' })
+
+    const card = await screen.findByTestId('queue-item-3')
+    await user.click(within(card).getByRole('button', { name: /identify with arr/i }))
+
+    expect(
+      await within(card).findByText(/arr is not configured for this release/i),
+    ).toBeInTheDocument()
+    expect(within(card).queryByTestId('identify-ambiguous')).not.toBeInTheDocument()
+    expect(within(card).queryAllByRole('button', { name: /^(radarr|sonarr)$/i })).toHaveLength(0)
+  })
+
+  it('renders a kind_conflict refusal as the sentence the server sent', async () => {
+    // The operator can act on this one, so it must not be dressed up as a
+    // generic "Identify failed" dead end.
+    vi.stubGlobal(
+      'fetch',
+      identifyFetch(
+        {
+          error: 'the release belongs to the movie library, not series',
+          code: 'kind_conflict',
+        },
+        undefined,
+        409,
+      ),
+    )
+    const user = userEvent.setup()
+    renderWithProviders(<QueuePage />, { route: '/queue' })
+
+    const card = await screen.findByTestId('queue-item-3')
+    await user.click(within(card).getByRole('button', { name: /identify with arr/i }))
+
+    expect(
+      await within(card).findByText('the release belongs to the movie library, not series'),
+    ).toBeInTheDocument()
+    expect(within(card).queryByText(/Identify failed:/)).not.toBeInTheDocument()
+    expect(within(card).queryByTestId('identify-ambiguous')).not.toBeInTheDocument()
+  })
+
+  it('marks only the row being identified while the request is in flight', async () => {
+    // The identify mutation carries object variables now; comparing that object
+    // to a bare id is always false, so the row's in-flight mark would vanish
+    // without any test noticing. A second unmatched row proves the mark is not
+    // slapped on every row either.
+    let releaseIdentify: (() => void) | undefined
+    const sibling = {
+      ...items[2],
+      id: 30,
+      source_file_path: '/watch/Frozen.2013.PL.mkv',
+      filename: 'Frozen.2013.PL.mkv',
+    }
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.endsWith('/api/queue') && isMethod(init, 'GET')) {
+        return jsonResponse({ items: [...items, sibling] })
+      }
+      if (url.includes('/api/queue/3/identify')) {
+        await new Promise<void>((resolve) => {
+          releaseIdentify = resolve
+        })
+        return jsonResponse(identifiedRelease)
+      }
+      return jsonResponse({ error: 'unexpected' }, 404)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    renderWithProviders(<QueuePage />, { route: '/queue' })
+
+    const card = await screen.findByTestId('queue-item-3')
+    const other = await screen.findByTestId('queue-item-30')
+    await user.click(within(card).getByRole('button', { name: /identify with arr/i }))
+
+    await within(card).findByRole('button', { name: /identifying/i })
+    expect(releaseIdentify).toBeDefined()
+    expect(within(other).getByRole('button', { name: 'Identify with arr' })).toBeInTheDocument()
+    expect(within(other).queryByRole('button', { name: /identifying/i })).not.toBeInTheDocument()
+
+    await act(async () => {
+      releaseIdentify?.()
+    })
+    await within(card).findByTestId('identify-result')
   })
 
   it('shows a clear empty state', async () => {

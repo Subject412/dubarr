@@ -227,14 +227,24 @@ export function useRejectQueueItem(): UseMutationResult<QueueTransition, Error, 
   })
 }
 
+export type IdentifyQueueVariables = {
+  id: number
+  /** The arr library the operator picked after a 409 ambiguous_kind. */
+  kind?: string
+}
+
 /**
  * Identifies one unmatched release with arr's own parser. Deliberately not
  * cached: the operator decides when to ask, and the verdict is not a match
  * until they pick a candidate.
  */
-export function useIdentifyQueueItem(): UseMutationResult<QueueIdentifyResponse, Error, number> {
+export function useIdentifyQueueItem(): UseMutationResult<
+  QueueIdentifyResponse,
+  Error,
+  IdentifyQueueVariables
+> {
   return useMutation({
-    mutationFn: (id) => api.identifyQueueItem(id),
+    mutationFn: ({ id, kind }) => api.identifyQueueItem(id, { kind }),
   })
 }
 

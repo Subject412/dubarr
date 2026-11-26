@@ -100,7 +100,7 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// statusResponse is the public /api/auth/status contract (IDEA.md): whether the
+// statusResponse is the public /api/auth/status contract: whether the
 // first-run admin exists, whether this caller is signed in, whether an OS
 // keyring backend is usable, and which master-key source is pinned. It carries
 // no user identity or secret material.

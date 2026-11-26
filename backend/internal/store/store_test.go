@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-// expectedTables are the nine specification tables from IDEA.md §4 plus the
+// expectedTables are the nine specification tables from the schema spec plus the
 // migration bookkeeping table owned by the runner.
 var expectedTables = []string{
 	"users",

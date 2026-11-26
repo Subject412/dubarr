@@ -24,7 +24,7 @@ func statusBody(t *testing.T, deps Dependencies) (int, map[string]any) {
 	return rec.Code, body
 }
 
-// TestStatusShape pins the IDEA.md contract: initialized/authenticated/
+// TestStatusShape pins the auth status contract: initialized/authenticated/
 // keyring_available, and nothing legacy like setup_required.
 func TestStatusShape(t *testing.T) {
 	st, err := store.Open(t.TempDir())

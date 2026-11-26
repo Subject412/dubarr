@@ -162,3 +162,30 @@ _Avoid_: profile, preset (when meaning a single rule)
 **Log Sink**:
 A destination for redacted log entries: stderr, a bounded in-memory ring buffer for the GUI, or an optional rotating file under DATA_DIR.
 _Avoid_: log target
+
+### Library ownership
+
+**Media Manager**:
+A Radarr or Sonarr instance whose library Dubarr mirrors. Dubarr has no TMDB/TVDB client of its own: it stores the identifiers the media manager reports and never resolves metadata itself (ADR-0014).
+_Avoid_: arr (ambiguous — say which), metadata source
+
+**Mirror Library**:
+Dubarr's read-only view of a Media Manager's movies, series and episodes — titles, years, identifiers and target paths. It is a clone, never a second source of truth: Dubarr never writes it, and a title leaving arr leaves the mirror but not the Audio Vault.
+_Avoid_: cache (when meaning the mirrored library), local library
+
+**Track Identity**:
+What makes a Vault track the same track across time: the arr-reported TMDB/TVDB id plus language and edition. It survives an arr reinstall and is preserved when audio is replaced, so existing jobs and Targets stay valid (ADR-0015).
+_Avoid_: track id, row id
+
+**Orphaned Track**:
+A Vault track whose title has disappeared from the Mirror Library. It is marked, never deleted: a media manager's library cleanup is not a decision about Dubarr's archive.
+_Avoid_: missing, stale, deleted
+
+**Vault Trash**:
+The holding area a removed track, or audio replaced by a better source, is moved to. Emptying it is a separate, explicit purge, and nothing reaches it except an operator action.
+_Avoid_: recycle bin, deleted
+
+**Vault Reorganisation**:
+Applying the vault naming scheme to files already archived — a previewed plan of source-to-destination moves, applied only on approval. Planned (issue #47), not implemented.
+_Avoid_: rename job, cleanup
+

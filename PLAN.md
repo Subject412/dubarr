@@ -1,7 +1,20 @@
 # Dubarr — Implementation Plan
 
-Spec: `IDEA.md`. Domain: `GLOSSARY.md`. Decisions: `docs/adr/0001–0013`. Contract: `AGENTS.md`.
+Spec: `VISION.md`. Domain: `GLOSSARY.md`. Decisions: `docs/adr/0001–0016`. Contract: `AGENTS.md`.
 Execution: subagent-driven-development (fresh implementer per task → spec review → quality review). Gate protocol: **stop for user OK at each milestone gate (M1→M5)**. For issues #1–#13 (M7–M10 below) the user settled on continuous execution with **no stop-for-OK gates**; milestones remain work batches only.
+
+## Status (2026-11-26)
+
+`v0.3.0` is released. M1–M10 are delivered, and M11 (issues #26–#30) shipped in
+0.3.0: the setup-wizard race and opt-in skip, the arr draft test and connection
+diagnostics, library health/routes/page/refresh/rescan, queue match state,
+Identify, the queue triage UI, the 0.3.0 release docs, and the
+`arr_library_cache` identity migration (0006).
+
+Next, not yet broken into tasks: the vault lifecycle defined by ADR-0015 (remove
+to Vault Trash, replace with better audio, mark orphaned tracks) and vault naming
+plus reorganisation (issue #47). Windows support is dropped (ADR-0016).
+
 
 ## Settled defaults (grilling Q1–Q15)
 - `required_filename_tags: []` (empty = neutral, ADR-0012 — a fresh install blocks nothing), `tag_match_mode: ANY`, `tag_case_sensitive: false`, `enforce_tag_filter: true`.
@@ -11,19 +24,19 @@ Execution: subagent-driven-development (fresh implementer per task → spec revi
 - Vault read-only 0444: ON (`settings.security.vault_read_only: true`).
 - `.bak` after verified mux: keep (`settings.mux.keep_bak: true`), opt-in auto-clean.
 - Track title in MKV: `Polski Dubbing` (configurable).
-- Verification: native Linux + Docker (M1/M5); Windows-ready code, Windows CI deferred.
+- Verification: native Linux + Docker. Windows dropped, not deferred (ADR-0016).
 - arr integration: mock-first (httptest), no live instance.
-- Repo: `~/Dokumenty/GitHub/dubarr`, branch main, conventional commits, local-only (remote/push deferred).
+- Repo: `~/Dokumenty/GitHub/dubarr`, conventional commits on branches, merged via PR to `main`.
 
 ## Proposed resolutions (approved Phase 0)
 - Checkpoints (analysis): 6 @ 10/25/40/55/70/85% of shorter duration, 150s windows, 8000 Hz mono `pcm_f32le`. Preview Slices (studio): 60s @ 10/25/50/75/90%.
 - `require_av1_warning: true`, `require_av1_strict: false`.
 - `force_ignore_tag_filter` honored only when `settings.security.allow_force_tag_override: true` (default false).
-- `dubarr-sync --max-offset-sec` default 180.
+- `sync.defaults.max_offset_sec` default 180 — enforced Go-side; the engine CLI has no such flag (only `--selftest`).
 - `--desktop` = open default browser at listen addr (`xdg-open`); no embedded webview v1.
 - Watch scan 10s (stability: two size checks ≥4s apart); arr sync manual + 5-min poll.
 - Go directive 1.26 (floor required by modernc.org/sqlite v1.62; toolchain 1.27), Rust edition 2021, module `github.com/Subject412/dubarr/backend`. Docker build image must be golang 1.27+.
-- License: MIT. Deferred: GitHub remote/push, Windows CI, Linux CI (post-M1).
+- License: MIT.
 
 ## Fixture matrix (testfiles/, originals read-only, tests on copies)
 | Pair | Donor | Target | Proves |
@@ -84,13 +97,13 @@ Full acceptance pass: container zero-env build+start, wizard creates admin + per
 - M4-1 — Rust `dubarr-sync` CLI core (sync-engine/): read WAV PCM slices (hound), compute offset_ms = t_target − t_donor via cross-correlation (rustfft), stdio/JSON output contract; golden tests with synthetic WAVs (known offsets); clap CLI.
 - M4-2 — Go↔Rust bridge: Go invokes the `dubarr-sync` binary (PATH, health-reported), passes job JSON on stdin, parses result; typed errors; timeout; version handshake; absent-binary ⇒ typed error (matches /api/health dubarr-sync:false).
 - M4-3 — Copy-on-Work: jobs copy vault `.mka` + target audio into WORK_DIR (SHA-256 verify against vault manifest), never touch VAULT_DIR (settled: vault write-once + copy-on-work + SHA-256); cleanup on completion/failure.
-- M4-4 — Reference Language Resolver: per IDEA.md priority (same_lang_reference original-language pair first, then policy languages); pure functions + tests over track metadata (probe types). NOTE (reviewer-accepted deviation): IDEA.md:367 prefers "channel count/bitrate" for tie-breaks; probe.AudioTrack carries no bitrate, so channels-then-index is the implemented proxy (documented in reflang.go). If bitrate matters later, extend probe to expose it.
+- M4-4 — Reference Language Resolver: per the Reference Language Resolver priority (same_lang_reference original-language pair first, then policy languages); pure functions + tests over track metadata (probe types). NOTE (reviewer-accepted deviation): IDEA.md:367 prefers "channel count/bitrate" for tie-breaks; probe.AudioTrack carries no bitrate, so channels-then-index is the implemented proxy (documented in reflang.go). If bitrate matters later, extend probe to expose it.
 - M4-5 — Checkpoints + drift: multi-point offset analysis at sync.defaults.checkpoint_positions_pct with checkpoint_window_sec; drift report (per-point offsets, monotonic sanity, max drift); lowpass/same-lang report accuracy tests.
 - M4-6 — Sync job API + status: POST /api/sync/jobs (target_track_id, target_library_cache_id, force_ignore_tag_filter gated by settled allow_force_tag_override=OFF), job status polling, results persisted.
 
 ### M5 tasks (drafted at gate, 2026-11-22)
 - M5-1 — Mux pipeline: tag-gated atomic mux — after a sync job completes with verdict ok/stable, mkvmerge appends/remuxes the synced audio track into a COPY of the target in WORK_DIR (video stream copied, never transcoded; ADR-0004), ambiguity loud-fail (ambiguous donor/target pairing aborts with typed error), result atomically renamed into place next to the target; `.bak` of the original kept (settled: keep .bak, opt-in clean); never writes VAULT_DIR; mux only tag-eligible targets unless allow_force_tag_override.
-- M5-2 — Sync Studio UI: wavesurfer.js job detail view — checkpoints visualization (offsets per checkpoint, verdict badges incl. unreliable), Execute trigger + status polling (M4-6 API), re-run on failure; vault/queue navigation links.
+- M5-2 — Sync Studio UI: SVG checkpoint-chart job detail view — checkpoints visualization (offsets per checkpoint, verdict badges incl. unreliable), Execute trigger + status polling (M4-6 API), re-run on failure; vault/queue navigation links.
 - M5-3 — Background worker: boot-wired Execute consumer in cmd/dubarr (single drain goroutine pattern of M3-4), picks queued sync jobs, runs Execute→mux→rescan chain, panic-safe.
 - M5-4 — arr Rescan: after successful mux, trigger Radarr `RescanMovie` (movieId) / Sonarr `RescanSeries` (seriesId) via the M2 arr clients — NOTE: PLAN originally said DownloadedMoviesScan; corrected after review (that command lacks a movieId field in Radarr v3); best-effort, non-fatal, logged; skip when no arr instance matches the library cache row's instance.
 - M5-5 — Acceptance fixtures runner: scripted end-to-end acceptance using testfiles/ COPIES in scratch (Shrek same-language proof + Minions ambiguity loud-fail), asserting zero vault/video modification, zero untagged mux, no secret leakage in logs/responses.
@@ -100,7 +113,7 @@ Full acceptance pass: container zero-env build+start, wizard creates admin + per
 - M6-1 — Automatic arr library sync: poller (settled 300s interval) walking all enabled arr instances via the M2 clients; upserts `arr_library_cache` (Radarr movies / Sonarr series+episodes) with media identity + target_file_path resolution (existing resolver logic from the M3 bridge reused); diff-safe upsert (update changed rows, keep ids); manual search bridge unchanged on top; mock-first tests.
 - M6-2 — Token-management UI: frontend page for `/api/auth/tokens` (existing backend): list tokens (name, last4, created, last_used), create (name → show full token ONCE), revoke; admin-only nav entry; X-Api-Key usage hint.
 - M6-3 — `.bak` opt-in clean: settings option (storage.options.keep_bak default true per settled); when disabled, successful mux deletes the `.bak` after post-mux validation; UI toggle in settings; mux tests for both modes.
-- M6-4 — Release infrastructure: GitHub Actions release workflow (tag `v*` → build Go backend + Rust sync-engine + frontend embed into release archives: linux amd64/arm64 + windows amd64; checksums); tag guidelines doc (docs/RELEASING.md: semver, tag format, what goes in archives, `dubarr-sync` bundled path expectation).
+- M6-4 — Release infrastructure: GitHub Actions release workflow (tag `v*` → build Go backend + Rust sync-engine + frontend embed into release archives: linux amd64/arm64; checksums); tag guidelines doc (docs/RELEASING.md: semver, tag format, what goes in archives, `dubarr-sync` bundled path expectation).
 
 ## M7–M10 (issues #1–#13; settled 2026-11-23, no stop-for-OK gates)
 
@@ -110,4 +123,4 @@ Source: `.hermes/plans/issues-1-13.md` (grill round 1: Q1–Q23). Decisions: `do
 - **M8** — #6 password change + account menu; #10 arr connection UI (test-connection button; full URL with explicit scheme); #12 logging sinks + `/logs` (redaction at sink); #4 root README + compose/env examples + build-from-source. Deps: #6→#5; #4→#1/#10/#12.
 - **M9** — #8 `org`/`all` reference tokens + prefer-original + wire `original_language_from_arr`; #2 mux output modes + new output root + result persistence; #9 arr tag/root-folder eligibility (migration 0003, ADR 0009). Deps: #10→#9; #8 before #9 (both touch gate); #2 before #11.
 - **M10** — #11 opt-in transcode rules (single ffmpeg encode with tempo, ffprobe verify, ADR 0010). Vault stays write-once/lossless.
-- Out of scope: live arr in tests, Windows CI, Docker socket logs, third-party processing APIs, in-container port override, per-media transcode overrides, git push.
+- Out of scope: live arr in tests, Windows (dropped, ADR-0016), Docker socket logs, third-party processing APIs, in-container port override, per-media transcode overrides, git push.

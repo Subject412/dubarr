@@ -9,6 +9,27 @@ change.
 
 ## [Unreleased]
 
+### Changed
+
+- **Windows support dropped.** The release workflow no longer builds or publishes
+  a `windows_amd64` archive, and no document describes Windows as supported or
+  planned (ADR-0016). Previously the release shipped a Windows zip that the docs
+  called deferred and untested.
+- `IDEA.md` is replaced by `VISION.md`. The WebSocket, 60-second preview slices
+  and `POST /api/mux` documented there were never built and are no longer
+  described anywhere.
+
+### Added
+
+- ADR-0014: metadata is delegated to the media managers — Dubarr mirrors
+  Radarr/Sonarr and has no TMDB/TVDB client of its own.
+- ADR-0015: vault lifecycle — remove a track to the Vault Trash, replace its
+  audio with a better source in place, and mark tracks orphaned when their title
+  leaves arr. Amends ADR-0002: write-once still protects the vault from the
+  pipeline, not from the operator.
+- ADR-0016: Linux only.
+
+
 ## [0.3.0]
 
 Pre-1.0. The HTTP API, settings schema and on-disk layout may still change before

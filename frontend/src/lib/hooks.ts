@@ -24,6 +24,8 @@ import {
   type LogLevel,
   type LogsQuery,
   type LogsResponse,
+  type QueueIdentifyResponse,
+  type QueueMatchResponse,
   type QueueResponse,
   type QueueTransition,
   type SettingsEnvelope,
@@ -219,6 +221,40 @@ export function useRejectQueueItem(): UseMutationResult<QueueTransition, Error, 
   const client = useQueryClient()
   return useMutation({
     mutationFn: (id) => api.rejectQueueItem(id),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: queryKeys.queue })
+    },
+  })
+}
+
+/**
+ * Identifies one unmatched release with arr's own parser. Deliberately not
+ * cached: the operator decides when to ask, and the verdict is not a match
+ * until they pick a candidate.
+ */
+export function useIdentifyQueueItem(): UseMutationResult<QueueIdentifyResponse, Error, number> {
+  return useMutation({
+    mutationFn: (id) => api.identifyQueueItem(id),
+  })
+}
+
+export type MatchQueueVariables = {
+  id: number
+  libraryCacheId: number
+  /** The candidate's identify score, used only for the stored confidence label. */
+  confidence?: number
+}
+
+/** Persists the operator's candidate pick and refreshes the card it belongs to. */
+export function useMatchQueueItem(): UseMutationResult<
+  QueueMatchResponse,
+  Error,
+  MatchQueueVariables
+> {
+  const client = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, libraryCacheId, confidence }) =>
+      api.matchQueueItem(id, libraryCacheId, confidence),
     onSuccess: () => {
       void client.invalidateQueries({ queryKey: queryKeys.queue })
     },

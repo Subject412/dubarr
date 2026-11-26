@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -396,6 +397,171 @@ func TestBaseURLTrailingSlashIsAccepted(t *testing.T) {
 	if err := c.Ping(context.Background()); err != nil {
 		t.Fatalf("Ping: %v", err)
 	}
+}
+
+// TestMovieByIDReadsOneMovie covers the additive per-item read: GET
+// /api/v3/movie/{id} returns the single movie, a missing id maps onto the shared
+// error model, and the API key is sent as X-Api-Key but never echoed in an error.
+func TestMovieByIDReadsOneMovie(t *testing.T) {
+	ctx := context.Background()
+	srv := arrmock.New(arrmock.Radarr, "per-item-radarr-key", arrmock.Fixtures{
+		Movies: []arrmock.Movie{{
+			ID: 7, Title: "Shrek", OriginalTitle: "Shrek (2001 original)", Year: 2001,
+			TmdbID: 808, Path: "/media/movies/Shrek (2001)", FolderName: "Shrek (2001)",
+			QualityProfileID: 4, Monitored: true, HasFile: true,
+			OriginalLanguage: arrmock.Language{ID: 1, Name: "English"},
+		}},
+	})
+	defer srv.Close()
+
+	c, err := arr.NewRadarrClient(srv.URL, srv.APIKey(), time.Second)
+	if err != nil {
+		t.Fatalf("NewRadarrClient: %v", err)
+	}
+	movie, err := c.MovieByID(ctx, 7)
+	if err != nil {
+		t.Fatalf("MovieByID: %v", err)
+	}
+	if movie.ID != 7 || movie.Title != "Shrek" || movie.Year != 2001 {
+		t.Errorf("movie = %+v, want Shrek (2001) id 7", movie)
+	}
+	if movie.OriginalTitle != "Shrek (2001 original)" {
+		t.Errorf("original title = %q, want the arr originalTitle", movie.OriginalTitle)
+	}
+	if movie.Path != "/media/movies/Shrek (2001)" || movie.TmdbID != 808 {
+		t.Errorf("movie path/tmdb = %q/%d", movie.Path, movie.TmdbID)
+	}
+
+	wantPath := "/api/v3/movie/7"
+	var sawGet bool
+	for _, r := range srv.Requests() {
+		if r.Path != wantPath {
+			continue
+		}
+		sawGet = true
+		if r.Method != httpMethodGet {
+			t.Errorf("%s method = %s, want GET", wantPath, r.Method)
+		}
+		if r.APIKey != srv.APIKey() {
+			t.Errorf("%s X-Api-Key = %q, want the configured key", wantPath, r.APIKey)
+		}
+	}
+	if !sawGet {
+		t.Fatalf("no GET %s reached the instance: %+v", wantPath, srv.Requests())
+	}
+
+	_, err = c.MovieByID(ctx, 999)
+	if !errors.Is(err, arr.ErrUnexpectedStatus) {
+		t.Fatalf("MovieByID(999) error = %v, want ErrUnexpectedStatus", err)
+	}
+	var status *arr.StatusError
+	if !errors.As(err, &status) || status.Code != http.StatusNotFound {
+		t.Fatalf("MovieByID(999) error = %v, want a 404 StatusError", err)
+	}
+	if strings.Contains(err.Error(), srv.APIKey()) {
+		t.Fatalf("error %q echoes the API key", err)
+	}
+}
+
+// TestSeriesByIDReadsOneSeries is the Sonarr half of the per-item read: GET
+// /api/v3/series/{id}, the 404 mapping and the key handling.
+func TestSeriesByIDReadsOneSeries(t *testing.T) {
+	ctx := context.Background()
+	srv := arrmock.New(arrmock.Sonarr, "per-item-sonarr-key", arrmock.Fixtures{
+		Series: []arrmock.Series{{
+			ID: 3, Title: "The Expanse", OriginalTitle: "The Expanse (orig)", Year: 2015,
+			TvdbID: 280619, Path: "/media/tv/The Expanse", FolderName: "The Expanse",
+			QualityProfileID: 2, Monitored: true,
+			OriginalLanguage: arrmock.Language{ID: 1, Name: "English"},
+		}},
+	})
+	defer srv.Close()
+
+	c, err := arr.NewSonarrClient(srv.URL, srv.APIKey(), time.Second)
+	if err != nil {
+		t.Fatalf("NewSonarrClient: %v", err)
+	}
+	show, err := c.SeriesByID(ctx, 3)
+	if err != nil {
+		t.Fatalf("SeriesByID: %v", err)
+	}
+	if show.ID != 3 || show.Title != "The Expanse" || show.TvdbID != 280619 {
+		t.Errorf("series = %+v, want The Expanse (tvdb 280619)", show)
+	}
+	if show.OriginalTitle != "The Expanse (orig)" || show.Path != "/media/tv/The Expanse" {
+		t.Errorf("series original title/path = %q/%q", show.OriginalTitle, show.Path)
+	}
+
+	_, err = c.SeriesByID(ctx, 99)
+	if !errors.Is(err, arr.ErrUnexpectedStatus) {
+		t.Fatalf("SeriesByID(99) error = %v, want ErrUnexpectedStatus", err)
+	}
+	var status *arr.StatusError
+	if !errors.As(err, &status) || status.Code != http.StatusNotFound {
+		t.Fatalf("SeriesByID(99) error = %v, want a 404 StatusError", err)
+	}
+	if strings.Contains(err.Error(), srv.APIKey()) {
+		t.Fatalf("error %q echoes the API key", err)
+	}
+}
+
+// TestPerItemReadsErrorModel pins the error mapping of the by-id reads and that
+// no failure text can carry the API key.
+func TestPerItemReadsErrorModel(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("auth failure", func(t *testing.T) {
+		srv := arrmock.New(arrmock.Radarr, "correct-key", radarrFixtures())
+		defer srv.Close()
+
+		c, err := arr.NewRadarrClient(srv.URL, "wrong-key", time.Second)
+		if err != nil {
+			t.Fatalf("NewRadarrClient: %v", err)
+		}
+		if _, err := c.MovieByID(ctx, 7); !errors.Is(err, arr.ErrAuth) {
+			t.Fatalf("MovieByID error = %v, want ErrAuth", err)
+		}
+	})
+
+	t.Run("unexpected status", func(t *testing.T) {
+		srv := arrmock.New(arrmock.Sonarr, "sonarr-key-value", sonarrFixtures())
+		defer srv.Close()
+		srv.FailAll(500)
+
+		c, err := arr.NewSonarrClient(srv.URL, srv.APIKey(), time.Second)
+		if err != nil {
+			t.Fatalf("NewSonarrClient: %v", err)
+		}
+		_, err = c.SeriesByID(ctx, 3)
+		if !errors.Is(err, arr.ErrUnexpectedStatus) {
+			t.Fatalf("SeriesByID error = %v, want ErrUnexpectedStatus", err)
+		}
+		var status *arr.StatusError
+		if !errors.As(err, &status) || status.Code != 500 {
+			t.Fatalf("SeriesByID error = %v, want a 500 StatusError", err)
+		}
+		if strings.Contains(err.Error(), srv.APIKey()) {
+			t.Fatalf("error %q echoes the API key", err)
+		}
+	})
+
+	t.Run("network failure does not echo the key", func(t *testing.T) {
+		const key = "very-distinctive-api-key-value"
+		srv := arrmock.New(arrmock.Radarr, key, radarrFixtures())
+		c, err := arr.NewRadarrClient(srv.URL, key, time.Second)
+		if err != nil {
+			t.Fatalf("NewRadarrClient: %v", err)
+		}
+		srv.Close()
+
+		_, err = c.MovieByID(ctx, 7)
+		if !errors.Is(err, arr.ErrNetwork) {
+			t.Fatalf("MovieByID error = %v, want ErrNetwork", err)
+		}
+		if strings.Contains(err.Error(), key) {
+			t.Fatalf("error %q echoes the API key", err)
+		}
+	})
 }
 
 const httpMethodGet = "GET"

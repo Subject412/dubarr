@@ -58,10 +58,25 @@ export function SetupPage() {
   // oxlint-enable react/set-state-in-effect
 
   // An already-initialised, signed-in visitor does not belong in the wizard.
-  // `adminCreated` keeps this guard from bouncing the wizard mid-flow once the
-  // setup mutation invalidates the auth-status query.
+  // `adminCreated` is set synchronously right after a successful setup mutation,
+  // before any further awaits, so the auth-status refetch that the mutation
+  // invalidates cannot commit while this guard still believes the wizard is unowned.
   if (!adminCreated && status.data?.initialized && status.data.authenticated) {
     return <Navigate to="/library" replace />
+  }
+
+  // Parts of the install the operator would still be missing if they left now.
+  // Purely derived from local state: this drives the warning text only, and the
+  // 'Set up later' escape below performs no writes at all.
+  const unsetParts: string[] = []
+  if (storage.watch_dir.trim() === '') unsetParts.push('watch folder')
+  if (storage.vault_dir.trim() === '') unsetParts.push('vault folder')
+  if ((storage.media_roots ?? []).length === 0) unsetParts.push('media roots')
+
+  const skipSetup = () => {
+    // Deliberately write-free: leave whatever is already persisted untouched and
+    // let the operator finish each section from Settings.
+    navigate('/library', { replace: true })
   }
 
   const saveStep = async (key: string, value: object) => {
@@ -86,11 +101,22 @@ export function SetupPage() {
     }
     try {
       await setup.mutateAsync({ username: username.trim(), password })
-      // /api/auth/setup sets the session cookie itself; fall back to login if a
-      // deployment ever returns 201 without a session.
-      const probe = await api.authStatus()
-      if (!probe.authenticated) await api.login(username.trim(), password)
+      // Claim the wizard before any further await: the mutation invalidates the
+      // auth-status query, and that refetch is delivered on a later macrotask.
+      // If it landed while `adminCreated` was still false the guard above would
+      // redirect to /library and unmount this wizard mid-flow.
       setAdminCreated(true)
+      // /api/auth/setup sets the session cookie itself; fall back to login if a
+      // deployment ever returns 201 without a session. This is best effort and
+      // must never strand the wizard: the account already exists server-side.
+      try {
+        const probe = await api.authStatus()
+        if (!probe.authenticated) await api.login(username.trim(), password)
+      } catch {
+        // /api/auth/setup sets the session cookie itself. If this best-effort
+        // probe fails the account still exists; continue the wizard rather than
+        // stranding the operator on a form that can no longer be submitted.
+      }
       setStep(1)
     } catch (error) {
       if (error instanceof ApiError && error.status === 409) {
@@ -503,9 +529,27 @@ export function SetupPage() {
           )}
         </div>
 
-        <p className="mt-6 text-center text-xs text-zinc-600">
-          Settings can be changed later under Settings → each section saves independently.
-        </p>
+        {/* Secondary escape route. Rendered only once the administrator exists
+            (step 0 is mandatory) and before the Finish step, where 'Open Library'
+            is the same action. It never writes: it just leaves. */}
+        {step >= 1 && step < 5 && (
+          <div className="mt-6 flex flex-col items-center gap-2 text-center text-xs">
+            <p className="text-zinc-600">
+              Settings can be changed later under Settings → each section saves independently.
+            </p>
+            {/* Local `storage` still holds DEFAULT_SETTINGS until the settings
+                query resolves, so a wrong warning would flash for operators who
+                already have paths persisted. Only warn once data has settled. */}
+            {!settings.isPending && settings.data !== undefined && unsetParts.length > 0 && (
+              <p className="text-amber-300/80">
+                Still unset: {unsetParts.join(', ')}. You can finish these under Settings.
+              </p>
+            )}
+            <Button type="button" variant="ghost" size="sm" onClick={skipSetup}>
+              Set up later
+            </Button>
+          </div>
+        )}
       </div>
     </div>
   )

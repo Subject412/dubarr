@@ -32,6 +32,7 @@ import (
 	"github.com/Subject412/dubarr/backend/internal/extract"
 	"github.com/Subject412/dubarr/backend/internal/gate"
 	"github.com/Subject412/dubarr/backend/internal/health"
+	"github.com/Subject412/dubarr/backend/internal/library"
 	"github.com/Subject412/dubarr/backend/internal/logs"
 	"github.com/Subject412/dubarr/backend/internal/mux"
 	"github.com/Subject412/dubarr/backend/internal/queue"
@@ -183,23 +184,13 @@ type server struct {
 	store    *store.Store
 	secrets  *secrets.Service
 	settings *settings.Store
-	scanner  *watch.Scanner
-	extract  *extract.Worker
-	sync     *syncworker.Worker
-	library  *arrsync.Poller
-	mux      *http.ServeMux
-	http     *http.Server
+	// sup owns the pipeline subsystems, including the ones it starts after a
+	// settings save when boot found their settings empty (#53).
+	sup  *subsystemSupervisor
+	mux  *http.ServeMux
+	http *http.Server
 	// logs owns the central slog logger, its ring and optional file sink.
 	logs *logs.Logger
-
-	// scannerCancel stops the watch loop; nil when no scanner was started.
-	scannerCancel context.CancelFunc
-	// extractCancel stops the approval-to-vault worker; nil when disabled.
-	extractCancel context.CancelFunc
-	// syncCancel stops the Execute→mux→rescan worker; nil when disabled.
-	syncCancel context.CancelFunc
-	// libraryCancel stops the arr library poller; nil when disabled.
-	libraryCancel context.CancelFunc
 
 	closeOnce sync.Once
 	closeErr  error
@@ -251,6 +242,44 @@ func newServerWithSecrets(cfg Config, secOpts secrets.Options) (*server, error) 
 	}
 	logger.Logger().Info("dubarr starting", "component", "main", "version", version)
 
+	// Built here and mounted last as the catch-all, so this is the last boot
+	// step that can fail. Every worker context below is created after it, so
+	// no error return can skip a cancel func and leak a context.
+	spa, err := newSPAHandler(web.FS)
+	if err != nil {
+		_ = st.Close()
+		_ = logger.Close()
+		return nil, fmt.Errorf("mount SPA: %w", err)
+	}
+
+	// M6-1: poll Radarr/Sonarr and refresh arr_library_cache so the manual
+	// search bridge and approvals always see the current library. Disabled
+	// (no instances, or a non-positive interval) rather than fatal.
+	//
+	// Built before the routes so POST /api/library/refresh shares this one
+	// poller (and therefore its single pass slot) with the scheduled loop.
+	libraryCtx, libraryCancel := context.WithCancel(context.Background())
+	libraryPoller, libraryErr := wireArrSync(libraryCtx, arrSyncWiring{
+		Settings: settingsStore,
+		Store:    st,
+		Secrets:  sec,
+		Logf:     logger.Logf("arrsync"),
+	})
+	if libraryErr != nil {
+		logger.Logger().Warn("arr library sync disabled", "component", "arrsync", "error", libraryErr)
+		libraryCancel()
+		libraryCancel = nil
+	} else if libraryPoller == nil {
+		libraryCancel()
+		libraryCancel = nil
+	}
+	// A typed nil *arrsync.Poller would satisfy the interface and panic on the
+	// first trigger, so the "disabled" case stays a nil interface.
+	var libraryRefresher library.Refresher
+	if libraryPoller != nil {
+		libraryRefresher = libraryPoller
+	}
+
 	mux := http.NewServeMux()
 
 	authSvc := auth.RegisterRoutes(mux, auth.Dependencies{
@@ -270,6 +299,15 @@ func newServerWithSecrets(cfg Config, secOpts secrets.Options) (*server, error) 
 	queue.RegisterRoutes(mux, queue.Dependencies{
 		DB:           st.DB,
 		Settings:     settingsStore,
+		Secrets:      sec,
+		RequireAdmin: authSvc.RequireAdmin,
+	})
+
+	libraryService := library.RegisterRoutes(mux, library.Dependencies{
+		DB:           st.DB,
+		Settings:     settingsStore,
+		Refresher:    libraryRefresher,
+		Secrets:      sec,
 		RequireAdmin: authSvc.RequireAdmin,
 	})
 
@@ -306,12 +344,6 @@ func newServerWithSecrets(cfg Config, secOpts secrets.Options) (*server, error) 
 		},
 	})
 
-	spa, err := newSPAHandler(web.FS)
-	if err != nil {
-		_ = st.Close()
-		_ = logger.Close()
-		return nil, fmt.Errorf("mount SPA: %w", err)
-	}
 	mux.Handle("/", spa)
 
 	scanCtx, scanCancel := context.WithCancel(context.Background())
@@ -325,8 +357,14 @@ func newServerWithSecrets(cfg Config, secOpts secrets.Options) (*server, error) 
 		// can still fix storage.paths in the UI and restart.
 		logger.Logger().Warn("watch scanner disabled", "component", "watch", "error", scanErr)
 		scanCancel()
+		scanCancel = nil
 	} else if watchScanner != nil {
 		watchScanner.Start(scanCtx)
+	} else {
+		// No watch_dir yet: release the loop context until the supervisor
+		// builds the scanner after a settings save (#53).
+		scanCancel()
+		scanCancel = nil
 	}
 
 	// M3-4: approval → extraction → vault. The worker consumes rows the user
@@ -372,42 +410,47 @@ func newServerWithSecrets(cfg Config, secOpts secrets.Options) (*server, error) 
 		syncCancel = nil
 	}
 
-	// M6-1: poll Radarr/Sonarr and refresh arr_library_cache so the manual
-	// search bridge and approvals always see the current library. Disabled
-	// (no instances, or a non-positive interval) rather than fatal.
-	libraryCtx, libraryCancel := context.WithCancel(context.Background())
-	libraryPoller, libraryErr := wireArrSync(libraryCtx, arrSyncWiring{
-		Settings: settingsStore,
-		Store:    st,
-		Secrets:  sec,
-		Logf:     logger.Logf("arrsync"),
-	})
-	if libraryErr != nil {
-		logger.Logger().Warn("arr library sync disabled", "component", "arrsync", "error", libraryErr)
-		libraryCancel()
-		libraryCancel = nil
-	} else if libraryPoller != nil {
+	// Start the arr loop only after every route is mounted: a boot failure
+	// before this point must not leave a polling goroutine behind.
+	if libraryPoller != nil {
 		libraryPoller.Start(libraryCtx)
-	} else {
-		libraryCancel()
-		libraryCancel = nil
 	}
 
+	// Issue #53: boot sees the settings the first-run wizard has not written
+	// yet, so a subsystem with an empty setting stays disabled here. The
+	// supervisor re-reads the settings after every successful save and starts
+	// only what is still missing, reusing the same wire* constructors. It
+	// never stops a running subsystem: a path change is a restart, not a swap.
+	sup := newSubsystemSupervisor(supervisorWiring{
+		Settings:      settingsStore,
+		Store:         st,
+		Secrets:       sec,
+		DataDir:       cfg.DataDir,
+		Logger:        logger,
+		AttachLibrary: libraryService.SetRefresher,
+	})
+	sup.adoptBoot(context.Background(), bootSubsystems{
+		Scanner:     watchScanner,
+		ScannerStop: scanCancel,
+		Extract:     extractWorker,
+		ExtractStop: extractCancel,
+		Sync:        syncWorker,
+		SyncStop:    syncCancel,
+		Library:     libraryPoller,
+		LibraryStop: libraryCancel,
+	})
+	// The wizard and the settings editor both go through the settings store,
+	// so one hook covers both save paths.
+	settingsStore.OnWrite(sup.HandleSettingsWrite)
+
 	s := &server{
-		cfg:           cfg,
-		store:         st,
-		secrets:       sec,
-		settings:      settingsStore,
-		scanner:       watchScanner,
-		extract:       extractWorker,
-		sync:          syncWorker,
-		library:       libraryPoller,
-		scannerCancel: scanCancel,
-		extractCancel: extractCancel,
-		syncCancel:    syncCancel,
-		libraryCancel: libraryCancel,
-		mux:           mux,
-		logs:          logger,
+		cfg:      cfg,
+		store:    st,
+		secrets:  sec,
+		settings: settingsStore,
+		sup:      sup,
+		mux:      mux,
+		logs:     logger,
 	}
 	s.http = &http.Server{
 		Addr:              cfg.Listen,
@@ -884,29 +927,8 @@ func (s *server) Handler() http.Handler { return s.mux }
 // call more than once.
 func (s *server) Close() error {
 	s.closeOnce.Do(func() {
-		if s.scannerCancel != nil {
-			s.scannerCancel()
-		}
-		if s.scanner != nil {
-			s.scanner.Stop()
-		}
-		if s.extractCancel != nil {
-			s.extractCancel()
-		}
-		if s.extract != nil {
-			s.extract.Stop()
-		}
-		if s.syncCancel != nil {
-			s.syncCancel()
-		}
-		if s.sync != nil {
-			s.sync.Stop()
-		}
-		if s.libraryCancel != nil {
-			s.libraryCancel()
-		}
-		if s.library != nil {
-			s.library.Stop()
+		if s.sup != nil {
+			s.sup.Stop()
 		}
 		if s.logs != nil {
 			if err := s.logs.Close(); err != nil && s.closeErr == nil {

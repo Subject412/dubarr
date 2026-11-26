@@ -217,6 +217,27 @@ export type SettingsExport = {
 
 export type QueueEligibility = 'eligible' | 'waiting_for_tags' | 'missing_target'
 
+/**
+ * Tri-state match outcome: no arr target, matched but not actionable, or
+ * approvable now (gate-eligible target plus a donor).
+ */
+export type QueueMatchState = 'unmatched' | 'matched_no_donor' | 'ready'
+
+/**
+ * Machine-readable cause behind `match_reason`, so the card never has to read
+ * the human sentence. Mirrors the server's closed set: `none` is the ready row,
+ * and a cause the server cannot prove arrives as `unknown`.
+ */
+export type QueueMatchBlocker =
+  | 'none'
+  | 'no_match'
+  | 'no_target'
+  | 'gate_tags'
+  | 'gate_excluded'
+  | 'mount'
+  | 'no_donor'
+  | 'unknown'
+
 export type QueueDonorCandidate = {
   filename: string
   path: string
@@ -245,10 +266,88 @@ export type QueueItem = {
   /** Whether the row carries an arr library identity; when false the operator must match it manually. */
   matched: boolean
   library_title: string
+  /** Tri-state match outcome; `unmatched` exactly when `matched` is false. */
+  match_state: QueueMatchState
+  /** Short human sentence explaining `match_state`, shown on the card. */
+  match_reason: string
+  /**
+   * Machine-readable blocker behind `match_reason`; the card branches on this
+   * and never parses the prose. Absent on older payloads, in which case the
+   * card falls back to a neutral hint rather than guessing a cause.
+   */
+  match_blocker?: QueueMatchBlocker
+  /**
+   * The configured donor filename patterns (blank entries dropped). Empty means
+   * no donor pattern is configured at all, which is a different next step from
+   * "nothing in the folder matched it". Absent on older payloads, in which case
+   * the card does not claim either cause.
+   */
+  donor_patterns?: string[]
+}
+
+/**
+ * Why an empty approval queue is empty. Mirrors the server's `diagnostics`
+ * object: no arr instance at all, configured but never synced, or synced and
+ * failing. `last_pass_at` is the last SUCCESSFUL pass, so a failure leaves it
+ * untouched. The counters are per-instance facts, so they only describe the
+ * installation when they add up to every configured instance.
+ */
+export type QueueDiagnostics = {
+  instances_configured: number
+  never_synced: number
+  sync_failed: number
+  last_pass_at: string | null
+  cache_items: number
+  /**
+   * False when the server could not read the sync health at all: the counts are
+   * then zeroed and say nothing about the installation. Absent on older
+   * payloads, which assert nothing either way.
+   */
+  sync_health_available?: boolean
+  /**
+   * Whether `security.options.allow_force_tag_override` is on: a global
+   * setting, not a per-row fact. When it is, the server accepts a gate-ineligible
+   * target, so its rows arrive as `match_state: 'ready'` and the card enables
+   * Approve without any separate eligibility rule. Absent on older payloads.
+   */
+  force_tag_override?: boolean
 }
 
 export type QueueResponse = {
   items: QueueItem[]
+  /** Absent on older payloads and in test fixtures; the page then says only that the queue is clear. */
+  diagnostics?: QueueDiagnostics
+}
+
+/** One arr library row arr's parse matched, with a deterministic 0..1 score. */
+export type QueueIdentifyCandidate = {
+  library_cache_id: number
+  title: string
+  year: number
+  media_type: string
+  external_item_id: number
+  confidence: number
+  matched_by: string
+}
+
+/** What arr's own parser made of the release name. `parsed` is false when the
+ * instance recognised no title at all — an unparsable release, which is not the
+ * same thing as a library with no matching rows. */
+export type QueueIdentifyParse = {
+  parsed: boolean
+  title: string
+  year: number
+  quality: string
+  confidence: number
+}
+
+export type QueueIdentifyResponse = {
+  parse: QueueIdentifyParse
+  candidates: QueueIdentifyCandidate[]
+}
+
+export type QueueMatchResponse = {
+  match_state: QueueMatchState
 }
 
 export type LibrarySearchItem = {
@@ -390,13 +489,16 @@ export type LogsQuery = {
 
 export class ApiError extends Error {
   readonly status: number
+  /** Machine-readable reason from the error body, when the route sends one. */
+  readonly code?: string
   /** Parsed JSON error body when the server sent one; otherwise undefined. */
   readonly payload: unknown
 
-  constructor(status: number, message: string, payload: unknown = undefined) {
+  constructor(status: number, message: string, code?: string, payload: unknown = undefined) {
     super(message)
     this.name = 'ApiError'
     this.status = status
+    this.code = code
     this.payload = payload
   }
 }
@@ -421,17 +523,24 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 
   if (!response.ok) {
     let message = `Request failed (${response.status})`
+    let code: string | undefined
     let payload: unknown
     try {
       payload = await response.json()
-      if (payload && typeof payload === 'object' && 'error' in payload) {
-        const raw = (payload as { error?: unknown }).error
-        if (typeof raw === 'string' && raw !== '') message = raw
+      if (payload && typeof payload === 'object') {
+        if ('error' in payload) {
+          const raw = (payload as { error?: unknown }).error
+          if (typeof raw === 'string' && raw !== '') message = raw
+        }
+        if ('code' in payload) {
+          const raw = (payload as { code?: unknown }).code
+          if (typeof raw === 'string' && raw !== '') code = raw
+        }
       }
     } catch {
       // Non-JSON error bodies fall back to the status message.
     }
-    throw new ApiError(response.status, message, payload)
+    throw new ApiError(response.status, message, code, payload)
   }
 
   if (response.status === 204) return undefined as T
@@ -499,8 +608,23 @@ export const api = {
       body:
         libraryCacheId == null ? undefined : JSON.stringify({ library_cache_id: libraryCacheId }),
     }),
-  rejectQueueItem: (id: number) =>
-    request<QueueTransition>(`/api/queue/${id}/reject`, { method: 'POST' }),
+  rejectQueueItem: (id: number) => request<QueueTransition>(`/api/queue/${id}/reject`, { method: 'POST' }),
+  /** Asks arr's own parser to identify the release; title overrides the filename stem. */
+  identifyQueueItem: (id: number, title?: string) =>
+    request<QueueIdentifyResponse>(`/api/queue/${id}/identify`, {
+      method: 'POST',
+      body: title ? JSON.stringify({ title }) : undefined,
+    }),
+  /** Persists the operator's pick; the server reports the resulting match state. */
+  matchQueueItem: (id: number, libraryCacheId: number, confidence?: number) =>
+    request<QueueMatchResponse>(`/api/queue/${id}/match`, {
+      method: 'POST',
+      body: JSON.stringify(
+        confidence == null
+          ? { library_cache_id: libraryCacheId }
+          : { library_cache_id: libraryCacheId, confidence },
+      ),
+    }),
   tokens: () => request<ApiTokensResponse>('/api/auth/tokens'),
   createToken: (name: string) =>
     request<ApiTokenCreated>('/api/auth/tokens', {

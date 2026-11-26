@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -331,6 +333,220 @@ func TestSyncLibraryCacheRejectsUnknownMediaType(t *testing.T) {
 		t.Fatal("SyncLibraryCache accepted media_type series")
 	} else if !errors.Is(err, ErrInvalidLibraryItem) {
 		t.Fatalf("error = %v, want ErrInvalidLibraryItem", err)
+	}
+}
+
+// TestSyncRecordsLastSeenAt pins the observation semantics of migration 0005:
+// a second pass over unchanged rows keeps their id and updated_at (content did
+// not change) while last_seen_at moves.
+func TestSyncRecordsLastSeenAt(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	ctx := context.Background()
+	instanceID := syncFixture(t, s, ctx)
+
+	items := []LibraryCacheItem{movieItem(1, "Shrek"), movieItem(2, "Minions")}
+	if _, err := s.SyncLibraryCache(ctx, instanceID, items); err != nil {
+		t.Fatalf("SyncLibraryCache (first pass): %v", err)
+	}
+
+	ids := map[int64]int64{}
+	updated := map[int64]string{}
+	rows, err := s.DB.QueryContext(ctx,
+		`SELECT id, external_item_id, COALESCE(updated_at, ''), COALESCE(last_seen_at, '')
+		 FROM arr_library_cache ORDER BY id`)
+	if err != nil {
+		t.Fatalf("select rows: %v", err)
+	}
+	for rows.Next() {
+		var id, external int64
+		var upd, seen string
+		if err := rows.Scan(&id, &external, &upd, &seen); err != nil {
+			t.Fatalf("scan row: %v", err)
+		}
+		ids[external] = id
+		updated[external] = upd
+		if seen == "" {
+			t.Errorf("first pass did not stamp last_seen_at for external id %d", external)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate rows: %v", err)
+	}
+	_ = rows.Close()
+
+	// Age the observation stamps so the second pass is distinguishable even
+	// within the same second (timestamps are stored with 1 s resolution).
+	if _, err := s.DB.ExecContext(ctx,
+		`UPDATE arr_library_cache SET last_seen_at = '2020-01-01 00:00:00'`); err != nil {
+		t.Fatalf("age last_seen_at: %v", err)
+	}
+
+	stats, err := s.SyncLibraryCache(ctx, instanceID, items)
+	if err != nil {
+		t.Fatalf("SyncLibraryCache (second pass): %v", err)
+	}
+	if stats.Unchanged != 2 || stats.Inserted != 0 || stats.Updated != 0 || stats.Deleted != 0 {
+		t.Fatalf("second pass stats = %+v, want 2 unchanged", stats)
+	}
+
+	for _, external := range []int64{1, 2} {
+		var (
+			id       int64
+			upd      string
+			lastSeen sql.NullString
+		)
+		if err := s.DB.QueryRowContext(ctx,
+			`SELECT id, COALESCE(updated_at, ''), last_seen_at
+			 FROM arr_library_cache WHERE external_item_id = ?`, external).
+			Scan(&id, &upd, &lastSeen); err != nil {
+			t.Fatalf("select row %d: %v", external, err)
+		}
+		if id != ids[external] {
+			t.Errorf("row %d id = %d, want %d (must stay stable)", external, id, ids[external])
+		}
+		if upd != updated[external] {
+			t.Errorf("row %d updated_at = %q, want %q (content did not change)",
+				external, upd, updated[external])
+		}
+		if !lastSeen.Valid || lastSeen.String == "" || lastSeen.String == "2020-01-01 00:00:00" {
+			t.Errorf("row %d last_seen_at = %v, want a fresh stamp", external, lastSeen)
+		}
+	}
+}
+
+// syncHealth is the arr_instances health projection the Library screen reads.
+type syncHealth struct {
+	syncOK    sql.NullInt64
+	syncError sql.NullString
+	attemptAt sql.NullString
+	lastSync  sql.NullString
+}
+
+func readSyncHealth(t *testing.T, s *Store, ctx context.Context, id int64) syncHealth {
+	t.Helper()
+	var h syncHealth
+	if err := s.DB.QueryRowContext(ctx,
+		`SELECT last_sync_ok, last_sync_error, last_attempt_at, last_sync_at
+		 FROM arr_instances WHERE id = ?`, id).
+		Scan(&h.syncOK, &h.syncError, &h.attemptAt, &h.lastSync); err != nil {
+		t.Fatalf("read sync health: %v", err)
+	}
+	return h
+}
+
+// TestFailedPassRecordsHealthAndKeepsSnapshot pins the failure contract: the
+// last ATTEMPT is recorded (ok=0, cause, attempt stamp) while the last SUCCESS
+// and every cached row stay exactly as they were.
+func TestFailedPassRecordsHealthAndKeepsSnapshot(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	ctx := context.Background()
+	instanceID := syncFixture(t, s, ctx)
+
+	if _, err := s.SyncLibraryCache(ctx, instanceID, []LibraryCacheItem{movieItem(1, "Shrek")}); err != nil {
+		t.Fatalf("SyncLibraryCache: %v", err)
+	}
+	if err := s.TouchArrInstanceSync(ctx, instanceID); err != nil {
+		t.Fatalf("TouchArrInstanceSync: %v", err)
+	}
+	before := readSyncHealth(t, s, ctx, instanceID)
+	if !before.syncOK.Valid || before.syncOK.Int64 != 1 || !before.lastSync.Valid || before.lastSync.String == "" {
+		t.Fatalf("pre-failure health = %+v, want ok=1 with last_sync_at", before)
+	}
+	var cacheID int64
+	var cacheUpdated string
+	if err := s.DB.QueryRowContext(ctx,
+		`SELECT id, COALESCE(updated_at, '') FROM arr_library_cache`).Scan(&cacheID, &cacheUpdated); err != nil {
+		t.Fatalf("read cache row: %v", err)
+	}
+
+	cause := "arr: list radarr movies: dial tcp 10.0.0.5:7878: connection refused"
+	if err := s.RecordArrInstanceSyncFailure(ctx, instanceID, cause); err != nil {
+		t.Fatalf("RecordArrInstanceSyncFailure: %v", err)
+	}
+
+	after := readSyncHealth(t, s, ctx, instanceID)
+	if !after.syncOK.Valid || after.syncOK.Int64 != 0 {
+		t.Errorf("last_sync_ok = %v, want 0", after.syncOK)
+	}
+	if !after.syncError.Valid || after.syncError.String != cause {
+		t.Errorf("last_sync_error = %v, want %q", after.syncError, cause)
+	}
+	if !after.attemptAt.Valid || after.attemptAt.String == "" {
+		t.Error("last_attempt_at not stamped on a failed pass")
+	}
+	if after.lastSync != before.lastSync {
+		t.Errorf("last_sync_at = %v, want %v (a failure must not rewrite the last success)",
+			after.lastSync, before.lastSync)
+	}
+
+	var gotID int64
+	var gotUpdated string
+	if err := s.DB.QueryRowContext(ctx,
+		`SELECT id, COALESCE(updated_at, '') FROM arr_library_cache`).Scan(&gotID, &gotUpdated); err != nil {
+		t.Fatalf("re-read cache row: %v", err)
+	}
+	if gotID != cacheID || gotUpdated != cacheUpdated {
+		t.Errorf("cache row = %d/%q, want %d/%q (snapshot must survive a failed pass)",
+			gotID, gotUpdated, cacheID, cacheUpdated)
+	}
+
+	// A pathological cause is capped, and credentials are redacted even if a
+	// caller forgot to scrub them.
+	if err := s.RecordArrInstanceSyncFailure(ctx, instanceID,
+		"boom api_key=super-secret-value "+strings.Repeat("x", 900)); err != nil {
+		t.Fatalf("RecordArrInstanceSyncFailure (long cause): %v", err)
+	}
+	capped := readSyncHealth(t, s, ctx, instanceID)
+	if len(capped.syncError.String) != SyncHealthCauseLimit {
+		t.Errorf("stored cause length = %d, want %d", len(capped.syncError.String), SyncHealthCauseLimit)
+	}
+	if strings.Contains(capped.syncError.String, "super-secret-value") {
+		t.Errorf("stored cause leaked an API key: %q", capped.syncError.String)
+	}
+}
+
+// TestSyncSuccessClearsPreviousError pins the recovery path: the next good pass
+// sets ok=1 and clears the stored error.
+func TestSyncSuccessClearsPreviousError(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	ctx := context.Background()
+	instanceID := syncFixture(t, s, ctx)
+
+	if err := s.RecordArrInstanceSyncFailure(ctx, instanceID, "arr: GET /movie: HTTP 500"); err != nil {
+		t.Fatalf("RecordArrInstanceSyncFailure: %v", err)
+	}
+	if h := readSyncHealth(t, s, ctx, instanceID); !h.syncError.Valid || h.syncOK.Int64 != 0 {
+		t.Fatalf("health after failure = %+v, want a stored error", h)
+	}
+
+	if _, err := s.SyncLibraryCache(ctx, instanceID, []LibraryCacheItem{movieItem(1, "Shrek")}); err != nil {
+		t.Fatalf("SyncLibraryCache: %v", err)
+	}
+	if err := s.TouchArrInstanceSync(ctx, instanceID); err != nil {
+		t.Fatalf("TouchArrInstanceSync: %v", err)
+	}
+
+	h := readSyncHealth(t, s, ctx, instanceID)
+	if !h.syncOK.Valid || h.syncOK.Int64 != 1 {
+		t.Errorf("last_sync_ok = %v, want 1", h.syncOK)
+	}
+	if h.syncError.Valid {
+		t.Errorf("last_sync_error = %q, want NULL after a successful pass", h.syncError.String)
+	}
+	if !h.lastSync.Valid || h.lastSync.String == "" || !h.attemptAt.Valid {
+		t.Errorf("health = %+v, want last_sync_at and last_attempt_at stamped", h)
 	}
 }
 

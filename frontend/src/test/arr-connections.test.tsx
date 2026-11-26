@@ -153,7 +153,7 @@ describe('arr connection base URL validation', () => {
 
 describe('arr diagnostics line', () => {
   function diagnostics(payload: Record<string, unknown>) {
-    return new ApiError(502, 'connection test failed', payload)
+    return new ApiError(502, 'connection test failed', undefined, payload)
   }
 
   it('brackets an IPv6 host so the port stays unambiguous', () => {

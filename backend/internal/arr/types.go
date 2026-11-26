@@ -24,8 +24,10 @@ type Tag struct {
 
 // Movie is the subset of a Radarr /api/v3/movie record Dubarr needs.
 type Movie struct {
-	ID               int      `json:"id"`
-	Title            string   `json:"title"`
+	ID    int    `json:"id"`
+	Title string `json:"title"`
+	// OriginalTitle is arr's originalTitle, empty when the instance omits it.
+	OriginalTitle    string   `json:"originalTitle"`
 	Year             int      `json:"year"`
 	TmdbID           int      `json:"tmdbId"`
 	Path             string   `json:"path"`
@@ -42,8 +44,10 @@ type Movie struct {
 
 // Series is the subset of a Sonarr /api/v3/series record Dubarr needs.
 type Series struct {
-	ID               int    `json:"id"`
-	Title            string `json:"title"`
+	ID    int    `json:"id"`
+	Title string `json:"title"`
+	// OriginalTitle is arr's originalTitle, empty when the instance omits it.
+	OriginalTitle    string `json:"originalTitle"`
 	Year             int    `json:"year"`
 	TvdbID           int    `json:"tvdbId"`
 	Path             string `json:"path"`

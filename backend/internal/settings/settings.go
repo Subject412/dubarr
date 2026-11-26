@@ -37,6 +37,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Subject412/dubarr/backend/internal/langtoken"
@@ -282,11 +283,42 @@ type ArrConnections struct {
 // Store reads and writes settings sections on the shared database handle.
 type Store struct {
 	db *sql.DB
+
+	// hookMu guards onWrite: writes may run concurrently with the composition
+	// root registering the hook, and the hook itself must run without this
+	// lock held (it reads settings back).
+	hookMu  sync.RWMutex
+	onWrite func(keys []string)
 }
 
 // New wraps an open database handle. It does not seed; call Seed once at
 // startup.
 func New(db *sql.DB) *Store { return &Store{db: db} }
+
+// OnWrite registers fn to run after every successful write (Set or Apply) with
+// the section keys written. cmd/dubarr uses it to start subsystems whose
+// settings became complete after boot (#53), so a wizard save takes effect
+// without a restart. Passing nil removes the hook.
+//
+// fn runs after the write commits and without any store lock held, so it may
+// read settings; it must not write them, which would recurse. It runs on the
+// writing goroutine, so it must stay cheap: register it before the API starts
+// serving.
+func (s *Store) OnWrite(fn func(keys []string)) {
+	s.hookMu.Lock()
+	s.onWrite = fn
+	s.hookMu.Unlock()
+}
+
+// notifyWrite runs the registered write hook, if any.
+func (s *Store) notifyWrite(keys ...string) {
+	s.hookMu.RLock()
+	fn := s.onWrite
+	s.hookMu.RUnlock()
+	if fn != nil {
+		fn(keys)
+	}
+}
 
 // DB exposes the underlying handle (used by the API layer for browse roots).
 func (s *Store) DB() *sql.DB { return s.db }
@@ -498,6 +530,7 @@ func (s *Store) Set(ctx context.Context, key string, raw json.RawMessage) error 
 		key, normalized, time.Now().UTC().Format("2006-01-02 15:04:05")); err != nil {
 		return fmt.Errorf("settings: write %s: %w", key, err)
 	}
+	s.notifyWrite(key)
 	return nil
 }
 
@@ -536,6 +569,7 @@ func (s *Store) Apply(ctx context.Context, updates map[string]json.RawMessage) e
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("settings: commit apply: %w", err)
 	}
+	s.notifyWrite(keys...)
 	return nil
 }
 

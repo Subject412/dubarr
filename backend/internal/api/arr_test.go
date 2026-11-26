@@ -318,9 +318,23 @@ func TestArrConnectionTestRejectsBadKeyWithoutLeaking(t *testing.T) {
 		t.Fatalf("test error leaked the API key: %s", body)
 	}
 
-	// Testing an unconfigured kind is a client error, not a crash.
-	if code, body := h.do(http.MethodPost, "/api/settings/arr/sonarr/test", nil); code != http.StatusNotFound && code != http.StatusBadRequest {
-		t.Fatalf("test unconfigured = %d: %s", code, body)
+	// Testing an unknown/unconfigured kind with no body is a 404: the handler
+	// looks the kind up in the saved connections and finds nothing.
+	if code, body := h.do(http.MethodPost, "/api/settings/arr/sonarr/test", nil); code != http.StatusNotFound {
+		t.Fatalf("test unconfigured = %d, want 404: %s", code, body)
+	}
+
+	// A draft base URL is enough to test a kind with no saved instance: the
+	// request pings the draft, so it is neither a 404 nor a 400.
+	draft := arrmock.New(arrmock.Sonarr, "draft-sonarr-key", arrmock.Fixtures{})
+	t.Cleanup(draft.Close)
+	if code, body := h.do(http.MethodPost, "/api/settings/arr/sonarr/test", map[string]any{
+		"base_url": draft.URL, "api_key": "draft-sonarr-key",
+	}); code != http.StatusOK {
+		t.Fatalf("test with draft url and no saved instance = %d, want 200: %s", code, body)
+	}
+	if reqs := draft.Requests(); len(reqs) != 1 || reqs[0].APIKey != "draft-sonarr-key" {
+		t.Fatalf("draft pings = %+v", reqs)
 	}
 }
 
@@ -502,5 +516,250 @@ func TestArrConcurrentUpsertsKeepBothConnections(t *testing.T) {
 			t.Fatalf("duplicate instance for %s: %+v", inst.Kind, list.Instances)
 		}
 		seen[inst.Kind] = true
+	}
+}
+
+// arrSectionSnapshot reads the raw arr.connections section so a test can prove
+// a request left the persisted metadata byte-identical.
+func arrSectionSnapshot(t *testing.T, h *harness) string {
+	t.Helper()
+	var section string
+	if err := h.db.QueryRow(`SELECT value FROM settings WHERE key = ?`, settings.KeyArrConnections).Scan(&section); err != nil {
+		t.Fatalf("read arr section: %v", err)
+	}
+	return section
+}
+
+// TestArrConnectionTestUsesDraftValuesWithoutPersisting pins the draft test:
+// the ping must reach the base URL and key from the request body, while the
+// saved connection and its stored secret stay byte-identical.
+func TestArrConnectionTestUsesDraftValuesWithoutPersisting(t *testing.T) {
+	h, sec := newArrHarness(t)
+	h.setupAdmin()
+	const savedKey = "saved-radarr-key"
+	const draftKey = "draft-radarr-key"
+
+	saved := arrmock.New(arrmock.Radarr, savedKey, arrmock.Fixtures{})
+	t.Cleanup(saved.Close)
+	draft := arrmock.New(arrmock.Radarr, draftKey, arrmock.Fixtures{})
+	t.Cleanup(draft.Close)
+
+	if code, body := h.do(http.MethodPut, "/api/settings/arr/radarr", map[string]any{
+		"base_url": saved.URL, "api_key": savedKey, "enabled": true,
+	}); code != http.StatusOK {
+		t.Fatalf("create = %d: %s", code, body)
+	}
+	before := arrSectionSnapshot(t, h)
+
+	code, body := h.do(http.MethodPost, "/api/settings/arr/radarr/test", map[string]any{
+		"base_url": draft.URL,
+		"api_key":  draftKey,
+	})
+	if code != http.StatusOK {
+		t.Fatalf("draft test = %d: %s", code, body)
+	}
+
+	// The draft instance was pinged with the draft key; the saved one was not.
+	if reqs := draft.Requests(); len(reqs) != 1 || reqs[0].Path != "/api/v3/system/status" || reqs[0].APIKey != draftKey {
+		t.Fatalf("draft pings = %+v", reqs)
+	}
+	if reqs := saved.Requests(); len(reqs) != 0 {
+		t.Fatalf("saved instance was pinged instead of the draft: %+v", reqs)
+	}
+
+	// Nothing persisted: same section bytes, same secret, same listing.
+	if after := arrSectionSnapshot(t, h); after != before {
+		t.Fatalf("draft test rewrote the section:\nbefore=%s\nafter=%s", before, after)
+	}
+	if key, err := sec.Get("arr.radarr.api_key"); err != nil || key != savedKey {
+		t.Fatalf("stored key after draft test = %q, %v", key, err)
+	}
+	list := h.listArr()
+	if len(list.Instances) != 1 || list.Instances[0].BaseURL != saved.URL ||
+		list.Instances[0].APIKey != secrets.Mask(savedKey) {
+		t.Fatalf("listing after draft test = %+v", list.Instances)
+	}
+}
+
+// TestArrConnectionTestBlankDraftKeyUsesStoredKey covers "blank key field means
+// keep the stored key" for an empty and a whitespace-only draft: both must fall
+// back to the saved secret instead of being sent as an empty X-Api-Key.
+func TestArrConnectionTestBlankDraftKeyUsesStoredKey(t *testing.T) {
+	const savedKey = "stored-sonarr-key"
+	for _, draftKey := range []string{"", "   "} {
+		t.Run(fmt.Sprintf("draft key %q", draftKey), func(t *testing.T) {
+			h, sec := newArrHarness(t)
+			h.setupAdmin()
+			fake := arrmock.New(arrmock.Sonarr, savedKey, arrmock.Fixtures{})
+			t.Cleanup(fake.Close)
+
+			if code, body := h.do(http.MethodPut, "/api/settings/arr/sonarr", map[string]any{
+				"base_url": "http://sonarr-old:8989", "api_key": savedKey, "enabled": true,
+			}); code != http.StatusOK {
+				t.Fatalf("create = %d: %s", code, body)
+			}
+			before := arrSectionSnapshot(t, h)
+
+			code, body := h.do(http.MethodPost, "/api/settings/arr/sonarr/test", map[string]any{
+				"base_url": fake.URL,
+				"api_key":  draftKey,
+			})
+			if code != http.StatusOK {
+				t.Fatalf("draft test with blank key = %d: %s", code, body)
+			}
+			if reqs := fake.Requests(); len(reqs) != 1 || reqs[0].APIKey != savedKey {
+				t.Fatalf("pings = %+v, want the stored key", reqs)
+			}
+			if after := arrSectionSnapshot(t, h); after != before {
+				t.Fatalf("blank-key test rewrote the section: %s", after)
+			}
+			if key, err := sec.Get("arr.sonarr.api_key"); err != nil || key != savedKey {
+				t.Fatalf("stored key after blank-key test = %q, %v", key, err)
+			}
+
+			// No stored key and no usable draft key is still the 400 the saved
+			// path returns: a whitespace-only key counts as absent.
+			h2, _ := newArrHarness(t)
+			h2.setupAdmin()
+			code, body = h2.do(http.MethodPost, "/api/settings/arr/radarr/test", map[string]any{
+				"base_url": fake.URL,
+				"api_key":  draftKey,
+			})
+			if code != http.StatusBadRequest {
+				t.Fatalf("draft test without any key = %d, want 400: %s", code, body)
+			}
+			if !bytes.Contains(body, []byte("api_key is not configured")) {
+				t.Fatalf("draft test without any key body = %s", body)
+			}
+		})
+	}
+}
+
+// TestArrConnectionTestInvalidDraftBaseURLIsBadRequest mirrors the upsert: a
+// malformed draft URL is a client error, never a 502 from the client ctor.
+func TestArrConnectionTestInvalidDraftBaseURLIsBadRequest(t *testing.T) {
+	h, sec := newArrHarness(t)
+	h.setupAdmin()
+	fake := arrmock.New(arrmock.Radarr, "abcdef-1234", arrmock.Fixtures{})
+	t.Cleanup(fake.Close)
+
+	if code, body := h.do(http.MethodPut, "/api/settings/arr/radarr", map[string]any{
+		"base_url": fake.URL, "api_key": "abcdef-1234", "enabled": true,
+	}); code != http.StatusOK {
+		t.Fatalf("create = %d: %s", code, body)
+	}
+	before := arrSectionSnapshot(t, h)
+
+	upsertCode, upsertBody := h.do(http.MethodPut, "/api/settings/arr/radarr", map[string]any{
+		"base_url": "not-a-url", "api_key": "abcdef-1234",
+	})
+	testCode, testBody := h.do(http.MethodPost, "/api/settings/arr/radarr/test", map[string]any{
+		"base_url": "not-a-url",
+	})
+	if upsertCode != http.StatusBadRequest {
+		t.Fatalf("upsert with bad url = %d: %s", upsertCode, upsertBody)
+	}
+	if testCode != http.StatusBadRequest {
+		t.Fatalf("test with bad draft url = %d, want 400: %s", testCode, testBody)
+	}
+	if !bytes.Contains(testBody, []byte("base_url must be an absolute http(s) URL")) {
+		t.Fatalf("test error = %s, want the upsert's validation message", testBody)
+	}
+	if reqs := fake.Requests(); len(reqs) != 0 {
+		t.Fatalf("invalid draft URL was still pinged: %+v", reqs)
+	}
+	if after := arrSectionSnapshot(t, h); after != before {
+		t.Fatalf("invalid draft test rewrote the section: %s", after)
+	}
+	if key, err := sec.Get("arr.radarr.api_key"); err != nil || key != "abcdef-1234" {
+		t.Fatalf("stored key after invalid draft = %q, %v", key, err)
+	}
+}
+
+// TestArrConnectionTestEmptyBodyTestsSavedConnection keeps the pre-draft
+// contract load-bearing: no body, `{}` and blank fields all test what is saved.
+func TestArrConnectionTestEmptyBodyTestsSavedConnection(t *testing.T) {
+	const savedKey = "saved-sonarr-key"
+	for _, tc := range []struct {
+		name string
+		body any
+	}{
+		{"nil body", nil},
+		{"empty object", map[string]any{}},
+		{"blank fields", map[string]any{"base_url": "", "api_key": ""}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, sec := newArrHarness(t)
+			h.setupAdmin()
+			fake := arrmock.New(arrmock.Sonarr, savedKey, arrmock.Fixtures{})
+			t.Cleanup(fake.Close)
+			if code, body := h.do(http.MethodPut, "/api/settings/arr/sonarr", map[string]any{
+				"base_url": fake.URL, "api_key": savedKey, "enabled": true,
+			}); code != http.StatusOK {
+				t.Fatalf("create = %d: %s", code, body)
+			}
+			before := arrSectionSnapshot(t, h)
+
+			code, body := h.do(http.MethodPost, "/api/settings/arr/sonarr/test", tc.body)
+			if code != http.StatusOK {
+				t.Fatalf("test = %d: %s", code, body)
+			}
+			if !bytes.Contains(body, []byte(`"ok":true`)) {
+				t.Fatalf("test body = %s", body)
+			}
+			reqs := fake.Requests()
+			if len(reqs) != 1 || reqs[0].Path != "/api/v3/system/status" || reqs[0].APIKey != savedKey {
+				t.Fatalf("pings = %+v", reqs)
+			}
+			if after := arrSectionSnapshot(t, h); after != before {
+				t.Fatalf("saved-state test rewrote the section: %s", after)
+			}
+			if key, err := sec.Get("arr.sonarr.api_key"); err != nil || key != savedKey {
+				t.Fatalf("stored key after saved-state test = %q, %v", key, err)
+			}
+		})
+	}
+}
+
+// TestArrConnectionTestFailedDraftMutatesNothing checks a 502 from an
+// unreachable draft host still leaves the stored connection and secret alone.
+func TestArrConnectionTestFailedDraftMutatesNothing(t *testing.T) {
+	h, sec := newArrHarness(t)
+	h.setupAdmin()
+	const savedKey = "abcdef-1234"
+	fake := arrmock.New(arrmock.Radarr, savedKey, arrmock.Fixtures{})
+	t.Cleanup(fake.Close)
+	if code, body := h.do(http.MethodPut, "/api/settings/arr/radarr", map[string]any{
+		"base_url": fake.URL, "api_key": savedKey, "enabled": true,
+	}); code != http.StatusOK {
+		t.Fatalf("create = %d: %s", code, body)
+	}
+	before := arrSectionSnapshot(t, h)
+
+	// A closed test server refuses connections, so the ping fails as a network
+	// error without touching any live host.
+	dead := httptest.NewServer(http.NotFoundHandler())
+	deadURL := dead.URL
+	dead.Close()
+
+	code, body := h.do(http.MethodPost, "/api/settings/arr/radarr/test", map[string]any{
+		"base_url": deadURL,
+		"api_key":  "draft-key",
+	})
+	if code != http.StatusBadGateway {
+		t.Fatalf("failed draft test = %d, want 502: %s", code, body)
+	}
+	if bytes.Contains(body, []byte("draft-key")) || bytes.Contains(body, []byte(savedKey)) {
+		t.Fatalf("failed draft test leaked a key: %s", body)
+	}
+	if after := arrSectionSnapshot(t, h); after != before {
+		t.Fatalf("failed draft test rewrote the section: %s", after)
+	}
+	if key, err := sec.Get("arr.radarr.api_key"); err != nil || key != savedKey {
+		t.Fatalf("stored key after failed draft = %q, %v", key, err)
+	}
+	list := h.listArr()
+	if len(list.Instances) != 1 || list.Instances[0].BaseURL != fake.URL {
+		t.Fatalf("listing after failed draft = %+v", list.Instances)
 	}
 }

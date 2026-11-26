@@ -50,9 +50,10 @@ This pulls `subject928/dubarr:latest`, publishes the UI on **8080** and mounts
 `./media` writable at `/media`. Open <http://localhost:8080> and complete the
 first-run wizard. Follow the logs with `docker logs -f dubarr`.
 
-`/media` must be writable because a `replace` mux writes beside the target file.
-If `./media` was created by Docker as root, the container user cannot write to
-it — give it to `PUID`/`PGID` first:
+`/media` must be mounted read-write, not `:ro`, because a `replace` mux writes
+beside the target file — a read-only mount fails with `EACCES` on the first
+replace. If `./media` was created by Docker as root, the container user cannot
+write to it either — give it to `PUID`/`PGID` first:
 
 ```sh
 sudo chown -R 1000:1000 ./media

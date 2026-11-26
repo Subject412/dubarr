@@ -1,6 +1,11 @@
 # Dubarr appliance service — the single documented example stack.
 #
-#   cd docker && docker compose up --build
+#   cd docker && docker compose up -d
+#
+# This file pulls the published image (subject928/dubarr:latest, also available
+# as ghcr.io/subject412/dubarr:latest) instead of building locally. Tags are
+# published as X.Y.Z, X.Y and latest. To build from source instead, see the
+# Development section of the root README.
 #
 # Every value below has an all-defaults `${VAR:-…}` fallback, so this file runs
 # as-is. To adapt it, put overrides in docker/.env (Compose loads it from this
@@ -16,12 +21,15 @@
 # container always listens on 8080, so it never enters the container.
 # CONFIG_PATH and MEDIA_PATH are likewise host-side paths consumed by Compose
 # when it builds the bind mounts — neither ever enters the container.
+#
+# /media is mounted read-write: the default mux.options.output_mode=replace
+# writes the muxed file beside the Target in the same directory (plus an
+# optional .bak), so the library must be writable. The vault, watch and work
+# directories are configured in Settings → Storage and may live under /media or
+# /config; see docker/README.md for a recommended layout.
 services:
   dubarr:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
-    image: dubarr:latest
+    image: subject928/dubarr:${DUBARR_IMAGE_TAG:-latest}
     container_name: dubarr
     restart: unless-stopped
     ports:
@@ -33,6 +41,7 @@ services:
       # Appliance state: database, master keyfile and logs. Persist this and
       # back it up — losing it loses the encrypted secrets.
       - "${CONFIG_PATH:-./config}:/config"
-      # Media roots. Point MEDIA_PATH at the host library; mounted read-only
-      # because the appliance never modifies source media in place.
-      - "${MEDIA_PATH:-./media}:/media:ro"
+      # Media roots. Point MEDIA_PATH at the host library. Writable, because
+      # replace-mode publication writes beside the Target; set
+      # mux.options.output_mode=separate to leave the library untouched.
+      - "${MEDIA_PATH:-./media}:/media"

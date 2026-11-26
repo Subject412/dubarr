@@ -9,10 +9,13 @@ source-build instructions, start at the [root README](../README.md).
 - `entrypoint.sh` — remaps the `dubarr` user to `PUID`/`PGID` (default
   1000/1000), fixes `/config` ownership (0700) and drops privileges with
   `gosu`.
-- `docker-compose.yml` — the canonical, self-documenting appliance example. It
-  carries inline `${VAR:-…}` fallbacks for every knob, so `docker compose up`
-  from this directory works with no `.env`; it documents itself in comments and
-  every variable is listed once in the table below.
+- `docker-compose.yml` — the canonical pull-based appliance service: it runs
+  `subject928/dubarr:latest` (no local build), carries inline `${VAR:-…}`
+  fallbacks for every knob, so `docker compose up` from this directory works
+  with no `.env`; it documents itself in comments and every variable is listed
+  once in the table below. The image is published to Docker Hub
+  (`subject928/dubarr`) and GHCR (`ghcr.io/subject412/dubarr`) with tags
+  `X.Y.Z`, `X.Y` and `latest` by the tag-triggered Docker Release workflow.
 
 ## Compose variables
 
@@ -22,11 +25,12 @@ defaults below are what it uses. A `docker/.env` overrides any of them.
 
 | Variable | Default | Consumed by | Purpose |
 | --- | --- | --- | --- |
-| `PUID` | `1000` | entrypoint, inside the container | uid the `dubarr` process runs as; must own `/config` and be able to read the media mount |
+| `PUID` | `1000` | entrypoint, inside the container | uid the `dubarr` process runs as; must own `/config` and be able to read and write the media mount |
 | `PGID` | `1000` | entrypoint, inside the container | gid for the same process |
 | `CONFIG_PATH` | `./config` | Compose, on the host | host directory bind-mounted at `/config` for appliance state (database, master keyfile, logs); back it up |
-| `MEDIA_PATH` | `./media` | Compose, on the host | host directory bind-mounted read-only at `/media` |
+| `MEDIA_PATH` | `./media` | Compose, on the host | host directory bind-mounted at `/media` (writable) |
 | `DUBARR_PORT` | `8080` | Compose, on the host | published host port for the web UI |
+| `DUBARR_IMAGE_TAG` | `latest` | Compose, on the host | image tag to pull; set `DUBARR_IMAGE_TAG=0.2.0` to pin a published release instead of tracking `latest` |
 
 `PUID` and `PGID` are the only environment variables the image honours.
 `CONFIG_PATH`, `MEDIA_PATH` and `DUBARR_PORT` never enter the container: Compose
@@ -48,26 +52,65 @@ PGID=1000
 CONFIG_PATH=./config
 MEDIA_PATH=/srv/media
 DUBARR_PORT=8090
+DUBARR_IMAGE_TAG=latest
 ```
 
 ## Run
 
-From this directory, with the defaults:
+From the repository root, with the defaults:
 
 ```sh
 cd docker
-docker compose up --build
+mkdir -p media/download media/vault media/content
+sudo chown -R 1000:1000 media        # PUID:PGID
+docker compose up -d
 ```
 
-`docker/.env` overrides `PUID`, `PGID`, `CONFIG_PATH`, `MEDIA_PATH` and
-`DUBARR_PORT` without touching the compose file.
+This pulls `subject928/dubarr:latest` from Docker Hub — no local build. The same
+image is published to `ghcr.io/subject412/dubarr:latest`; swap the `image:` line
+in `docker-compose.yml` to use that registry instead.
+
+To pin a published version instead of tracking `latest`, set
+`DUBARR_IMAGE_TAG` (`DUBARR_IMAGE_TAG=0.2.0` in `docker/.env`); the compose
+file needs no edit.
+
+`docker/.env` overrides `PUID`, `PGID`, `CONFIG_PATH`, `MEDIA_PATH`,
+`DUBARR_PORT` and `DUBARR_IMAGE_TAG` without touching the compose file.
+
+### Media ownership
+
+`MEDIA_PATH` must point at a tree owned by `PUID`/`PGID` (default 1000:1000).
+The default `./media` does not exist in a fresh clone and cannot be tracked, so
+Docker would create `docker/media` as `root:root`; `entrypoint.sh` only fixes
+ownership of `/config`. Replace-mode publication writes the muxed file (and an
+optional `.bak`) beside the Target, so a root-owned bind mount makes every
+publish fail with `EACCES`. Create the tree and chown it before the first `up`,
+as in the commands above, and do the same for any other `MEDIA_PATH`.
+
+### Recommended storage layout
+
+The storage roots are independent settings under **Settings → Storage**: keep
+each on its own directory, never inside another. For a single combined bind
+(`MEDIA_PATH` mounted at `/media`) use:
+
+| Setting | Value |
+| --- | --- |
+| `storage.paths.watch_dir` | `/media/download` |
+| `storage.paths.vault_dir` | `/media/vault` |
+| `storage.paths.media_roots` | `/media/content` |
+| `storage.paths.work_dir` | `/config/work` |
+
+`/config/work` is also the default when `work_dir` is left unset
+(`<DATA_DIR>/work`). `storage.paths.output_dir` is only used when
+`mux.options.output_mode=separate`, and it must not sit inside the vault.
 
 Or build and run without Compose from the repository root:
 
 ```sh
 docker build -f docker/Dockerfile -t dubarr:latest .
 docker run -d --name dubarr -p 8080:8080 \
-  -e PUID=1000 -e PGID=1000 -v "$PWD/docker/config:/config" dubarr:latest
+  -e PUID=1000 -e PGID=1000 \
+  -v "$PWD/docker/config:/config" -v "$PWD/docker/media:/media" dubarr:latest
 ```
 
 The UI is served on the published port (8080 by default).

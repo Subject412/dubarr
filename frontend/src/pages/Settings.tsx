@@ -504,18 +504,6 @@ export function SettingsPage() {
                   checked={draft.allow_force_tag_override}
                   onChange={(allow_force_tag_override) => update({ allow_force_tag_override })}
                 />
-                <Toggle
-                  label="Require AV1 warning acknowledgement"
-                  help={settingsHelp('security.options', 'require_av1_warning')}
-                  checked={draft.require_av1_warning}
-                  onChange={(require_av1_warning) => update({ require_av1_warning })}
-                />
-                <Toggle
-                  label="Require AV1 strict mode"
-                  help={settingsHelp('security.options', 'require_av1_strict')}
-                  checked={draft.require_av1_strict}
-                  onChange={(require_av1_strict) => update({ require_av1_strict })}
-                />
               </>
             )}
           </Section>

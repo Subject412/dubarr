@@ -8,7 +8,7 @@
 //	languages.policy   target/reference languages, commentary exclusion, export mode
 //	target.tag_filter  Processing Gate: filename tags + optional arr tags/roots (ADR-0005, ADR-0009)
 //	sync.defaults      max offset, checkpoint/preview sampling positions
-//	security.options   tag override, AV1 warnings
+//	security.options   tag override
 //	mux.options        keep .bak, track title written into Matroska
 //	audio.options      opt-in Transcode Rules: codec/channels/bitrate/sample rate (ADR-0010)
 //	watch.options      watch-folder scan cadence and stability window
@@ -196,8 +196,6 @@ type SyncDefaults struct {
 // SecurityOptions are appliance-wide safety switches.
 type SecurityOptions struct {
 	AllowForceTagOverride bool `json:"allow_force_tag_override"`
-	RequireAV1Warning     bool `json:"require_av1_warning"`
-	RequireAV1Strict      bool `json:"require_av1_strict"`
 }
 
 // Mux output destination modes (ADR-0011).
@@ -365,8 +363,6 @@ func Defaults(dataDir string) map[string]any {
 		},
 		KeySecurityOptions: SecurityOptions{
 			AllowForceTagOverride: false,
-			RequireAV1Warning:     true,
-			RequireAV1Strict:      false,
 		},
 		KeyMuxOptions: MuxOptions{
 			KeepBak:         true,

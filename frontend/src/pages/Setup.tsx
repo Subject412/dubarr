@@ -458,16 +458,6 @@ export function SetupPage() {
                 checked={security.allow_force_tag_override}
                 onChange={(allow_force_tag_override) => setSecurity({ ...security, allow_force_tag_override })}
               />
-              <Toggle
-                label="Require AV1 warning"
-                checked={security.require_av1_warning}
-                onChange={(require_av1_warning) => setSecurity({ ...security, require_av1_warning })}
-              />
-              <Toggle
-                label="Require AV1 strict mode"
-                checked={security.require_av1_strict}
-                onChange={(require_av1_strict) => setSecurity({ ...security, require_av1_strict })}
-              />
               <div className="flex justify-between">
                 <Button type="button" variant="ghost" onClick={() => setStep(3)}>
                   Back

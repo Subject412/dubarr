@@ -114,8 +114,6 @@ describe('settings section save', () => {
       },
       'security.options': {
         allow_force_tag_override: false,
-        require_av1_warning: true,
-        require_av1_strict: false,
       },
       'mux.options': { keep_bak: true, track_title_in_mkv: 'Polski Dubbing' },
       'watch.options': { scan_interval_sec: 10, stability_check_interval_sec: 4 },
@@ -348,7 +346,7 @@ describe('mux options keep_bak', () => {
   })
 })
 
-describe('security options (vault_read_only retired)', () => {
+describe('security options (vault_read_only and AV1 switches retired)', () => {
   function mockSecurityFetch(): ReturnType<typeof vi.fn> {
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
@@ -360,8 +358,6 @@ describe('security options (vault_read_only retired)', () => {
           settings: {
             'security.options': {
               allow_force_tag_override: false,
-              require_av1_warning: true,
-              require_av1_strict: false,
             },
           },
         })
@@ -372,14 +368,19 @@ describe('security options (vault_read_only retired)', () => {
     return fetchMock
   }
 
-  it('renders the force tag override control and no vault read-only one', async () => {
+  it('renders the force tag override control and no retired switch', async () => {
     mockSecurityFetch()
     renderWithProviders(<SettingsPage />, { route: '/settings' })
     expect(await screen.findByRole('heading', { name: 'Security options' })).toBeInTheDocument()
 
+    expect(
+      screen.getByText('Safety switches for the tag override.'),
+    ).toBeInTheDocument()
     expect(screen.getByRole('switch', { name: 'Allow force tag override' })).toBeInTheDocument()
     expect(screen.queryByRole('switch', { name: 'Vault read-only' })).toBeNull()
     expect(screen.queryByText(/vault read-only/i)).toBeNull()
+    expect(screen.queryByRole('switch', { name: /AV1/i })).toBeNull()
+    expect(screen.queryByText(/AV1/i)).toBeNull()
   })
 })
 

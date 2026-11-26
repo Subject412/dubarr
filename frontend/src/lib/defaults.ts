@@ -47,8 +47,6 @@ export const DEFAULT_SETTINGS: DubarrSettings = {
   },
   'security.options': {
     allow_force_tag_override: false,
-    require_av1_warning: true,
-    require_av1_strict: false,
   },
   'mux.options': {
     keep_bak: true,

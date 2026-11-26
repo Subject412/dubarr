@@ -35,8 +35,6 @@ const SETTINGS = {
   },
   'security.options': {
     allow_force_tag_override: false,
-    require_av1_warning: true,
-    require_av1_strict: false,
   },
   'mux.options': { keep_bak: true, track_title_in_mkv: 'Polski Dubbing' },
   'audio.options': {

@@ -32,10 +32,6 @@ var ErrMissingAPIKey = errors.New("arrsync: arr instance has no API key")
 // poller. A second pass is never queued: the caller gets this sentinel instead.
 var ErrSyncBusy = errors.New("arrsync: a sync pass is already running")
 
-// ErrManualSyncDisabled reports that arr.options.manual_sync is off. A manual
-// trigger then makes no arr request at all; only the poll loop may sync.
-var ErrManualSyncDisabled = errors.New("arrsync: manual sync is disabled")
-
 // ErrPollerStopped rejects a trigger that arrives before Start or after Stop:
 // shutdown wins, and there is no cancellable loop context to run a pass on.
 var ErrPollerStopped = errors.New("arrsync: poller is stopped")
@@ -734,19 +730,10 @@ func (p *Poller) endPass() {
 //
 // The slot is shared with the scheduled loop: a manual pass makes the loop
 // skip its tick, and a Trigger while any pass runs reports ErrSyncBusy instead
-// of queueing. When arr.options.manual_sync is off the trigger is refused with
-// ErrManualSyncDisabled before any arr request is made. A poller that has not
-// been started (or has been stopped) refuses with ErrPollerStopped: there is
-// no cancellable loop context, so the pass could never be drained.
+// of queueing. A poller that has not been started (or has been stopped)
+// refuses with ErrPollerStopped: there is no cancellable loop context, so the
+// pass could never be drained.
 func (p *Poller) Trigger(ctx context.Context, kind string) error {
-	enabled, err := p.manualSyncEnabled(ctx)
-	if err != nil {
-		return err
-	}
-	if !enabled {
-		return ErrManualSyncDisabled
-	}
-
 	p.mu.Lock()
 	if p.stopped {
 		p.mu.Unlock()
@@ -782,35 +769,6 @@ func (p *Poller) Trigger(ctx context.Context, kind string) error {
 		}
 	}()
 	return nil
-}
-
-// manualSyncEnabled reads arr.options.manual_sync for the poller's own settings.
-func (p *Poller) manualSyncEnabled(ctx context.Context) (bool, error) {
-	return ManualSyncEnabled(ctx, p.settings)
-}
-
-// ManualSyncEnabled reads arr.options.manual_sync. An absent section (or a
-// section written before the key existed) means the seeded default, true.
-// Exported so the Library health API can report the same decision the poller
-// enforces instead of keeping its own copy of the rule.
-func ManualSyncEnabled(ctx context.Context, st *settings.Store) (bool, error) {
-	raw, ok, err := st.Get(ctx, settings.KeyArrOptions)
-	if err != nil {
-		return false, fmt.Errorf("arrsync: read %s: %w", settings.KeyArrOptions, err)
-	}
-	if !ok {
-		return true, nil
-	}
-	var opts struct {
-		ManualSync *bool `json:"manual_sync"`
-	}
-	if err := json.Unmarshal(raw, &opts); err != nil {
-		return false, fmt.Errorf("arrsync: decode %s: %w", settings.KeyArrOptions, err)
-	}
-	if opts.ManualSync == nil {
-		return true, nil
-	}
-	return *opts.ManualSync, nil
 }
 
 // Stop cancels the loop and waits for it to exit. Safe to call more than once

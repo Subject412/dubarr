@@ -60,15 +60,12 @@ function pageOf(items: LibraryItem[], url: URL, total = items.length) {
 function mockLibrary({
   instances,
   cacheItems = 0,
-  manualSync = true,
   items,
   refresh,
   rescan,
 }: {
   instances: LibraryHealthInstance[]
   cacheItems?: number
-  /** arr.options.manual_sync, as GET /api/library/health reports it. */
-  manualSync?: boolean
   items: ItemsHandler
   /** POST /api/library/refresh response; defaults to an accepted pass. */
   refresh?: () => Response | Promise<Response>
@@ -78,7 +75,7 @@ function mockLibrary({
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input), 'http://localhost')
     if (url.pathname === '/api/library/health') {
-      return jsonResponse({ instances, cache_items: cacheItems, manual_sync: manualSync })
+      return jsonResponse({ instances, cache_items: cacheItems })
     }
     if (url.pathname === '/api/library/items') {
       return jsonResponse(items(url))
@@ -517,20 +514,7 @@ describe('library page manual refresh (#29)', () => {
     expect(screen.getByText('Arrival')).toBeInTheDocument()
   })
 
-  it('disables the controls from the health payload when manual sync is off', async () => {
-    mockLibrary({
-      instances: [instance()],
-      items: (url) => pageOf([], url),
-      manualSync: false,
-    })
-    renderWithProviders(<LibraryPage />, { route: '/library' })
-
-    // The server state is authoritative: no request is needed to disable them.
-    expect(await screen.findByRole('button', { name: 'Refresh now' })).toBeDisabled()
-    expect(screen.getByRole('button', { name: 'Refresh all' })).toBeDisabled()
-  })
-
-  it('keeps the controls usable when the health payload reports manual sync on', async () => {
+  it('keeps the refresh controls usable with a healthy payload', async () => {
     mockLibrary({
       instances: [instance()],
       items: (url) => pageOf([], url),

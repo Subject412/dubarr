@@ -37,12 +37,10 @@ function HealthCard({
   instance,
   onRefresh,
   syncing,
-  disabled,
 }: {
   instance: LibraryHealthInstance
   onRefresh: () => void
   syncing: boolean
-  disabled: boolean
 }) {
   const state = healthState(instance)
   const failed = instance.last_ok === false
@@ -81,7 +79,7 @@ function HealthCard({
         variant="secondary"
         size="sm"
         className="mt-3"
-        disabled={disabled || syncing}
+        disabled={syncing}
         onClick={onRefresh}
       >
         {syncing ? 'Syncing...' : 'Refresh now'}
@@ -95,7 +93,6 @@ function HealthStrip({
   error,
   onRefresh,
   pendingKind,
-  disabled,
   note,
 }: {
   health: LibraryHealthResponse | undefined
@@ -103,7 +100,6 @@ function HealthStrip({
   onRefresh: (kind: LibraryKind | '') => void
   /** The kind whose refresh is in flight; '' = all, null = nothing pending. */
   pendingKind: LibraryKind | '' | null
-  disabled: boolean
   note: string | null
 }) {
   if (error) return <Alert>Could not read arr sync health: {error.message}</Alert>
@@ -120,7 +116,7 @@ function HealthStrip({
           <Button
             variant="secondary"
             size="sm"
-            disabled={disabled || pendingKind !== null}
+            disabled={pendingKind !== null}
             onClick={() => onRefresh('')}
           >
             {pendingKind === '' ? 'Syncing...' : 'Refresh all'}
@@ -143,7 +139,6 @@ function HealthStrip({
               key={`${instance.kind}-${instance.name}`}
               instance={instance}
               syncing={pendingKind === instance.kind}
-              disabled={disabled}
               onRefresh={() => onRefresh(instance.kind)}
             />
           ))}
@@ -330,10 +325,8 @@ export function LibraryPage() {
     }
   }, [])
 
-  const manualSyncOff = health.data?.manual_sync === false
-
   const startRefresh = async (kind: LibraryKind | '') => {
-    if (pendingRefresh !== null || manualSyncOff) return
+    if (pendingRefresh !== null) return
     setPendingRefresh(kind)
     setRefreshNote(null)
     try {
@@ -364,12 +357,6 @@ export function LibraryPage() {
         switch (error.code) {
           case 'busy':
             setRefreshNote('A sync pass is already running.')
-            break
-          case 'manual_sync_disabled':
-            // The health payload said manual sync was on, so it is stale:
-            // re-read it and the controls disable themselves from it.
-            setRefreshNote('Manual sync is disabled in settings.')
-            void queryClient.invalidateQueries({ queryKey: ['library', 'health'] })
             break
           case 'not_configured':
             setRefreshNote('No arr instance is configured yet.')
@@ -473,7 +460,6 @@ export function LibraryPage() {
         error={health.error ?? null}
         onRefresh={(kind) => void startRefresh(kind)}
         pendingKind={pendingRefresh}
-        disabled={manualSyncOff}
         note={refreshNote}
       />
 

@@ -57,12 +57,6 @@ export type LibraryHealthInstance = {
 export type LibraryHealthResponse = {
   instances: LibraryHealthInstance[]
   cache_items: number
-  /**
-   * arr.options.manual_sync, as the server reads it. The refresh controls are
-   * disabled from this value, so flipping the setting in Settings takes effect
-   * on the next health read instead of latching a client-side flag.
-   */
-  manual_sync: boolean
 }
 
 export type LibraryItemsQuery = {
@@ -263,7 +257,7 @@ export function fetchLibraryHealth(): Promise<LibraryHealthResponse> {
 }
 
 /** Machine-readable reasons POST /api/library/refresh refuses a request. */
-export type LibraryRefreshCode = 'busy' | 'manual_sync_disabled' | 'not_configured' | 'stopped'
+export type LibraryRefreshCode = 'busy' | 'not_configured' | 'stopped'
 
 export type LibraryRefreshResponse = {
   accepted: boolean
@@ -310,7 +304,7 @@ export async function refreshLibrary(
       if (body && typeof body === 'object') {
         const raw = body as { error?: unknown; code?: unknown }
         if (typeof raw.error === 'string' && raw.error !== '') message = raw.error
-        if (raw.code === 'busy' || raw.code === 'manual_sync_disabled' || raw.code === 'not_configured' || raw.code === 'stopped') {
+        if (raw.code === 'busy' || raw.code === 'not_configured' || raw.code === 'stopped') {
           code = raw.code
         }
       }

@@ -1336,49 +1336,6 @@ func TestScheduledPassSkipsWhileManualRuns(t *testing.T) {
 	p.Wait()
 }
 
-// TestTriggerRefusedWhenManualSyncDisabled pins arr.options.manual_sync = false:
-// the trigger is refused and no arr client is ever built, i.e. zero requests.
-func TestTriggerRefusedWhenManualSyncDisabled(t *testing.T) {
-	r := newRig(t)
-	r.configure(settings.ArrConnection{Kind: "radarr", BaseURL: "http://radarr.invalid", Enabled: true})
-	r.key("radarr", "key-radarr")
-
-	raw, err := json.Marshal(settings.ArrOptions{PollIntervalSec: 300, ManualSync: false})
-	if err != nil {
-		t.Fatalf("marshal arr options: %v", err)
-	}
-	if err := r.settings.Set(context.Background(), settings.KeyArrOptions, raw); err != nil {
-		t.Fatalf("set arr options: %v", err)
-	}
-
-	src := singleMovieRadarr()
-	clients := 0
-	p, err := New(Deps{
-		Store: r.store, Settings: r.settings, Secrets: r.secrets,
-		Interval: time.Minute,
-		NewRadarr: func(baseURL, apiKey string) (RadarrSource, error) {
-			clients++
-			return &src, nil
-		},
-		Logf: t.Logf,
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-
-	if err := p.Trigger(context.Background(), "radarr"); !errors.Is(err, ErrManualSyncDisabled) {
-		t.Fatalf("Trigger = %v, want ErrManualSyncDisabled", err)
-	}
-	p.Wait()
-	if clients != 0 {
-		t.Errorf("arr clients built = %d, want 0 (a disabled manual sync must not touch arr)", clients)
-	}
-	rows := readCache(t, r.store)
-	if len(rows) != 0 {
-		t.Errorf("cache rows = %d, want 0 (the pass must never run)", len(rows))
-	}
-}
-
 // TestManualPassRecordsHealth pins that a manual pass writes sync health
 // exactly like a scheduled one: green on success, red with the cause on
 // failure, and the cached snapshot untouched by the failure.

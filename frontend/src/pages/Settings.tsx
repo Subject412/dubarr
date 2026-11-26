@@ -672,20 +672,12 @@ export function SettingsPage() {
             save={save}
           >
             {(draft, update) => (
-              <>
-                <NumberField
-                  label="Poll interval (s)"
-                  value={draft.poll_interval_sec}
-                  onChange={(poll_interval_sec) => update({ poll_interval_sec })}
-                  help={settingsHelp('arr.options', 'poll_interval_sec')}
-                />
-                <Toggle
-                  label="Manual sync enabled"
-                  help={settingsHelp('arr.options', 'manual_sync')}
-                  checked={draft.manual_sync}
-                  onChange={(manual_sync) => update({ manual_sync })}
-                />
-              </>
+              <NumberField
+                label="Poll interval (s)"
+                value={draft.poll_interval_sec}
+                onChange={(poll_interval_sec) => update({ poll_interval_sec })}
+                help={settingsHelp('arr.options', 'poll_interval_sec')}
+              />
             )}
           </Section>
         </div>

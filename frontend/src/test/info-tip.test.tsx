@@ -50,7 +50,7 @@ const SETTINGS = {
     ],
   },
   'watch.options': { scan_interval_sec: 10, stability_check_interval_sec: 4 },
-  'arr.options': { poll_interval_sec: 300, manual_sync: true },
+  'arr.options': { poll_interval_sec: 300 },
   'imports.options': { donor_patterns: ['PL.DUB'] },
 }
 

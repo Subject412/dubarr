@@ -15,7 +15,7 @@ export const SETTINGS_HELP: Record<SettingsSectionKey, Record<string, string>> =
     work_dir:
       'Temp folder: the workspace a job runs in. It holds copies only while the job is running and is cleared afterwards. On the same pool as your media the finished file moves into place as an atomic rename; on a faster separate pool the job runs quicker, but publishing has to copy the file across filesystems.',
     output_dir:
-      'Destination for the "write to the mux output folder" mode: the muxed file lands here as <name>.dubarr.mkv and the library file is left untouched. Must not be the Audio Vault or inside it.',
+      'Destination for the "write to the mux output folder" mode: the muxed file lands here as <name>.dubarr.mkv and the library file is left untouched. It is used only when Output mode is separate. Must not be the Audio Vault or inside it.',
     media_roots:
       'Library folders Dubarr is allowed to read Targets from. Paths are canonicalized and confined to these roots.',
   },

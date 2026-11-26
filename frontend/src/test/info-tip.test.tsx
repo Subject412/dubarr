@@ -36,7 +36,9 @@ const SETTINGS = {
   'security.options': {
     allow_force_tag_override: false,
   },
-  'mux.options': { track_title_in_mkv: 'Polski Dubbing' },
+  // `separate` keeps the dependent Mux output folder in the form, so every
+  // authored help entry has a control to document.
+  'mux.options': { track_title_in_mkv: 'Polski Dubbing', output_mode: 'separate' },
   'audio.options': {
     rules: [
       {

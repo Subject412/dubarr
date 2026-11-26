@@ -11,6 +11,7 @@ export function PathField({
   value,
   onChange,
   placeholder,
+  hidden = false,
 }: {
   label: string
   hint?: string
@@ -19,11 +20,13 @@ export function PathField({
   value: string
   onChange: (next: string) => void
   placeholder?: string
+  /** Drop the whole field from the DOM when it does not apply. */
+  hidden?: boolean
 }) {
   const [open, setOpen] = useState(false)
   const id = `path-${label.replace(/\s+/g, '-').toLowerCase()}`
   return (
-    <Field label={label} hint={hint} help={help} htmlFor={id}>
+    <Field label={label} hint={hint} help={help} htmlFor={id} hidden={hidden}>
       <div className="flex gap-2">
         <Input
           id={id}

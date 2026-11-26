@@ -249,6 +249,13 @@ export function SettingsPage() {
 
   const data = settings.data?.settings
 
+  // The Mux output folder is a `storage.paths` setting, so its control stays in
+  // the Storage card, but it only applies when the SAVED mux options write to a
+  // separate folder. The mode is read from the page data (what every card is
+  // seeded from), never from the mux card's unsaved draft: switching the mode
+  // hides or reveals the folder only after the Mux options card is saved.
+  const savedOutputMode = (data?.['mux.options'] as MuxOptions | undefined)?.output_mode ?? 'replace'
+
   // Category navigation lives in the URL (`/settings?section=<key>`) so the
   // location is shareable and browser back/forward keeps working. Cards are
   // only scrolled, never remounted, so unsaved drafts survive a switch.
@@ -394,6 +401,7 @@ export function SettingsPage() {
                   <PathField
                     label="Mux output folder"
                     help={settingsHelp('storage.paths', 'output_dir')}
+                    hidden={savedOutputMode === 'replace'}
                     value={draft.output_dir ?? ''}
                     onChange={(output_dir) => update({ output_dir })}
                   />

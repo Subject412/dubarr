@@ -176,8 +176,8 @@ describe('watch restart notice', () => {
 
   // The banner may only name the settings that are still read at startup.
   const RESTART_NOTICE =
-    'Restart required to apply watch changes. The watch folder and tag filter are read at startup; ' +
-    'the scan interval and stability window apply without a restart.'
+    'Restart required to apply watch changes. The watch folder is read at startup; ' +
+    'the scan interval, stability window and tag filter apply without a restart.'
 
   function mockSettings(): ReturnType<typeof vi.fn> {
     let current: Record<string, unknown> = settings
@@ -209,6 +209,23 @@ describe('watch restart notice', () => {
     await user.click(screen.getByLabelText('Save Watch options'))
 
     expect(await screen.findByText('saved')).toBeInTheDocument()
+    expect(screen.queryByText(/Restart required/)).not.toBeInTheDocument()
+  })
+
+  it('does not ask for a restart when the tag filter changes', async () => {
+    const user = userEvent.setup()
+    mockSettings()
+    renderWithProviders(<SettingsPage />, { route: '/settings' })
+
+    expect(
+      await screen.findByRole('heading', { name: 'Process only files tagged as …' }),
+    ).toBeInTheDocument()
+    await user.click(screen.getByRole('switch', { name: 'Case sensitive' }))
+    await user.click(screen.getByLabelText('Save Process only files tagged as …'))
+
+    expect(await screen.findByText('saved')).toBeInTheDocument()
+    // The gate re-reads target.tag_filter on every classification, so an edit
+    // applies to the next candidate without a restart.
     expect(screen.queryByText(/Restart required/)).not.toBeInTheDocument()
   })
 

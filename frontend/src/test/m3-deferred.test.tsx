@@ -147,7 +147,7 @@ describe('watch scanner restart notice', () => {
     expect(screen.queryByText(/restart required to apply watch changes/i)).not.toBeInTheDocument()
   })
 
-  it('warns after target.tag_filter changes', async () => {
+  it('applies a target.tag_filter edit without a restart notice', async () => {
     const user = userEvent.setup()
     mockSettings({
       'target.tag_filter': {
@@ -164,8 +164,10 @@ describe('watch scanner restart notice', () => {
     await user.click(screen.getByRole('switch', { name: 'Case sensitive' }))
     await user.click(screen.getByLabelText('Save Process only files tagged as …'))
 
-    expect(
-      await screen.findByText(/restart required to apply watch changes/i),
-    ).toBeInTheDocument()
+    await waitFor(() => {
+      expect(screen.getByText('saved')).toBeInTheDocument()
+    })
+    // The gate re-reads target.tag_filter per classification, so no restart.
+    expect(screen.queryByText(/restart required to apply watch changes/i)).not.toBeInTheDocument()
   })
 })

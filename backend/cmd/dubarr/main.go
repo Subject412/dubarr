@@ -488,10 +488,11 @@ type scannerWiring struct {
 // scanned for donors. With no watch_dir configured it returns (nil, nil) after
 // logging once, so a fresh install can serve the setup wizard.
 //
-// watch_dir, tag_filter and the stability window are read at boot; watch_dir
-// and tag_filter still need a restart to change. scan_interval_sec and
+// watch_dir and the stability window are read at boot; watch_dir still needs a
+// restart to change. tag_filter is re-read from the settings store on every
+// classification through the gate's rule source, and scan_interval_sec and
 // stability_check_interval_sec are re-read every scan iteration through
-// watchSettingsProvider, so edits to them apply live.
+// watchSettingsProvider, so edits to those apply live.
 func wireScanner(ctx context.Context, deps scannerWiring) (*watch.Scanner, error) {
 	logf := deps.Logf
 	if logf == nil {
@@ -511,8 +512,10 @@ func wireScanner(ctx context.Context, deps scannerWiring) (*watch.Scanner, error
 		return nil, nil
 	}
 
-	rule, err := loadGateRule(ctx, deps.Settings)
-	if err != nil {
+	// Surface an unreadable target.tag_filter at boot instead of failing every
+	// later classification. The service still re-reads it per candidate, so an
+	// edit made after startup takes effect on the next classification.
+	if _, err := loadGateRule(ctx, deps.Settings); err != nil {
 		return nil, err
 	}
 
@@ -521,7 +524,9 @@ func wireScanner(ctx context.Context, deps scannerWiring) (*watch.Scanner, error
 		return nil, fmt.Errorf("watch scanner: %w", err)
 	}
 
-	gateSvc := gate.NewService(rule, deps.Store)
+	gateSvc := gate.NewService(func(ctx context.Context) (gate.Rule, error) {
+		return loadGateRule(ctx, deps.Settings)
+	}, deps.Store)
 	scanner.SetCandidateHook(func(ctx context.Context, sourcePath, _ string, _ int64) error {
 		// M2 has no arr target resolution on the watch path yet, so the
 		// dropped file is classified by its own filename — exactly what

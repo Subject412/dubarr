@@ -357,8 +357,8 @@ export function SettingsPage() {
         <Alert tone="warning">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <span>
-              Restart required to apply watch changes. The watch folder and tag filter are read at
-              startup; the scan interval and stability window apply without a restart.
+              Restart required to apply watch changes. The watch folder is read at startup; the scan
+              interval, stability window and tag filter apply without a restart.
             </span>
             <Button size="sm" variant="ghost" onClick={() => setWatchRestartNotice(false)}>
               Dismiss
@@ -482,9 +482,6 @@ export function SettingsPage() {
             sectionKey="target.tag_filter"
             value={(data['target.tag_filter'] as TargetTagFilter) ?? DEFAULTS['target.tag_filter']}
             save={save}
-            onSaved={(saved, previous) => {
-              if (JSON.stringify(saved) !== JSON.stringify(previous)) flagWatchRestart()
-            }}
           >
             {(draft, update) => (
               <>

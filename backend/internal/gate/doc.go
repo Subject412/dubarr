@@ -23,7 +23,9 @@
 // Container tags are read for informational/display purposes only and never
 // decide eligibility; the arr criterion comes from the arr poll cache, not from
 // the container. Service binds the import-queue store to persist the outcome
-// per candidate and evaluates the filename source only (donor ingestion).
+// per candidate and evaluates the filename source only (donor ingestion). Its
+// rule is re-read from settings on every classification, so an operator editing
+// target.tag_filter changes the next verdict without a restart.
 //
 // The export-policy split (SplitExportTracks) is likewise pure: it partitions
 // probed audio tracks into the policy import set (dub + original + reference

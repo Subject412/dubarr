@@ -21,6 +21,15 @@ type Refresher interface {
 	Trigger(ctx context.Context, kind string) error
 }
 
+// InstanceState is an optional Refresher extension: it reports whether the
+// poller has any enabled arr instance to sync. *arrsync.Poller implements it,
+// so a running poller with every instance disabled can answer with a message
+// naming that configuration instead of repeating the fresh-install conflict. A
+// Refresher that does not implement it is treated as configured.
+type InstanceState interface {
+	HasEnabledInstance(ctx context.Context) bool
+}
+
 // refreshRequest is the optional POST body: an empty body (or an empty kind)
 // means every configured instance.
 type refreshRequest struct {
@@ -59,7 +68,8 @@ func (s *Service) handleRefresh(w http.ResponseWriter, r *http.Request) {
 
 	// A fresh install has no poller at all; that is a conflict with the
 	// request, not a server fault, and it must never panic here.
-	if s.refresher == nil {
+	refresher := s.refresherRef()
+	if refresher == nil {
 		writeJSON(w, http.StatusConflict, errorBody{
 			Error: "no arr instance is configured yet",
 			Code:  "not_configured",
@@ -67,7 +77,18 @@ func (s *Service) handleRefresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err := s.refresher.Trigger(r.Context(), kind)
+	// A poller can exist while every instance is disabled (the operator turned
+	// them off after boot). That is "not running", not a fresh install: name
+	// the missing configuration instead of repeating the message above.
+	if state, ok := refresher.(InstanceState); ok && !state.HasEnabledInstance(r.Context()) {
+		writeJSON(w, http.StatusConflict, errorBody{
+			Error: "no enabled arr instance: enable Radarr or Sonarr under Settings → Connections",
+			Code:  "not_configured",
+		})
+		return
+	}
+
+	err := refresher.Trigger(r.Context(), kind)
 	switch {
 	case err == nil:
 		writeJSON(w, http.StatusAccepted, refreshResponse{

@@ -24,6 +24,14 @@ func (f *fakeRefresher) Trigger(_ context.Context, kind string) error {
 	return f.err
 }
 
+// disabledRefresher is a poller that exists while every arr instance is
+// disabled: it reports no enabled instance to sync.
+type disabledRefresher struct {
+	fakeRefresher
+}
+
+func (f *disabledRefresher) HasEnabledInstance(context.Context) bool { return false }
+
 // newRefreshHarness mounts the library routes with a refresher (nil means "no
 // poller was built"), so the refresh contract is tested through the real mux.
 func newRefreshHarness(t *testing.T, refresher Refresher) *harness {
@@ -165,6 +173,32 @@ func TestLibraryRefreshNotConfigured(t *testing.T) {
 	}
 	if body.Error != "no arr instance is configured yet" {
 		t.Errorf("error = %q, want the not-configured message", body.Error)
+	}
+}
+
+// TestLibraryRefreshNoEnabledInstance pins the "poller exists but nothing is
+// enabled" conflict: it must name the missing configuration, not repeat the
+// fresh-install message, and it must not reach the poller.
+func TestLibraryRefreshNoEnabledInstance(t *testing.T) {
+	refresher := &disabledRefresher{}
+	h := newRefreshHarness(t, refresher)
+
+	rec := h.post("/api/library/refresh", `{"kind":"radarr"}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (body %s)", rec.Code, rec.Body.String())
+	}
+	body := decodeRefreshError(t, rec)
+	if body.Code != "not_configured" {
+		t.Errorf("code = %q, want not_configured", body.Code)
+	}
+	if body.Error == "no arr instance is configured yet" {
+		t.Error("error repeats the unconfigured-install message")
+	}
+	if !strings.Contains(body.Error, "no enabled arr instance") {
+		t.Errorf("error = %q, want it to name the missing arr instance", body.Error)
+	}
+	if len(refresher.kinds) != 0 {
+		t.Errorf("Trigger calls = %v, want none while no instance is enabled", refresher.kinds)
 	}
 }
 

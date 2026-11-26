@@ -199,6 +199,24 @@ func New(deps Deps) (*Poller, error) {
 // Interval reports the pass cadence.
 func (p *Poller) Interval() time.Duration { return p.interval }
 
+// HasEnabledInstance reports whether arr.connections holds at least one enabled
+// instance with a base URL, i.e. whether a pass has anything to do. It lets the
+// library API tell "no instance configured" from "poller running, nothing
+// enabled". An unreadable section reports true so the caller surfaces the real
+// error instead of claiming no instance exists.
+func (p *Poller) HasEnabledInstance(ctx context.Context) bool {
+	conns, err := p.connections(ctx)
+	if err != nil {
+		return true
+	}
+	for _, conn := range conns {
+		if conn.Enabled && strings.TrimSpace(conn.BaseURL) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // Sync performs one pass over every enabled connection. It returns the
 // aggregated stats and a joined error; a failing instance never stops the rest
 // and never touches its own previous cache rows.

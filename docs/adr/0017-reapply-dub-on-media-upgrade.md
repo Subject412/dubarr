@@ -26,14 +26,20 @@ track. That is recoverable by muxing again, and it is not data loss.
 
 The decision above is settled. These parameters are not yet:
 
-1. **Gate interaction — settled: the gate always applies.** The tag is not only a
-   match filter, it is a **pipeline-stage marker**: in the reference setup the tag
-   means "the upstream video pipeline has finished with this file". Muxing before
-   that stage is worse than a wrong match — the upstream pipeline cleans the
-   container and drops unwanted audio tracks, so a dub muxed in early would be
-   removed when that pipeline later replaces the file, and the work would be lost.
-   A re-apply therefore waits for the tag, exactly like a first mux. The upgrade
-   sequence is arr upgrade → upstream processing → tag → dubarr mux.
+1. **Gate interaction — settled: the gate always applies.** Eligibility is a policy
+   question — which targets dubarr may touch at all — and the operator answers it
+   with a filename tag (in the reference setup, the marker that the upstream video
+   pipeline has finished) or with arr tags on the title. Both are supported; the
+   code already models arr tags as an eligibility source.
+
+   Muxing before the upstream stage is not destructive: a well-built pipeline keeps
+   the audio the operator wants. It is simply wasted, because the pipeline replaces
+   the file and the mux goes with it, so dubarr would mux again once the tag
+   appears. The gate is enforced for policy and for a sane sequence, not to prevent
+   data loss.
+
+   Expected order in the reference setup: arr upgrade → upstream processing → tag →
+   dubarr mux.
 2. **Offset drift — settled.** Re-application always re-runs offset analysis
    rather than reusing the previous offset. If the new offset moves by more than
    the acceptance threshold from the previous one, the job is **parked for
@@ -48,6 +54,19 @@ The decision above is settled. These parameters are not yet:
    offset drift, or the loop cap tripping — surfaces as a queue entry, because
    those are the cases that need a human.
 
+## Idempotency — how dubarr knows a target is already dubbed
+
+Two sources, in this order: the stored record for the file, and a probe of the
+target for a track carrying the dub language and title. The record is the fast
+path; the probe is the truth, because arr may have replaced the file since the
+record was written. A record that says "dubbed" while the probe disagrees is the
+signature of a replaced file — exactly the case re-application exists to handle.
+
+**Dubarr writes no tag into the filename.** The muxed track is the marker and
+cannot lie. A filename tag would need arr to rename the file to keep the naming
+rule tidy, and that rename would look like a target change and trigger another
+mux — the automation would feed itself.
+
 ## Consequences
 
 - Completion is confirmed by the mirror, not by the job: after publishing, dubarr
@@ -59,4 +78,4 @@ The decision above is settled. These parameters are not yet:
 - A vault track that is orphaned (its title left arr) cannot be re-applied, since
   there is no target left to apply it to.
 
-Status: accepted in principle; guardrails open. Implementation not started.
+Status: accepted. Guardrails settled; implementation not started.

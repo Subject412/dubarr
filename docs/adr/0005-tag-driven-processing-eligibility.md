@@ -16,10 +16,14 @@ We accept that eligibility depends on metadata another tool writes, rather than 
 
 Status: accepted.
 
-Note: the tag is not only a match filter. In the reference deployment it is a
-**pipeline-stage marker** — it means the upstream video pipeline has finished
-with the file — and muxing before that stage loses the work when the pipeline
-replaces the container (ADR-0017). Treat the gate as an ordering constraint, not
-just an eligibility check.
+Note: the tag has two roles. It is a **policy selector** — which targets dubarr
+may touch at all — and in the reference deployment it doubles as a
+**pipeline-stage marker**, meaning the upstream video pipeline has finished with
+the file. Eligibility may come from a filename tag or from arr tags on the title.
+
+Muxing before the upstream stage is not destructive (a well-built pipeline keeps
+the tracks the operator wants), but it is wasted: the pipeline replaces the file,
+so the mux goes with it. The gate is therefore enforced for policy and for a sane
+sequence rather than to prevent data loss (ADR-0017).
 
 Supersedes: ADR-0005's original title and framing ("Tdarr eligibility via filename tags, not a Tdarr API", "the marker must be something Tdarr actually writes"). Amended by ADR-0009.

@@ -107,7 +107,7 @@ func TestWireArrSyncReadsSettingsInterval(t *testing.T) {
 		t.Errorf("interval = %v, want the seeded 300s", got)
 	}
 
-	raw, err := json.Marshal(settings.ArrOptions{PollIntervalSec: 90, ManualSync: true})
+	raw, err := json.Marshal(settings.ArrOptions{PollIntervalSec: 90})
 	if err != nil {
 		t.Fatalf("marshal arr options: %v", err)
 	}

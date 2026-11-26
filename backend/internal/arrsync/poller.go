@@ -41,6 +41,23 @@ var ErrPollerStopped = errors.New("arrsync: poller is stopped")
 // repeatedly refreshed one kind could defer the other kind's pass forever.
 const maxSkipRetryDelay = 30 * time.Second
 
+// pollTicker abstracts time.Ticker so a test can drive the poll loop by hand
+// instead of waiting out a real cadence.
+type pollTicker interface {
+	Chan() <-chan time.Time
+	Reset(time.Duration)
+	Stop()
+}
+
+// realTicker is the production pollTicker.
+type realTicker struct{ ticker *time.Ticker }
+
+func newRealTicker(d time.Duration) pollTicker { return realTicker{ticker: time.NewTicker(d)} }
+
+func (t realTicker) Chan() <-chan time.Time { return t.ticker.C }
+func (t realTicker) Reset(d time.Duration)  { t.ticker.Reset(d) }
+func (t realTicker) Stop()                  { t.ticker.Stop() }
+
 // syncFailureWriteTimeout bounds the detached health UPDATE: the write runs
 // after a cancelled pass, so it needs its own short deadline instead of an
 // unbounded context.
@@ -99,8 +116,11 @@ type Deps struct {
 	Store    LibraryStore
 	Settings *settings.Store
 	Secrets  SecretStore
-	// Interval overrides DefaultInterval; <= 0 selects DefaultInterval. The
-	// composition root disables the poller instead of starting a 0 interval.
+	// Interval seeds the poll cadence; <= 0 selects DefaultInterval. It is
+	// only the boot value: the running loop re-reads
+	// settings arr.options.poll_interval_sec and applies an edit without a
+	// restart. The composition root disables the poller instead of starting a
+	// 0 interval.
 	Interval time.Duration
 	// Timeout bounds one arr HTTP request; 0 selects arr.DefaultTimeout.
 	Timeout time.Duration
@@ -126,11 +146,18 @@ type Poller struct {
 	store    LibraryStore
 	settings *settings.Store
 	secrets  SecretStore
+	// interval is the live cadence, guarded by mu: New seeds it from
+	// Deps.Interval and the loop rewrites it whenever
+	// arr.options.poll_interval_sec changes, so Interval() never reports the
+	// value captured at boot.
 	interval time.Duration
 	timeout  time.Duration
 	logf     func(format string, args ...any)
 	radarr   func(baseURL, apiKey string) (RadarrSource, error)
 	sonarr   func(baseURL, apiKey string) (SonarrSource, error)
+	// newTicker builds the loop's ticker (newRealTicker in production). A test
+	// replaces it before Start to drive the cadence by hand.
+	newTicker func(time.Duration) pollTicker
 
 	mu      sync.Mutex
 	started bool
@@ -170,14 +197,15 @@ func New(deps Deps) (*Poller, error) {
 		logf = log.Printf
 	}
 	p := &Poller{
-		store:    deps.Store,
-		settings: deps.Settings,
-		secrets:  deps.Secrets,
-		interval: interval,
-		timeout:  timeout,
-		logf:     logf,
-		radarr:   deps.NewRadarr,
-		sonarr:   deps.NewSonarr,
+		store:     deps.Store,
+		settings:  deps.Settings,
+		secrets:   deps.Secrets,
+		interval:  interval,
+		timeout:   timeout,
+		logf:      logf,
+		radarr:    deps.NewRadarr,
+		sonarr:    deps.NewSonarr,
+		newTicker: newRealTicker,
 	}
 	if p.radarr == nil {
 		p.radarr = func(baseURL, apiKey string) (RadarrSource, error) {
@@ -192,8 +220,22 @@ func New(deps Deps) (*Poller, error) {
 	return p, nil
 }
 
-// Interval reports the pass cadence.
-func (p *Poller) Interval() time.Duration { return p.interval }
+// Interval reports the current pass cadence: the value the loop last read from
+// settings arr.options.poll_interval_sec, so an operator's edit is reflected
+// without a restart. It is read under the mutex because the loop goroutine
+// writes it.
+func (p *Poller) Interval() time.Duration {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.interval
+}
+
+// setInterval records the cadence the loop just applied.
+func (p *Poller) setInterval(d time.Duration) {
+	p.mu.Lock()
+	p.interval = d
+	p.mu.Unlock()
+}
 
 // HasEnabledInstance reports whether arr.connections holds at least one enabled
 // instance with a base URL, i.e. whether a pass has anything to do. It lets the
@@ -597,6 +639,26 @@ func (p *Poller) gateRule(ctx context.Context) (gate.Rule, error) {
 	return gate.RuleFromTagFilter(tf), nil
 }
 
+// readPollInterval reads settings arr.options.poll_interval_sec. found is false
+// when the section is absent, so the loop keeps its current cadence instead of
+// inventing one. The duration is the stored value verbatim, including a
+// non-positive one the caller must reject: the supervisor owns "disabled", not
+// the loop.
+func (p *Poller) readPollInterval(ctx context.Context) (interval time.Duration, found bool, err error) {
+	raw, ok, err := p.settings.Get(ctx, settings.KeyArrOptions)
+	if err != nil {
+		return 0, false, fmt.Errorf("arrsync: read %s: %w", settings.KeyArrOptions, err)
+	}
+	if !ok {
+		return 0, false, nil
+	}
+	var opts settings.ArrOptions
+	if err := json.Unmarshal(raw, &opts); err != nil {
+		return 0, false, fmt.Errorf("arrsync: decode %s: %w", settings.KeyArrOptions, err)
+	}
+	return time.Duration(opts.PollIntervalSec) * time.Second, true, nil
+}
+
 // Start launches the poll loop. The first pass runs immediately, then one per
 // interval. It is idempotent and a no-op after Stop.
 func (p *Poller) Start(ctx context.Context) {
@@ -618,13 +680,20 @@ func (p *Poller) Start(ctx context.Context) {
 	}()
 }
 
+// run passes once immediately and then once per cadence. The cadence is re-read
+// from settings on every iteration, so a saved arr.options.poll_interval_sec
+// applies without a restart; the ticker is rebuilt only when the value actually
+// moves. A bad value or a failed read keeps the last known-good cadence — the
+// supervisor, not the loop, owns "disabled" — and is reported once instead of
+// once per tick.
 func (p *Poller) run(ctx context.Context) {
-	if p.interval <= 0 {
+	interval := p.Interval()
+	if interval <= 0 {
 		// Defensive: New never returns a non-positive interval, but a 0
 		// ticker would panic and kill the process.
 		return
 	}
-	ticker := time.NewTicker(p.interval)
+	ticker := p.newTicker(interval)
 	defer ticker.Stop()
 
 	// retry carries a skipped pass back to the loop after a short delay
@@ -666,16 +735,55 @@ func (p *Poller) run(ctx context.Context) {
 		}
 	}
 
+	// lastWarn remembers which settings problem was already reported, so a
+	// persistently bad section logs once rather than on every tick.
+	lastWarn := ""
+
 	for {
-		if p.syncPass(ctx) {
+		ran := p.syncPass(ctx)
+		if ctx.Err() != nil {
+			// Shutting down: no cadence to apply and no retry to schedule,
+			// and a cancelled context would only turn the read below into a
+			// spurious settings error.
+			return
+		}
+		// Re-read the cadence before every wait: the arr card's edit must
+		// take effect on the running loop. The ticker is only reset when the
+		// value moved, never on an unchanged tick.
+		next, found, err := p.readPollInterval(ctx)
+		switch {
+		case err != nil:
+			if lastWarn != "read" {
+				p.logf("%v (keeping the %v poll interval)", err, interval)
+				lastWarn = "read"
+			}
+		case !found:
+			// Absent section: nothing was configured, so nothing changes.
+			lastWarn = ""
+		case next <= 0:
+			if lastWarn != "value" {
+				p.logf("arrsync: %s poll_interval_sec is not positive (%d s), keeping the %v poll interval",
+					settings.KeyArrOptions, int(next/time.Second), interval)
+				lastWarn = "value"
+			}
+		default:
+			lastWarn = ""
+			if next != interval {
+				interval = next
+				p.setInterval(next)
+				ticker.Reset(next)
+				p.logf("arrsync: poll interval is now %v", next)
+			}
+		}
+		if ran {
 			clearRetry()
 		} else {
-			retryIn(min(p.interval, maxSkipRetryDelay))
+			retryIn(min(interval, maxSkipRetryDelay))
 		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-ticker.Chan():
 		case <-retry:
 		}
 	}

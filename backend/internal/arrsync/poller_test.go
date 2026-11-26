@@ -344,6 +344,10 @@ func TestLoopSurvivesPanic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	// The loop re-reads arr.options (300 s after seeding) on every iteration,
+	// so the ticks are hand driven instead of waiting out a real cadence.
+	tr := newFakeTicker()
+	p.newTicker = func(time.Duration) pollTicker { return tr }
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -351,16 +355,18 @@ func TestLoopSurvivesPanic(t *testing.T) {
 	defer p.Stop()
 
 	deadline := time.Now().Add(5 * time.Second)
+	attempts := 0
 	for time.Now().Before(deadline) {
 		fake.mu.Lock()
-		attempts := fake.attempts
+		attempts = fake.attempts
 		fake.mu.Unlock()
 		if attempts >= 2 {
 			return
 		}
+		tr.ch <- time.Now()
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("poller made %d attempts, want at least 2 (loop must survive a panic)", fake.attempts)
+	t.Fatalf("poller made %d attempts, want at least 2 (loop must survive a panic)", attempts)
 }
 
 // TestNewDefaultsInterval pins the settled 300 s cadence.
@@ -1404,4 +1410,319 @@ func TestManualPassRecordsHealth(t *testing.T) {
 	if !attempt.Valid || attempt.String == "" {
 		t.Error("last_attempt_at not stamped by a failed manual pass")
 	}
+}
+
+// fakeTicker is a hand-driven pollTicker: ch delivers a tick when a test sends
+// one and resets records every cadence the loop asks for, so no wall-clock
+// period is ever waited on.
+type fakeTicker struct {
+	ch     chan time.Time
+	resets chan time.Duration
+}
+
+func newFakeTicker() *fakeTicker {
+	return &fakeTicker{ch: make(chan time.Time, 64), resets: make(chan time.Duration, 64)}
+}
+
+func (f *fakeTicker) Chan() <-chan time.Time { return f.ch }
+func (f *fakeTicker) Reset(d time.Duration)  { f.resets <- d }
+func (f *fakeTicker) Stop()                  {}
+
+// logCapture records the poller's log lines without touching *testing.T from
+// the loop goroutine.
+type logCapture struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (l *logCapture) logf(format string, args ...any) {
+	line := fmt.Sprintf(format, args...)
+	l.mu.Lock()
+	l.lines = append(l.lines, line)
+	l.mu.Unlock()
+}
+
+// count reports how many captured lines contain sub.
+func (l *logCapture) count(sub string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	n := 0
+	for _, line := range l.lines {
+		if strings.Contains(line, sub) {
+			n++
+		}
+	}
+	return n
+}
+
+// waitFor blocks until a captured line contains sub.
+func (l *logCapture) waitFor(t *testing.T, sub string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if l.count(sub) > 0 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("no poller log line containing %q", sub)
+}
+
+// pollInterval stores arr.options.poll_interval_sec through the validated API.
+func (r *rig) pollInterval(sec int) {
+	r.t.Helper()
+	raw, err := json.Marshal(settings.ArrOptions{PollIntervalSec: sec})
+	if err != nil {
+		r.t.Fatalf("marshal arr options: %v", err)
+	}
+	if err := r.settings.Set(r.context(), settings.KeyArrOptions, raw); err != nil {
+		r.t.Fatalf("set arr options: %v", err)
+	}
+}
+
+// rawPollInterval writes arr.options straight into the settings table, past
+// Set's 30..86400 validation, so the loop's guard against a hand-edited
+// non-positive (or sub-30 s) value can be exercised.
+func (r *rig) rawPollInterval(sec int) {
+	r.t.Helper()
+	if _, err := r.store.DB.Exec(
+		`INSERT INTO settings (key, value) VALUES (?, ?)
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+		settings.KeyArrOptions, fmt.Sprintf(`{"poll_interval_sec":%d}`, sec)); err != nil {
+		r.t.Fatalf("store raw arr options: %v", err)
+	}
+}
+
+// loopRig wires one enabled Radarr connection and starts the poll loop with a
+// hand-driven ticker.
+func loopRig(
+	t *testing.T,
+	boot time.Duration,
+	newRadarr func(baseURL, apiKey string) (RadarrSource, error),
+	logf func(format string, args ...any),
+) (*rig, *Poller, *fakeTicker) {
+	t.Helper()
+	r := newRig(t)
+	r.configure(settings.ArrConnection{Kind: "radarr", BaseURL: "http://radarr.invalid", Enabled: true})
+	r.key("radarr", "key-radarr")
+	if logf == nil {
+		logf = t.Logf
+	}
+	p, err := New(Deps{
+		Store:     r.store,
+		Settings:  r.settings,
+		Secrets:   r.secrets,
+		Interval:  boot,
+		Timeout:   2 * time.Second,
+		Logf:      logf,
+		NewRadarr: newRadarr,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	tr := newFakeTicker()
+	p.newTicker = func(time.Duration) pollTicker { return tr }
+	p.Start(context.Background())
+	t.Cleanup(p.Stop)
+	return r, p, tr
+}
+
+// waitForFirstPass blocks until the loop's opening pass cached a row, so the
+// ticker the test drives belongs to a loop that already ran.
+func waitForFirstPass(t *testing.T, r *rig) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, ok := readCache(t, r.store)["movie|7"]; ok {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("the poll loop never completed its first pass")
+}
+
+// TestLoopAppliesPollIntervalChangeLive pins U1.4: an edit of
+// arr.options.poll_interval_sec moves the running loop's cadence, so it is no
+// longer silently ignored until the next restart.
+func TestLoopAppliesPollIntervalChangeLive(t *testing.T) {
+	src := singleMovieRadarr()
+	r, p, tr := loopRig(t, 300*time.Second,
+		func(baseURL, apiKey string) (RadarrSource, error) { return &src, nil }, nil)
+	r.pollInterval(300)
+	waitForFirstPass(t, r)
+
+	if got := p.Interval(); got != 300*time.Second {
+		t.Fatalf("Interval() = %v, want the boot 300s", got)
+	}
+
+	r.pollInterval(60)
+	tr.ch <- time.Now() // wake the loop so it re-reads settings
+
+	select {
+	case got := <-tr.resets:
+		if got != 60*time.Second {
+			t.Fatalf("ticker rebuilt to %v, want 60s", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the loop did not rebuild its ticker after the interval changed")
+	}
+	if got := p.Interval(); got != 60*time.Second {
+		t.Errorf("Interval() = %v, want the live 60s", got)
+	}
+
+	// An unchanged value must not rebuild the ticker on every pass.
+	tr.ch <- time.Now()
+	select {
+	case got := <-tr.resets:
+		t.Errorf("ticker rebuilt to %v although the interval did not change", got)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// TestLoopKeepsIntervalOnNonPositiveSetting pins the guard: a non-positive
+// stored poll_interval_sec (only reachable by editing the row) keeps the last
+// known cadence and is reported once, not once per tick — the supervisor, not
+// the loop, owns "disabled".
+func TestLoopKeepsIntervalOnNonPositiveSetting(t *testing.T) {
+	src := singleMovieRadarr()
+	logs := &logCapture{}
+	r, p, tr := loopRig(t, 300*time.Second,
+		func(baseURL, apiKey string) (RadarrSource, error) { return &src, nil }, logs.logf)
+	waitForFirstPass(t, r)
+
+	r.rawPollInterval(0)
+	tr.ch <- time.Now()
+	logs.waitFor(t, "not positive")
+
+	// A negative value and further ticks change neither the cadence nor the
+	// number of warnings.
+	r.rawPollInterval(-5)
+	tr.ch <- time.Now()
+	tr.ch <- time.Now()
+	time.Sleep(200 * time.Millisecond)
+
+	if got := p.Interval(); got != 300*time.Second {
+		t.Errorf("Interval() = %v, want the previous 300s", got)
+	}
+	select {
+	case got := <-tr.resets:
+		t.Errorf("ticker rebuilt to %v for a non-positive interval", got)
+	default:
+	}
+	if n := logs.count("not positive"); n != 1 {
+		t.Errorf("non-positive interval logged %d times, want once", n)
+	}
+}
+
+// TestReadPollIntervalReportsReadError pins the signal the loop keeps its
+// cadence on: an unreadable section reports an error instead of a zero
+// duration, so "unknown right now" is never mistaken for "disabled".
+func TestReadPollIntervalReportsReadError(t *testing.T) {
+	r := newRig(t)
+	p := r.newPoller(time.Minute)
+	if err := r.store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	if _, found, err := p.readPollInterval(context.Background()); err == nil {
+		t.Fatalf("readPollInterval on an unreadable store = found %v, want an error", found)
+	}
+}
+
+// gatedRadarr lets the first listing through and blocks every later one until
+// the test releases it, so a manual pass can hold the shared slot while the
+// loop keeps ticking.
+type gatedRadarr struct {
+	fakeRadarr
+	mu      sync.Mutex
+	calls   int
+	second  chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func newGatedRadarr() *gatedRadarr {
+	return &gatedRadarr{
+		fakeRadarr: singleMovieRadarr(),
+		second:     make(chan struct{}),
+		release:    make(chan struct{}),
+	}
+}
+
+func (g *gatedRadarr) Movies(ctx context.Context) ([]arr.Movie, error) {
+	g.mu.Lock()
+	g.calls++
+	call := g.calls
+	g.mu.Unlock()
+	if call == 1 {
+		return g.fakeRadarr.Movies(ctx)
+	}
+	g.once.Do(func() { close(g.second) })
+	select {
+	case <-g.release:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return g.fakeRadarr.Movies(ctx)
+}
+
+// TestSkippedPassRetriesWithLiveInterval pins the retry path: a skipped tick
+// re-attempts after min(current interval, maxSkipRetryDelay), and "current" is
+// the value the loop just read, not the cadence captured at boot. The boot 5
+// min would cap the retry at 30 s, so only the live 1 s explains a second
+// attempt inside the deadline.
+func TestSkippedPassRetriesWithLiveInterval(t *testing.T) {
+	gated := newGatedRadarr()
+	logs := &logCapture{}
+	r, p, tr := loopRig(t, 5*time.Minute,
+		func(baseURL, apiKey string) (RadarrSource, error) { return gated, nil }, logs.logf)
+	waitForFirstPass(t, r)
+	t.Cleanup(func() { close(gated.release) })
+
+	// A manual pass now owns the shared slot, so the next tick must skip.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		err := p.Trigger(context.Background(), "radarr")
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, ErrSyncBusy) || time.Now().After(deadline) {
+			t.Fatalf("Trigger: %v", err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	select {
+	case <-gated.second:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the manual pass never reached the arr listing")
+	}
+
+	// 1 s is below Set's 30 s floor, so it stands in for a hand-edited row.
+	r.rawPollInterval(1)
+	tr.ch <- time.Now()
+
+	deadline = time.Now().Add(5 * time.Second)
+	for logs.count("skipping scheduled pass") < 2 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := logs.count("skipping scheduled pass"); got < 2 {
+		t.Fatalf("skipped passes = %d, want at least 2: the retry did not use the live 1s interval", got)
+	}
+}
+
+// TestTriggerRejectsWhileScheduledPassRuns pins the shared slot: while the
+// loop's own pass is in flight a manual trigger still reports ErrSyncBusy
+// instead of queueing a second pass.
+func TestTriggerRejectsWhileScheduledPassRuns(t *testing.T) {
+	src := newBlockingRadarr()
+	_, p, _ := loopRig(t, time.Minute,
+		func(baseURL, apiKey string) (RadarrSource, error) { return src, nil }, nil)
+	src.waitForList(t)
+
+	if err := p.Trigger(context.Background(), "radarr"); !errors.Is(err, ErrSyncBusy) {
+		t.Fatalf("Trigger during a scheduled pass = %v, want ErrSyncBusy", err)
+	}
+	if got := src.listCalls(); got != 1 {
+		t.Errorf("arr listings = %d, want 1: a refused trigger must not reach arr", got)
+	}
+	close(src.release)
 }

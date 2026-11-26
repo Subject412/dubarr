@@ -251,8 +251,7 @@ type WatchOptions struct {
 
 // ArrOptions configure Radarr/Sonarr polling.
 type ArrOptions struct {
-	PollIntervalSec int  `json:"poll_interval_sec"`
-	ManualSync      bool `json:"manual_sync"`
+	PollIntervalSec int `json:"poll_interval_sec"`
 }
 
 // ImportsOptions configure approval-queue donor pairing. DonorPatterns are
@@ -375,7 +374,6 @@ func Defaults(dataDir string) map[string]any {
 		},
 		KeyArrOptions: ArrOptions{
 			PollIntervalSec: 300,
-			ManualSync:      true,
 		},
 		KeyArrConnections: ArrConnections{
 			Instances: []ArrConnection{},
@@ -465,6 +463,19 @@ func serveable(key, value string) json.RawMessage {
 		return blob
 	case KeyTargetTagFilter:
 		var p TargetTagFilter
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return raw
+		}
+		blob, err := json.Marshal(p)
+		if err != nil {
+			return raw
+		}
+		return blob
+	case KeyArrOptions:
+		// A row written before the manual-refresh flag was retired still
+		// carries it. Decoding into the current schema and re-marshalling
+		// drops it, so the API never serves a setting that no longer exists.
+		var p ArrOptions
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return raw
 		}

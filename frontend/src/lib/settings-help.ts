@@ -127,7 +127,6 @@ export const SETTINGS_HELP: Record<SettingsSectionKey, Record<string, string>> =
   },
   'arr.options': {
     poll_interval_sec: 'How often the Radarr/Sonarr libraries are refreshed.',
-    manual_sync: 'Allow triggering an arr library sync from the UI as well as on the poll timer.',
   },
 }
 

@@ -117,7 +117,7 @@ describe('settings section save', () => {
       },
       'mux.options': { keep_bak: true, track_title_in_mkv: 'Polski Dubbing' },
       'watch.options': { scan_interval_sec: 10, stability_check_interval_sec: 4 },
-      'arr.options': { poll_interval_sec: 300, manual_sync: true },
+      'arr.options': { poll_interval_sec: 300 },
     }
 
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {

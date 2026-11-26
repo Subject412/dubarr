@@ -204,10 +204,14 @@ func New(deps Dependencies) *Muxer {
 // uniquely named hidden temp in the destination directory (same filesystem),
 // ffprobe validates the result, and only then is the temp renamed into place —
 // after a backup copy of the original in replace mode. Any failure removes only
-// the temp this call created and leaves the original bytes in place. Staging is
-// owned by this call: once {WORK_DIR}/jobs/{id} has been created, every return
-// path removes it again, so no caller has to. That removal is idempotent, which
-// keeps a second cleanup by the sync worker a no-op.
+// the temp this call created and leaves the original bytes in place. In replace
+// mode the target is re-identified immediately before the swap: if the media
+// manager replaced it while mkvmerge ran, the temp is discarded, nothing — not
+// even a .bak — is written, and the call fails with [ErrTargetChanged]
+// (ADR-0018). Staging is owned by this call: once {WORK_DIR}/jobs/{id} has been
+// created, every return path removes it again, so no caller has to. That
+// removal is idempotent, which keeps a second cleanup by the sync worker a
+// no-op.
 func (m *Muxer) Mux(ctx context.Context, job Job) (Result, error) {
 	target, _, jobDir, lang, err := job.normalize()
 	if err != nil {
@@ -278,6 +282,13 @@ func (m *Muxer) Mux(ctx context.Context, job Job) (Result, error) {
 	if err := copyFile(target, workCopy, 0o644); err != nil {
 		return Result{}, fmt.Errorf("%w: work copy: %v", ErrPublish, err)
 	}
+	// ADR-0018: record what mkvmerge is about to read, taken after the copy
+	// so the identity describes the bytes actually copied rather than a file
+	// that was already replaced before the copy started.
+	identity, err := captureTargetIdentity(target)
+	if err != nil {
+		return Result{}, fmt.Errorf("%w: stat target after copy: %v", ErrTargetMissing, err)
+	}
 
 	bin := m.mkvmergePath
 	if bin == "" {
@@ -342,6 +353,27 @@ func (m *Muxer) Mux(ctx context.Context, job Job) (Result, error) {
 		return Result{}, err
 	}
 
+	// ADR-0018: publish only over the file this call actually copied. A mux
+	// takes minutes and the media manager does not wait, so arr may have
+	// replaced the target meanwhile; renaming this temp would then destroy a
+	// brand-new release and still look like a successful mux. The check is as
+	// late as it can be — mkvmerge has finished and the temp has validated —
+	// and a mismatch publishes nothing: the temp and the staging go, the
+	// target and any .bak stay exactly as they are.
+	//
+	// Separate mode reads the target but never replaces it (ADR-0011), so a
+	// target that moved underneath is harmless there and must not abort the
+	// job. That asymmetry is deliberate.
+	if mode == OutputModeReplace {
+		same, err := identity.matches(target)
+		if err != nil {
+			return Result{}, fmt.Errorf("%w: re-stat target %s: %v", ErrTargetMissing, target, err)
+		}
+		if !same {
+			return Result{}, fmt.Errorf("%w: %s", ErrTargetChanged, target)
+		}
+	}
+
 	bak := ""
 	if mode == OutputModeReplace {
 		bak = target + ".bak"
@@ -393,6 +425,42 @@ func (m *Muxer) publish(temp, dest string) error {
 		return fmt.Errorf("%w: rename output: %v", ErrPublish, err)
 	}
 	return nil
+}
+
+// targetIdentity is the identity of the target bytes a mux copied: inode, size
+// and mtime (ADR-0018).
+type targetIdentity struct {
+	info  os.FileInfo
+	size  int64
+	mtime time.Time
+}
+
+// captureTargetIdentity stats path and records what was copied. It is called
+// immediately after the Copy-on-Work copy, so the identity describes the bytes
+// mkvmerge actually reads.
+func captureTargetIdentity(path string) (targetIdentity, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return targetIdentity{}, err
+	}
+	return targetIdentity{info: info, size: info.Size(), mtime: info.ModTime()}, nil
+}
+
+// matches reports whether path is still the file this identity was captured
+// from: the same inode (os.SameFile) with the same size and mtime. A replaced
+// file, a rewrite in place and a vanished target are all mismatches, so the
+// caller must not publish over it. A stat failure is reported as an error
+// rather than being taken as "unchanged". Linux only, like the rest
+// (ADR-0016).
+func (t targetIdentity) matches(path string) (bool, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false, err
+	}
+	if !os.SameFile(t.info, info) {
+		return false, nil
+	}
+	return t.size == info.Size() && t.mtime.Equal(info.ModTime()), nil
 }
 
 // requireMatroska refuses a path whose extension cannot hold Matroska output.

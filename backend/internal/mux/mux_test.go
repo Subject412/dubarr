@@ -779,17 +779,34 @@ func TestPostMuxProbeFailureAborts(t *testing.T) {
 	}
 }
 
-// TestConcurrentMuxesUseDistinctTemps runs two publishes on one target: each
-// job must own its temp file, so neither can delete the other's output.
-func TestConcurrentMuxesUseDistinctTemps(t *testing.T) {
+// isMkvmergeWrite reports the argv of the publishing mkvmerge call (as opposed
+// to a probe): "-o <temp> --quiet <workCopy> ...". It is the seam the tests use
+// to act mid-mux.
+func isMkvmergeWrite(bin string, args []string) bool {
+	return filepath.Base(bin) == "mkvmerge" && len(args) > 0 && args[0] == "-o"
+}
+
+// TestConcurrentMuxesOnDistinctTargetsPublishIndependently keeps this test's
+// original point — each mux owns its temp file, so neither can delete the
+// other's output — on the topology where concurrency actually happens: two
+// different films drained at once. Both must publish, and each result must be a
+// valid Matroska with exactly one appended track and no temp left beside it.
+func TestConcurrentMuxesOnDistinctTargetsPublishIndependently(t *testing.T) {
 	h := newHarness(t)
 	second := *h
 	second.id = 43
+	second.target = copyFixture(t, fixtureTarget, h.dir, "Other Movie (2022) [TDARR].mkv")
 	secondJobDir := filepath.Join(h.work, "jobs", "43")
 	if err := os.MkdirAll(secondJobDir, 0o755); err != nil {
 		t.Fatalf("mkdir second job: %v", err)
 	}
 	second.audio = copyFixture(t, fixtureAudio, secondJobDir, "synced.pl.mka")
+
+	targets := []string{h.target, second.target}
+	before := make([]int, len(targets))
+	for i, target := range targets {
+		before[i] = len(audioStreams(probeFile(t, target)))
+	}
 
 	jobs := []Job{h.job(), second.job()}
 	errs := make([]error, len(jobs))
@@ -804,16 +821,179 @@ func TestConcurrentMuxesUseDistinctTemps(t *testing.T) {
 	wg.Wait()
 	for i, err := range errs {
 		if err != nil {
-			t.Fatalf("concurrent Mux %d: %v", i, err)
+			t.Fatalf("concurrent Mux %d on its own target: %v", i, err)
+		}
+	}
+
+	for i, target := range targets {
+		noTempsLeft(t, target)
+		if _, err := os.Stat(target + ".bak"); err != nil {
+			t.Errorf("target %d left no .bak: %v", i, err)
+		}
+		doc := probeFile(t, target)
+		if len(videoOnly(doc)) == 0 {
+			t.Errorf("target %d has no video stream", i)
+		}
+		if got, want := len(audioStreams(doc)), before[i]+1; got != want {
+			t.Errorf("target %d audio tracks = %d, want %d", i, got, want)
+		}
+		if _, ok := findAudio(doc, "pl", "PL DUB"); !ok {
+			t.Errorf("target %d has no pl/PL DUB track", i)
+		}
+	}
+}
+
+// TestSequentialMuxesComposeTwoAudioTracks pins the real workflow: dubs are
+// muxed one at a time into the same target, so the second publish copies a file
+// that already carries the first dub and must append its own without losing it.
+// The drain is sequential, so this — not a concurrent merge — is what
+// production relies on, and it must not regress.
+func TestSequentialMuxesComposeTwoAudioTracks(t *testing.T) {
+	h := newHarness(t)
+	first := h.job()
+	first.TrackTitle = "FIRST DUB"
+
+	second := *h
+	second.id = 43
+	secondJobDir := filepath.Join(h.work, "jobs", "43")
+	if err := os.MkdirAll(secondJobDir, 0o755); err != nil {
+		t.Fatalf("mkdir second job: %v", err)
+	}
+	second.audio = copyFixture(t, fixtureAudio, secondJobDir, "synced.pl.mka")
+	secondJob := second.job()
+	secondJob.TrackTitle = "SECOND DUB"
+
+	before := len(audioStreams(probeFile(t, h.target)))
+
+	if _, err := New(Dependencies{}).Mux(context.Background(), first); err != nil {
+		t.Fatalf("first Mux: %v", err)
+	}
+	if _, err := New(Dependencies{}).Mux(context.Background(), secondJob); err != nil {
+		t.Fatalf("second Mux: %v", err)
+	}
+
+	doc := probeFile(t, h.target)
+	if len(videoOnly(doc)) == 0 {
+		t.Error("composed target has no video stream")
+	}
+	if got, want := len(audioStreams(doc)), before+2; got != want {
+		t.Fatalf("audio tracks = %d, want %d (the original plus both dubs)", got, want)
+	}
+	for _, title := range []string{"FIRST DUB", "SECOND DUB"} {
+		if _, ok := findAudio(doc, "pl", title); !ok {
+			t.Errorf("no pl/%s track in %+v; the earlier dub was lost", title, audioStreams(doc))
 		}
 	}
 	noTempsLeft(t, h.target)
-	doc := probeFile(t, h.target)
-	if got := len(audioStreams(doc)); got != 2 {
-		t.Errorf("audio tracks = %d, want 2 (one per concurrent job)", got)
+}
+
+// TestConcurrentMuxesOnTheSameTargetPublishExactlyOnce pins the rule the
+// staleness check introduced for replace mode. A mux is a read-copy-publish
+// cycle over a file the media manager may replace at any time, so two muxes
+// that both copied the same old target cannot both publish: the second rename
+// would overwrite the first and drop its track. Refusing beats last-writer-wins
+// here because publishing a copy taken before the other mux ran silently loses
+// an audio track while looking like a successful merge.
+//
+// The race is orchestrated rather than hoped for: both calls are held at their
+// mkvmerge step until both have arrived (so both copied the original), and the
+// loser is then held until the winner's publish has landed, which makes the
+// identity check deterministic.
+func TestConcurrentMuxesOnTheSameTargetPublishExactlyOnce(t *testing.T) {
+	h := newHarness(t)
+	second := *h
+	second.id = 43
+	secondJobDir := filepath.Join(h.work, "jobs", "43")
+	if err := os.MkdirAll(secondJobDir, 0o755); err != nil {
+		t.Fatalf("mkdir second job: %v", err)
 	}
-	if _, err := os.Stat(h.target + ".bak"); err != nil {
-		t.Errorf("concurrent mux left no .bak: %v", err)
+	second.audio = copyFixture(t, fixtureAudio, secondJobDir, "synced.pl.mka")
+
+	before := len(audioStreams(probeFile(t, h.target)))
+
+	winnerJob := h.job()
+	winnerJob.TrackTitle = "RACE WINNER"
+	winnerJob.KeepBak = boolPtr(false)
+	loserJob := second.job()
+	loserJob.TrackTitle = "RACE LOSER"
+	loserJob.KeepBak = boolPtr(false)
+
+	var mu sync.Mutex
+	arrived := 0
+	bothCopied := make(chan struct{})
+	winnerPublished := make(chan struct{})
+	gate := func() {
+		mu.Lock()
+		arrived++
+		if arrived == 2 {
+			close(bothCopied)
+		}
+		mu.Unlock()
+		<-bothCopied
+	}
+	runWinner := func(ctx context.Context, bin string, args ...string) ([]byte, error) {
+		if isMkvmergeWrite(bin, args) {
+			gate()
+		}
+		return execRun(ctx, bin, args...)
+	}
+	runLoser := func(ctx context.Context, bin string, args ...string) ([]byte, error) {
+		if isMkvmergeWrite(bin, args) {
+			gate()
+			<-winnerPublished
+		}
+		return execRun(ctx, bin, args...)
+	}
+
+	winner := New(Dependencies{Run: runWinner})
+	winner.rename = func(oldpath, newpath string) error {
+		defer close(winnerPublished)
+		return os.Rename(oldpath, newpath)
+	}
+	loser := New(Dependencies{Run: runLoser})
+
+	var (
+		wg     sync.WaitGroup
+		errWin error
+		errLos error
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, errWin = winner.Mux(context.Background(), winnerJob)
+	}()
+	go func() {
+		defer wg.Done()
+		_, errLos = loser.Mux(context.Background(), loserJob)
+	}()
+	wg.Wait()
+
+	if errWin != nil {
+		t.Fatalf("the winning mux failed: %v", errWin)
+	}
+	if !errors.Is(errLos, ErrTargetChanged) {
+		t.Fatalf("the losing mux error = %v, want ErrTargetChanged", errLos)
+	}
+
+	// The published target is a whole, valid Matroska — not truncated and not
+	// half-written — carrying the winner's track only.
+	doc := probeFile(t, h.target)
+	if len(videoOnly(doc)) == 0 {
+		t.Error("published target has no video stream")
+	}
+	if got, want := len(audioStreams(doc)), before+1; got != want {
+		t.Errorf("audio tracks = %d, want %d (the winner's only, never a merged pair)", got, want)
+	}
+	if _, ok := findAudio(doc, "pl", "RACE WINNER"); !ok {
+		t.Errorf("no pl/RACE WINNER track in %+v", audioStreams(doc))
+	}
+	if _, ok := findAudio(doc, "pl", "RACE LOSER"); ok {
+		t.Errorf("the loser's track is in the target: a stale copy was published as a merge")
+	}
+
+	noTempsLeft(t, h.target)
+	if _, err := os.Stat(h.target + ".bak"); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf(".bak left behind by the race: %v", err)
 	}
 }
 
@@ -1105,6 +1285,72 @@ func TestSeparateModeIgnoresKeepBak(t *testing.T) {
 	}
 }
 
+// TestSeparateModePublishesWhenTargetChangesMidMux pins the deliberate
+// asymmetry of the staleness check: separate mode only reads the target and
+// publishes beside it, so a target the media manager replaced mid-run cannot
+// corrupt the deliverable and must not fail the job. Replace mode refuses the
+// same race (ADR-0018); this half proves the check did not leak into the mode
+// where it would be a false failure.
+func TestSeparateModePublishesWhenTargetChangesMidMux(t *testing.T) {
+	h := newHarness(t)
+	job, outDir, dest := h.separateHarness(t)
+	before := len(audioStreams(probeFile(t, h.target)))
+
+	upgraded := []byte("a brand-new release installed by the media manager")
+	sum := sha256.Sum256(upgraded)
+	upgradedHash := hex.EncodeToString(sum[:])
+
+	run := func(ctx context.Context, bin string, args ...string) ([]byte, error) {
+		if isMkvmergeWrite(bin, args) {
+			staged := h.target + ".upgrade"
+			if err := os.WriteFile(staged, upgraded, 0o644); err != nil {
+				t.Fatalf("write upgrade: %v", err)
+			}
+			if err := os.Rename(staged, h.target); err != nil {
+				t.Fatalf("install upgrade: %v", err)
+			}
+		}
+		return execRun(ctx, bin, args...)
+	}
+
+	res, err := New(Dependencies{Run: run}).Mux(context.Background(), job)
+	if err != nil {
+		t.Fatalf("separate-mode Mux: %v, want a publish despite the changed target", err)
+	}
+	if res.OutputPath != dest {
+		t.Fatalf("OutputPath = %q, want %q", res.OutputPath, dest)
+	}
+	if res.BackupPath != "" {
+		t.Errorf("BackupPath = %q, want empty in separate mode", res.BackupPath)
+	}
+	// The target read for the copy is gone; nothing was written into it.
+	if got := sha256File(t, h.target); got != upgradedHash {
+		t.Errorf("target hash = %s, want the upgraded bytes %s", got, upgradedHash)
+	}
+	if _, err := os.Stat(h.target + ".bak"); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf(".bak created in separate mode: %v", err)
+	}
+
+	doc := probeFile(t, dest)
+	if len(videoOnly(doc)) == 0 {
+		t.Error("separate deliverable has no video stream")
+	}
+	if got, want := len(audioStreams(doc)), before+1; got != want {
+		t.Fatalf("deliverable audio tracks = %d, want %d", got, want)
+	}
+	if _, ok := findAudio(doc, "pl", "PL DUB"); !ok {
+		t.Errorf("no pl/PL DUB track in %+v", audioStreams(doc))
+	}
+	entries, err := os.ReadDir(outDir)
+	if err != nil {
+		t.Fatalf("read output dir: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != filepath.Base(dest) {
+		t.Fatalf("output dir entries = %v, want only %s", entries, filepath.Base(dest))
+	}
+	noTempsLeft(t, dest)
+}
+
 // TestSeparateModeStillEnforcesTheTagGate: the gate is evaluated against the
 // source Target in both modes.
 func TestSeparateModeStillEnforcesTheTagGate(t *testing.T) {
@@ -1332,4 +1578,78 @@ func TestMuxContainerGuardAcceptsMatroska(t *testing.T) {
 			noTempsLeft(t, h.target)
 		})
 	}
+}
+
+// TestMuxStalenessRefusesToPublishOverAChangedTarget pins ADR-0018's staleness
+// check: the mux copies the target, the media manager then replaces it while
+// mkvmerge runs, and the publish must be refused rather than silently
+// overwriting the upgrade with output built from the old file. The upgraded
+// bytes survive untouched, no temp and no .bak are left behind, and the job
+// staging is removed as on every other return path.
+func TestMuxStalenessRefusesToPublishOverAChangedTarget(t *testing.T) {
+	h := newHarness(t)
+
+	upgraded := []byte("a brand-new release installed by the media manager")
+	sum := sha256.Sum256(upgraded)
+	upgradedHash := hex.EncodeToString(sum[:])
+
+	// The Run seam is the injection point the other tests use: rewrite the
+	// target exactly when mkvmerge starts, which is mid-mux, after the work
+	// copy was taken and before the publish.
+	run := func(ctx context.Context, bin string, args ...string) ([]byte, error) {
+		if filepath.Base(bin) == "mkvmerge" && len(args) > 0 && args[0] == "-o" {
+			staged := h.target + ".upgrade"
+			if err := os.WriteFile(staged, upgraded, 0o644); err != nil {
+				t.Fatalf("write upgrade: %v", err)
+			}
+			// Rename so the inode changes too, as an arr upgrade would.
+			if err := os.Rename(staged, h.target); err != nil {
+				t.Fatalf("install upgrade: %v", err)
+			}
+		}
+		return execRun(ctx, bin, args...)
+	}
+
+	_, err := New(Dependencies{Run: run}).Mux(context.Background(), h.job())
+	if !errors.Is(err, ErrTargetChanged) {
+		t.Fatalf("Mux error = %v, want ErrTargetChanged", err)
+	}
+	if !strings.Contains(err.Error(), h.target) {
+		t.Errorf("error %q should name the target %s", err, h.target)
+	}
+
+	if got := sha256File(t, h.target); got != upgradedHash {
+		t.Errorf("target hash = %s, want the upgraded bytes %s", got, upgradedHash)
+	}
+	noTempsLeft(t, h.target)
+	if _, err := os.Stat(h.target + ".bak"); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf(".bak created by a refused publish: %v", err)
+	}
+	jobDir := filepath.Join(h.work, "jobs", "42")
+	if _, err := os.Stat(jobDir); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("job staging %s survived the refusal: %v", jobDir, err)
+	}
+}
+
+// TestMuxStalenessControlPublishesWhenTargetUnchanged is the control half: an
+// untouched target still publishes, so the check cannot pass by refusing every
+// mux.
+func TestMuxStalenessControlPublishesWhenTargetUnchanged(t *testing.T) {
+	h := newHarness(t)
+	beforeHash := sha256File(t, h.target)
+
+	res, err := New(Dependencies{}).Mux(context.Background(), h.job())
+	if err != nil {
+		t.Fatalf("Mux: %v", err)
+	}
+	if res.OutputPath != h.target {
+		t.Fatalf("OutputPath = %q, want %q", res.OutputPath, h.target)
+	}
+	if got := sha256File(t, h.target); got == beforeHash {
+		t.Error("target content unchanged, mux did not publish")
+	}
+	if got := sha256File(t, h.target+".bak"); got != beforeHash {
+		t.Errorf(".bak hash = %s, want the original %s", got, beforeHash)
+	}
+	noTempsLeft(t, h.target)
 }

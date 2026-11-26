@@ -50,6 +50,90 @@ const REFERENCE_TOKEN_PRESETS = [
   { value: 'all', label: 'all — any shared language' },
 ]
 
+/**
+ * The tag sources the card can display. Only `filename` is applied: nothing
+ * feeds the Processing Gate arr metadata yet (`gate.ArrMetadata` is built in
+ * tests only), so `arr` and `both` are shown as stored-but-inactive instead of
+ * being silently rewritten to `filename`.
+ */
+const TAG_SOURCE_LABELS: Record<TargetTagFilter['source_mode'], string> = {
+  filename: 'Filename tags',
+  arr: 'Radarr/Sonarr tags',
+  both: 'Filename and Radarr/Sonarr tags',
+}
+
+/** Read-only truth for a filter stored with an arr source mode. */
+function StoredArrSourceNote({ filter }: { filter: TargetTagFilter }) {
+  const mode = filter.source_mode ?? 'filename'
+  const criteria = (
+    [
+      ['Required *arr tags', filter.required_arr_tags ?? []],
+      ['Excluded *arr tags', filter.excluded_arr_tags ?? []],
+      ['Root folders', filter.root_folder_paths ?? []],
+    ] as Array<[string, string[]]>
+  ).filter(([, values]) => values.length > 0)
+
+  return (
+    <div
+      role="note"
+      aria-label="Stored tag source"
+      className="space-y-1.5 rounded-lg border border-ink-700 bg-ink-800/50 px-3 py-2 text-sm"
+    >
+      <p className="font-medium text-zinc-200">
+        Stored tag source: {TAG_SOURCE_LABELS[mode]}
+      </p>
+      <p className="text-zinc-400">
+        Radarr/Sonarr criteria are not applied yet — only tags in the Target filename decide which
+        files are processed. The stored *arr values below are kept unchanged and saved back with
+        this section.
+      </p>
+      {criteria.length > 0 && (
+        <dl className="space-y-0.5 text-xs text-zinc-500">
+          {criteria.map(([label, values]) => (
+            <div key={label} className="flex gap-1">
+              <dt>{label}:</dt>
+              <dd>{values.join(', ')}</dd>
+            </div>
+          ))}
+        </dl>
+      )}
+    </div>
+  )
+}
+
+/**
+ * One source mode at a time. `filename` is the only mode that can be selected;
+ * a stored `arr`/`both` stays visible (and unchangeable) next to a note saying
+ * its criteria are not applied — never silently dropped from the UI.
+ */
+function TagSourceFields({ filter }: { filter: TargetTagFilter }) {
+  const mode = filter.source_mode ?? 'filename'
+  const arrStored = mode !== 'filename'
+
+  return (
+    <>
+      <Field
+        label="Tag source"
+        htmlFor="tag-source-mode"
+        hint={
+          arrStored
+            ? 'Stored but not applied: only filename tags filter files today.'
+            : 'Only tags in the Target filename are matched.'
+        }
+        help={settingsHelp('target.tag_filter', 'source_mode')}
+      >
+        <Select id="tag-source-mode" value={mode} disabled>
+          <option value={mode}>
+            {TAG_SOURCE_LABELS[mode]}
+            {arrStored ? ' (stored, not applied)' : ''}
+          </option>
+        </Select>
+      </Field>
+      {arrStored && <StoredArrSourceNote filter={filter} />}
+    </>
+  )
+}
+
 function Section<T extends object>({
   sectionKey,
   value,
@@ -396,24 +480,7 @@ export function SettingsPage() {
           >
             {(draft, update) => (
               <>
-                <Field
-                  label="Tag source"
-                  htmlFor="tag-source-mode"
-                  hint="Sources are combined: a file must satisfy each selected source."
-                  help={settingsHelp('target.tag_filter', 'source_mode')}
-                >
-                  <Select
-                    id="tag-source-mode"
-                    value={draft.source_mode ?? 'filename'}
-                    onChange={(event) =>
-                      update({ source_mode: event.target.value as TargetTagFilter['source_mode'] })
-                    }
-                  >
-                    <option value="filename">Filename tags</option>
-                    <option value="arr">Radarr/Sonarr tags</option>
-                    <option value="both">Filename and Radarr/Sonarr tags</option>
-                  </Select>
-                </Field>
+                <TagSourceFields filter={draft} />
                 <StringListEditor
                   label="Required filename tags"
                   inputLabel="Add required tag"
@@ -428,29 +495,6 @@ export function SettingsPage() {
                   values={draft.excluded_filename_tags ?? []}
                   onChange={(excluded_filename_tags) => update({ excluded_filename_tags })}
                   help={settingsHelp('target.tag_filter', 'excluded_filename_tags')}
-                />
-                <StringListEditor
-                  label="Required Radarr/Sonarr tags"
-                  inputLabel="Add required *arr tag"
-                  values={draft.required_arr_tags ?? []}
-                  onChange={(required_arr_tags) => update({ required_arr_tags })}
-                  placeholder="dub"
-                  help={settingsHelp('target.tag_filter', 'required_arr_tags')}
-                />
-                <StringListEditor
-                  label="Excluded Radarr/Sonarr tags"
-                  inputLabel="Add excluded *arr tag"
-                  values={draft.excluded_arr_tags ?? []}
-                  onChange={(excluded_arr_tags) => update({ excluded_arr_tags })}
-                  placeholder="cam"
-                  help={settingsHelp('target.tag_filter', 'excluded_arr_tags')}
-                />
-                <PathListEditor
-                  label="Radarr/Sonarr root folders"
-                  values={draft.root_folder_paths ?? []}
-                  onChange={(root_folder_paths) => update({ root_folder_paths })}
-                  emptyText="No root folders configured — every root folder is accepted."
-                  help={settingsHelp('target.tag_filter', 'root_folder_paths')}
                 />
                 <div className="grid gap-4 md:grid-cols-2">
                   <Field

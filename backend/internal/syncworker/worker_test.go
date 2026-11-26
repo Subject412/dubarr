@@ -925,9 +925,11 @@ func TestProcessOnceContainerRefusalIsTerminalFailure(t *testing.T) {
 
 // TestProcessOnceTargetChangedRequeuesJob pins the worker half of ADR-0018: a
 // mux that refused to publish because the media manager replaced the target
-// mid-run did not fail the job. The row goes back to queued with exactly one
-// log line, the drain pass it ran in ends instead of immediately re-running it,
-// and a later pass does run it again against the new file.
+// mid-run did not fail the job. The row goes back to queued, the requeue is
+// reported exactly once and the row is claimed exactly once (a requeued job is
+// not claimed twice in the same pass), the drain pass it ran in ends instead of
+// immediately re-running it, and a later pass does run it again against the new
+// file.
 func TestProcessOnceTargetChangedRequeuesJob(t *testing.T) {
 	r := newRig(t)
 	jobID := r.newJob(t)
@@ -956,11 +958,24 @@ func TestProcessOnceTargetChangedRequeuesJob(t *testing.T) {
 	if rec.ErrorMessage != "" {
 		t.Fatalf("error_message = %q, want it cleared", rec.ErrorMessage)
 	}
-	if len(logs) != 1 {
-		t.Fatalf("log lines = %v, want exactly one", logs)
+	// Count by message, not by total: the claim is an info line of its own
+	// (U1.6), so the property here is that the requeue is reported exactly
+	// once and the row was claimed exactly once — a requeued job must not be
+	// claimed twice in the same pass.
+	var claimed, requeued int
+	for _, line := range logs {
+		if strings.Contains(line, fmt.Sprintf("job %d claimed", jobID)) {
+			claimed++
+		}
+		if strings.Contains(line, fmt.Sprintf("job %d target changed", jobID)) && strings.Contains(line, "requeued") {
+			requeued++
+		}
 	}
-	if !strings.Contains(logs[0], "target changed") || !strings.Contains(logs[0], "requeued") {
-		t.Fatalf("log line = %q, want it to explain the changed target and the requeue", logs[0])
+	if requeued != 1 {
+		t.Fatalf("requeue log lines = %d in %v, want exactly one explaining the changed target and the requeue", requeued, logs)
+	}
+	if claimed != 1 {
+		t.Fatalf("claimed log lines = %d in %v, want exactly one (a requeued job must not be claimed twice)", claimed, logs)
 	}
 	// Issue #23: the staging goes with the pass; the next attempt re-stages.
 	if _, err := os.Stat(filepath.Dir(audio)); !errors.Is(err, os.ErrNotExist) {

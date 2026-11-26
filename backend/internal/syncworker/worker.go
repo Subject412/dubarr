@@ -133,8 +133,12 @@ type Dependencies struct {
 	WorkDir string
 	// Interval is the idle cadence; 0 selects DefaultInterval.
 	Interval time.Duration
-	// Logf receives worker diagnostics. Nil uses log.Printf.
+	// Logf receives worker decisions at info: job claimed, mux published.
+	// Nil uses log.Printf.
 	Logf func(format string, args ...any)
+	// Errorf receives a job failure at error, with the job id and the stage it
+	// failed at. Nil falls back to Logf so a bare worker still reports it.
+	Errorf func(format string, args ...any)
 }
 
 // Worker consumes queued sync jobs serially.
@@ -148,6 +152,7 @@ type Worker struct {
 	workDir    string
 	interval   time.Duration
 	logf       func(string, ...any)
+	errorf     func(string, ...any)
 
 	mu      sync.Mutex
 	started bool
@@ -184,6 +189,10 @@ func New(deps Dependencies) (*Worker, error) {
 	if logf == nil {
 		logf = log.Printf
 	}
+	errorf := deps.Errorf
+	if errorf == nil {
+		errorf = logf
+	}
 	transcoder := deps.Transcoder
 	if transcoder == nil {
 		transcoder = transcode.New(transcode.Dependencies{})
@@ -198,6 +207,7 @@ func New(deps Dependencies) (*Worker, error) {
 		workDir:    deps.WorkDir,
 		interval:   interval,
 		logf:       logf,
+		errorf:     errorf,
 	}, nil
 }
 
@@ -327,6 +337,7 @@ func (w *Worker) processOnce(ctx context.Context, visited map[int64]bool) (bool,
 	if visited != nil {
 		visited[id] = true
 	}
+	w.logf("syncworker: job %d claimed", id)
 	// Issue #23: whatever happens to the job, its staging directory is
 	// removed once the worker is done with it - completed (after mux), failed
 	// (Execute's own failure path is idempotent with this) or requeued (a
@@ -338,7 +349,7 @@ func (w *Worker) processOnce(ctx context.Context, visited map[int64]bool) (bool,
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
-				jobErr = fmt.Errorf("syncworker: job %d panic: %v", id, r)
+				jobErr = atStage("panic", fmt.Errorf("syncworker: job %d panic: %v", id, r))
 			}
 		}()
 		jobErr = w.processJob(ctx, id)
@@ -352,7 +363,7 @@ func (w *Worker) processOnce(ctx context.Context, visited map[int64]bool) (bool,
 		if errors.Is(jobErr, errRequeued) {
 			return true, nil
 		}
-		w.logf("syncworker: job %d failed: %v", id, jobErr)
+		w.errorf("syncworker: job %d failed at %s: %v", id, failureStage(jobErr), jobErr)
 		// Execute may already have recorded its own failure; overwriting with
 		// the same first line is idempotent.
 		if ferr := w.store.SetSyncJobStatus(context.WithoutCancel(ctx), id, statusFailed, errorSummary(jobErr)); ferr != nil {
@@ -374,10 +385,10 @@ const (
 func (w *Worker) processJob(ctx context.Context, id int64) error {
 	rec, ok, err := w.store.SyncJobByID(ctx, id)
 	if err != nil {
-		return err
+		return atStage("load", err)
 	}
 	if !ok {
-		return fmt.Errorf("syncworker: job %d not found", id)
+		return atStage("load", fmt.Errorf("syncworker: job %d not found", id))
 	}
 
 	// ADR-0010: Transcode Rules are matched against PRE-TEMPO vault-track
@@ -386,36 +397,36 @@ func (w *Worker) processJob(ctx context.Context, id int64) error {
 	// through an encode (Q19).
 	plan, track, err := w.transcodePlan(ctx, rec)
 	if err != nil {
-		return err
+		return atStage("plan", err)
 	}
 	if plan.Encode() {
 		if available, detail := w.transcoder.EncoderAvailable(ctx, plan.Encoder()); !available {
-			return fmt.Errorf("%w: rule %d needs %s for audio track %d: %s",
-				ErrEncoderUnavailable, plan.RuleIndex+1, plan.Encoder(), rec.TargetTrackID, detail)
+			return atStage("encoder", fmt.Errorf("%w: rule %d needs %s for audio track %d: %s",
+				ErrEncoderUnavailable, plan.RuleIndex+1, plan.Encoder(), rec.TargetTrackID, detail))
 		}
 	}
 
 	report, err := w.executor.Execute(ctx, id)
 	if err != nil {
-		return err
+		return atStage("analyze", err)
 	}
 	if !muxableVerdict(report.Verdict) {
-		return fmt.Errorf("%w: verdict %q (%s)", ErrUnmuxableVerdict, report.Verdict, strings.TrimSpace(report.Reason))
+		return atStage("verdict", fmt.Errorf("%w: verdict %q (%s)", ErrUnmuxableVerdict, report.Verdict, strings.TrimSpace(report.Reason)))
 	}
 
 	// Execute persisted the report and offset; re-read for the canonical row.
 	if rec, ok, err = w.store.SyncJobByID(ctx, id); err != nil {
-		return err
+		return atStage("reload", err)
 	} else if !ok {
-		return fmt.Errorf("syncworker: job %d disappeared", id)
+		return atStage("reload", fmt.Errorf("syncworker: job %d disappeared", id))
 	}
 
 	lib, ok, err := w.store.LibraryCacheJobTargetByID(ctx, rec.TargetLibraryCacheID)
 	if err != nil {
-		return err
+		return atStage("target", err)
 	}
 	if !ok {
-		return fmt.Errorf("syncworker: library target %d not found", rec.TargetLibraryCacheID)
+		return atStage("target", fmt.Errorf("syncworker: library target %d not found", rec.TargetLibraryCacheID))
 	}
 	targetPath := strings.TrimSpace(rec.TargetVideoPath)
 	if targetPath == "" {
@@ -424,31 +435,31 @@ func (w *Worker) processJob(ctx context.Context, id int64) error {
 
 	audio, err := w.stagedAudio(id)
 	if err != nil {
-		return err
+		return atStage("staging", err)
 	}
 	if plan.Encode() {
 		if audio, err = w.transcodeStaged(ctx, id, audio, plan, track); err != nil {
-			return err
+			return atStage("transcode", err)
 		}
 	}
 	offset := medianOffsetMS(report.OffsetsMS)
 	rule, err := w.gateRule(ctx)
 	if err != nil {
-		return err
+		return atStage("gate", err)
 	}
 	candidates, err := w.candidates(ctx, id, rec)
 	if err != nil {
-		return err
+		return atStage("candidates", err)
 	}
 
 	if err := w.store.SetSyncJobStatus(ctx, id, statusMuxing, ""); err != nil {
-		return err
+		return atStage("status", err)
 	}
 
 	opts, _ := w.muxOptions(ctx)
 	mode, outputDir, err := w.outputDestination(ctx, opts)
 	if err != nil {
-		return err
+		return atStage("output", err)
 	}
 	res, err := w.muxer.Mux(ctx, mux.Job{
 		ID:             id,
@@ -485,7 +496,7 @@ func (w *Worker) processJob(ctx context.Context, id int64) error {
 		// A mux sentinel — a non-Matroska container (mux.ErrUnsupportedContainer)
 		// included — is terminal: it is returned unwrapped and ProcessOnce
 		// records it as the job's failed status once, with no retry.
-		return err
+		return atStage("mux", err)
 	}
 
 	// ADR-0011: record where the file landed so the API/UI can show it. This
@@ -494,6 +505,7 @@ func (w *Worker) processJob(ctx context.Context, id int64) error {
 	if err := w.store.SetSyncJobOutputPath(context.WithoutCancel(ctx), id, res.OutputPath); err != nil {
 		w.logf("syncworker: job %d output path: %v", id, err)
 	}
+	w.logf("syncworker: job %d mux published: %s (mode=%s, offset=%d ms)", id, res.OutputPath, mode, offset)
 
 	// M5-4: rescan is best-effort and never undoes a published mux. Separate
 	// mode leaves the library Target untouched, so there is nothing for the
@@ -511,7 +523,7 @@ func (w *Worker) processJob(ctx context.Context, id int64) error {
 	// otherwise fail this write and leave ProcessOnce marking a published job
 	// failed. Only this last write is detached; the rescan above stays
 	// cancellable and best-effort.
-	return w.store.FinishSyncJobAnalysis(context.WithoutCancel(ctx), id, statusCompleted, string(report.SyncMethod), offset, report, "")
+	return atStage("finish", w.store.FinishSyncJobAnalysis(context.WithoutCancel(ctx), id, statusCompleted, string(report.SyncMethod), offset, report, ""))
 }
 
 // muxableVerdict accepts exactly the two verdicts M5-1 may publish. The
@@ -885,6 +897,35 @@ func medianOffsetMS(offsets []float64) int64 {
 		median = (sorted[mid-1] + sorted[mid]) / 2
 	}
 	return int64(math.Round(median))
+}
+
+// stageError names the pipeline stage a job failure came from, so the failure
+// line can say where the job stopped instead of only what broke. Unwrap keeps
+// the mux sentinels and errRequeued reachable through errors.Is.
+type stageError struct {
+	stage string
+	err   error
+}
+
+func (e *stageError) Error() string { return e.err.Error() }
+func (e *stageError) Unwrap() error { return e.err }
+
+// atStage tags err with the stage it failed at. A nil error stays nil.
+func atStage(stage string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return &stageError{stage: stage, err: err}
+}
+
+// failureStage reports the stage a job error was tagged with ("unknown" for an
+// error that never passed through atStage).
+func failureStage(err error) string {
+	var se *stageError
+	if errors.As(err, &se) {
+		return se.stage
+	}
+	return "unknown"
 }
 
 // errorSummary trims an error to one storable line.

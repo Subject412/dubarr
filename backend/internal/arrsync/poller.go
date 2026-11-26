@@ -124,8 +124,11 @@ type Deps struct {
 	Interval time.Duration
 	// Timeout bounds one arr HTTP request; 0 selects arr.DefaultTimeout.
 	Timeout time.Duration
-	// Logf reports pass failures. Nil means log.Printf.
+	// Logf reports pass decisions and failures at info. Nil means log.Printf.
 	Logf func(format string, args ...any)
+	// Debugf reports per-item detail (one line per cached row). Nil discards;
+	// it must never be used for a decision, only for the "why" behind one.
+	Debugf func(format string, args ...any)
 	// NewRadarr/NewSonarr build the clients; nil uses the M2 arr clients.
 	NewRadarr func(baseURL, apiKey string) (RadarrSource, error)
 	NewSonarr func(baseURL, apiKey string) (SonarrSource, error)
@@ -153,6 +156,7 @@ type Poller struct {
 	interval time.Duration
 	timeout  time.Duration
 	logf     func(format string, args ...any)
+	debugf   func(format string, args ...any)
 	radarr   func(baseURL, apiKey string) (RadarrSource, error)
 	sonarr   func(baseURL, apiKey string) (SonarrSource, error)
 	// newTicker builds the loop's ticker (newRealTicker in production). A test
@@ -196,6 +200,10 @@ func New(deps Deps) (*Poller, error) {
 	if logf == nil {
 		logf = log.Printf
 	}
+	debugf := deps.Debugf
+	if debugf == nil {
+		debugf = func(string, ...any) {}
+	}
 	p := &Poller{
 		store:     deps.Store,
 		settings:  deps.Settings,
@@ -203,6 +211,7 @@ func New(deps Deps) (*Poller, error) {
 		interval:  interval,
 		timeout:   timeout,
 		logf:      logf,
+		debugf:    debugf,
 		radarr:    deps.NewRadarr,
 		sonarr:    deps.NewSonarr,
 		newTicker: newRealTicker,
@@ -275,8 +284,9 @@ func (p *Poller) syncKind(ctx context.Context, kind string) (Stats, error) {
 		return Stats{}, err
 	}
 
-	var stats Stats
-	var errs []error
+	// Select first so the start line can name how many instances the pass will
+	// contact; the loop below must then visit exactly that set, in order.
+	selected := make([]settings.ArrConnection, 0, len(conns))
 	for _, conn := range conns {
 		if !conn.Enabled || strings.TrimSpace(conn.BaseURL) == "" {
 			continue
@@ -284,6 +294,15 @@ func (p *Poller) syncKind(ctx context.Context, kind string) (Stats, error) {
 		if kind != "" && conn.Kind != kind {
 			continue
 		}
+		selected = append(selected, conn)
+	}
+
+	label := kindOrAll(kind)
+	p.logf("arrsync: %s refresh pass started: %d instance(s)", label, len(selected))
+
+	var stats Stats
+	var errs []error
+	for _, conn := range selected {
 		stats.Instances++
 		if err := p.syncInstance(ctx, rule, conn, &stats); err != nil {
 			stats.Failed++
@@ -291,6 +310,9 @@ func (p *Poller) syncKind(ctx context.Context, kind string) (Stats, error) {
 			p.logf("arrsync: %s: %v", conn.Kind, err)
 		}
 	}
+	p.logf("arrsync: %s refresh pass finished: %d item(s) (%d inserted, %d updated, %d unchanged, %d deleted), %d instance(s), %d failed",
+		label, stats.Inserted+stats.Updated+stats.Unchanged+stats.Deleted,
+		stats.Inserted, stats.Updated, stats.Unchanged, stats.Deleted, stats.Instances, stats.Failed)
 	return stats, errors.Join(errs...)
 }
 
@@ -368,6 +390,8 @@ func (p *Poller) syncInstance(ctx context.Context, rule gate.Rule, conn settings
 	if err := p.store.TouchArrInstanceSync(ctx, instanceID); err != nil {
 		return err
 	}
+	p.logf("arrsync: %s: pass finished: %d inserted, %d updated, %d unchanged, %d deleted",
+		conn.Kind, stats2.Inserted, stats2.Updated, stats2.Unchanged, stats2.Deleted)
 	return nil
 }
 
@@ -457,6 +481,8 @@ func (p *Poller) listItems(ctx context.Context, conn settings.ArrConnection, api
 				Tags:       arrLabels,
 				RootFolder: root,
 			})
+			p.debugf("arrsync: radarr cache row movie/%d %q target=%q root=%q tags=%v gate=%s (matched=%t)",
+				movie.ID, movie.Title, target, root, arrLabels, status, matches)
 			items = append(items, store.LibraryCacheItem{
 				MediaType:            "movie",
 				ExternalItemID:       int64(movie.ID),
@@ -511,6 +537,8 @@ func (p *Poller) listItems(ctx context.Context, conn settings.ArrConnection, api
 					RootFolder: root,
 				})
 				season, number := episode.SeasonNumber, episode.EpisodeNumber
+				p.debugf("arrsync: sonarr cache row episode/%d %q S%02dE%02d target=%q root=%q tags=%v gate=%s (matched=%t)",
+					episode.ID, show.Title, season, number, target, root, arrLabels, status, matches)
 				items = append(items, store.LibraryCacheItem{
 					MediaType:            "episode",
 					ExternalItemID:       int64(episode.ID),

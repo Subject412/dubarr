@@ -208,7 +208,8 @@ func (s *subsystemSupervisor) startScanner(paths settings.StoragePaths) {
 	scanner, err := wireScanner(runCtx, scannerWiring{
 		Settings: s.settings,
 		Store:    s.store,
-		Logf:     quietLogf,
+		Logf:     s.logger.Logf("watch"),
+		Debugf:   s.logger.Debugf("watch"),
 	})
 	if err != nil {
 		cancel()
@@ -238,7 +239,8 @@ func (s *subsystemSupervisor) startExtract(paths settings.StoragePaths) {
 		Settings: s.settings,
 		Store:    s.store,
 		DataDir:  s.dataDir,
-		Logf:     quietLogf,
+		Logf:     s.logger.Logf("extract"),
+		Debugf:   s.logger.Debugf("extract"),
 	})
 	if err != nil {
 		cancel()
@@ -269,7 +271,8 @@ func (s *subsystemSupervisor) startSync(paths settings.StoragePaths) {
 		Settings: s.settings,
 		Store:    s.store,
 		Secrets:  s.secrets,
-		Logf:     quietLogf,
+		Logf:     s.logger.Logf("syncworker"),
+		Errorf:   s.logger.Errorf("syncworker"),
 	})
 	if err != nil {
 		cancel()
@@ -302,7 +305,8 @@ func (s *subsystemSupervisor) startLibrary() {
 		Settings: s.settings,
 		Store:    s.store,
 		Secrets:  s.secrets,
-		Logf:     quietLogf,
+		Logf:     s.logger.Logf("arrsync"),
+		Debugf:   s.logger.Debugf("arrsync"),
 	})
 	if err != nil {
 		cancel()
@@ -323,11 +327,12 @@ func (s *subsystemSupervisor) startLibrary() {
 	s.activated("arrsync", "arr.connections")
 }
 
-// quietLogf discards the wire constructors' "disabled" messages: reconcile
-// calls a constructor only for a subsystem it believes is missing, and reports
-// the outcome itself. It keeps a settings save from re-logging "not configured"
-// for every section that is still empty.
-func quietLogf(string, ...any) {}
+// Post-boot subsystems get the same log seams as the boot ones: a worker
+// started after a settings save must be as visible in /logs as one started at
+// boot, otherwise the "why did nothing happen" question comes straight back
+// for a subsystem the wizard activated. The constructors' "still disabled"
+// messages are acceptable here because reconcile only calls a constructor for
+// a subsystem it believes is missing.
 
 // activated logs the activation exactly once per subsystem, naming the setting
 // that made it eligible. Silence here was part of the field report's "no logs".

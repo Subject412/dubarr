@@ -143,6 +143,11 @@ type Scanner struct {
 	observations map[string]observation
 	// hook is the optional post-record callback, guarded by mu.
 	hook CandidateHook
+	// logf/debugf are the optional log seams, guarded by mu: info for the one
+	// line per scan, debug for the per-path detail. Nil keeps the scanner
+	// silent, which is the pre-U1.6 behaviour of a bare New.
+	logf   func(format string, args ...any)
+	debugf func(format string, args ...any)
 
 	// running is the debounce latch: Scan holds it for its whole duration.
 	running sync.Mutex
@@ -272,6 +277,37 @@ func (s *Scanner) SetCandidateHook(fn CandidateHook) {
 	s.mu.Unlock()
 }
 
+// SetLogging installs the scan log seams: logf gets one info line per scan
+// (files seen / candidates added / skipped), debugf gets one line per scanned
+// path with the reason it was skipped. Both are optional and nil keeps the
+// scanner silent; the levels come from the seam, so a debug line disappears at
+// the info threshold without the scanner knowing about levels.
+func (s *Scanner) SetLogging(logf, debugf func(format string, args ...any)) {
+	s.mu.Lock()
+	s.logf, s.debugf = logf, debugf
+	s.mu.Unlock()
+}
+
+// info emits one scan-level line through the installed seam.
+func (s *Scanner) info(format string, args ...any) {
+	s.mu.Lock()
+	fn := s.logf
+	s.mu.Unlock()
+	if fn != nil {
+		fn(format, args...)
+	}
+}
+
+// debug emits one per-path line through the installed seam.
+func (s *Scanner) debug(format string, args ...any) {
+	s.mu.Lock()
+	fn := s.debugf
+	s.mu.Unlock()
+	if fn != nil {
+		fn(format, args...)
+	}
+}
+
 // invokeHook runs the configured post-record callback, if any. A panic in the
 // hook is recovered and returned as an error: the hook runs in the scan loop
 // goroutine, so letting it unwind would kill the loop permanently.
@@ -324,6 +360,11 @@ func (s *Scanner) Scan(ctx context.Context) (Result, error) {
 	if complete {
 		s.pruneObservations(present)
 	}
+	// One info line per scan: what it saw and what it did with it. "Skipped"
+	// is every seen file that did not become a new candidate this pass —
+	// still settling, already queued, or a record/hook error.
+	s.info("watch: scan finished: %d file(s) seen, %d candidate(s) added, %d skipped, %d error(s)",
+		res.Seen, res.Added, res.Seen-res.Added, len(res.Errors))
 	return res, errors.Join(res.Errors...)
 }
 
@@ -366,6 +407,7 @@ func (s *Scanner) scanRoot(ctx context.Context, root string, res *Result, presen
 			return nil
 		}
 		if !confined(resolved, root) {
+			s.debug("watch: skipped %s: it escapes media root %s", path, root)
 			res.Errors = append(res.Errors, fmt.Errorf("watch: %q escapes media root %q", path, root))
 			return nil
 		}
@@ -375,13 +417,16 @@ func (s *Scanner) scanRoot(ctx context.Context, root string, res *Result, presen
 			return nil
 		}
 		if !info.Mode().IsRegular() {
+			s.debug("watch: skipped %s: not a regular file", resolved)
 			return nil
 		}
 
 		res.Seen++
 		present[resolved] = struct{}{}
+		s.debug("watch: scanned %s (%d bytes, mtime %s)", resolved, info.Size(), info.ModTime().UTC().Format(time.RFC3339))
 		if !s.observe(resolved, info) {
 			// Still being written: keep the reading and retry next pass.
+			s.debug("watch: skipped %s: size/mtime not stable for %v yet", resolved, s.stabilityWindow())
 			return nil
 		}
 		created, err := s.store.RecordImportCandidate(ctx, resolved, info.Name(), info.Size())
@@ -395,9 +440,12 @@ func (s *Scanner) scanRoot(ctx context.Context, root string, res *Result, presen
 		// it when the row was deleted. No local latch, nothing to get stale.
 		if created {
 			res.Added++
+			s.debug("watch: queued %s as a new import candidate", resolved)
 			if err := s.invokeHook(ctx, resolved, info.Name(), info.Size()); err != nil {
 				res.Errors = append(res.Errors, fmt.Errorf("watch: post-record hook for %q: %w", resolved, err))
 			}
+		} else {
+			s.debug("watch: skipped %s: already queued", resolved)
 		}
 		return nil
 	})

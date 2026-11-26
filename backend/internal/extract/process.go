@@ -63,10 +63,13 @@ func (w *Worker) processJob(ctx context.Context, job store.ImportExtractionJob) 
 	if err != nil {
 		return fmt.Errorf("extract: probe donor: %w", err)
 	}
+	w.debugf("extract: job %d probed donor %s: %d audio track(s), duration %v",
+		job.ID, donor, len(media.Tracks), media.Duration)
 	tracks, err := w.selectTracks(ctx, job, media)
 	if err != nil {
 		return err
 	}
+	w.debugf("extract: job %d export policy selected %d of %d donor track(s)", job.ID, len(tracks), len(media.Tracks))
 
 	mkvTracks, err := w.audioTracks(ctx, donor)
 	if err != nil {
@@ -142,6 +145,8 @@ func (w *Worker) processJob(ctx context.Context, job store.ImportExtractionJob) 
 				return fmt.Errorf("extract: probe staged output %s: %w", out, err)
 			}
 			got := info.Tracks[0]
+			w.debugf("extract: job %d probed staged %s: codec=%s channels=%d duration=%v",
+				job.ID, out, got.Codec, got.Channels, info.Duration)
 			staged = append(staged, StagedTrack{
 				Path:         out,
 				Language:     trackLanguage(tracks[i]),

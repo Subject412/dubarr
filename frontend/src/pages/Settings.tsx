@@ -499,12 +499,6 @@ export function SettingsPage() {
             {(draft, update) => (
               <>
                 <Toggle
-                  label="Vault read-only"
-                  help={settingsHelp('security.options', 'vault_read_only')}
-                  checked={draft.vault_read_only}
-                  onChange={(vault_read_only) => update({ vault_read_only })}
-                />
-                <Toggle
                   label="Allow force tag override"
                   help={settingsHelp('security.options', 'allow_force_tag_override')}
                   checked={draft.allow_force_tag_override}

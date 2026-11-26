@@ -372,7 +372,7 @@ func TestSettingsPutRejectsNullSections(t *testing.T) {
 	if err := json.Unmarshal(env.Settings[settings.KeySecurityOptions], &sec); err != nil {
 		t.Fatalf("decode security: %v", err)
 	}
-	if !sec.VaultReadOnly || !sec.RequireAV1Warning {
+	if !sec.RequireAV1Warning {
 		t.Errorf("null write disabled safety switches: %+v", sec)
 	}
 	var sp settings.StoragePaths
@@ -381,6 +381,82 @@ func TestSettingsPutRejectsNullSections(t *testing.T) {
 	}
 	if sp.WorkDir != filepath.Join(h.dataDir, "work") {
 		t.Errorf("null write cleared storage.paths: %+v", sp)
+	}
+}
+
+// TestSettingsServesLegacySecurityOptionsWithoutVaultReadOnly pins the read
+// path: a row stored before security.options.vault_read_only was retired still
+// loads (200) and is served without the removed key, because the section
+// decodes into the current schema. The stored row itself stays untouched.
+func TestSettingsServesLegacySecurityOptionsWithoutVaultReadOnly(t *testing.T) {
+	h := newHarness(t)
+	h.setupAdmin()
+	legacy := `{"vault_read_only":true,"allow_force_tag_override":true,"require_av1_warning":false,"require_av1_strict":false}`
+	if _, err := h.db.Exec(
+		`INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`,
+		settings.KeySecurityOptions, legacy,
+	); err != nil {
+		t.Fatalf("seed legacy security.options: %v", err)
+	}
+
+	env := h.getSettings() // fails on any non-200
+	raw, ok := env.Settings[settings.KeySecurityOptions]
+	if !ok {
+		t.Fatal("GET /api/settings dropped security.options")
+	}
+	var opts map[string]any
+	if err := json.Unmarshal(raw, &opts); err != nil {
+		t.Fatalf("decode security.options: %v (%s)", err, raw)
+	}
+	if _, ok := opts["vault_read_only"]; ok {
+		t.Errorf("security.options still serves vault_read_only: %s", raw)
+	}
+	if got, _ := opts["allow_force_tag_override"].(bool); !got {
+		t.Errorf("allow_force_tag_override = %v, want the stored true", opts["allow_force_tag_override"])
+	}
+	if got, _ := opts["require_av1_warning"].(bool); got {
+		t.Errorf("require_av1_warning = %v, want the stored false", opts["require_av1_warning"])
+	}
+
+	// Serving is not rewriting: the legacy bytes are still in the row.
+	var stored string
+	if err := h.db.QueryRow(`SELECT value FROM settings WHERE key = ?`, settings.KeySecurityOptions).Scan(&stored); err != nil {
+		t.Fatalf("read stored security.options: %v", err)
+	}
+	if stored != legacy {
+		t.Errorf("stored row was rewritten: %s, want %s", stored, legacy)
+	}
+}
+
+// TestSettingsPutRejectsLegacyVaultReadOnly pins the write path: the retired key
+// is not silently ignored, the API answers 400 and names the unknown field, so a
+// client cannot keep writing a setting that no longer exists.
+func TestSettingsPutRejectsLegacyVaultReadOnly(t *testing.T) {
+	h := newHarness(t)
+	h.setupAdmin()
+
+	code, body := h.do(http.MethodPut, "/api/settings", map[string]any{
+		"settings": map[string]any{
+			settings.KeySecurityOptions: map[string]any{
+				"vault_read_only": true,
+			},
+		},
+	})
+	if code != http.StatusBadRequest {
+		t.Fatalf("PUT security.options with vault_read_only = %d, want 400: %s", code, body)
+	}
+	if !bytes.Contains(body, []byte("vault_read_only")) {
+		t.Errorf("400 body does not name the unknown field: %s", body)
+	}
+
+	// Nothing was written: the seeded section keeps its defaults.
+	env := h.getSettings()
+	var sec settings.SecurityOptions
+	if err := json.Unmarshal(env.Settings[settings.KeySecurityOptions], &sec); err != nil {
+		t.Fatalf("decode security.options: %v", err)
+	}
+	if sec.AllowForceTagOverride || !sec.RequireAV1Warning {
+		t.Errorf("rejected write changed security.options: %+v", sec)
 	}
 }
 

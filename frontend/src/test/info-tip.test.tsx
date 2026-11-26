@@ -34,7 +34,6 @@ const SETTINGS = {
     preview_window_sec: 60,
   },
   'security.options': {
-    vault_read_only: true,
     allow_force_tag_override: false,
     require_av1_warning: true,
     require_av1_strict: false,
@@ -244,7 +243,7 @@ async function renderSettingsAndReturnMock() {
 describe('settings help module', () => {
   it('documents every settings field exactly once', () => {
     expect(SETTINGS_HELP['storage.paths'].watch_dir).toMatch(/Watch Folder/i)
-    expect(SETTINGS_HELP['security.options'].vault_read_only).toMatch(/write-once/i)
+    expect(SETTINGS_HELP['security.options'].allow_force_tag_override).toMatch(/bypass/i)
     expect(SETTINGS_HELP['mux.options'].keep_bak).toMatch(/backup/i)
     expect(SETTINGS_HELP['sync.defaults'].max_offset_sec).toMatch(/offset/i)
   })

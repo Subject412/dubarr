@@ -113,7 +113,6 @@ describe('settings section save', () => {
         preview_window_sec: 60,
       },
       'security.options': {
-        vault_read_only: true,
         allow_force_tag_override: false,
         require_av1_warning: true,
         require_av1_strict: false,
@@ -346,6 +345,41 @@ describe('mux options keep_bak', () => {
     }
     expect(body.settings['mux.options'].keep_bak).toBe(false)
     expect(body.settings['mux.options'].track_title_in_mkv).toBe('Polski Dubbing')
+  })
+})
+
+describe('security options (vault_read_only retired)', () => {
+  function mockSecurityFetch(): ReturnType<typeof vi.fn> {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/api/settings') && isMethod(init, 'PUT')) {
+        return jsonResponse({ settings: {} })
+      }
+      if (url.includes('/api/settings')) {
+        return jsonResponse({
+          settings: {
+            'security.options': {
+              allow_force_tag_override: false,
+              require_av1_warning: true,
+              require_av1_strict: false,
+            },
+          },
+        })
+      }
+      return jsonResponse({ error: 'unexpected' }, 404)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    return fetchMock
+  }
+
+  it('renders the force tag override control and no vault read-only one', async () => {
+    mockSecurityFetch()
+    renderWithProviders(<SettingsPage />, { route: '/settings' })
+    expect(await screen.findByRole('heading', { name: 'Security options' })).toBeInTheDocument()
+
+    expect(screen.getByRole('switch', { name: 'Allow force tag override' })).toBeInTheDocument()
+    expect(screen.queryByRole('switch', { name: 'Vault read-only' })).toBeNull()
+    expect(screen.queryByText(/vault read-only/i)).toBeNull()
   })
 })
 

@@ -102,14 +102,18 @@ func (s *Store) Path() string { return s.dbPath }
 // DataDir returns the directory the store was opened against.
 func (s *Store) DataDir() string { return s.dataDir }
 
-// Close releases the database handle and is idempotent. A Store is a
-// single-owner handle: use it from one goroutine at a time (or serialize access
-// yourself), since Close is not safe to race with queries on DB.
+// Close releases the database handle and is idempotent. It deliberately leaves
+// s.DB pointing at the closed *sql.DB: every package captures the handle once at
+// wiring time, so clearing it here would race those readers (issue #62: the
+// health handler dereferenced a nil DB while shutting down). After Close,
+// queries fail with database/sql's "database is closed" error, which callers
+// already report as "database unavailable". database/sql makes the second Close
+// a no-op (DB.Close returns nil once its internal closed flag is set, and it is
+// safe to call concurrently with queries), so the guards below are defence for
+// a zero-value Store, not the idempotence mechanism.
 func (s *Store) Close() error {
 	if s == nil || s.DB == nil {
 		return nil
 	}
-	err := s.DB.Close()
-	s.DB = nil
-	return err
+	return s.DB.Close()
 }

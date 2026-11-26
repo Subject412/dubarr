@@ -194,6 +194,14 @@ type server struct {
 
 	closeOnce sync.Once
 	closeErr  error
+
+	// serveMu guards serveDone, the channel Serve closes once it has returned
+	// (which, with the graceful shutdown below, means in-flight handlers have
+	// drained). Close reads it to stop the HTTP server before releasing the
+	// store. It is nil until Serve starts, so Close on a never-served server
+	// does not block.
+	serveMu   sync.Mutex
+	serveDone chan struct{}
 }
 
 // newServer opens DATA_DIR, wires every package onto one mux and returns a
@@ -923,13 +931,22 @@ func loadWatchInterval(ctx context.Context, st *settings.Store) (time.Duration, 
 // Handler exposes the wired mux (used by tests and embed checks).
 func (s *server) Handler() http.Handler { return s.mux }
 
-// Close stops the watch loop and releases the database handle. It is safe to
-// call more than once.
+// Close stops the HTTP server, the watch loop and releases the database handle.
+// It is safe to call more than once.
+//
+// Ordering matters (issue #62): the HTTP server is shut down and Serve is
+// allowed to finish before the store is closed. Serve returns as soon as the
+// listener closes, which happens before the last in-flight handler has run, so
+// stopping the store first would let a running handler query a closed pool.
+// Shutdown is bounded by shutdownTimeout, so a wedged handler delays — but never
+// blocks — the release; once the window expires the handler only sees a
+// closed-database error, never a nil handle.
 func (s *server) Close() error {
 	s.closeOnce.Do(func() {
 		if s.sup != nil {
 			s.sup.Stop()
 		}
+		s.stopHTTP()
 		if s.logs != nil {
 			if err := s.logs.Close(); err != nil && s.closeErr == nil {
 				s.closeErr = err
@@ -944,10 +961,35 @@ func (s *server) Close() error {
 	return s.closeErr
 }
 
+// stopHTTP gracefully stops the HTTP server, bounded by shutdownTimeout, and
+// waits until Serve has returned so no handler is still executing when the
+// caller releases the store. It is a no-op when Serve never ran.
+func (s *server) stopHTTP() {
+	s.serveMu.Lock()
+	done := s.serveDone
+	s.serveMu.Unlock()
+	if done == nil || s.http == nil {
+		return
+	}
+	shutCtx, shutCancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer shutCancel()
+	_ = s.http.Shutdown(shutCtx)
+	<-done
+}
+
 // Serve binds cfg.Listen, reports the bound address through onListen and blocks
 // until ctx is cancelled or the server fails. Cancellation triggers a bounded
 // graceful shutdown; ErrServerClosed is reported as success.
 func (s *server) Serve(ctx context.Context, onListen func(addr string)) error {
+	// Register the completion channel before listening: Close consults it to
+	// stop the HTTP server first and wait for handlers, and must not observe a
+	// half-started server (nil) after the listener is accepting.
+	done := make(chan struct{})
+	s.serveMu.Lock()
+	s.serveDone = done
+	s.serveMu.Unlock()
+	defer close(done)
+
 	ln, err := net.Listen("tcp", s.cfg.Listen)
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", s.cfg.Listen, err)
@@ -973,9 +1015,12 @@ func (s *server) Serve(ctx context.Context, onListen func(addr string)) error {
 	if errors.Is(err, http.ErrServerClosed) {
 		err = nil
 	}
-	if ctx.Err() != nil {
-		<-stopped
-	}
+	// Always wait for the graceful shutdown to drain in-flight handlers before
+	// returning: http.Serve returns when the listener closes, which is earlier
+	// than the last handler. Close relies on this to release the store only
+	// after the HTTP server has stopped (issue #62).
+	cancel()
+	<-stopped
 	return err
 }
 

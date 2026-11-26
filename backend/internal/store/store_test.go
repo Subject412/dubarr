@@ -205,6 +205,31 @@ func TestSchemaDefaults(t *testing.T) {
 	}
 }
 
+// TestCloseIsIdempotentAndKeepsHandle pins the issue-#62 contract: Close leaves
+// DB non-nil, so a reader that captured the handle can never observe a nil in
+// place of a closed pool. A second Close is a no-op (database/sql returns nil
+// once its internal closed flag is set) and queries after Close fail with a
+// closed-database error instead of panicking.
+func TestCloseIsIdempotentAndKeepsHandle(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	db := s.DB
+	if err := s.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+	if s.DB != db {
+		t.Fatalf("Close replaced DB (got %v), want the closed handle kept", s.DB)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	if err := s.DB.Ping(); err == nil {
+		t.Fatal("Ping after Close succeeded, want a closed-database error")
+	}
+}
+
 // TestSchemaSQLMirrorsMigration keeps backend/schema.sql — the human-facing
 // schema referenced by PLAN.md — byte-identical to the migration
 // the runner actually applies. schema.sql must never drift from 0001_initial.sql.

@@ -10,7 +10,6 @@ import (
 	"strings"
 
 	"github.com/Subject412/dubarr/backend/internal/arr"
-	"github.com/Subject412/dubarr/backend/internal/arrsync"
 	"github.com/Subject412/dubarr/backend/internal/settings"
 )
 
@@ -39,11 +38,6 @@ type instanceHealth struct {
 type healthResponse struct {
 	Instances  []instanceHealth `json:"instances"`
 	CacheItems int64            `json:"cache_items"`
-	// ManualSync is arr.options.manual_sync, the same decision the poller
-	// enforces. The Library screen derives its refresh controls' disabled
-	// state from here, so flipping the setting in Settings takes effect on
-	// the next health read instead of latching a client-side flag.
-	ManualSync bool `json:"manual_sync"`
 }
 
 // handleHealth merges two sources into one list keyed by kind:
@@ -120,24 +114,7 @@ func (s *Service) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, healthResponse{
 		Instances:  instances,
 		CacheItems: cacheItems,
-		ManualSync: s.manualSyncEnabled(r.Context()),
 	})
-}
-
-// manualSyncEnabled reports arr.options.manual_sync via the poller's own rule,
-// so the UI and the poller can never disagree. Health must not fail because of
-// it: a read error is logged and falls back to the seeded default, true.
-func (s *Service) manualSyncEnabled(ctx context.Context) bool {
-	if s.settings == nil {
-		return true
-	}
-	enabled, err := arrsync.ManualSyncEnabled(ctx, s.settings)
-	if err != nil {
-		slog.Default().Warn("library health: read manual_sync",
-			"component", "library", "error", err)
-		return true
-	}
-	return enabled
 }
 
 // configuredConnections returns the arr.connections entries, or nil when no

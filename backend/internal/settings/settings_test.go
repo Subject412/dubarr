@@ -104,7 +104,7 @@ func TestSeedDefaults(t *testing.T) {
 		t.Errorf("watch options = %+v", w)
 	}
 	a := decode[ArrOptions](t, all[KeyArrOptions])
-	if a.PollIntervalSec != 300 || !a.ManualSync {
+	if a.PollIntervalSec != 300 {
 		t.Errorf("arr options = %+v", a)
 	}
 }

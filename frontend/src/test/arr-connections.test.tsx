@@ -19,7 +19,7 @@ const LS = window.localStorage
 function settingsPayload() {
   return {
     settings: {
-      'arr.options': { poll_interval_sec: 300, manual_sync: true },
+      'arr.options': { poll_interval_sec: 300 },
     },
   }
 }

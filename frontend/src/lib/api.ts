@@ -139,7 +139,6 @@ export type WatchOptions = {
 
 export type ArrOptions = {
   poll_interval_sec: number
-  manual_sync: boolean
 }
 
 /** Supported *arr applications; also the `{kind}` path segment on the API. */

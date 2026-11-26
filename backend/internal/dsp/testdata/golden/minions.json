@@ -1,0 +1,267 @@
+{
+  "case": "minions",
+  "tier": "real",
+  "engine": "rust dubarr-sync (reference engine, sync-engine/)",
+  "provenance": {
+    "rust_commit": "ccfa2e30443509d58dee8f8f88752192a3c2c1ff",
+    "cargo_lock_sha256": "cb4f43fbcec8117125aa8a6327384e85a441c725d7f8bc37214b8728b1abe10f",
+    "dubarr_sync_version": "dubarr-sync 0.1.0",
+    "ffmpeg_version": "ffmpeg version n9.1 Copyright (c) 2000-2026 the FFmpeg developers",
+    "host": "CiastekLT Linux 7.3.6-1-cachyos x86_64",
+    "date": "2026-11-26T22:59:38Z",
+    "argv": {
+      "emit": [
+        "cargo",
+        "test",
+        "--offline",
+        "--release",
+        "--test",
+        "emit",
+        "--",
+        "--out",
+        "<scratch>/synthetic"
+      ],
+      "decode": [
+        {
+          "source": "testfiles/Shrek (2001) - [ArcA310][Remux-2160p][HDR10][Opus 7.1][AV1][imdb-tt0126029]-FraMeSToR.mkv",
+          "stream": 1,
+          "argv": [
+            "-v",
+            "error",
+            "-nostdin",
+            "-y",
+            "-i",
+            "testfiles/Shrek (2001) - [ArcA310][Remux-2160p][HDR10][Opus 7.1][AV1][imdb-tt0126029]-FraMeSToR.mkv",
+            "-map",
+            "0:1",
+            "-ac",
+            "1",
+            "-ar",
+            "8000",
+            "-af",
+            "highpass=f=80,lowpass=f=3500",
+            "-c:a",
+            "pcm_f32le",
+            "<scratch>/full/shrek-target.wav"
+          ]
+        },
+        {
+          "source": "testfiles/Shrek.2001.1080p.SKST.WEB-DL.MULTi.DDP5.1.H.264-KIFR.mkv",
+          "stream": 2,
+          "argv": [
+            "-v",
+            "error",
+            "-nostdin",
+            "-y",
+            "-i",
+            "testfiles/Shrek.2001.1080p.SKST.WEB-DL.MULTi.DDP5.1.H.264-KIFR.mkv",
+            "-map",
+            "0:2",
+            "-ac",
+            "1",
+            "-ar",
+            "8000",
+            "-af",
+            "highpass=f=80,lowpass=f=3500",
+            "-c:a",
+            "pcm_f32le",
+            "<scratch>/full/shrek-donor.wav"
+          ]
+        },
+        {
+          "source": "testfiles/Minions and Monsters (2026) - [ArcA310][Remux-2160p][HDR10][Opus 7.1][AV1][imdb-tt32890033]-FraMeSToR.mkv",
+          "stream": 1,
+          "argv": [
+            "-v",
+            "error",
+            "-nostdin",
+            "-y",
+            "-i",
+            "testfiles/Minions and Monsters (2026) - [ArcA310][Remux-2160p][HDR10][Opus 7.1][AV1][imdb-tt32890033]-FraMeSToR.mkv",
+            "-map",
+            "0:1",
+            "-ac",
+            "1",
+            "-ar",
+            "8000",
+            "-af",
+            "highpass=f=30,lowpass=f=200",
+            "-c:a",
+            "pcm_f32le",
+            "<scratch>/full/minions-target.wav"
+          ]
+        },
+        {
+          "source": "testfiles/Minions and Monsters 2026 PL.DUB.MD.1080p.AMZN.WEB-DL.XviD-MAXX.mp4",
+          "stream": 1,
+          "argv": [
+            "-v",
+            "error",
+            "-nostdin",
+            "-y",
+            "-i",
+            "testfiles/Minions and Monsters 2026 PL.DUB.MD.1080p.AMZN.WEB-DL.XviD-MAXX.mp4",
+            "-map",
+            "0:1",
+            "-ac",
+            "1",
+            "-ar",
+            "8000",
+            "-af",
+            "highpass=f=30,lowpass=f=200",
+            "-c:a",
+            "pcm_f32le",
+            "<scratch>/full/minions-donor.wav"
+          ]
+        }
+      ],
+      "excerpt": [
+        "ffmpeg",
+        "-v",
+        "error",
+        "-nostdin",
+        "-y",
+        "-i",
+        "<full-decode>/<source>.wav",
+        "-ss",
+        "<checkpoint_start_sec>",
+        "-t",
+        "<excerpt_sec>",
+        "-c:a",
+        "pcm_s16le",
+        "<testdata>/wav/<fixture>-cp<pct>-<side>.wav"
+      ],
+      "sync": [
+        "sync-engine/target/release/dubarr-sync"
+      ]
+    }
+  },
+  "entries": [
+    {
+      "id": "minions@10%",
+      "position_pct": 10,
+      "source_start_sec": 533.752,
+      "target_wav": "backend/internal/dsp/testdata/wav/minions-cp10-target.wav",
+      "donor_wav": "backend/internal/dsp/testdata/wav/minions-cp10-donor.wav",
+      "target_wav_sha256": "b31a4442c3ebe926a240645a114b2a7238c6715d514070f6926b89ad13dc7a09",
+      "donor_wav_sha256": "3d4a170f8d105458e6723eb0c8679d36a7c4fe06664461f584db29881248e7b0",
+      "payload": "{\"target\":{\"path\":\"backend/internal/dsp/testdata/wav/minions-cp10-target.wav\"},\"donor\":{\"path\":\"backend/internal/dsp/testdata/wav/minions-cp10-donor.wav\"},\"slice_start_sec\":0,\"slice_len_sec\":10,\"window_sec\":10}",
+      "result": {
+        "offset_ms": 9477.625,
+        "correlation_quality": 0.205,
+        "sample_rate": 8000,
+        "analyzed": {
+          "start": 0,
+          "len": 10
+        }
+      },
+      "margin_to_0_10": 0.105,
+      "thin": false
+    },
+    {
+      "id": "minions@25%",
+      "position_pct": 25,
+      "source_start_sec": 1341.88,
+      "target_wav": "backend/internal/dsp/testdata/wav/minions-cp25-target.wav",
+      "donor_wav": "backend/internal/dsp/testdata/wav/minions-cp25-donor.wav",
+      "target_wav_sha256": "37568522543ba69bd3ed2d688d18ad16f973c10de912c42505df5b887947c209",
+      "donor_wav_sha256": "1756b88a5ace2db2172750562c0245a637277b965b0cec4f9129b8b4b6be3cec",
+      "payload": "{\"target\":{\"path\":\"backend/internal/dsp/testdata/wav/minions-cp25-target.wav\"},\"donor\":{\"path\":\"backend/internal/dsp/testdata/wav/minions-cp25-donor.wav\"},\"slice_start_sec\":0,\"slice_len_sec\":10,\"window_sec\":10}",
+      "result": {
+        "offset_ms": 1557.125,
+        "correlation_quality": 0.209,
+        "sample_rate": 8000,
+        "analyzed": {
+          "start": 0,
+          "len": 10
+        }
+      },
+      "margin_to_0_10": 0.109,
+      "thin": false
+    },
+    {
+      "id": "minions@40%",
+      "position_pct": 40,
+      "source_start_sec": 2150.008,
+      "target_wav": "backend/internal/dsp/testdata/wav/minions-cp40-target.wav",
+      "donor_wav": "backend/internal/dsp/testdata/wav/minions-cp40-donor.wav",
+      "target_wav_sha256": "2d06e414ec2d53ef05b8d3bed118171704589b4b2803d4e782a117c1c34ebbdc",
+      "donor_wav_sha256": "2c867c10eded16013e21a12d21948edd0dff9beaba18ba4861e1324b3a172acb",
+      "payload": "{\"target\":{\"path\":\"backend/internal/dsp/testdata/wav/minions-cp40-target.wav\"},\"donor\":{\"path\":\"backend/internal/dsp/testdata/wav/minions-cp40-donor.wav\"},\"slice_start_sec\":0,\"slice_len_sec\":10,\"window_sec\":10}",
+      "result": {
+        "offset_ms": 2975.375,
+        "correlation_quality": 0.113,
+        "sample_rate": 8000,
+        "analyzed": {
+          "start": 0,
+          "len": 10
+        }
+      },
+      "margin_to_0_10": 0.013,
+      "thin": true
+    },
+    {
+      "id": "minions@55%",
+      "position_pct": 55,
+      "source_start_sec": 2958.136,
+      "target_wav": "backend/internal/dsp/testdata/wav/minions-cp55-target.wav",
+      "donor_wav": "backend/internal/dsp/testdata/wav/minions-cp55-donor.wav",
+      "target_wav_sha256": "a786ecb177806ae0f9ea8934d85466182f0725413aa08885d578e5f0851e45bc",
+      "donor_wav_sha256": "2d51b8a286854e2c061765b5c518bff3fc86b809d4b01e334e68b66bb2f89754",
+      "payload": "{\"target\":{\"path\":\"backend/internal/dsp/testdata/wav/minions-cp55-target.wav\"},\"donor\":{\"path\":\"backend/internal/dsp/testdata/wav/minions-cp55-donor.wav\"},\"slice_start_sec\":0,\"slice_len_sec\":10,\"window_sec\":10}",
+      "result": {
+        "offset_ms": 7695.5,
+        "correlation_quality": 0.289,
+        "sample_rate": 8000,
+        "analyzed": {
+          "start": 0,
+          "len": 10
+        }
+      },
+      "margin_to_0_10": 0.189,
+      "thin": false
+    },
+    {
+      "id": "minions@70%",
+      "position_pct": 70,
+      "source_start_sec": 3766.264,
+      "target_wav": "backend/internal/dsp/testdata/wav/minions-cp70-target.wav",
+      "donor_wav": "backend/internal/dsp/testdata/wav/minions-cp70-donor.wav",
+      "target_wav_sha256": "7f2235deb2ea3433424621431dc35560095cf0294847b29fa3480500b216a476",
+      "donor_wav_sha256": "08c301f2c564a0048153d1d1453ddf7fef3dfbe227fafb91850b6aa957e3cedd",
+      "payload": "{\"target\":{\"path\":\"backend/internal/dsp/testdata/wav/minions-cp70-target.wav\"},\"donor\":{\"path\":\"backend/internal/dsp/testdata/wav/minions-cp70-donor.wav\"},\"slice_start_sec\":0,\"slice_len_sec\":10,\"window_sec\":10}",
+      "result": {
+        "offset_ms": 7841,
+        "correlation_quality": 0.373,
+        "sample_rate": 8000,
+        "analyzed": {
+          "start": 0,
+          "len": 10
+        }
+      },
+      "margin_to_0_10": 0.273,
+      "thin": false
+    },
+    {
+      "id": "minions@85%",
+      "position_pct": 85,
+      "source_start_sec": 4574.392,
+      "target_wav": "backend/internal/dsp/testdata/wav/minions-cp85-target.wav",
+      "donor_wav": "backend/internal/dsp/testdata/wav/minions-cp85-donor.wav",
+      "target_wav_sha256": "35f97c1fd73107873aa46b887c485c345cc03013241b5d2f0ab640dd9049694a",
+      "donor_wav_sha256": "044905a5ef8bc09ba85c028490d8e5fbb1f8bd4263d1d7465a8cb64de762c835",
+      "payload": "{\"target\":{\"path\":\"backend/internal/dsp/testdata/wav/minions-cp85-target.wav\"},\"donor\":{\"path\":\"backend/internal/dsp/testdata/wav/minions-cp85-donor.wav\"},\"slice_start_sec\":0,\"slice_len_sec\":10,\"window_sec\":10}",
+      "result": {
+        "offset_ms": 8536.625,
+        "correlation_quality": 0.202,
+        "sample_rate": 8000,
+        "analyzed": {
+          "start": 0,
+          "len": 10
+        }
+      },
+      "margin_to_0_10": 0.102,
+      "thin": false
+    }
+  ]
+}

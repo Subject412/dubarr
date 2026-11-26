@@ -1,0 +1,165 @@
+{
+  "case": "synthetic/stereo",
+  "tier": "synthetic",
+  "engine": "rust dubarr-sync (reference engine, sync-engine/)",
+  "provenance": {
+    "rust_commit": "ccfa2e30443509d58dee8f8f88752192a3c2c1ff",
+    "cargo_lock_sha256": "cb4f43fbcec8117125aa8a6327384e85a441c725d7f8bc37214b8728b1abe10f",
+    "dubarr_sync_version": "dubarr-sync 0.1.0",
+    "ffmpeg_version": "ffmpeg version n9.1 Copyright (c) 2000-2026 the FFmpeg developers",
+    "host": "CiastekLT Linux 7.3.6-1-cachyos x86_64",
+    "date": "2026-11-26T22:59:38Z",
+    "argv": {
+      "emit": [
+        "cargo",
+        "test",
+        "--offline",
+        "--release",
+        "--test",
+        "emit",
+        "--",
+        "--out",
+        "<scratch>/synthetic"
+      ],
+      "decode": [
+        {
+          "source": "testfiles/Shrek (2001) - [ArcA310][Remux-2160p][HDR10][Opus 7.1][AV1][imdb-tt0126029]-FraMeSToR.mkv",
+          "stream": 1,
+          "argv": [
+            "-v",
+            "error",
+            "-nostdin",
+            "-y",
+            "-i",
+            "testfiles/Shrek (2001) - [ArcA310][Remux-2160p][HDR10][Opus 7.1][AV1][imdb-tt0126029]-FraMeSToR.mkv",
+            "-map",
+            "0:1",
+            "-ac",
+            "1",
+            "-ar",
+            "8000",
+            "-af",
+            "highpass=f=80,lowpass=f=3500",
+            "-c:a",
+            "pcm_f32le",
+            "<scratch>/full/shrek-target.wav"
+          ]
+        },
+        {
+          "source": "testfiles/Shrek.2001.1080p.SKST.WEB-DL.MULTi.DDP5.1.H.264-KIFR.mkv",
+          "stream": 2,
+          "argv": [
+            "-v",
+            "error",
+            "-nostdin",
+            "-y",
+            "-i",
+            "testfiles/Shrek.2001.1080p.SKST.WEB-DL.MULTi.DDP5.1.H.264-KIFR.mkv",
+            "-map",
+            "0:2",
+            "-ac",
+            "1",
+            "-ar",
+            "8000",
+            "-af",
+            "highpass=f=80,lowpass=f=3500",
+            "-c:a",
+            "pcm_f32le",
+            "<scratch>/full/shrek-donor.wav"
+          ]
+        },
+        {
+          "source": "testfiles/Minions and Monsters (2026) - [ArcA310][Remux-2160p][HDR10][Opus 7.1][AV1][imdb-tt32890033]-FraMeSToR.mkv",
+          "stream": 1,
+          "argv": [
+            "-v",
+            "error",
+            "-nostdin",
+            "-y",
+            "-i",
+            "testfiles/Minions and Monsters (2026) - [ArcA310][Remux-2160p][HDR10][Opus 7.1][AV1][imdb-tt32890033]-FraMeSToR.mkv",
+            "-map",
+            "0:1",
+            "-ac",
+            "1",
+            "-ar",
+            "8000",
+            "-af",
+            "highpass=f=30,lowpass=f=200",
+            "-c:a",
+            "pcm_f32le",
+            "<scratch>/full/minions-target.wav"
+          ]
+        },
+        {
+          "source": "testfiles/Minions and Monsters 2026 PL.DUB.MD.1080p.AMZN.WEB-DL.XviD-MAXX.mp4",
+          "stream": 1,
+          "argv": [
+            "-v",
+            "error",
+            "-nostdin",
+            "-y",
+            "-i",
+            "testfiles/Minions and Monsters 2026 PL.DUB.MD.1080p.AMZN.WEB-DL.XviD-MAXX.mp4",
+            "-map",
+            "0:1",
+            "-ac",
+            "1",
+            "-ar",
+            "8000",
+            "-af",
+            "highpass=f=30,lowpass=f=200",
+            "-c:a",
+            "pcm_f32le",
+            "<scratch>/full/minions-donor.wav"
+          ]
+        }
+      ],
+      "excerpt": [
+        "ffmpeg",
+        "-v",
+        "error",
+        "-nostdin",
+        "-y",
+        "-i",
+        "<full-decode>/<source>.wav",
+        "-ss",
+        "<checkpoint_start_sec>",
+        "-t",
+        "<excerpt_sec>",
+        "-c:a",
+        "pcm_s16le",
+        "<testdata>/wav/<fixture>-cp<pct>-<side>.wav"
+      ],
+      "sync": [
+        "sync-engine/target/release/dubarr-sync"
+      ]
+    }
+  },
+  "expected": {
+    "offset_ms": 1000,
+    "tolerance_ms": 2,
+    "min_quality": 0.4
+  },
+  "entries": [
+    {
+      "id": "stereo",
+      "target_wav": "backend/internal/dsp/testdata/wav/stereo-target.wav",
+      "donor_wav": "backend/internal/dsp/testdata/wav/stereo-donor.wav",
+      "target_wav_sha256": "9f8dce448e0b6da42704f489ca8f51e4ee7fb6998dd0c58e313041e2c4d2d6c7",
+      "donor_wav_sha256": "b5f304343d65b23e7e630789ff71dd292486a9f0f8740bfd9197d97131baecc1",
+      "payload": "{\"target\":{\"path\":\"backend/internal/dsp/testdata/wav/stereo-target.wav\"},\"donor\":{\"path\":\"backend/internal/dsp/testdata/wav/stereo-donor.wav\"},\"slice_start_sec\":5,\"slice_len_sec\":10,\"window_sec\":2}",
+      "result": {
+        "offset_ms": 1000,
+        "correlation_quality": 1,
+        "sample_rate": 8000,
+        "analyzed": {
+          "start": 5,
+          "len": 10
+        }
+      },
+      "margin_to_0_10": 0.9,
+      "thin": false
+    }
+  ]
+}

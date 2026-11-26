@@ -35,7 +35,7 @@ RUN cd frontend && npm run build
 # --------------------------------------------------------------------------
 # Stage 2: backend build. modernc.org/sqlite is pure Go, so CGO stays off.
 # --------------------------------------------------------------------------
-FROM golang:1.27-alpine AS backend
+FROM golang:1.27.4-alpine AS backend
 
 WORKDIR /src
 

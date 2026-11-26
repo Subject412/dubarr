@@ -164,6 +164,72 @@ describe('settings section save', () => {
   })
 })
 
+describe('watch restart notice', () => {
+  const settings = {
+    'storage.paths': { watch_dir: '/watch', vault_dir: '/vault', work_dir: '/work', media_roots: [] },
+    'watch.options': { scan_interval_sec: 10, stability_check_interval_sec: 4 },
+    'target.tag_filter': {
+      required_filename_tags: [],
+      tag_match_mode: 'ANY',
+      tag_case_sensitive: false,
+      excluded_filename_tags: [],
+      enforce_tag_filter: true,
+    },
+  }
+
+  // The banner may only name the settings that are still read at startup.
+  const RESTART_NOTICE =
+    'Restart required to apply watch changes. The watch folder and tag filter are read at startup; ' +
+    'the scan interval and stability window apply without a restart.'
+
+  function mockSettings(): ReturnType<typeof vi.fn> {
+    let current: Record<string, unknown> = settings
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/api/settings') && isMethod(init, 'GET')) {
+        return jsonResponse({ settings: current })
+      }
+      if (url.includes('/api/settings') && isMethod(init, 'PUT')) {
+        const body = JSON.parse(String(init?.body)) as { settings: Record<string, unknown> }
+        current = { ...current, ...body.settings }
+        return jsonResponse({ settings: current })
+      }
+      return jsonResponse({ error: 'unexpected' }, 404)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    return fetchMock
+  }
+
+  it('does not ask for a restart when the scan interval changes', async () => {
+    const user = userEvent.setup()
+    mockSettings()
+    renderWithProviders(<SettingsPage />, { route: '/settings' })
+
+    expect(await screen.findByRole('heading', { name: 'Watch options' })).toBeInTheDocument()
+    const interval = screen.getByLabelText('Scan interval (s)')
+    await user.clear(interval)
+    await user.type(interval, '30')
+    await user.click(screen.getByLabelText('Save Watch options'))
+
+    expect(await screen.findByText('saved')).toBeInTheDocument()
+    expect(screen.queryByText(/Restart required/)).not.toBeInTheDocument()
+  })
+
+  it('still asks for a restart for the boot-read watch folder and names only those settings', async () => {
+    const user = userEvent.setup()
+    mockSettings()
+    renderWithProviders(<SettingsPage />, { route: '/settings' })
+
+    expect(await screen.findByRole('heading', { name: 'Storage paths' })).toBeInTheDocument()
+    const watch = screen.getByLabelText('Watch folder')
+    await user.clear(watch)
+    await user.type(watch, '/new/watch')
+    await user.click(screen.getByLabelText('Save Storage paths'))
+
+    expect(await screen.findByText(RESTART_NOTICE)).toBeInTheDocument()
+  })
+})
+
 describe('languages policy reference tokens', () => {
   const storedPolicy = {
     target_import_languages: ['pl'],

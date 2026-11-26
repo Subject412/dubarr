@@ -25,6 +25,39 @@ import (
 // settings.KeyWatchOptions default scan_interval_sec = 10).
 const DefaultInterval = 10 * time.Second
 
+// DefaultStabilityWindow is the settled stability window (settings
+// watch.options.stability_check_interval_sec default = 4, validated >= 4).
+const DefaultStabilityWindow = 4 * time.Second
+
+// OptionsProvider supplies the live watch cadence and stability window. The
+// run loop re-reads it once per iteration, so a settings save takes effect
+// without a restart. Implementations are called from the scan-loop goroutine
+// and must be safe for that.
+//
+// An error means "unknown right now": the scanner keeps the last value it
+// read instead of stopping or reverting to a default.
+type OptionsProvider interface {
+	ScanInterval() (time.Duration, error)
+	StabilityWindow() (time.Duration, error)
+}
+
+// scanTicker abstracts time.Ticker so tests can drive the run loop by hand
+// instead of waiting on wall-clock periods.
+type scanTicker interface {
+	Chan() <-chan time.Time
+	Reset(time.Duration)
+	Stop()
+}
+
+// realTicker is the production scanTicker.
+type realTicker struct{ ticker *time.Ticker }
+
+func newRealTicker(d time.Duration) scanTicker { return realTicker{ticker: time.NewTicker(d)} }
+
+func (t realTicker) Chan() <-chan time.Time { return t.ticker.C }
+func (t realTicker) Reset(d time.Duration)  { t.ticker.Reset(d) }
+func (t realTicker) Stop()                  { t.ticker.Stop() }
+
 // ErrScanInProgress is returned when Scan is called while a previous scan is
 // still running. The overlapping call is skipped, not queued.
 var ErrScanInProgress = errors.New("watch: scan already in progress")
@@ -79,11 +112,35 @@ type Result struct {
 	Errors []error
 }
 
+// observation is one candidate's last size/mtime reading, held in memory and
+// keyed by scanned path. since is when that exact size/mtime pair was first
+// seen. There is deliberately no "already recorded" flag: the store's UNIQUE
+// source_file_path row is the single source of truth for "queued", so a
+// settled file is re-offered on every pass and a deleted queue row is
+// re-created instead of stranding the file.
+type observation struct {
+	size    int64
+	modTime time.Time
+	since   time.Time
+}
+
 // Scanner periodically walks the configured roots for new media files.
 type Scanner struct {
 	store    CandidateStore
 	roots    []string
-	interval time.Duration
+	provider OptionsProvider
+	// interval and stability are the last values the loop read from the
+	// provider, guarded by mu. now is the clock used for stability
+	// observations (time.Now in production); newTicker builds the loop's
+	// ticker (time.NewTicker in production). Tests replace the last two before
+	// Start.
+	interval  time.Duration
+	stability time.Duration
+	now       func() time.Time
+	newTicker func(time.Duration) scanTicker
+	// observations holds the in-flight stability readings, guarded by obsMu.
+	// Entries are pruned for paths that disappear from the roots.
+	observations map[string]observation
 	// hook is the optional post-record callback, guarded by mu.
 	hook CandidateHook
 
@@ -96,28 +153,51 @@ type Scanner struct {
 	// wg.Add happens under mu so a concurrent Stop's cancel+Wait never sees a
 	// zero counter that is about to be incremented.
 	mu      sync.Mutex
+	obsMu   sync.Mutex
 	started bool
 	stopped bool
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
 }
 
-// New builds a Scanner for the given roots. interval <= 0 selects
-// DefaultInterval; a negative interval is an error. Every root must be an
-// absolute, existing directory; it is resolved with filepath.EvalSymlinks so
-// confinement checks compare canonical paths.
-func New(store CandidateStore, roots []string, interval time.Duration) (*Scanner, error) {
+// New builds a Scanner for the given roots. The provider is read for the
+// initial cadence and stability window and again once per loop iteration, so
+// settings changes apply live. An interval <= 0 selects DefaultInterval; a
+// non-positive stability window selects DefaultStabilityWindow, so a zero
+// window can never silently disable the stability gate. A negative interval is
+// an error.
+// Every root must be an absolute, existing directory; it is resolved with
+// filepath.EvalSymlinks so confinement checks compare canonical paths.
+func New(store CandidateStore, roots []string, provider OptionsProvider) (*Scanner, error) {
 	if store == nil {
 		return nil, errors.New("watch: candidate store is required")
 	}
+	if provider == nil {
+		return nil, errors.New("watch: options provider is required")
+	}
 	if len(roots) == 0 {
 		return nil, errors.New("watch: at least one media root is required")
+	}
+	interval, err := provider.ScanInterval()
+	if err != nil {
+		return nil, fmt.Errorf("watch: read scan interval: %w", err)
 	}
 	if interval < 0 {
 		return nil, fmt.Errorf("watch: interval must not be negative, got %v", interval)
 	}
 	if interval == 0 {
 		interval = DefaultInterval
+	}
+	stability, err := provider.StabilityWindow()
+	if err != nil {
+		return nil, fmt.Errorf("watch: read stability window: %w", err)
+	}
+	// A non-positive window can never mean "gate off": that would make the
+	// feature disappear silently if a provider returned a bad value. Fall back
+	// to the settled default instead (the settings provider validates >= 4 s,
+	// so this only fires for a buggy or hand-built provider).
+	if stability <= 0 {
+		stability = DefaultStabilityWindow
 	}
 
 	canonical := make([]string, 0, len(roots))
@@ -144,11 +224,44 @@ func New(store CandidateStore, roots []string, interval time.Duration) (*Scanner
 		canonical = append(canonical, resolved)
 	}
 
-	return &Scanner{store: store, roots: canonical, interval: interval}, nil
+	return &Scanner{
+		store:        store,
+		roots:        canonical,
+		provider:     provider,
+		interval:     interval,
+		stability:    stability,
+		now:          time.Now,
+		newTicker:    newRealTicker,
+		observations: make(map[string]observation),
+	}, nil
 }
 
-// Interval reports the effective scan cadence.
-func (s *Scanner) Interval() time.Duration { return s.interval }
+// Interval reports the current scan cadence. It is the value the loop last
+// read from the provider, so it follows settings changes live.
+func (s *Scanner) Interval() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.interval
+}
+
+// stabilityWindow reports the stability window the loop last read.
+func (s *Scanner) stabilityWindow() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stability
+}
+
+func (s *Scanner) setInterval(d time.Duration) {
+	s.mu.Lock()
+	s.interval = d
+	s.mu.Unlock()
+}
+
+func (s *Scanner) setStabilityWindow(d time.Duration) {
+	s.mu.Lock()
+	s.stability = d
+	s.mu.Unlock()
+}
 
 // SetCandidateHook installs fn as the post-record callback. Passing nil clears
 // it. Set it before Start; a hook installed later takes effect on the next
@@ -184,6 +297,9 @@ func (s *Scanner) Roots() []string { return append([]string(nil), s.roots...) }
 // for the first caller; overlapping callers are skipped immediately. Per-file
 // failures are collected in Result.Errors and also returned aggregated, so the
 // caller can log them without losing the successful candidates.
+//
+// A file is only recorded once its size and mtime have stayed unchanged for
+// the stability window, so a file still being copied is not enqueued mid-copy.
 func (s *Scanner) Scan(ctx context.Context) (Result, error) {
 	if !s.acquire() {
 		return Result{}, ErrScanInProgress
@@ -191,13 +307,22 @@ func (s *Scanner) Scan(ctx context.Context) (Result, error) {
 	defer s.release()
 
 	var res Result
+	present := make(map[string]struct{})
+	complete := true
 	for _, root := range s.roots {
-		if err := s.scanRoot(ctx, root, &res); err != nil {
+		if err := s.scanRoot(ctx, root, &res, present); err != nil {
 			res.Errors = append(res.Errors, err)
 		}
 		if ctx.Err() != nil {
+			complete = false
 			break
 		}
+	}
+	// Prune stability observations for files that left the roots, so the map
+	// stays bounded by what is actually on disk. A cancelled pass may not
+	// have seen every root, so it must not prune the roots it never walked.
+	if complete {
+		s.pruneObservations(present)
 	}
 	return res, errors.Join(res.Errors...)
 }
@@ -218,7 +343,7 @@ func (s *Scanner) release() {
 	s.running.Unlock()
 }
 
-func (s *Scanner) scanRoot(ctx context.Context, root string, res *Result) error {
+func (s *Scanner) scanRoot(ctx context.Context, root string, res *Result, present map[string]struct{}) error {
 	return filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			// Vanished or unreadable entry: record and keep walking the rest.
@@ -254,11 +379,20 @@ func (s *Scanner) scanRoot(ctx context.Context, root string, res *Result) error 
 		}
 
 		res.Seen++
+		present[resolved] = struct{}{}
+		if !s.observe(resolved, info) {
+			// Still being written: keep the reading and retry next pass.
+			return nil
+		}
 		created, err := s.store.RecordImportCandidate(ctx, resolved, info.Name(), info.Size())
 		if err != nil {
 			res.Errors = append(res.Errors, fmt.Errorf("watch: record %q: %w", resolved, err))
 			return nil
 		}
+		// The store is the single source of truth for "queued": it inserts with
+		// INSERT OR IGNORE against a UNIQUE source_file_path, so re-offering a
+		// settled file every pass is a no-op while the row exists and re-creates
+		// it when the row was deleted. No local latch, nothing to get stale.
 		if created {
 			res.Added++
 			if err := s.invokeHook(ctx, resolved, info.Name(), info.Size()); err != nil {
@@ -267,6 +401,36 @@ func (s *Scanner) scanRoot(ctx context.Context, root string, res *Result) error 
 		}
 		return nil
 	})
+}
+
+// observe records this pass's size/mtime reading for path and reports whether
+// the file may be offered to the store. A file is offered once the same size
+// and mtime have been observed for at least the stability window; a changed
+// reading restarts the window. Whether the file is already queued is the
+// store's business, not this map's.
+func (s *Scanner) observe(path string, info fs.FileInfo) bool {
+	window := s.stabilityWindow()
+
+	s.obsMu.Lock()
+	defer s.obsMu.Unlock()
+	now := s.now()
+	prev, ok := s.observations[path]
+	if !ok || prev.size != info.Size() || !prev.modTime.Equal(info.ModTime()) {
+		s.observations[path] = observation{size: info.Size(), modTime: info.ModTime(), since: now}
+		return false
+	}
+	return now.Sub(prev.since) >= window
+}
+
+// pruneObservations drops readings for paths no longer under any scan root.
+func (s *Scanner) pruneObservations(present map[string]struct{}) {
+	s.obsMu.Lock()
+	defer s.obsMu.Unlock()
+	for path := range s.observations {
+		if _, ok := present[path]; !ok {
+			delete(s.observations, path)
+		}
+	}
 }
 
 // confined reports whether path is root itself or nested under it. Both are
@@ -314,8 +478,14 @@ func (s *Scanner) Start(ctx context.Context) {
 	}()
 }
 
+// run scans once immediately and then once per cadence. The cadence and the
+// stability window are re-read from the provider every iteration, so a saved
+// settings change applies without a restart; the ticker is rebuilt only when
+// the cadence actually moves. A read error keeps the last known value — a
+// settings hiccup must not change cadence or drop the stability gate.
 func (s *Scanner) run(ctx context.Context) {
-	ticker := time.NewTicker(s.interval)
+	interval := s.Interval()
+	ticker := s.newTicker(interval)
 	defer ticker.Stop()
 
 	for {
@@ -326,10 +496,29 @@ func (s *Scanner) run(ctx context.Context) {
 		for _, err := range res.Errors {
 			log.Printf("WARN watch: scan error: %v", err)
 		}
+
+		if next, err := s.provider.ScanInterval(); err != nil {
+			log.Printf("WARN watch: read scan interval: %v (keeping %v)", err, interval)
+		} else if next > 0 && next != interval {
+			interval = next
+			s.setInterval(next)
+			ticker.Reset(next)
+		}
+		if window, err := s.provider.StabilityWindow(); err != nil {
+			log.Printf("WARN watch: read stability window: %v", err)
+		} else {
+			// Same rule as New: a non-positive window is a bad provider
+			// value, never "turn the gate off".
+			if window <= 0 {
+				window = DefaultStabilityWindow
+			}
+			s.setStabilityWindow(window)
+		}
+
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-ticker.Chan():
 		}
 	}
 }

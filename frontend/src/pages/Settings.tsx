@@ -266,8 +266,8 @@ export function SettingsPage() {
         <Alert tone="warning">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <span>
-              Restart required to apply watch changes. The watch folder, scan interval and tag
-              filter are read at startup.
+              Restart required to apply watch changes. The watch folder and tag filter are read at
+              startup; the scan interval and stability window apply without a restart.
             </span>
             <Button size="sm" variant="ghost" onClick={() => setWatchRestartNotice(false)}>
               Dismiss
@@ -627,9 +627,6 @@ export function SettingsPage() {
             sectionKey="watch.options"
             value={(data['watch.options'] as WatchOptions) ?? DEFAULTS['watch.options']}
             save={save}
-            onSaved={(saved, previous) => {
-              if (saved.scan_interval_sec !== previous.scan_interval_sec) flagWatchRestart()
-            }}
           >
             {(draft, update) => (
               <div className="grid gap-4 md:grid-cols-2">

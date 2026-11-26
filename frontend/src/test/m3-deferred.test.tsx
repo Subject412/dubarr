@@ -127,7 +127,7 @@ describe('watch scanner restart notice', () => {
     expect(screen.queryByText(/restart required to apply watch changes/i)).not.toBeInTheDocument()
   })
 
-  it('warns after watch.options changes the scan interval', async () => {
+  it('applies the scan interval without a restart notice', async () => {
     const user = userEvent.setup()
     mockSettings({
       'watch.options': { scan_interval_sec: 10, stability_check_interval_sec: 4 },
@@ -140,9 +140,11 @@ describe('watch scanner restart notice', () => {
     await user.type(interval, '30')
     await user.click(screen.getByLabelText('Save Watch options'))
 
-    expect(
-      await screen.findByText(/restart required to apply watch changes/i),
-    ).toBeInTheDocument()
+    await waitFor(() => {
+      expect(screen.getByText('saved')).toBeInTheDocument()
+    })
+    // The scanner re-reads the interval every loop, so no restart is needed.
+    expect(screen.queryByText(/restart required to apply watch changes/i)).not.toBeInTheDocument()
   })
 
   it('warns after target.tag_filter changes', async () => {

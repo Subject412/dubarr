@@ -1,12 +1,15 @@
 # Dubarr
 
-Self-hosted dubbing-sync appliance for a Radarr/Sonarr media library.
+A self-hosted **arr for audio**. Dubarr curates a library of extracted audio
+tracks for the movies and series already in your Radarr/Sonarr library: it pulls
+audio out of donor releases, keeps it losslessly in an **Audio Vault**, measures
+the timing offset against the target's original track, and muxes the matched dub
+into the target MKV. Video is never re-encoded, and the target is only replaced
+atomically after the muxed file passes `ffprobe` validation.
 
-Dubarr watches a donor folder, identifies the media, archives the foreign-language
-audio losslessly in a write-once **Audio Vault**, measures the timing offset
-against the target's original track, and muxes the matched dub into the target
-MKV. Video is never re-encoded, and the target is only replaced atomically after
-the muxed file passes `ffprobe` validation.
+Dubarr owns exactly one library — the vault. Everything else it shows is a
+read-only mirror of what Radarr/Sonarr report, so a working media manager is a
+prerequisite: it has no TMDB/TVDB client of its own.
 
 Nothing is destructive without an explicit decision: a target must be matched,
 tag-eligible and paired with a donor before it can be approved, and the Audio
@@ -31,9 +34,8 @@ release notes before upgrading.
 
 ## Platform support
 
-- **Linux** — native and Docker; the verified platform.
-- **Windows** — the code is kept cross-platform, but Windows builds and CI are
-  deferred and untested. Do not expect a supported Windows deployment yet.
+**Linux** only — native and Docker. Windows is not supported: no Windows build is
+published and nothing is tested there (ADR-0016).
 
 ## Quick start with Docker
 
@@ -214,6 +216,7 @@ release tag.
 
 ## Documentation
 
+- [VISION.md](VISION.md) — what Dubarr is, what it is not, and the rules that hold.
 - [CHANGELOG.md](CHANGELOG.md) — what changed in each release, and upgrade notes.
 - [PLAN.md](PLAN.md) — milestones, defaults and implementation plan.
 - [GLOSSARY.md](GLOSSARY.md) — domain vocabulary (donor, target, vault, gate…).
@@ -221,7 +224,6 @@ release tag.
 - [docs/RELEASING.md](docs/RELEASING.md) — versioning policy and release process.
 - [docker/README.md](docker/README.md) — container packaging and compose variables.
 - [AGENTS.md](AGENTS.md) — contributor and agent conventions.
-- [IDEA.md](IDEA.md) — historical design narrative, non-normative.
 
 ## License
 

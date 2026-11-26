@@ -1,4 +1,4 @@
-// Package probe inspects media files with ffprobe (IDEA.md §3.3, PLAN.md M2-4).
+// Package probe inspects media files with ffprobe (PLAN.md M2-4).
 //
 // It wraps the host ffprobe binary (`ffprobe -show_streams -show_format -of
 // json`) and extracts the fields Dubarr needs from every audio stream: codec,

@@ -12,7 +12,7 @@
 //  3. stream its bytes into a temp file inside the vault directory while
 //     computing SHA-256 of exactly the bytes being archived, then fsync it;
 //  4. atomically rename the temp file to <base>.<iso2>.mka (ISO 639-1 suffix,
-//     per GLOSSARY "Target Language" and IDEA.md §3.3), re-checking that the
+//     per GLOSSARY "Target Language"), re-checking that the
 //     destination is still absent under the writer's mutex;
 //  5. fsync the vault directory so the rename is durable;
 //  6. chmod the published file 0444 (ADR-0002 immutability);

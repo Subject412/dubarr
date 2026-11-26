@@ -4,7 +4,7 @@ name: release
 # docs/RELEASING.md). Everything is built on one pinned Ubuntu runner so the
 # three archives are produced from the same commit and toolchain:
 #   * Go: native cross-compilation (CGO_ENABLED=0), no extra toolchain.
-#   * Rust: rustup target + distro cross GCC for linux-arm64 / windows-amd64.
+#   * Rust: rustup target + distro cross GCC for linux-arm64.
 on:
   push:
     tags:
@@ -49,7 +49,7 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-unknown-linux-gnu,x86_64-pc-windows-gnu
+          targets: aarch64-unknown-linux-gnu
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -64,8 +64,6 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             gcc-aarch64-linux-gnu \
             libc6-dev-arm64-cross \
-            gcc-mingw-w64-x86-64 \
-            zip
 
       # The SPA is embedded by Go (backend/web), so the Vite build must run
       # before any `go build`. Vite writes into backend/web with
@@ -93,7 +91,6 @@ jobs:
           }
           build linux amd64 dubarr-linux-amd64
           build linux arm64 dubarr-linux-arm64
-          build windows amd64 dubarr-windows-amd64.exe
 
       - name: Build dubarr-sync
         working-directory: sync-engine
@@ -109,10 +106,6 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
             cargo build --release --locked --target aarch64-unknown-linux-gnu
 
-          # windows/amd64: GNU target linked by mingw-w64; rustc links the
-          # mingw runtime statically, so no extra DLLs ship.
-          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc \
-            cargo build --release --locked --target x86_64-pc-windows-gnu
 
       - name: Assemble archives
         shell: bash
@@ -157,18 +150,9 @@ jobs:
           stage_linux amd64 amd64 x86_64-unknown-linux-gnu
           stage_linux arm64 arm64 aarch64-unknown-linux-gnu
 
-          dir="dubarr_${VERSION}_windows_amd64"
-          mkdir -p "${ART}/${dir}"
-          cp "${BIN}/dubarr-windows-amd64.exe" "${ART}/${dir}/dubarr.exe"
-          cp sync-engine/target/x86_64-pc-windows-gnu/release/dubarr-sync.exe "${ART}/${dir}/dubarr-sync.exe"
-          cp LICENSE "${ART}/${dir}/LICENSE"
-          make_readme "windows/amd64" > "${ART}/${dir}/README.txt"
-          (cd "${ART}" && zip -q -r "${dir}.zip" "${dir}")
-
           (cd "${ART}" && sha256sum \
             "dubarr_${VERSION}_linux_amd64.tar.gz" \
             "dubarr_${VERSION}_linux_arm64.tar.gz" \
-            "dubarr_${VERSION}_windows_amd64.zip" \
             > "dubarr_${VERSION}_checksums.txt")
 
           ls -l "${ART}"
@@ -183,5 +167,4 @@ jobs:
           fail_on_unmatched_files: true
           files: |
             release-artifacts/*.tar.gz
-            release-artifacts/*.zip
             release-artifacts/*_checksums.txt

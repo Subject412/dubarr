@@ -9,7 +9,7 @@ import (
 )
 
 // LibrarySearchLimit caps how many arr_library_cache rows the manual matching
-// search returns (IDEA.md §4 GET /api/imports/search-library).
+// search returns (GET /api/imports/search-library).
 const LibrarySearchLimit = 20
 
 // likeEscapeChar is the single-character ESCAPE used by every LIKE in the

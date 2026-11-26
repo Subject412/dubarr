@@ -14,8 +14,9 @@ Dubarr is pre-1.0, so the usual SemVer rules are read as:
 - `1.0.0` is reserved for the point at which the HTTP API, settings schema and
   on-disk data layout are considered stable.
 
-The next release is `0.3.0`. Being prepared for release is not the same as
-leaving beta: the version number describes how stable the API is, not how ready
+`0.3.0` is released. The next version is chosen when the vault model settles;
+there is no 1.0 target, because being prepared for release is not the same as
+leaving beta. The version number describes how stable the API is, not how ready
 the software is to run.
 
 Pre-release identifiers (`v0.3.0-rc.1`) are permitted and publish a GitHub
@@ -39,12 +40,13 @@ What 0.x does **not** promise:
 
 - **API and on-disk stability.** The HTTP API, settings schema and on-disk
   layout may change between minor releases.
-- **Windows builds.** The code is kept cross-platform, but Windows compilation
-  and CI are deferred and untested.
+- **Windows.** Not supported and not built: no Windows archive is published and
+  nothing is tested there (ADR-0016).
 - **Automatic vault reorganisation** — moving or renaming files inside the
-  Audio Vault. Deliberately unimplemented rather than approximated: any future
-  version must gate it the way the arr applications gate media moves, so nothing
-  is ever deleted without an explicit approval.
+  Audio Vault. Planned, not implemented (issue #47). When it lands it must gate
+  the way the arr applications gate media moves: a previewed plan, applied only
+  on approval. Operator-initiated removal and replacement are already defined
+  (ADR-0015) and always go through the Vault Trash.
 - **Stable internal Go packages.** Only the HTTP API is a contract; `internal/`
   packages may be restructured between minor releases.
 
@@ -105,7 +107,6 @@ One archive per platform, all built from the same commit and tag:
 | --- | --- | --- |
 | linux/amd64 | `dubarr_<version>_linux_amd64.tar.gz` | `dubarr`, `dubarr-sync`, `README.txt`, `LICENSE` |
 | linux/arm64 | `dubarr_<version>_linux_arm64.tar.gz` | `dubarr`, `dubarr-sync`, `README.txt`, `LICENSE` |
-| windows/amd64 | `dubarr_<version>_windows_amd64.zip` | `dubarr.exe`, `dubarr-sync.exe`, `README.txt`, `LICENSE` |
 
 Each archive unpacks to a single top-level directory named like the archive
 (`dubarr_<version>_linux_amd64/`). Checksums:
@@ -132,7 +133,7 @@ This is the actual behaviour of the code, not an aspiration:
   internal constructor seam for tests/embedders — it is not exposed as a CLI
   flag or environment variable. `ADR-0003` forbids environment configuration.
 - Dubarr does **not** search `./bin/` or the directory next to the `dubarr`
-  executable (despite the older note in `IDEA.md`). The bundled layout is
+  executable (despite an older note). The bundled layout is
   therefore "two binaries in one directory", and that directory must be on
   `PATH`.
 
@@ -153,16 +154,13 @@ export PATH="$PWD/dubarr_<version>_linux_amd64:$PATH"
 ./dubarr_<version>_linux_amd64/dubarr --data-dir ./data
 ```
 
-On Windows, add the unpacked directory to `PATH` (or copy both `.exe` files to a
-directory already on `PATH`). Check `GET /api/health` and confirm
-`"dubarr-sync": {"available": true, ...}`; `dubarr-sync --version` should print
-the crate version.
+Check `GET /api/health` and confirm `"dubarr-sync": {"available": true, ...}`;
+`dubarr-sync --version` should print the crate version.
 
 ## Cross-compilation decision
 
-- **Go**: `CGO_ENABLED=0 GOOS/GOARCH` builds `linux/amd64`, `linux/arm64` and
-  `windows/amd64` directly; the SQLite driver is pure Go, so no C toolchain is
-  involved.
+- **Go**: `CGO_ENABLED=0 GOOS/GOARCH` builds `linux/amd64` and `linux/arm64`
+  directly; the SQLite driver is pure Go, so no C toolchain is involved.
 - **Rust linux/arm64**: `rustup target add aarch64-unknown-linux-gnu` plus the
   distro cross linker (`gcc-aarch64-linux-gnu`) and
   `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc`.
@@ -171,10 +169,6 @@ the crate version.
   binaries are linked on Ubuntu 22.04, so they require glibc >= 2.35 (Debian 12,
   Ubuntu 22.04 or newer). For older distros, build from source with
   `cargo build --release`.
-- **Rust windows/amd64**: `rustup target add x86_64-pc-windows-gnu` plus
-  `gcc-mingw-w64-x86-64`, with
-  `CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc`. The
-  resulting `.exe` links the mingw runtime statically and needs no DLLs.
 - This avoids fragile cross-OS runner matrices: all archives are assembled in a
   single job, so a release either succeeds or fails as a unit.
 

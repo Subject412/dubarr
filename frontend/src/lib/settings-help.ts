@@ -2,7 +2,7 @@ import type { SettingsSectionKey } from './settings-sections'
 
 /**
  * Static help copy for the Settings page, keyed by settings section and field.
- * Definitions come from GLOSSARY.md / IDEA.md / the ADRs; short examples stay
+ * Definitions come from GLOSSARY.md and the ADRs; short examples stay
  * inline in the form (placeholders, ranges). This module is presentation only —
  * help strings are never part of the settings payload or stored settings.
  */

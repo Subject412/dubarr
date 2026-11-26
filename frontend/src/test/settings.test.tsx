@@ -283,7 +283,7 @@ describe('mux options keep_bak', () => {
   })
 })
 
-describe('tag match mode (IDEA.md §3.5, ADR-0005)', () => {
+describe('tag match mode (ADR-0005)', () => {
   const tagFilter = (mode: string) => ({
     required_filename_tags: ['[ArcA310]'],
     tag_match_mode: mode,

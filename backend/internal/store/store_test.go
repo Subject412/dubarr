@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-// expectedTables are the nine specification tables from IDEA.md §4 plus the
+// expectedTables are the nine specification tables from the schema spec plus the
 // migration bookkeeping table owned by the runner.
 var expectedTables = []string{
 	"users",
@@ -206,7 +206,7 @@ func TestSchemaDefaults(t *testing.T) {
 }
 
 // TestSchemaSQLMirrorsMigration keeps backend/schema.sql — the human-facing
-// schema referenced by IDEA.md and PLAN.md — byte-identical to the migration
+// schema referenced by PLAN.md — byte-identical to the migration
 // the runner actually applies. schema.sql must never drift from 0001_initial.sql.
 func TestSchemaSQLMirrorsMigration(t *testing.T) {
 	want, err := os.ReadFile(filepath.Join("migrations", "0001_initial.sql"))

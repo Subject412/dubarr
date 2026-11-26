@@ -1,7 +1,7 @@
 // Package settings persists Dubarr's application configuration in the
 // `settings` key/value table and validates every write.
 //
-// Layout follows IDEA.md §4: one row per settings section, the row value being
+// Layout: one row per settings section, the row value being
 // the JSON object for that section. Section keys:
 //
 //	storage.paths      watch_dir, vault_dir, work_dir, output_dir, media_roots
@@ -15,7 +15,7 @@
 //	arr.options        Radarr/Sonarr polling cadence
 //	arr.connections    Radarr/Sonarr instances (API keys live in internal/secrets)
 //
-// mux/watch/arr sections are an extension of the IDEA.md key list: the spec
+// mux/watch/arr sections are an extension of the original key list: the spec
 // only names the first five, but the settled defaults for keep_bak, the track
 // title, the 10 s watch scan and the 300 s *arr poll need a home. They live as
 // separate sections rather than being smuggled into sync.defaults.
@@ -69,7 +69,7 @@ var knownKeys = []string{
 // KnownKeys returns the writable section keys in stable order.
 func KnownKeys() []string { return append([]string(nil), knownKeys...) }
 
-// StoragePaths are the five logical storage areas (IDEA.md §3.3). Empty values
+// StoragePaths are the five logical storage areas. Empty values
 // mean "not configured yet" and are filled by the setup wizard.
 type StoragePaths struct {
 	WatchDir string `json:"watch_dir"`
@@ -246,7 +246,7 @@ func (m *MuxOptions) UnmarshalJSON(data []byte) error {
 type AudioOptions = transcode.Options
 
 // WatchOptions configure donor-folder scanning. StabilityCheckIntervalSec is
-// how far apart the two size checks must be (>= 4 s per IDEA.md §3.5).
+// how far apart the two size checks must be (>= 4 s per the watch contract).
 type WatchOptions struct {
 	ScanIntervalSec           int `json:"scan_interval_sec"`
 	StabilityCheckIntervalSec int `json:"stability_check_interval_sec"`

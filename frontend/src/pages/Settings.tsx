@@ -641,7 +641,7 @@ export function SettingsPage() {
                 />
                 <NumberField
                   label="Stability check interval (s)"
-                  hint="Minimum 4 seconds per IDEA.md §3.5."
+                  hint="Minimum 4 seconds."
                   value={draft.stability_check_interval_sec}
                   onChange={(stability_check_interval_sec) => update({ stability_check_interval_sec })}
                   help={settingsHelp('watch.options', 'stability_check_interval_sec')}

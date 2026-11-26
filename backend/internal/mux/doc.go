@@ -17,7 +17,7 @@
 //     let mkvmerge read only that copy plus the staged .mka. The target itself
 //     is opened read-only.
 //  5. Append the .mka with `--language 0:<iso2> --track-name 0:<title>
-//     --sync 0:<offset>` (IDEA.md:397-403). The target's video and existing
+//     --sync 0:<offset>` (ADR-0004). The target's video and existing
 //     audio are copied as-is, never transcoded.
 //  6. Validate the muxed temp with ffprobe (ADR-0004): the probe must succeed
 //     and exactly one audio track must have been appended. A failure returns

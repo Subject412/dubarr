@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
@@ -198,8 +199,21 @@ func TestClientErrorModel(t *testing.T) {
 		if _, err := c.Movies(ctx); !errors.Is(err, arr.ErrAuth) {
 			t.Fatalf("Movies error = %v, want ErrAuth", err)
 		}
-		if err := c.Ping(ctx); !errors.Is(err, arr.ErrAuth) {
+		err = c.Ping(ctx)
+		if !errors.Is(err, arr.ErrAuth) {
 			t.Fatalf("Ping error = %v, want ErrAuth", err)
+		}
+		// The status code must be structural (not parsed out of the message)
+		// so the api layer can report it as a diagnostic.
+		var authErr *arr.AuthError
+		if !errors.As(err, &authErr) {
+			t.Fatalf("error %v is not an *arr.AuthError", err)
+		}
+		if authErr.Code != http.StatusUnauthorized {
+			t.Errorf("AuthError.Code = %d, want 401", authErr.Code)
+		}
+		if authErr.Path != "/api/v3/system/status" || authErr.Method != http.MethodGet {
+			t.Errorf("AuthError = %+v, want GET /api/v3/system/status", authErr)
 		}
 	})
 
@@ -212,8 +226,32 @@ func TestClientErrorModel(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewSonarrClient: %v", err)
 		}
-		if _, err := c.Series(ctx); !errors.Is(err, arr.ErrAuth) {
+		_, err = c.Series(ctx)
+		if !errors.Is(err, arr.ErrAuth) {
 			t.Fatalf("Series error = %v, want ErrAuth", err)
+		}
+		var authErr *arr.AuthError
+		if !errors.As(err, &authErr) {
+			t.Fatalf("error %v is not an *arr.AuthError", err)
+		}
+		if authErr.Code != http.StatusForbidden {
+			t.Errorf("AuthError.Code = %d, want 403", authErr.Code)
+		}
+	})
+
+	t.Run("decode failure", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte("<html>not json</html>"))
+		}))
+		defer srv.Close()
+
+		c, err := arr.NewRadarrClient(srv.URL, "k", time.Second)
+		if err != nil {
+			t.Fatalf("NewRadarrClient: %v", err)
+		}
+		if err := c.Ping(ctx); !errors.Is(err, arr.ErrDecode) {
+			t.Fatalf("Ping error = %v, want ErrDecode", err)
 		}
 	})
 

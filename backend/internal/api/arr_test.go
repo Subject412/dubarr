@@ -3,18 +3,23 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/Subject412/dubarr/backend/internal/arr"
 	"github.com/Subject412/dubarr/backend/internal/arr/arrmock"
 	"github.com/Subject412/dubarr/backend/internal/auth"
 	"github.com/Subject412/dubarr/backend/internal/secrets"
@@ -761,5 +766,313 @@ func TestArrConnectionTestFailedDraftMutatesNothing(t *testing.T) {
 	list := h.listArr()
 	if len(list.Instances) != 1 || list.Instances[0].BaseURL != fake.URL {
 		t.Fatalf("listing after failed draft = %+v", list.Instances)
+	}
+}
+
+// arrTestFailureBody is the 502 shape the diagnostics tests decode.
+type arrTestFailureBody struct {
+	Error      string `json:"error"`
+	Class      string `json:"class"`
+	StatusCode int    `json:"status_code"`
+	Host       string `json:"host"`
+	Port       string `json:"port"`
+}
+
+// timeoutNetError is a bare net.Error whose Timeout() reports true, modelling a
+// socket-level deadline that wraps no context/os deadline sentinel.
+type timeoutNetError struct{}
+
+func (timeoutNetError) Error() string   { return "i/o timeout" }
+func (timeoutNetError) Timeout() bool   { return true }
+func (timeoutNetError) Temporary() bool { return true }
+
+// TestArrTestDiagnosticsClassifiesFailures drives the classifier directly: it
+// must name the failure kind and carry the HTTP status code structurally, and
+// it must never repeat error text.
+func TestArrTestDiagnosticsClassifiesFailures(t *testing.T) {
+	const path = "/api/v3/system/status"
+	tests := []struct {
+		name       string
+		err        error
+		baseURL    string
+		wantClass  string
+		wantStatus int
+		wantHost   string
+		wantPort   string
+	}{
+		{
+			name:       "401 is auth",
+			err:        &arr.AuthError{Code: http.StatusUnauthorized, Method: http.MethodGet, Path: path},
+			baseURL:    "http://radarr:7878",
+			wantClass:  "auth",
+			wantStatus: 401,
+			wantHost:   "radarr",
+			wantPort:   "7878",
+		},
+		{
+			name:       "403 is auth",
+			err:        &arr.AuthError{Code: http.StatusForbidden, Method: http.MethodGet, Path: path},
+			baseURL:    "http://radarr:7878",
+			wantClass:  "auth",
+			wantStatus: 403,
+			wantHost:   "radarr",
+			wantPort:   "7878",
+		},
+		{
+			name:       "404 is status",
+			err:        &arr.StatusError{Code: http.StatusNotFound, Method: http.MethodGet, Path: path},
+			baseURL:    "http://radarr:7878",
+			wantClass:  "status",
+			wantStatus: 404,
+			wantHost:   "radarr",
+			wantPort:   "7878",
+		},
+		{
+			name:       "500 is status",
+			err:        &arr.StatusError{Code: http.StatusInternalServerError, Method: http.MethodGet, Path: path},
+			baseURL:    "http://radarr:7878",
+			wantClass:  "status",
+			wantStatus: 500,
+			wantHost:   "radarr",
+			wantPort:   "7878",
+		},
+		{
+			name:      "deadline is timeout",
+			err:       fmt.Errorf("%w: GET %s: %w", arr.ErrNetwork, path, context.DeadlineExceeded),
+			baseURL:   "http://radarr:7878",
+			wantClass: "timeout",
+			wantHost:  "radarr",
+			wantPort:  "7878",
+		},
+		{
+			name:      "dns failure",
+			err:       fmt.Errorf("%w: GET %s: %w", arr.ErrNetwork, path, &net.DNSError{Err: "no such host", Name: "radarr.invalid", IsNotFound: true}),
+			baseURL:   "http://radarr.invalid:7878",
+			wantClass: "dns",
+			wantHost:  "radarr.invalid",
+			wantPort:  "7878",
+		},
+		{
+			// A resolver that gives up is a DNS problem first: the class must
+			// not degrade to the generic timeout because IsTimeout is set.
+			name:      "dns timeout is dns",
+			err:       fmt.Errorf("%w: GET %s: %w", arr.ErrNetwork, path, &net.DNSError{Err: "i/o timeout", Name: "radarr.invalid", IsTimeout: true}),
+			baseURL:   "http://radarr.invalid:7878",
+			wantClass: "dns",
+			wantHost:  "radarr.invalid",
+			wantPort:  "7878",
+		},
+		{
+			name:      "dns not found is dns",
+			err:       fmt.Errorf("%w: GET %s: %w", arr.ErrNetwork, path, &net.DNSError{Err: "no such host", Name: "radarr.invalid", IsNotFound: true}),
+			baseURL:   "http://radarr.invalid:7878",
+			wantClass: "dns",
+			wantHost:  "radarr.invalid",
+			wantPort:  "7878",
+		},
+		{
+			// Socket-level deadline: net.Error.Timeout() without a context or
+			// os deadline sentinel in the chain.
+			name:      "socket timeout is timeout",
+			err:       fmt.Errorf("%w: GET %s: %w", arr.ErrNetwork, path, timeoutNetError{}),
+			baseURL:   "http://radarr:7878",
+			wantClass: "timeout",
+			wantHost:  "radarr",
+			wantPort:  "7878",
+		},
+		{
+			name:      "tls failure",
+			err:       fmt.Errorf("%w: GET %s: %w", arr.ErrNetwork, path, x509.UnknownAuthorityError{}),
+			baseURL:   "https://radarr.example.com",
+			wantClass: "tls",
+			wantHost:  "radarr.example.com",
+			wantPort:  "443",
+		},
+		{
+			name:      "plain network failure",
+			err:       fmt.Errorf("%w: GET %s: %w", arr.ErrNetwork, path, errors.New("connection refused")),
+			baseURL:   "http://radarr:7878",
+			wantClass: "network",
+			wantHost:  "radarr",
+			wantPort:  "7878",
+		},
+		{
+			name:      "kind mismatch",
+			err:       &arr.KindMismatchError{Expected: arr.KindRadarr, Got: "Sonarr"},
+			baseURL:   "http://sonarr:8989",
+			wantClass: "kind_mismatch",
+			wantHost:  "sonarr",
+			wantPort:  "8989",
+		},
+		{
+			name:      "decode failure",
+			err:       fmt.Errorf("%w: GET %s: %w", arr.ErrDecode, path, io.ErrUnexpectedEOF),
+			baseURL:   "http://radarr:7878",
+			wantClass: "decode",
+			wantHost:  "radarr",
+			wantPort:  "7878",
+		},
+		{
+			name:      "url validation failure",
+			err:       &arrBaseURLError{msg: "base_url must not contain credentials"},
+			baseURL:   "http://radarr:7878",
+			wantClass: "invalid",
+			wantHost:  "radarr",
+			wantPort:  "7878",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			class, status, host, port := arrTestDiagnostics(tt.err, tt.baseURL)
+			if class != tt.wantClass {
+				t.Errorf("class = %q, want %q", class, tt.wantClass)
+			}
+			if status != tt.wantStatus {
+				t.Errorf("status_code = %d, want %d", status, tt.wantStatus)
+			}
+			if host != tt.wantHost || port != tt.wantPort {
+				t.Errorf("target = %s:%s, want %s:%s", host, port, tt.wantHost, tt.wantPort)
+			}
+		})
+	}
+}
+
+// TestArrTargetHostPortParsesPathPrefixAndPort pins host/port extraction for a
+// URL with a path prefix, a defaulted port and an unparseable value.
+func TestArrTargetHostPortParsesPathPrefixAndPort(t *testing.T) {
+	tests := []struct {
+		baseURL  string
+		wantHost string
+		wantPort string
+	}{
+		{"https://radarr.example.com/radarr", "radarr.example.com", "443"},
+		{"http://radarr:7878/radarr", "radarr", "7878"},
+		{"https://proxy.example.com:9443/sonarr/", "proxy.example.com", "9443"},
+		{"http://192.168.1.10", "192.168.1.10", "80"},
+		{"not-a-url", "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.baseURL, func(t *testing.T) {
+			host, port := arrTargetHostPort(tt.baseURL)
+			if host != tt.wantHost || port != tt.wantPort {
+				t.Errorf("target = %s:%s, want %s:%s", host, port, tt.wantHost, tt.wantPort)
+			}
+		})
+	}
+}
+
+// TestArrConnectionTestFailureCarriesDiagnostics checks the 502 body of a real
+// ping failure: the legacy error text is unchanged, the additive diagnostics
+// describe the failure, and no key material reaches the raw JSON.
+func TestArrConnectionTestFailureCarriesDiagnostics(t *testing.T) {
+	t.Run("rejected key is auth/401", func(t *testing.T) {
+		h, _ := newArrHarness(t)
+		h.setupAdmin()
+		fake := arrmock.New(arrmock.Radarr, "right-key", arrmock.Fixtures{})
+		t.Cleanup(fake.Close)
+		const wrongKey = "wrong-key-do-not-leak"
+		if code, body := h.do(http.MethodPut, "/api/settings/arr/radarr", map[string]any{
+			"base_url": fake.URL, "api_key": wrongKey,
+		}); code != http.StatusOK {
+			t.Fatalf("create = %d: %s", code, body)
+		}
+
+		code, body := h.do(http.MethodPost, "/api/settings/arr/radarr/test", nil)
+		if code != http.StatusBadGateway {
+			t.Fatalf("test = %d, want 502: %s", code, body)
+		}
+		if bytes.Contains(body, []byte(wrongKey)) {
+			t.Fatalf("502 body leaked the API key: %s", body)
+		}
+		var got arrTestFailureBody
+		if err := json.Unmarshal(body, &got); err != nil {
+			t.Fatalf("decode 502 body: %v (%s)", err, body)
+		}
+		if got.Error != "authentication failed: the API key was rejected" {
+			t.Errorf("error = %q, want the unchanged operator message", got.Error)
+		}
+		if got.Class != "auth" || got.StatusCode != http.StatusUnauthorized {
+			t.Errorf("diagnostics = %q/%d, want auth/401", got.Class, got.StatusCode)
+		}
+		u, err := url.Parse(fake.URL)
+		if err != nil {
+			t.Fatalf("parse mock URL: %v", err)
+		}
+		if got.Host != u.Hostname() || got.Port != u.Port() {
+			t.Errorf("target = %s:%s, want %s:%s", got.Host, got.Port, u.Hostname(), u.Port())
+		}
+	})
+
+	t.Run("unreachable host is network", func(t *testing.T) {
+		h, _ := newArrHarness(t)
+		h.setupAdmin()
+		dead := httptest.NewServer(http.NotFoundHandler())
+		deadURL := dead.URL
+		dead.Close()
+		const draftKey = "draft-key-do-not-leak"
+
+		code, body := h.do(http.MethodPost, "/api/settings/arr/radarr/test", map[string]any{
+			"base_url": deadURL, "api_key": draftKey,
+		})
+		if code != http.StatusBadGateway {
+			t.Fatalf("test = %d, want 502: %s", code, body)
+		}
+		if bytes.Contains(body, []byte(draftKey)) {
+			t.Fatalf("502 body leaked the API key: %s", body)
+		}
+		var got arrTestFailureBody
+		if err := json.Unmarshal(body, &got); err != nil {
+			t.Fatalf("decode 502 body: %v (%s)", err, body)
+		}
+		if got.Error != "could not reach the instance: check the base URL and network" {
+			t.Errorf("error = %q, want the unchanged operator message", got.Error)
+		}
+		if got.Class != "network" || got.StatusCode != 0 {
+			t.Errorf("diagnostics = %q/%d, want network/0", got.Class, got.StatusCode)
+		}
+		u, err := url.Parse(deadURL)
+		if err != nil {
+			t.Fatalf("parse dead URL: %v", err)
+		}
+		if got.Host != u.Hostname() || got.Port != u.Port() {
+			t.Errorf("target = %s:%s, want %s:%s", got.Host, got.Port, u.Hostname(), u.Port())
+		}
+	})
+}
+
+// TestArrBaseURLRejectsEmbeddedCredentials: a URL carrying userinfo is a client
+// error on both the upsert and the draft test, and nothing is persisted.
+func TestArrBaseURLRejectsEmbeddedCredentials(t *testing.T) {
+	h, sec := newArrHarness(t)
+	h.setupAdmin()
+	const withCreds = "http://user:super-secret-pass@radarr:7878"
+
+	code, body := h.do(http.MethodPut, "/api/settings/arr/radarr", map[string]any{
+		"base_url": withCreds, "api_key": "abcdef-1234",
+	})
+	if code != http.StatusBadRequest {
+		t.Fatalf("upsert with credentials = %d, want 400: %s", code, body)
+	}
+	if !bytes.Contains(body, []byte("base_url must not contain credentials")) {
+		t.Errorf("upsert error = %s, want the credentials rejection", body)
+	}
+	if bytes.Contains(body, []byte("super-secret-pass")) {
+		t.Errorf("upsert error echoed the password: %s", body)
+	}
+	if res := h.listArr(); len(res.Instances) != 0 {
+		t.Fatalf("rejected upsert persisted: %+v", res.Instances)
+	}
+	if _, err := sec.Get("arr.radarr.api_key"); !errors.Is(err, secrets.ErrNotFound) {
+		t.Fatalf("rejected upsert stored a secret: %v", err)
+	}
+
+	code, body = h.do(http.MethodPost, "/api/settings/arr/radarr/test", map[string]any{
+		"base_url": withCreds, "api_key": "abcdef-1234",
+	})
+	if code != http.StatusBadRequest {
+		t.Fatalf("draft test with credentials = %d, want 400: %s", code, body)
+	}
+	if !bytes.Contains(body, []byte("base_url must not contain credentials")) {
+		t.Errorf("draft test error = %s, want the credentials rejection", body)
 	}
 }

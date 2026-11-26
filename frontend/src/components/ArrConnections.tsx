@@ -6,6 +6,7 @@ import type {
   ArrConnectionTestPayload,
 } from '../lib/api'
 import {
+  arrDiagnosticsLine,
   arrErrorMessage,
   arrKindLabel,
   maskedArrKeyLabel,
@@ -23,7 +24,7 @@ import { Alert, Badge, Button, Card, Field, Input, Toggle } from './ui'
 
 const ARR_KINDS: readonly ArrConnectionKind[] = ['radarr', 'sonarr']
 
-type Notice = { tone: 'success' | 'danger'; text: string }
+type Notice = { tone: 'success' | 'danger'; text: string; diagnostics?: string | null }
 
 /**
  * One Radarr or Sonarr connection. The API key field is write-only: it starts
@@ -111,7 +112,14 @@ function ArrConnectionCard({
       {
         onSuccess: () =>
           setNotice({ tone: 'success', text: `${label} accepted the entered connection.` }),
-        onError: (error) => setNotice({ tone: 'danger', text: arrErrorMessage(error) }),
+        // A failed ping carries server-classified diagnostics (class/status/
+        // host) alongside the generic error; show both, and never the key.
+        onError: (error) =>
+          setNotice({
+            tone: 'danger',
+            text: arrErrorMessage(error),
+            diagnostics: arrDiagnosticsLine(error),
+          }),
       },
     )
   }
@@ -201,7 +209,14 @@ function ArrConnectionCard({
         }}
       />
 
-      {notice && <Alert tone={notice.tone}>{notice.text}</Alert>}
+      {notice && (
+        <Alert tone={notice.tone}>
+          {notice.text}
+          {notice.diagnostics && (
+            <span className="mt-1 block text-xs opacity-80">{notice.diagnostics}</span>
+          )}
+        </Alert>
+      )}
 
       <p className="text-right text-xs text-zinc-500">Tests the values above; saving is separate.</p>
 

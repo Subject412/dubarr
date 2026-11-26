@@ -46,3 +46,53 @@ export function arrErrorMessage(error: unknown): string {
   if (error instanceof ApiError && error.status === 503) return 'Secrets are not initialised'
   return error instanceof Error ? error.message : 'Request failed'
 }
+
+/** Human labels for the server's failure classes (`class` in the 502 body). */
+const ARR_FAILURE_CLASSES: Record<string, string> = {
+  auth: 'authentication',
+  timeout: 'timed out',
+  dns: 'host not found',
+  tls: 'TLS/certificate',
+  status: 'unexpected status',
+  kind_mismatch: 'wrong product',
+  network: 'unreachable',
+  decode: 'bad response',
+  invalid: 'invalid address',
+}
+
+type ArrTestDiagnosticsBody = {
+  class?: unknown
+  status_code?: unknown
+  host?: unknown
+  port?: unknown
+}
+
+/**
+ * Compact secondary line for a failed arr connection test, e.g.
+ * `authentication (HTTP 401) · radarr:7878`. It is built only from the
+ * server-classified fields — never from the raw base URL or an error body — so
+ * an API key cannot be echoed back. Returns null when the server sent no
+ * diagnostics (the pre-existing generic `error` message then stands alone).
+ */
+export function arrDiagnosticsLine(error: unknown): string | null {
+  if (!(error instanceof ApiError)) return null
+  const payload = error.payload
+  if (!payload || typeof payload !== 'object') return null
+
+  const body = payload as ArrTestDiagnosticsBody
+  const rawClass = typeof body.class === 'string' ? body.class : ''
+  if (rawClass === '') return null
+
+  const label = ARR_FAILURE_CLASSES[rawClass] ?? rawClass
+  const status = typeof body.status_code === 'number' ? body.status_code : 0
+  const code = status > 0 ? ` (HTTP ${status})` : ''
+  const host = typeof body.host === 'string' ? body.host : ''
+  const port = typeof body.port === 'string' ? body.port : ''
+  // An IPv6 literal is ambiguous without brackets (`::1:7878`); bracket it so
+  // the host/port split stays readable.
+  const shownHost = host.includes(':') ? `[${host}]` : host
+  const target =
+    shownHost === '' ? '' : port === '' ? shownHost : `${shownHost}:${port}`
+
+  return target === '' ? `${label}${code}` : `${label}${code} · ${target}`
+}

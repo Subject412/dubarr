@@ -18,8 +18,10 @@ written and what happens before it is swapped in** — not a backup copy.
    original untouched.
 4. The validated temp is renamed over the target. Same filesystem, so the swap is
    atomic: a reader sees either the old file or the new one.
-5. Optionally, the previous file is copied to `<target>.bak` through its own temp
-   before the swap.
+5. A pre-existing `<target>.bak` is **left exactly as it is**. dubarr neither
+   writes nor deletes a sidecar: an earlier version copied the previous file
+   there, and deleting those leftovers now would destroy a file the operator may
+   still be relying on.
 
 ## Why `.bak` is not the safety net
 
@@ -28,12 +30,13 @@ safe. That is wrong, and it matters: a `.bak` only helps if someone notices the
 new file is bad *after* the fact. Validation before the rename prevents the bad
 file from ever becoming the target.
 
-The `.bak` is a convenience copy, kept only when configured, and it is
-overwritten by design on each publish — it is the previous good copy, not a
-history. With automatic re-application (ADR-0017) a `.bak` would be created on
-every arr upgrade, so it should default to off — the code currently seeds
-`KeepBak: true`, which is the discrepancy noted in the status line, not a
-description of intended behaviour.
+The `.bak` was a convenience copy, written only when configured, and overwritten
+by design on each publish — the previous good copy, not a history. With automatic
+re-application (ADR-0017) it would have been written on every arr upgrade, and it
+lives in the media library beside the film, where it invites exactly the kind of
+cleanup that deletes the wrong thing. The option has since been removed
+completely: dubarr writes no sidecar, and deliberately does not delete existing
+ones.
 
 ### Where it would live, and why that is a problem
 
@@ -46,10 +49,12 @@ watching the library, a cleaner that removes "trash" files) has every right to
 delete it, making it a backup that quietly disappears.
 
 Neither Radarr nor Sonarr keeps a backup of a replaced file; they move the old
-one to their own recycle bin, or drop it. **Proposed: remove `.bak` entirely.**
+one to their own recycle bin, or drop it. **`.bak` has been removed entirely.**
 Validation before the rename is the safety mechanism, the Audio Vault already
 holds the audio, and a copy beside the target is storage cost in a directory
-dubarr does not own. Pending confirmation before the option is deleted.
+dubarr does not own. Existing `.bak` files are left untouched: they were written
+by a version that promised to keep them, and deleting them now would be dubarr
+destroying a file the operator may still rely on.
 
 ## Staleness check before publish
 
@@ -81,9 +86,9 @@ original in place. A crash or power loss mid-write leaves the original plus a
   new media, or arr will import a partial file. The hidden `.dubarr-*.tmp` name
   keeps it out of the media-extension set.
 
-Status: accepted. **Steps 1-4 are implemented** in `internal/mux` (temp beside
-the target, `ffprobe` validation, rename, cleanup). **The staleness check is not
-implemented**: `mux.go:216` stats the target once and `mux.go:355` renames
-unconditionally. **`.bak` removal is not implemented**: `settings.go:386` seeds
-`KeepBak: true`, so the current default is the opposite of what this ADR argues
-for. Both are outstanding work, not finished behaviour.
+Status: accepted and fully implemented. Steps 1-4 are in `internal/mux` (temp
+beside the target, `ffprobe` validation, atomic rename, cleanup); the staleness
+check now compares the target's identity (size, mtime, inode) immediately before
+the rename and refuses to publish over a file that changed mid-mux; and the
+`.bak` option has been deleted outright, so no sidecar is written and none is
+removed.

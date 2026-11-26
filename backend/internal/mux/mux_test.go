@@ -393,8 +393,6 @@ func eligibleRule() gate.Rule {
 	return gate.Rule{Required: []string{"[TDARR]"}, Mode: gate.MatchAny, Enforce: true}
 }
 
-func boolPtr(v bool) *bool { return &v }
-
 type harness struct {
 	t      *testing.T
 	dir    string
@@ -436,7 +434,11 @@ func (h *harness) job() Job {
 	}
 }
 
-func TestMuxPublishesAtomicallyWithBackup(t *testing.T) {
+// TestMuxPublishesAtomically: a successful replace-mode publish is a single
+// rename of the validated temp over the target — new inode, no temp and no
+// sidecar left beside it. There is no .bak: safety comes from the pre-rename
+// validation (ADR-0018), which the failure tests below exercise.
+func TestMuxPublishesAtomically(t *testing.T) {
 	h := newHarness(t)
 	beforeTargetHash := sha256File(t, h.target)
 	beforeInfo, err := os.Stat(h.target)
@@ -451,9 +453,6 @@ func TestMuxPublishesAtomicallyWithBackup(t *testing.T) {
 		t.Fatalf("Mux: %v", err)
 	}
 
-	if res.BackupPath != h.target+".bak" {
-		t.Errorf("BackupPath = %q, want %q", res.BackupPath, h.target+".bak")
-	}
 	if res.OutputPath != h.target {
 		t.Errorf("OutputPath = %q, want %q", res.OutputPath, h.target)
 	}
@@ -462,17 +461,8 @@ func TestMuxPublishesAtomicallyWithBackup(t *testing.T) {
 	} else if len(leftovers) > 0 {
 		t.Errorf("temp files still present beside target: %v", leftovers)
 	}
-
-	// The original bytes survive verbatim in the sidecar backup.
-	if got := sha256File(t, h.target+".bak"); got != beforeTargetHash {
-		t.Errorf(".bak hash = %s, want %s", got, beforeTargetHash)
-	}
-	bakInfo, err := os.Stat(h.target + ".bak")
-	if err != nil {
-		t.Fatalf("stat .bak: %v", err)
-	}
-	if bakInfo.Mode().Perm() != beforeInfo.Mode().Perm() {
-		t.Errorf(".bak mode = %v, want %v", bakInfo.Mode().Perm(), beforeInfo.Mode().Perm())
+	if _, err := os.Stat(h.target + ".bak"); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf(".bak created beside the target (err = %v), want none", err)
 	}
 
 	// The content at the original path is new; the path was replaced, not
@@ -623,8 +613,8 @@ func TestForceBypassesGateButNotAmbiguity(t *testing.T) {
 	if _, err := New(Dependencies{}).Mux(context.Background(), job); err != nil {
 		t.Fatalf("forced Mux: %v", err)
 	}
-	if _, err := os.Stat(untagged + ".bak"); err != nil {
-		t.Errorf("forced mux did not keep .bak: %v", err)
+	if _, err := os.Stat(untagged + ".bak"); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("forced mux created a .bak: %v", err)
 	}
 }
 
@@ -827,8 +817,8 @@ func TestConcurrentMuxesOnDistinctTargetsPublishIndependently(t *testing.T) {
 
 	for i, target := range targets {
 		noTempsLeft(t, target)
-		if _, err := os.Stat(target + ".bak"); err != nil {
-			t.Errorf("target %d left no .bak: %v", i, err)
+		if _, err := os.Stat(target + ".bak"); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("target %d left a .bak: %v", i, err)
 		}
 		doc := probeFile(t, target)
 		if len(videoOnly(doc)) == 0 {
@@ -913,10 +903,8 @@ func TestConcurrentMuxesOnTheSameTargetPublishExactlyOnce(t *testing.T) {
 
 	winnerJob := h.job()
 	winnerJob.TrackTitle = "RACE WINNER"
-	winnerJob.KeepBak = boolPtr(false)
 	loserJob := second.job()
 	loserJob.TrackTitle = "RACE LOSER"
-	loserJob.KeepBak = boolPtr(false)
 
 	var mu sync.Mutex
 	arrived := 0
@@ -997,71 +985,55 @@ func TestConcurrentMuxesOnTheSameTargetPublishExactlyOnce(t *testing.T) {
 	}
 }
 
-// TestMuxDiscardsBackupWhenKeepBakFalse covers settings mux.options.keep_bak=
-// false: the validated publish stands, but no <target>.bak is left behind.
-func TestMuxDiscardsBackupWhenKeepBakFalse(t *testing.T) {
-	h := newHarness(t)
-	beforeAudio := len(audioStreams(probeFile(t, h.target)))
+// TestMuxLeavesPreExistingBackupUntouched: the operator (or an older dubarr
+// build) may have a <target>.bak beside the library file. A mux must publish
+// but leave that file byte-identical with its mode intact in both modes:
+// dubarr never deletes or rewrites a file it did not create in this run.
+func TestMuxLeavesPreExistingBackupUntouched(t *testing.T) {
+	seeded := []byte("operator backup from an older dubarr build")
+	for _, tc := range []struct {
+		name     string
+		separate bool
+	}{
+		{name: "replace mode"},
+		{name: "separate mode", separate: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			bak := h.target + ".bak"
+			if err := os.WriteFile(bak, seeded, 0o600); err != nil {
+				t.Fatalf("seed pre-existing .bak: %v", err)
+			}
+			wantHash := sha256File(t, bak)
+			targetBefore := sha256File(t, h.target)
 
-	job := h.job()
-	job.KeepBak = boolPtr(false)
-	res, err := New(Dependencies{}).Mux(context.Background(), job)
-	if err != nil {
-		t.Fatalf("Mux: %v", err)
-	}
-	if _, err := os.Stat(h.target + ".bak"); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf(".bak still present (err = %v), want removed", err)
-	}
-	if res.BackupPath != "" {
-		t.Errorf("BackupPath = %q, want empty after removal", res.BackupPath)
-	}
-	if res.OutputPath != h.target {
-		t.Errorf("OutputPath = %q, want %q", res.OutputPath, h.target)
-	}
-	afterProbe := probeFile(t, h.target)
-	if got, want := len(audioStreams(afterProbe)), beforeAudio+1; got != want {
-		t.Errorf("audio tracks = %d, want %d", got, want)
-	}
-	if _, ok := findAudio(afterProbe, "pl", "PL DUB"); !ok {
-		t.Errorf("no pl/PL DUB audio track in %+v", audioStreams(afterProbe))
-	}
-	if leftovers, err := tempLeftovers(h.target); err != nil {
-		t.Fatalf("list temps: %v", err)
-	} else if len(leftovers) > 0 {
-		t.Errorf("temp files still present beside target: %v", leftovers)
-	}
-}
+			job := h.job()
+			if tc.separate {
+				job, _, _ = h.separateHarness(t)
+			}
+			if _, err := New(Dependencies{}).Mux(context.Background(), job); err != nil {
+				t.Fatalf("Mux: %v", err)
+			}
 
-// TestMuxBackupRemovalFailureWarnsAndPublishes: a failing .bak removal is a
-// WARN, never a mux failure. The backup simply stays on disk.
-func TestMuxBackupRemovalFailureWarnsAndPublishes(t *testing.T) {
-	h := newHarness(t)
-	var warnings []string
-	merr := New(Dependencies{Warnf: func(format string, args ...any) {
-		warnings = append(warnings, fmt.Sprintf(format, args...))
-	}})
-	merr.remove = func(string) error { return errors.New("remove denied") }
-
-	job := h.job()
-	job.KeepBak = boolPtr(false)
-	res, err := merr.Mux(context.Background(), job)
-	if err != nil {
-		t.Fatalf("Mux: %v", err)
-	}
-	if res.BackupPath != h.target+".bak" {
-		t.Errorf("BackupPath = %q, want %q (removal failed, backup stays)", res.BackupPath, h.target+".bak")
-	}
-	if _, err := os.Stat(h.target + ".bak"); err != nil {
-		t.Errorf("stat .bak: %v, want the backup left in place", err)
-	}
-	if len(warnings) != 1 {
-		t.Fatalf("warnings = %v, want exactly one", warnings)
-	}
-	if !strings.Contains(warnings[0], ".bak") || !strings.Contains(warnings[0], "remove denied") {
-		t.Errorf("warning %q should name the backup and the reason", warnings[0])
-	}
-	if _, ok := findAudio(probeFile(t, h.target), "pl", "PL DUB"); !ok {
-		t.Errorf("publish did not survive the backup removal failure")
+			if got := sha256File(t, bak); got != wantHash {
+				t.Errorf(".bak hash = %s, want it untouched at %s", got, wantHash)
+			}
+			info, err := os.Stat(bak)
+			if err != nil {
+				t.Fatalf("stat .bak: %v", err)
+			}
+			if info.Mode().Perm() != 0o600 {
+				t.Errorf(".bak mode = %v, want 0600 untouched", info.Mode().Perm())
+			}
+			if tc.separate {
+				if got := sha256File(t, h.target); got != targetBefore {
+					t.Error("separate mode modified the library target")
+				}
+			} else if got := sha256File(t, h.target); got == targetBefore {
+				t.Error("replace mode did not publish the muxed file")
+			}
+			noTempsLeft(t, h.target)
+		})
 	}
 }
 
@@ -1113,9 +1085,6 @@ func TestSeparateModeWritesDeterministicOutputAndKeepsTarget(t *testing.T) {
 	}
 	if res.OutputPath != wantDest {
 		t.Fatalf("OutputPath = %q, want %q", res.OutputPath, wantDest)
-	}
-	if res.BackupPath != "" {
-		t.Errorf("BackupPath = %q, want empty in separate mode", res.BackupPath)
 	}
 	if got, want := sha256File(t, h.target), targetHash; got != want {
 		t.Errorf("target hash = %s, want unchanged %s", got, want)
@@ -1253,38 +1222,6 @@ func TestSeparateModeValidatesBeforePublish(t *testing.T) {
 	}
 }
 
-// TestSeparateModeIgnoresKeepBak: nothing was replaced, so keep_bak is inert
-// and the .bak removal hook is never called.
-func TestSeparateModeIgnoresKeepBak(t *testing.T) {
-	h := newHarness(t)
-	job, _, dest := h.separateHarness(t)
-	discard := false
-	job.KeepBak = &discard
-
-	removed := false
-	m := New(Dependencies{})
-	m.remove = func(string) error {
-		removed = true
-		return errors.New("should not be called")
-	}
-	res, err := m.Mux(context.Background(), job)
-	if err != nil {
-		t.Fatalf("Mux: %v", err)
-	}
-	if removed {
-		t.Error("keep_bak removal ran in separate mode")
-	}
-	if res.BackupPath != "" {
-		t.Errorf("BackupPath = %q, want empty", res.BackupPath)
-	}
-	if _, err := os.Stat(dest); err != nil {
-		t.Errorf("separate output missing: %v", err)
-	}
-	if _, err := os.Stat(h.target + ".bak"); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf(".bak created in separate mode: %v", err)
-	}
-}
-
 // TestSeparateModePublishesWhenTargetChangesMidMux pins the deliberate
 // asymmetry of the staleness check: separate mode only reads the target and
 // publishes beside it, so a target the media manager replaced mid-run cannot
@@ -1319,9 +1256,6 @@ func TestSeparateModePublishesWhenTargetChangesMidMux(t *testing.T) {
 	}
 	if res.OutputPath != dest {
 		t.Fatalf("OutputPath = %q, want %q", res.OutputPath, dest)
-	}
-	if res.BackupPath != "" {
-		t.Errorf("BackupPath = %q, want empty in separate mode", res.BackupPath)
 	}
 	// The target read for the copy is gone; nothing was written into it.
 	if got := sha256File(t, h.target); got != upgradedHash {
@@ -1572,8 +1506,8 @@ func TestMuxContainerGuardAcceptsMatroska(t *testing.T) {
 			if got := sha256File(t, h.target); got == beforeHash {
 				t.Error("target content unchanged, mux did not publish")
 			}
-			if got := sha256File(t, h.target+".bak"); got != beforeHash {
-				t.Errorf(".bak hash = %s, want original %s", got, beforeHash)
+			if _, err := os.Stat(h.target + ".bak"); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf(".bak created by a replace-mode publish: %v", err)
 			}
 			noTempsLeft(t, h.target)
 		})
@@ -1648,8 +1582,8 @@ func TestMuxStalenessControlPublishesWhenTargetUnchanged(t *testing.T) {
 	if got := sha256File(t, h.target); got == beforeHash {
 		t.Error("target content unchanged, mux did not publish")
 	}
-	if got := sha256File(t, h.target+".bak"); got != beforeHash {
-		t.Errorf(".bak hash = %s, want the original %s", got, beforeHash)
+	if _, err := os.Stat(h.target + ".bak"); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf(".bak created by a replace-mode publish: %v", err)
 	}
 	noTempsLeft(t, h.target)
 }

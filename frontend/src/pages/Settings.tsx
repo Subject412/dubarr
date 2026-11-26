@@ -574,12 +574,6 @@ export function SettingsPage() {
                     <option value="separate">Write to the mux output folder</option>
                   </Select>
                 </Field>
-                <Toggle
-                  label="Keep .bak backup"
-                  help={settingsHelp('mux.options', 'keep_bak')}
-                  checked={draft.keep_bak}
-                  onChange={(keep_bak) => update({ keep_bak })}
-                />
                 <Field
                   label="Track title written into Matroska"
                   htmlFor="track-title"

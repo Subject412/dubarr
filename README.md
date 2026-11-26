@@ -112,7 +112,7 @@ command: ["--log-level", "debug", "--log-file"]
 
 | Mode | Behaviour |
 | --- | --- |
-| `replace` (default) | The muxed file atomically replaces the library target; `keep_bak` keeps a `.bak` copy next to it. |
+| `replace` (default) | The muxed file atomically replaces the library target; no `.bak` copy is written. |
 | `separate` | The muxed file is written to the **Mux output folder** (`storage.paths.output_dir`) and the library target is not touched. |
 
 In `separate` mode the name is derived from the target basename plus
@@ -121,13 +121,14 @@ The destination is never overwritten and never auto-suffixed — a job whose
 deliverable already exists fails with a clear error, so re-running a mux is an
 explicit decision. The folder is a storage root of its own (absolute,
 symlink-resolved, must exist) and may not be the Audio Vault or inside it.
-`keep_bak` does not apply because nothing is replaced, and the arr rescan is
-skipped because the library file is unchanged. Temp files are created inside the
+Nothing is replaced in `separate` mode, and the arr rescan is skipped because the
+library file is unchanged. Temp files are created inside the
 destination folder so the final rename stays atomic on one filesystem: if the
 destination is on another filesystem from the temp, the job fails instead of
 falling back to a non-atomic copy. The tag gate and `ffprobe` validation still
-apply, and the vault is never written. Completed jobs record the published path,
-exposed as `output_path` by `GET /api/sync/jobs`.
+apply, and the vault is never written. A pre-existing `.bak` beside a target is
+never created, rewritten or deleted by a mux. Completed jobs record the published
+path, exposed as `output_path` by `GET /api/sync/jobs`.
 
 **Never commit** `data/`, `docker/config/`, `docker/media/`, media files, `.env`
 files, `.master.key` or `*.keyfile`. These paths are already in `.gitignore`;

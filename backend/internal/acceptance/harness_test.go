@@ -138,7 +138,7 @@ func newHarness(t *testing.T) *harness {
 	t.Helper()
 	root := t.TempDir()
 	// Copying the fixtures needs room for the target video plus the mux work
-	// copy and .bak. Skip instead of failing on hosts whose TMPDIR is a small
+	// copy and temp. Skip instead of failing on hosts whose TMPDIR is a small
 	// tmpfs; the assertion value comes from the chain, not the disk size.
 	const wantFree = 14 << 30
 	var stat syscall.Statfs_t

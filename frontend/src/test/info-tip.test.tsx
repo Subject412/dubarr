@@ -36,7 +36,7 @@ const SETTINGS = {
   'security.options': {
     allow_force_tag_override: false,
   },
-  'mux.options': { keep_bak: true, track_title_in_mkv: 'Polski Dubbing' },
+  'mux.options': { track_title_in_mkv: 'Polski Dubbing' },
   'audio.options': {
     rules: [
       {
@@ -86,11 +86,32 @@ describe('info tooltip (issue #3)', () => {
     // Every control kind wires help, not just text inputs.
     expect(screen.getByLabelText('Vault folder')).toHaveAttribute('aria-describedby')
     expect(screen.getByLabelText('Export mode')).toHaveAttribute('aria-describedby')
-    expect(screen.getByRole('switch', { name: 'Keep .bak backup' })).toHaveAttribute(
-      'aria-describedby',
-    )
+    expect(screen.getByLabelText('Output mode')).toHaveAttribute('aria-describedby')
     expect(screen.getByLabelText('Add target language')).toHaveAttribute('aria-describedby')
     expect(screen.getByLabelText('Checkpoint positions (%)')).toHaveAttribute('aria-describedby')
+  })
+
+  it('wires help to a switch control, not just inputs and selects', async () => {
+    const user = userEvent.setup()
+    await renderSettings()
+
+    // Toggle renders role="switch" with the same aria-describedby wiring as
+    // every other control kind, so the tip is announced on the switch itself.
+    const control = screen.getByRole('switch', { name: 'Allow force tag override' })
+    const helpId = control.getAttribute('aria-describedby') ?? ''
+    expect(helpId).not.toBe('')
+
+    const trigger = screen.getByRole('button', { name: 'About Allow force tag override' })
+    expect(trigger).toHaveAttribute('aria-describedby', helpId)
+
+    act(() => trigger.focus())
+    // The tip carries the authored help for the switch it documents.
+    const tooltip = await screen.findByRole('tooltip')
+    expect(tooltip).toHaveAttribute('id', helpId)
+    expect(tooltip).toHaveTextContent(SETTINGS_HELP['security.options'].allow_force_tag_override)
+
+    await user.keyboard('{Escape}')
+    expect(screen.queryByRole('tooltip')).not.toBeInTheDocument()
   })
 
   it('opens on hover with role=tooltip and closes when the pointer leaves', async () => {
@@ -113,10 +134,13 @@ describe('info tooltip (issue #3)', () => {
     const user = userEvent.setup()
     await renderSettings()
 
-    const trigger = screen.getByRole('button', { name: 'About Keep .bak backup' })
+    const trigger = screen.getByRole('button', { name: 'About Track title written into Matroska' })
 
     act(() => trigger.focus())
-    expect(await screen.findByRole('tooltip')).toBeInTheDocument()
+    // The tip carries the authored help for the mux option it documents.
+    expect(await screen.findByRole('tooltip')).toHaveTextContent(
+      SETTINGS_HELP['mux.options'].track_title_in_mkv,
+    )
 
     await user.keyboard('{Escape}')
     expect(screen.queryByRole('tooltip')).not.toBeInTheDocument()
@@ -242,7 +266,7 @@ describe('settings help module', () => {
   it('documents every settings field exactly once', () => {
     expect(SETTINGS_HELP['storage.paths'].watch_dir).toMatch(/Watch Folder/i)
     expect(SETTINGS_HELP['security.options'].allow_force_tag_override).toMatch(/bypass/i)
-    expect(SETTINGS_HELP['mux.options'].keep_bak).toMatch(/backup/i)
+    expect(SETTINGS_HELP['mux.options'].output_mode).toMatch(/atomically overwrite/i)
     expect(SETTINGS_HELP['sync.defaults'].max_offset_sec).toMatch(/offset/i)
   })
 })

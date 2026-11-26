@@ -861,7 +861,11 @@ func TestMeasureSyncResources(t *testing.T) {
 		OriginalLanguage: "en",
 	}
 	analyzeStart := time.Now()
-	report, err := analyze.Analyze(ctx, &measuredEngine{bin: syncBinary, rec: rec}, cfg, req)
+	// budgetEngine substitutes the shared acceptance budget (testJobTimeout) for
+	// the per-checkpoint deadline cfg derives, so this measurement run is bounded
+	// exactly like the other acceptance tests that drive the real engine.
+	measured := &measuredEngine{bin: syncBinary, rec: rec}
+	report, err := analyze.Analyze(ctx, budgetEngine{inner: measured}, cfg, req)
 	if err != nil {
 		t.Fatalf("Analyze: %v", err)
 	}

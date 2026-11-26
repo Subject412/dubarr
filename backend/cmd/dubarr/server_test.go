@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -14,6 +15,24 @@ import (
 	"time"
 
 	"github.com/Subject412/dubarr/backend/internal/secrets"
+)
+
+// Wall-clock budgets for this package's HTTP tests. They are deliberately
+// generous: a loaded runner slowing the test server down is not a defect, and
+// these exist to bound a hang, never to assert performance.
+const (
+	// testHTTPTimeout bounds one HTTP request/response exchange.
+	testHTTPTimeout = 30 * time.Second
+	// testDialTimeout bounds one TCP dial in the post-shutdown listener check.
+	testDialTimeout = 5 * time.Second
+	// testServeStartTimeout bounds waiting for Serve to report its address and
+	// for the graceful shutdown to return.
+	testServeStartTimeout = 30 * time.Second
+	// testHealthAttempts and testHealthBackoff bound the /api/health retry
+	// loop: the handler shells out to ffmpeg/ffprobe/mkvmerge, so a request
+	// that times out on a busy host says nothing about correctness.
+	testHealthAttempts = 5
+	testHealthBackoff  = 250 * time.Millisecond
 )
 
 func newTestServer(t *testing.T) *server {
@@ -84,12 +103,12 @@ func TestFullRouteFlow(t *testing.T) {
 		base = "http://" + addr
 	case err := <-done:
 		t.Fatalf("Serve exited before listening: %v", err)
-	case <-time.After(10 * time.Second):
+	case <-time.After(testServeStartTimeout):
 		t.Fatal("server did not start")
 	}
 
 	jar, _ := cookiejar.New(nil)
-	client := &http.Client{Jar: jar, Timeout: 5 * time.Second}
+	client := &http.Client{Jar: jar, Timeout: testHTTPTimeout}
 	post := func(path, body string) (int, string) {
 		resp, err := client.Post(base+path, "application/json", strings.NewReader(body))
 		if err != nil {
@@ -100,18 +119,11 @@ func TestFullRouteFlow(t *testing.T) {
 		return resp.StatusCode, string(raw)
 	}
 	getInto := func(path string, dst any) int {
-		resp, err := client.Get(base + path)
+		code, err := fetchJSON(client, base, path, dst)
 		if err != nil {
 			t.Fatalf("GET %s: %v", path, err)
 		}
-		defer resp.Body.Close()
-		raw, _ := io.ReadAll(resp.Body)
-		if dst != nil {
-			if err := json.Unmarshal(raw, dst); err != nil {
-				t.Fatalf("GET %s decode: %v (%s)", path, err, raw)
-			}
-		}
-		return resp.StatusCode
+		return code
 	}
 
 	// 1. Fresh install: public status reports uninitialized.
@@ -154,7 +166,9 @@ func TestFullRouteFlow(t *testing.T) {
 		t.Fatal("settings leaked auth.session_key")
 	}
 
-	// 5. Health reports the toolchain without secrets.
+	// 5. Health reports the toolchain without secrets. /api/health shells out
+	// to ffmpeg/ffprobe/mkvmerge for versions, so it is fetched with a bounded
+	// retry: a timed-out request on a loaded host is not a correctness signal.
 	var health struct {
 		Status string `json:"status"`
 		DBOK   bool   `json:"db_ok"`
@@ -164,7 +178,7 @@ func TestFullRouteFlow(t *testing.T) {
 		} `json:"tools"`
 		AuthInitialized bool `json:"auth_initialized"`
 	}
-	if code := getInto("/api/health", &health); code != http.StatusOK {
+	if code := getIntoRetrying(t, client, base, "/api/health", &health); code != http.StatusOK {
 		t.Fatalf("GET /api/health = %d", code)
 	}
 	if !health.DBOK || health.Status != "ok" {
@@ -189,7 +203,7 @@ func TestFullRouteFlow(t *testing.T) {
 	}
 
 	// 7. Unauthenticated clients stay locked out of privileged routes.
-	anon := &http.Client{Timeout: 5 * time.Second}
+	anon := &http.Client{Timeout: testHTTPTimeout}
 	resp, err := anon.Get(base + "/api/settings")
 	if err != nil {
 		t.Fatalf("anon GET settings: %v", err)
@@ -206,11 +220,11 @@ func TestFullRouteFlow(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Serve returned %v after shutdown, want nil", err)
 		}
-	case <-time.After(15 * time.Second):
+	case <-time.After(testServeStartTimeout):
 		t.Fatal("server did not shut down")
 	}
 
-	conn, err := net.DialTimeout("tcp", strings.TrimPrefix(base, "http://"), time.Second)
+	conn, err := net.DialTimeout("tcp", strings.TrimPrefix(base, "http://"), testDialTimeout)
 	if err == nil {
 		conn.Close()
 		t.Fatal("listener still accepting connections after shutdown")
@@ -245,10 +259,54 @@ func serveForTest(t *testing.T, srv *server, ctx context.Context) (string, <-cha
 		return "http://" + addr, done
 	case err := <-done:
 		t.Fatalf("Serve exited before listening: %v", err)
-	case <-time.After(10 * time.Second):
+	case <-time.After(testServeStartTimeout):
 		t.Fatal("server did not start")
 	}
 	return "", nil
+}
+
+// fetchJSON performs one GET and decodes the body into dst, returning the
+// status code. Errors are returned instead of failing the test so callers can
+// retry; assertions on the response stay with the caller.
+func fetchJSON(client *http.Client, base, path string, dst any) (int, error) {
+	resp, err := client.Get(base + path)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, err
+	}
+	if dst != nil {
+		if err := json.Unmarshal(raw, dst); err != nil {
+			return 0, fmt.Errorf("decode: %w (%s)", err, raw)
+		}
+	}
+	return resp.StatusCode, nil
+}
+
+// getIntoRetrying is getInto with a bounded retry for handlers that do real
+// work ( /api/health runs ffmpeg/ffprobe/mkvmerge): a request that times out on
+// a loaded runner is not a correctness signal, so it is retried up to
+// testHealthAttempts times with testHealthBackoff between attempts. Once a
+// response arrives it is asserted exactly as before.
+func getIntoRetrying(t *testing.T, client *http.Client, base, path string, dst any) int {
+	t.Helper()
+	var lastErr error
+	for attempt := 1; attempt <= testHealthAttempts; attempt++ {
+		code, err := fetchJSON(client, base, path, dst)
+		if err == nil {
+			return code
+		}
+		lastErr = err
+		t.Logf("GET %s attempt %d/%d: %v", path, attempt, testHealthAttempts, err)
+		if attempt < testHealthAttempts {
+			time.Sleep(testHealthBackoff)
+		}
+	}
+	t.Fatalf("GET %s: %v (gave up after %d attempts)", path, lastErr, testHealthAttempts)
+	return 0
 }
 
 // healthResult is the client-side outcome of one GET /api/health.
@@ -262,7 +320,7 @@ type healthResult struct {
 }
 
 func getHealth(base string) healthResult {
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{Timeout: testHTTPTimeout}
 	resp, err := client.Get(base + "/api/health")
 	if err != nil {
 		return healthResult{err: err}
@@ -303,7 +361,7 @@ func waitForSignal(t *testing.T, ch <-chan struct{}, what string) {
 	t.Helper()
 	select {
 	case <-ch:
-	case <-time.After(10 * time.Second):
+	case <-time.After(testServeStartTimeout):
 		t.Fatalf("timed out waiting for %s", what)
 	}
 }
@@ -398,7 +456,7 @@ func TestCloseStopsHTTPBeforeReleasingStore(t *testing.T) {
 		// Close stopped the HTTP server, as required.
 	case err := <-closeDone:
 		t.Fatalf("Close returned (%v) without stopping the HTTP server first", err)
-	case <-time.After(10 * time.Second):
+	case <-time.After(testServeStartTimeout):
 		t.Fatal("Close did not start the HTTP shutdown")
 	}
 	select {

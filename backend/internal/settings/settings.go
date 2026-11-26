@@ -8,7 +8,7 @@
 //	languages.policy   target/reference languages, commentary exclusion, export mode
 //	target.tag_filter  Processing Gate: filename tags + optional arr tags/roots (ADR-0005, ADR-0009)
 //	sync.defaults      max offset, checkpoint/preview sampling positions
-//	security.options   vault read-only, tag override, AV1 warnings
+//	security.options   tag override, AV1 warnings
 //	mux.options        keep .bak, track title written into Matroska
 //	audio.options      opt-in Transcode Rules: codec/channels/bitrate/sample rate (ADR-0010)
 //	watch.options      watch-folder scan cadence and stability window
@@ -195,7 +195,6 @@ type SyncDefaults struct {
 
 // SecurityOptions are appliance-wide safety switches.
 type SecurityOptions struct {
-	VaultReadOnly         bool `json:"vault_read_only"`
 	AllowForceTagOverride bool `json:"allow_force_tag_override"`
 	RequireAV1Warning     bool `json:"require_av1_warning"`
 	RequireAV1Strict      bool `json:"require_av1_strict"`
@@ -364,7 +363,6 @@ func Defaults(dataDir string) map[string]any {
 			PreviewWindowSec:       60,
 		},
 		KeySecurityOptions: SecurityOptions{
-			VaultReadOnly:         true,
 			AllowForceTagOverride: false,
 			RequireAV1Warning:     true,
 			RequireAV1Strict:      false,
@@ -441,6 +439,9 @@ func (s *Store) Get(ctx context.Context, key string) (json.RawMessage, bool, err
 // legacy rows predate prefer_original_language / output_mode / source_mode, and
 // the UI/API/export all decode the served JSON directly, so absence has to be
 // materialized as the agreed default here too.
+//
+// It also canonicalises sections that lost a field: security.options must not
+// keep serving a retired key from a row stored before it was deleted.
 func serveable(key, value string) json.RawMessage {
 	raw := json.RawMessage(value)
 	switch key {
@@ -479,6 +480,20 @@ func serveable(key, value string) json.RawMessage {
 		// carries it. Decoding into the current schema and re-marshalling
 		// drops it, so the API never serves a setting that no longer exists.
 		var p ArrOptions
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return raw
+		}
+		blob, err := json.Marshal(p)
+		if err != nil {
+			return raw
+		}
+		return blob
+	case KeySecurityOptions:
+		// A row written before vault_read_only was retired still carries it.
+		// Decoding into the current schema and re-marshalling drops it, so the
+		// API never serves a setting that no longer exists. The stored row is
+		// left untouched.
+		var p SecurityOptions
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return raw
 		}

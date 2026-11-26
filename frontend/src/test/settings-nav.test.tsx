@@ -36,7 +36,6 @@ const SETTINGS = {
     preview_window_sec: 60,
   },
   'security.options': {
-    vault_read_only: true,
     allow_force_tag_override: false,
     require_av1_warning: true,
     require_av1_strict: false,

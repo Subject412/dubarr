@@ -121,7 +121,6 @@ export type SyncDefaults = {
 }
 
 export type SecurityOptions = {
-  vault_read_only: boolean
   allow_force_tag_override: boolean
   require_av1_warning: boolean
   require_av1_strict: boolean

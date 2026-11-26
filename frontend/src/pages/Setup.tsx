@@ -453,12 +453,6 @@ export function SetupPage() {
                 </span>
               </div>
               <Toggle
-                label="Vault read-only"
-                description="Never modify the mounted vault."
-                checked={security.vault_read_only}
-                onChange={(vault_read_only) => setSecurity({ ...security, vault_read_only })}
-              />
-              <Toggle
                 label="Allow force tag override"
                 description="Permit per-item bypass of the processing filter."
                 checked={security.allow_force_tag_override}
@@ -511,10 +505,6 @@ export function SetupPage() {
                   <dd className="text-zinc-200">
                     {tagFilter.required_filename_tags.join(', ') || 'none'}
                   </dd>
-                </div>
-                <div className="flex justify-between gap-4 px-3 py-2 text-sm">
-                  <dt className="text-zinc-500">Vault read-only</dt>
-                  <dd className="text-zinc-200">{security.vault_read_only ? 'yes' : 'no'}</dd>
                 </div>
               </dl>
               <div className="flex justify-between">

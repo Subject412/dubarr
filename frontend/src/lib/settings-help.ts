@@ -53,8 +53,6 @@ export const SETTINGS_HELP: Record<SettingsSectionKey, Record<string, string>> =
       'Reject Targets that do not satisfy the filter. Donor ingestion into the Audio Vault is never gated.',
   },
   'security.options': {
-    vault_read_only:
-      'Keep the mounted Audio Vault read-only (0444): the write-once archive is never modified, only verified copies in the Work Area.',
     allow_force_tag_override:
       'Let an operator bypass the processing filter for a single item. Off by default.',
     require_av1_warning: 'Show the AV1 hand-off warning before muxing into an AV1 Target.',

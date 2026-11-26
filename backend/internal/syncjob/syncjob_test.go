@@ -196,7 +196,7 @@ func TestCreateJobEligibilityGate(t *testing.T) {
 	}
 
 	// Turning the setting on honours force for an otherwise ineligible row.
-	raw, err := json.Marshal(settings.SecurityOptions{VaultReadOnly: true, AllowForceTagOverride: true})
+	raw, err := json.Marshal(settings.SecurityOptions{AllowForceTagOverride: true})
 	if err != nil {
 		t.Fatal(err)
 	}

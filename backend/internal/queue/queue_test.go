@@ -78,7 +78,7 @@ func newHarness(t *testing.T) *harness {
 // section instead of a test-invented flag.
 func (h *harness) enableForceTagOverride(t *testing.T) {
 	t.Helper()
-	raw, err := json.Marshal(settings.SecurityOptions{VaultReadOnly: true, AllowForceTagOverride: true})
+	raw, err := json.Marshal(settings.SecurityOptions{AllowForceTagOverride: true})
 	if err != nil {
 		t.Fatalf("marshal security options: %v", err)
 	}

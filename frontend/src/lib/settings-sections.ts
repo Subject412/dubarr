@@ -39,7 +39,7 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   {
     key: 'security.options',
     title: 'Security options',
-    description: 'Safety switches around the vault and AV1 hand-off.',
+    description: 'Safety switches for the tag override and the AV1 hand-off.',
   },
   {
     key: 'sync.defaults',

@@ -55,9 +55,6 @@ export const SETTINGS_HELP: Record<SettingsSectionKey, Record<string, string>> =
   'security.options': {
     allow_force_tag_override:
       'Let an operator bypass the processing filter for a single item. Off by default.',
-    require_av1_warning: 'Show the AV1 hand-off warning before muxing into an AV1 Target.',
-    require_av1_strict:
-      'Treat the AV1 hand-off warning as a hard stop instead of an acknowledgement.',
   },
   'sync.defaults': {
     max_offset_sec:

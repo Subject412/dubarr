@@ -358,6 +358,14 @@ func TestBrowseSetupModeAllowsAbsolutePaths(t *testing.T) {
 func TestSettingsPutRejectsNullSections(t *testing.T) {
 	h := newHarness(t)
 	h.setupAdmin()
+	// Turn the one surviving safety switch on, so a null write has something to
+	// destroy and the check below can tell "untouched" from "zeroed".
+	if _, err := h.db.Exec(
+		`INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`,
+		settings.KeySecurityOptions, `{"allow_force_tag_override":true}`,
+	); err != nil {
+		t.Fatalf("seed security.options: %v", err)
+	}
 	code, body := h.do(http.MethodPut, "/api/settings", map[string]any{
 		"settings": map[string]any{
 			settings.KeySecurityOptions: nil,
@@ -372,7 +380,7 @@ func TestSettingsPutRejectsNullSections(t *testing.T) {
 	if err := json.Unmarshal(env.Settings[settings.KeySecurityOptions], &sec); err != nil {
 		t.Fatalf("decode security: %v", err)
 	}
-	if !sec.RequireAV1Warning {
+	if !sec.AllowForceTagOverride {
 		t.Errorf("null write disabled safety switches: %+v", sec)
 	}
 	var sp settings.StoragePaths
@@ -384,14 +392,15 @@ func TestSettingsPutRejectsNullSections(t *testing.T) {
 	}
 }
 
-// TestSettingsServesLegacySecurityOptionsWithoutVaultReadOnly pins the read
-// path: a row stored before security.options.vault_read_only was retired still
-// loads (200) and is served without the removed key, because the section
-// decodes into the current schema. The stored row itself stays untouched.
-func TestSettingsServesLegacySecurityOptionsWithoutVaultReadOnly(t *testing.T) {
+// TestSettingsServesLegacySecurityOptionsWithoutRetiredKeys pins the read path:
+// a row stored before security.options retired vault_read_only and the AV1
+// switches still loads (200) and is served without any of the removed keys,
+// because the section decodes into the current schema. The stored row itself
+// stays untouched.
+func TestSettingsServesLegacySecurityOptionsWithoutRetiredKeys(t *testing.T) {
 	h := newHarness(t)
 	h.setupAdmin()
-	legacy := `{"vault_read_only":true,"allow_force_tag_override":true,"require_av1_warning":false,"require_av1_strict":false}`
+	legacy := `{"vault_read_only":true,"allow_force_tag_override":true,"require_av1_warning":true,"require_av1_strict":false}`
 	if _, err := h.db.Exec(
 		`INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`,
 		settings.KeySecurityOptions, legacy,
@@ -408,14 +417,13 @@ func TestSettingsServesLegacySecurityOptionsWithoutVaultReadOnly(t *testing.T) {
 	if err := json.Unmarshal(raw, &opts); err != nil {
 		t.Fatalf("decode security.options: %v (%s)", err, raw)
 	}
-	if _, ok := opts["vault_read_only"]; ok {
-		t.Errorf("security.options still serves vault_read_only: %s", raw)
+	for _, key := range []string{"vault_read_only", "require_av1_warning", "require_av1_strict"} {
+		if _, ok := opts[key]; ok {
+			t.Errorf("security.options still serves %s: %s", key, raw)
+		}
 	}
 	if got, _ := opts["allow_force_tag_override"].(bool); !got {
 		t.Errorf("allow_force_tag_override = %v, want the stored true", opts["allow_force_tag_override"])
-	}
-	if got, _ := opts["require_av1_warning"].(bool); got {
-		t.Errorf("require_av1_warning = %v, want the stored false", opts["require_av1_warning"])
 	}
 
 	// Serving is not rewriting: the legacy bytes are still in the row.
@@ -428,35 +436,39 @@ func TestSettingsServesLegacySecurityOptionsWithoutVaultReadOnly(t *testing.T) {
 	}
 }
 
-// TestSettingsPutRejectsLegacyVaultReadOnly pins the write path: the retired key
-// is not silently ignored, the API answers 400 and names the unknown field, so a
+// TestSettingsPutRejectsRetiredSecurityKeys pins the write path: a retired key is
+// not silently ignored, the API answers 400 and names the unknown field, so a
 // client cannot keep writing a setting that no longer exists.
-func TestSettingsPutRejectsLegacyVaultReadOnly(t *testing.T) {
-	h := newHarness(t)
-	h.setupAdmin()
+func TestSettingsPutRejectsRetiredSecurityKeys(t *testing.T) {
+	for _, key := range []string{"vault_read_only", "require_av1_warning", "require_av1_strict"} {
+		t.Run(key, func(t *testing.T) {
+			h := newHarness(t)
+			h.setupAdmin()
 
-	code, body := h.do(http.MethodPut, "/api/settings", map[string]any{
-		"settings": map[string]any{
-			settings.KeySecurityOptions: map[string]any{
-				"vault_read_only": true,
-			},
-		},
-	})
-	if code != http.StatusBadRequest {
-		t.Fatalf("PUT security.options with vault_read_only = %d, want 400: %s", code, body)
-	}
-	if !bytes.Contains(body, []byte("vault_read_only")) {
-		t.Errorf("400 body does not name the unknown field: %s", body)
-	}
+			code, body := h.do(http.MethodPut, "/api/settings", map[string]any{
+				"settings": map[string]any{
+					settings.KeySecurityOptions: map[string]any{
+						key: true,
+					},
+				},
+			})
+			if code != http.StatusBadRequest {
+				t.Fatalf("PUT security.options with %s = %d, want 400: %s", key, code, body)
+			}
+			if !bytes.Contains(body, []byte(key)) {
+				t.Errorf("400 body does not name the unknown field: %s", body)
+			}
 
-	// Nothing was written: the seeded section keeps its defaults.
-	env := h.getSettings()
-	var sec settings.SecurityOptions
-	if err := json.Unmarshal(env.Settings[settings.KeySecurityOptions], &sec); err != nil {
-		t.Fatalf("decode security.options: %v", err)
-	}
-	if sec.AllowForceTagOverride || !sec.RequireAV1Warning {
-		t.Errorf("rejected write changed security.options: %+v", sec)
+			// Nothing was written: the seeded section keeps its defaults.
+			env := h.getSettings()
+			var sec settings.SecurityOptions
+			if err := json.Unmarshal(env.Settings[settings.KeySecurityOptions], &sec); err != nil {
+				t.Fatalf("decode security.options: %v", err)
+			}
+			if sec.AllowForceTagOverride {
+				t.Errorf("rejected write changed security.options: %+v", sec)
+			}
+		})
 	}
 }
 

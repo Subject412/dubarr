@@ -30,7 +30,7 @@ plus reorganisation (issue #47). Windows support is dropped (ADR-0016).
 
 ## Proposed resolutions (approved Phase 0)
 - Checkpoints (analysis): 6 @ 10/25/40/55/70/85% of shorter duration, 150s windows, 8000 Hz mono `pcm_f32le`. Preview Slices (studio): 60s @ 10/25/50/75/90%.
-- `require_av1_warning: true`, `require_av1_strict: false`.
+- `require_av1_warning: true`, `require_av1_strict: false`. — **superseded:** both settings were deleted (#54 item 10); muxing audio does not depend on the video codec.
 - `force_ignore_tag_filter` honored only when `settings.security.allow_force_tag_override: true` (default false).
 - `sync.defaults.max_offset_sec` default 180 — enforced Go-side; the engine CLI has no such flag (only `--selftest`).
 - `--desktop` = open default browser at listen addr (`xdg-open`); no embedded webview v1.

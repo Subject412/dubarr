@@ -122,8 +122,6 @@ export type SyncDefaults = {
 
 export type SecurityOptions = {
   allow_force_tag_override: boolean
-  require_av1_warning: boolean
-  require_av1_strict: boolean
 }
 
 export type MuxOutputMode = 'replace' | 'separate'

@@ -71,7 +71,7 @@ func TestSeedDefaults(t *testing.T) {
 	}
 
 	sec := decode[SecurityOptions](t, all[KeySecurityOptions])
-	if sec.AllowForceTagOverride || !sec.RequireAV1Warning || sec.RequireAV1Strict {
+	if sec.AllowForceTagOverride {
 		t.Errorf("security options = %+v", sec)
 	}
 
@@ -209,7 +209,7 @@ func TestSetRejectsInvalidValues(t *testing.T) {
 		KeyLanguagesPolicy: `{"export_mode":"whatever"}`,
 		KeySyncDefaults:    `{"max_offset_sec":-5}`,
 		KeyWatchOptions:    `{"scan_interval_sec":0}`,
-		KeySecurityOptions: `{"require_av1_warning":"yes"}`,
+		KeySecurityOptions: `{"allow_force_tag_override":"yes"}`,
 		KeyStoragePaths:    `{"media_roots":"not-a-list"}`,
 		KeyMuxOptions:      `{"keep_bak":true,"track_title_in_mkv":""}`,
 	}
@@ -276,8 +276,8 @@ func mustGet(t *testing.T, s *Store, ctx context.Context, key string) json.RawMe
 }
 
 // A null JSON token decodes into a struct as a no-op, so without an explicit
-// object check it would persist an all-zero section: security.options would lose
-// require_av1_warning and storage.paths would lose its roots.
+// object check it would persist an all-zero section: mux.options would lose its
+// track title and storage.paths would lose its roots.
 func TestSetRejectsNullAndNonObjectSections(t *testing.T) {
 	ctx := context.Background()
 	s := openStore(t)
@@ -294,7 +294,7 @@ func TestSetRejectsNullAndNonObjectSections(t *testing.T) {
 	}
 
 	sec := decode[SecurityOptions](t, mustGet(t, s, ctx, KeySecurityOptions))
-	if !sec.RequireAV1Warning || sec.AllowForceTagOverride || sec.RequireAV1Strict {
+	if sec.AllowForceTagOverride {
 		t.Errorf("security.options changed by a rejected write: %+v", sec)
 	}
 	sp := decode[StoragePaths](t, mustGet(t, s, ctx, KeyStoragePaths))

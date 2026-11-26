@@ -40,7 +40,7 @@ var (
 )
 
 // RecordImportCandidate inserts a newly discovered donor file into the
-// approval queue (IDEA.md §4 table 5) and reports whether the row was created.
+// approval queue (schema.sql) and reports whether the row was created.
 //
 // import_queue.source_file_path is UNIQUE, so the scanner can rescan the same
 // tree every cycle: an already-known path is a no-op and created is false.

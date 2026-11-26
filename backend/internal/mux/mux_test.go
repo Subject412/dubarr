@@ -361,8 +361,8 @@ func findAudio(doc probeDoc, lang, title string) (probeStream, bool) {
 }
 
 // audioTrackIETF returns the LanguageIETF of the last audio track. mkvmerge
-// stores both the legacy code (pol) and the IETF code (pl) from --language 0:pl
-// (IDEA.md:393); ffprobe only exposes the legacy tag.
+// stores both the legacy code (pol) and the IETF code (pl) from --language 0:pl;
+// ffprobe only exposes the legacy tag.
 func audioTrackIETF(t *testing.T, path string) string {
 	t.Helper()
 	out, err := exec.Command("mkvmerge", "-J", path).Output()
@@ -500,7 +500,7 @@ func TestMuxPublishesAtomicallyWithBackup(t *testing.T) {
 	}
 
 	// Exactly one audio track was appended, tagged with the vault track's ISO2
-	// language and the dub marker (IDEA.md:506 "PL DUB").
+	// language and the dub marker ("PL DUB").
 	if got, want := len(audioStreams(afterProbe)), len(audioStreams(beforeProbe))+1; got != want {
 		t.Fatalf("audio tracks = %d, want %d", got, want)
 	}
@@ -522,7 +522,7 @@ func TestMuxPublishesAtomicallyWithBackup(t *testing.T) {
 		t.Errorf("job staging still present after a publish: %v", err)
 	}
 
-	// Command shape follows IDEA.md:397-403: target as input, then the
+	// Command shape (ADR-0004): target as input, then the
 	// appended audio with language, title, sync and default-flag options.
 	joined := strings.Join(res.Command, " ")
 	for _, want := range []string{"--language 0:pl", "--track-name 0:PL DUB", "--sync 0:-750", "--default-track-flag 0:no"} {

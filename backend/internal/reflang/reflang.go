@@ -1,12 +1,12 @@
 // Package reflang resolves which audio track pairs drive a synchronization
-// job (IDEA.md §5.2 "Reference Language Resolution", PLAN.md M4-4).
+// job (PLAN.md M4-4, GLOSSARY "Reference Language").
 //
 // The resolver is a pure function over ffprobe metadata: it sees the audio
 // tracks of the target video file and the sibling tracks of the donor group,
 // plus the persisted language policy and the arr-reported original language,
 // and returns candidate reference pairs in priority order.
 //
-// Priority order (IDEA.md:365-369):
+// Priority order:
 //
 //  1. Priority 1 (same_lang_reference): the media's original language exists
 //     in both the donor group and the target (e.g. ja <-> ja). Active only when
@@ -18,7 +18,7 @@
 //  3. Priority 3 (lowpass_fallback): no shared reference language exists, so
 //     the incoming (target-language) vault track is compared low-pass 30-200
 //     Hz against the target's original, English or first non-commentary
-//     stream (IDEA.md:369, IDEA.md:379).
+//     stream.
 //
 // Tracks tagged "und" or with no usable language are never selected as a
 // language reference (settled: und never policy, see gate.SplitExportTracks).
@@ -58,7 +58,7 @@ type Languages struct {
 	OriginalLanguageFromArr bool
 }
 
-// Method is the sync_method a pair resolves to (IDEA.md:295).
+// Method is the sync_method a pair resolves to.
 type Method string
 
 const (
@@ -90,7 +90,7 @@ type Result struct {
 // Resolve returns reference pairs in priority order.
 //
 // Tie-breaks: within a language, the track with the highest channel count wins
-// (IDEA.md:367 prefers higher channel count/bitrate; probe.AudioTrack carries
+// (higher channel count/bitrate preferred; probe.AudioTrack carries
 // no bitrate, so channels is the available quality proxy), then the lowest
 // container stream index (earliest track). Pair order is: Priority 1, then
 // Priority 2 languages in policy-reference order followed by remaining shared
@@ -192,7 +192,7 @@ func Resolve(targetTracks []probe.AudioTrack, vaultTracks []probe.AudioTrack, po
 
 // SameLang reports the same-lang report case: the target already carries a
 // non-commentary audio track in vaultLang, the language of the vault track
-// being synchronized (PLAN.md M4-5, IDEA.md:365). und/empty never matches.
+// being synchronized (PLAN.md M4-5). und/empty never matches.
 func SameLang(targetTracks []probe.AudioTrack, vaultLang string) bool {
 	lang := probe.ISO639_1(vaultLang)
 	if lang == "" {
@@ -203,8 +203,8 @@ func SameLang(targetTracks []probe.AudioTrack, vaultLang string) bool {
 }
 
 // Lowpass reports the low-pass report case: no target track shares the vault
-// track's language, so IDEA.md:369 mandates the cross-language fallback with
-// the 30-200 Hz band (IDEA.md:379).
+// track's language, so the cross-language fallback with the 30-200 Hz band
+// is mandated.
 func Lowpass(targetTracks []probe.AudioTrack, vaultLang string) bool {
 	return !SameLang(targetTracks, vaultLang)
 }
@@ -262,7 +262,7 @@ func targetLanguageTrack(vaultTracks []probe.AudioTrack, targets []string) (prob
 }
 
 // lowpassTarget picks the target stream for Priority 3: original language,
-// else English, else the first non-commentary stream (IDEA.md:369).
+// else English, else the first non-commentary stream.
 func lowpassTarget(targetTracks []probe.AudioTrack, original string) (probe.AudioTrack, bool) {
 	if original != "" {
 		if t, ok := bestTrack(targetTracks, original); ok {

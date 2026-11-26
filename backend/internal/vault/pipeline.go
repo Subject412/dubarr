@@ -405,7 +405,7 @@ func (w *Writer) storagePaths(ctx context.Context) (vaultDir, workDir string, er
 }
 
 // canonicalStaged resolves the staged file and confines it to the extraction
-// root (IDEA.md §3.2 path guard).
+// root (path guard).
 func canonicalStaged(path, extractRoot string) (string, error) {
 	if strings.TrimSpace(path) == "" {
 		return "", fmt.Errorf("%w: staged path is required", ErrInvalidRequest)
@@ -490,8 +490,8 @@ func normalizeLanguage(raw string) (iso2, iso3 string, err error) {
 	if iso1 := probe.ISO639_1(token); iso1 != "" {
 		return iso1, probe.ISO639_2B(iso1), nil
 	}
-	// Rare languages without an ISO 639-1 code keep their 639-2/3 code
-	// (IDEA.md §3.3 fallback).
+	// Rare languages without an ISO 639-1 code keep their 639-2/3 code as
+	// a fallback.
 	if len(token) == 3 && isAlpha(token) {
 		return token, probe.ISO639_2B(token), nil
 	}

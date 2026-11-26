@@ -533,7 +533,7 @@ func (s *Service) handleList(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleSearchLibrary serves the manual-match lookup: a case-insensitive title
-// substring search over the arr-synced library cache (IDEA.md §4), used when
+// substring search over the arr-synced library cache, used when
 // the automatic /api/v3/parse match failed (e.g. localized release names).
 func (s *Service) handleSearchLibrary(w http.ResponseWriter, r *http.Request) {
 	if s.store == nil || s.store.DB == nil {

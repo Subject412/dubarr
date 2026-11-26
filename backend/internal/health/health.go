@@ -18,7 +18,7 @@ import (
 	"time"
 )
 
-// defaultTools are the external binaries IDEA.md requires /api/health to report.
+// defaultTools are the external binaries /api/health must report.
 var defaultTools = []string{"ffmpeg", "ffprobe", "mkvmerge", "dubarr-sync"}
 
 // versionProbeTimeout bounds how long a single `<tool> -version` call may take.

@@ -8,7 +8,7 @@ import (
 	"fmt"
 )
 
-// SyncJobRecord is one row of sync_mux_jobs (IDEA.md §4 table 8) as the sync
+// SyncJobRecord is one row of sync_mux_jobs (schema.sql) as the sync
 // job API needs it. Status holds the persisted schema value
 // (queued/analyzing/ready_for_review/muxing/completed/failed); the API layer
 // maps it onto the public queued/running/done/failed vocabulary.

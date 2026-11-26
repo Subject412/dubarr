@@ -24,8 +24,8 @@ func testChunk(id string, payload []byte) []byte {
 // testFmt builds a 16-byte PCM fmt payload with the given byte rate.
 func testFmt(byteRate uint32) []byte {
 	p := make([]byte, 16)
-	binary.LittleEndian.PutUint16(p[0:2], 1)  // PCM
-	binary.LittleEndian.PutUint16(p[2:4], 1)  // mono
+	binary.LittleEndian.PutUint16(p[0:2], 1) // PCM
+	binary.LittleEndian.PutUint16(p[2:4], 1) // mono
 	binary.LittleEndian.PutUint32(p[4:8], 8000)
 	binary.LittleEndian.PutUint32(p[8:12], byteRate)
 	binary.LittleEndian.PutUint16(p[12:14], 2) // block align

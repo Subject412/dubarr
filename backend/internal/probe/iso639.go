@@ -3,7 +3,7 @@ package probe
 import "strings"
 
 // langEntry is one row of the built-in ISO 639 table. Dubarr only needs a
-// small, dependency-free subset (IDEA.md §3.3): enough to recognise the
+// small, dependency-free subset: enough to recognise the
 // languages that appear on real media releases and to round-trip between the
 // bibliographic ISO 639-2/B codes ffprobe/Matroska emit (pol, ger, fre, cze,
 // chi, gre, ...), the terminological /T variants (deu, fra, ces, zho, ell),
@@ -133,7 +133,7 @@ func init() {
 // subtags ("en-US", "pt_BR"), and returns "" for absent, "und" or unknown
 // languages — callers that need a always-present code use ISO639_2B instead.
 // Unmapped but structurally valid two-letter codes pass through so rare
-// languages are never silently dropped (IDEA.md §3.3).
+// languages are never silently dropped.
 func ISO639_1(raw string) string {
 	tok := normalizeLangToken(raw)
 	if undTokens[tok] {
@@ -154,8 +154,7 @@ func ISO639_1(raw string) string {
 // ISO639_2B normalises the same inputs as ISO639_1 to the bibliographic
 // ISO 639-2/B code (eng, pol, ger, fre, cze, chi, gre, ...). Absent or
 // unrecognised languages become "und"; unmapped three-letter codes pass
-// through lower-cased, mirroring the "fall back to ISO 639-2/3 or und" rule in
-// IDEA.md §3.3.
+// through lower-cased, mirroring the "fall back to ISO 639-2/3 or und" rule.
 func ISO639_2B(raw string) string {
 	tok := normalizeLangToken(raw)
 	if undTokens[tok] {

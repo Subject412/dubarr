@@ -2,7 +2,7 @@
 // track against one arr target, poll its status, and run the multi-point drift
 // analysis through internal/analyze.
 //
-// POST /api/sync/jobs is the eligibility gate (IDEA.md:478): a waiting_for_tags
+// POST /api/sync/jobs is the eligibility gate: a waiting_for_tags
 // or missing_target library row is rejected unless the caller asks for a force
 // override *and* settings security.options.allow_force_tag_override is true.
 // The settled default is false, so a force request is itself rejected with 409
@@ -121,7 +121,7 @@ func RegisterRoutes(mux *http.ServeMux, deps Dependencies) *Service {
 	return svc
 }
 
-// createRequest is the POST /api/sync/jobs body (IDEA.md:478).
+// createRequest is the POST /api/sync/jobs body.
 type createRequest struct {
 	VaultTrackID         int64 `json:"vault_track_id"`
 	TargetLibraryCacheID int64 `json:"target_library_cache_id"`
@@ -577,7 +577,7 @@ func (s *Service) resolveFFmpeg() (string, error) {
 	return path, nil
 }
 
-// analysisFilter is the IDEA.md §5.2 band shaping: speech for a same-language
+// analysisFilter shapes the correlation band: speech for a same-language
 // pair, a 30-200 Hz low-pass for the cross-language fallback.
 func analysisFilter(method reflang.Method) string {
 	if method == reflang.LowpassFallback {

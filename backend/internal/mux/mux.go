@@ -68,7 +68,8 @@ type Job struct {
 	// {WORK_DIR}/jobs/{id}/.
 	AudioPath string
 	// SyncOffsetMS is final_offset_ms: offset = t_target - t_donor, positive
-	// delays the donor (mkvmerge --sync 0:+N), negative advances it (IDEA.md:335).
+	// delays the donor (mkvmerge --sync 0:+N), negative advances it
+	// (GLOSSARY "Sync Offset").
 	SyncOffsetMS int64
 	// TrackTitle is the Matroska track name (settings mux.options
 	// track_title_in_mkv). Empty selects [DefaultTrackTitle].
@@ -313,7 +314,7 @@ func (m *Muxer) Mux(ctx context.Context, job Job) (Result, error) {
 		}
 	}()
 
-	// IDEA.md:397-403: the target is input 0 and is copied as-is; per-input
+	// ADR-0004: the target is input 0 and is copied as-is; per-input
 	// options bind to the appended .mka (input 0 of that file).
 	args := []string{
 		"-o", temp,
@@ -521,7 +522,7 @@ func checkAmbiguity(job Job, target, lang string) error {
 }
 
 // resolveAudio canonicalizes the staged audio and confines it to the job
-// directory: IDEA.md:114/393 forbid reading a vault file during mux.
+// directory: ADR-0002 forbids reading a vault file during mux.
 func resolveAudio(audioPath, jobDir string) (string, error) {
 	abs, err := filepath.Abs(audioPath)
 	if err != nil {
@@ -613,7 +614,7 @@ func (m *Muxer) validatePublished(ctx context.Context, bin, path string, beforeA
 }
 
 // DefaultTrackTitle is the fallback Matroska track name: the ISO-2 language
-// plus the dub marker, rendered like the vault badge "PL DUB" (IDEA.md:506).
+// plus the dub marker, rendered like the vault badge "PL DUB".
 // A configured mux.options.track_title_in_mkv (default "Polski Dubbing")
 // overrides it.
 func DefaultTrackTitle(iso2 string) string {

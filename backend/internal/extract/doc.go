@@ -23,7 +23,7 @@
 //
 // # Staging layout
 //
-// Output goes to {WORK_DIR}/extract/{import_id}/ (IDEA.md §3.3), never into
+// Output goes to {WORK_DIR}/extract/{import_id}/, never into
 // the Vault. WORK_DIR is storage.paths.work_dir; when unset it falls back to
 // DATA_DIR/work. On any failure the job directory is wiped; on success it is
 // left in place for the vault pipeline unless a VaultHook is configured, in

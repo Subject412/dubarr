@@ -1,5 +1,5 @@
 // Package analyze runs multi-point checkpoint drift analysis for a staged
-// dubbing-sync job (IDEA.md §5.2, PLAN.md M4-5).
+// dubbing-sync job (PLAN.md M4-5).
 //
 // It slices both staged WAV sources at the configured checkpoint positions
 // (sync.defaults.checkpoint_positions_pct), correlates each window through the
@@ -8,7 +8,7 @@
 // answers three questions the mux stage (M5) needs:
 //
 //   - What is the offset at each point, and how consistent is it? A constant
-//     shift keeps the spread across checkpoints below 40 ms (IDEA.md:385);
+//     shift keeps the spread across checkpoints below 40 ms;
 //     a larger spread means speed drift or a mid-movie edit.
 //   - Does any point exceed sync.defaults.max_offset_sec? Then the verdict is
 //     [VerdictOutOfRange] and M5 must fail loudly instead of muxing.
@@ -36,12 +36,13 @@ import (
 	"github.com/Subject412/dubarr/backend/internal/sync"
 )
 
-// Defaults from IDEA.md §5.2 and the settled sync.defaults values.
+// Defaults from the settled sync.defaults values.
 const (
 	// DefaultCheckpointWindowSec is the settled 150 s analysis window.
 	DefaultCheckpointWindowSec = 150
-	// DefaultMaxOffsetSec is the settled ±180 s search/acceptance bound
-	// (IDEA.md §5.1 --max-offset-sec is the engine search window).
+	// DefaultMaxOffsetSec is the settled ±180 s search/acceptance bound; the
+	// bound itself lives in sync.defaults.max_offset_sec, which also widens
+	// the analysed slice the engine searches.
 	DefaultMaxOffsetSec = 180
 	// CheckWindowMarginSec widens the analysed slice beyond max_offset_sec so
 	// the engine can actually reach the bound: the engine caps |lag| at the
@@ -52,13 +53,13 @@ const (
 )
 
 // DefaultCheckpointPositionsPct is the settled 6-point sampling of the
-// timeline (IDEA.md:373).
+// timeline.
 var DefaultCheckpointPositionsPct = []int{10, 25, 40, 55, 70, 85}
 
 // StableSpreadThresholdMS is the maximum checkpoint spread that still counts
-// as a constant offset. IDEA.md:385: "Spread across valid checkpoints < 40 ms
-// -> final offset is median, speed_mode = 'none'". No other threshold is
-// specified, so the spec's 40 ms is used verbatim.
+// as a constant offset: "Spread across valid checkpoints < 40 ms -> final
+// offset is median, speed_mode = 'none'". No other threshold is specified,
+// so 40 ms is used verbatim.
 const StableSpreadThresholdMS = 40.0
 
 // LowQualityThreshold is the correlation_quality floor below which a
@@ -301,7 +302,7 @@ func Analyze(ctx context.Context, engine Engine, cfg Config, req Request) (Repor
 
 // searchWindowSec is the analysed slice length. It is at least the settled
 // checkpoint window, but widened to max_offset_sec + CheckWindowMarginSec so
-// the engine's lag search reaches the full offset bound (IDEA.md §5.1).
+// the engine's lag search reaches the full offset bound.
 func searchWindowSec(cfg Config) float64 {
 	return math.Max(float64(cfg.CheckpointWindowSec), float64(cfg.MaxOffsetSec+CheckWindowMarginSec))
 }

@@ -30,8 +30,9 @@ const DefaultInterval = 10 * time.Second
 var ErrScanInProgress = errors.New("watch: scan already in progress")
 
 // mediaExtensions is the set of donor video containers the scanner enqueues.
-// IDEA.md names .mkv explicitly; the remaining common containers are accepted
-// so a donor drop is never silently ignored. Matching is case-insensitive.
+// The watch contract names .mkv explicitly; the remaining common containers
+// are accepted so a donor drop is never silently ignored. Matching is
+// case-insensitive.
 var mediaExtensions = map[string]bool{
 	".mkv":  true,
 	".mp4":  true,
@@ -48,7 +49,7 @@ var mediaExtensions = map[string]bool{
 }
 
 // partialSuffixes are in-progress download/processing artefacts that must not
-// be enqueued (IDEA.md §3.5). Lower-case comparison.
+// be enqueued (the watch contract). Lower-case comparison.
 var partialSuffixes = []string{".!qb", ".part", ".tmp", ".crdownload", ".tdarr"}
 
 // CandidateStore persists a discovered donor file. *store.Store satisfies it.

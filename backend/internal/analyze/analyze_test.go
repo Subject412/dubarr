@@ -178,7 +178,7 @@ func TestAnalyzeStable(t *testing.T) {
 		t.Fatalf("slice_len = %v, want %v", got, want)
 	}
 	// The engine search window must cover the full max_offset_sec bound, not
-	// just the 150 s checkpoint window (IDEA.md §5.1).
+	// just the 150 s checkpoint window.
 	if eng.calls[0].WindowSec == nil {
 		t.Fatal("window_sec = nil, want the analysed slice length")
 	}

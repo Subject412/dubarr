@@ -182,6 +182,7 @@ export function Field({
   error,
   htmlFor,
   help,
+  hidden = false,
   children,
 }: {
   label: string
@@ -190,8 +191,16 @@ export function Field({
   htmlFor?: string
   /** Long-form definition rendered in an info popover instead of inline text. */
   help?: string
+  /**
+   * A control that does not apply under the current settings must be absent,
+   * not greyed out: render nothing at all (no label, no input, no disabled
+   * placeholder) so it cannot be found or focused.
+   */
+  hidden?: boolean
   children: ReactNode
 }) {
+  if (hidden) return null
+
   const describedBy = help ? helpIdFor(label) : undefined
   const content =
     describedBy && isValidElement(children)
@@ -279,6 +288,7 @@ export function Toggle({
   description,
   help,
   disabled,
+  hidden = false,
 }: {
   checked: boolean
   onChange: (next: boolean) => void
@@ -287,7 +297,11 @@ export function Toggle({
   /** Long-form definition rendered in an info popover. */
   help?: string
   disabled?: boolean
+  /** Inapplicable switches are absent from the DOM, never rendered disabled. */
+  hidden?: boolean
 }) {
+  if (hidden) return null
+
   return (
     <div className="flex items-start justify-between gap-4 py-2">
       <div>

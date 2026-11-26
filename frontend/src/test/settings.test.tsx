@@ -493,28 +493,39 @@ describe('setup wizard tag filter step', () => {
 })
 
 describe('mux output destination', () => {
-  const settings = {
-    'storage.paths': {
-      watch_dir: '/watch',
-      vault_dir: '/vault',
-      work_dir: '/work',
-      output_dir: '/deliver',
-      media_roots: [],
-    },
-    'mux.options': {
-      track_title_in_mkv: 'Polski Dubbing',
-      output_mode: 'replace',
-    },
+  type OutputMode = 'replace' | 'separate'
+
+  function muxSettings(outputMode: OutputMode) {
+    return {
+      'storage.paths': {
+        watch_dir: '/watch',
+        vault_dir: '/vault',
+        work_dir: '/work',
+        output_dir: '/deliver',
+        media_roots: [],
+      },
+      'mux.options': {
+        track_title_in_mkv: 'Polski Dubbing',
+        output_mode: outputMode,
+      },
+    }
   }
 
-  function mockMuxFetch(): ReturnType<typeof vi.fn> {
+  /**
+   * `current` is echoed back on PUT, the way the real endpoint replaces the
+   * whole envelope, so a save re-seeds every card from the new settings.
+   */
+  function mockMuxFetch(outputMode: OutputMode = 'replace'): ReturnType<typeof vi.fn> {
+    let current: Record<string, unknown> = muxSettings(outputMode)
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
       if (url.includes('/api/settings') && isMethod(init, 'PUT')) {
-        return jsonResponse({ settings })
+        const body = JSON.parse(String(init?.body)) as { settings: Record<string, unknown> }
+        current = { ...current, ...body.settings }
+        return jsonResponse({ settings: current })
       }
       if (url.includes('/api/settings')) {
-        return jsonResponse({ settings })
+        return jsonResponse({ settings: current })
       }
       return jsonResponse({ error: 'unexpected' }, 404)
     })
@@ -529,6 +540,12 @@ describe('mux output destination', () => {
       settings: Record<string, Record<string, unknown>>
     }
     return body.settings[key]
+  }
+
+  function storageCard(): HTMLElement {
+    const element = document.getElementById(settingsSectionId('storage.paths'))
+    expect(element).not.toBeNull()
+    return element as HTMLElement
   }
 
   it('offers both destination modes and saves separate', async () => {
@@ -553,7 +570,7 @@ describe('mux output destination', () => {
 
   it('saves the mux output folder with the section', async () => {
     const user = userEvent.setup()
-    const fetchMock = mockMuxFetch()
+    const fetchMock = mockMuxFetch('separate')
     renderWithProviders(<SettingsPage />, { route: '/settings' })
 
     expect(await screen.findByRole('heading', { name: 'Storage paths' })).toBeInTheDocument()
@@ -571,6 +588,74 @@ describe('mux output destination', () => {
       output_dir: '/deliver/new',
       media_roots: [],
     })
+  })
+
+  it('omits the mux output folder entirely when the saved mode is replace', async () => {
+    mockMuxFetch('replace')
+    renderWithProviders(<SettingsPage />, { route: '/settings' })
+    expect(await screen.findByRole('heading', { name: 'Storage paths' })).toBeInTheDocument()
+
+    const card = storageCard()
+    // A control that does not apply must be absent, not greyed out: no label,
+    // no input, no disabled placeholder and no help trigger.
+    expect(within(card).queryByLabelText('Mux output folder')).toBeNull()
+    expect(document.getElementById('path-mux-output-folder')).toBeNull()
+    expect(screen.queryByRole('button', { name: 'About Mux output folder' })).toBeNull()
+    // Only the three unconditional path fields render, so the folder is gone
+    // rather than present-and-disabled.
+    expect(card.querySelectorAll('input[id^="path-"]')).toHaveLength(3)
+    const textboxes = within(card).getAllByRole('textbox') as HTMLInputElement[]
+    expect(textboxes.some((input) => input.disabled)).toBe(false)
+  })
+
+  it('shows the mux output folder with its stored value when the saved mode is separate', async () => {
+    mockMuxFetch('separate')
+    renderWithProviders(<SettingsPage />, { route: '/settings' })
+    expect(await screen.findByRole('heading', { name: 'Storage paths' })).toBeInTheDocument()
+
+    const field = within(storageCard()).getByLabelText('Mux output folder')
+    expect(field).toHaveValue('/deliver')
+    expect(field).toBeEnabled()
+  })
+
+  it('still saves the stored output_dir while the field is hidden', async () => {
+    const user = userEvent.setup()
+    const fetchMock = mockMuxFetch('replace')
+    renderWithProviders(<SettingsPage />, { route: '/settings' })
+    expect(await screen.findByRole('heading', { name: 'Storage paths' })).toBeInTheDocument()
+
+    expect(screen.queryByLabelText('Mux output folder')).toBeNull()
+    await user.click(screen.getByLabelText('Save Storage paths'))
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.some(([, init]) => isMethod(init, 'PUT'))).toBe(true),
+    )
+
+    // The draft keeps the value; hiding the control only drops it from the DOM.
+    expect(savedSection(fetchMock, 'storage.paths')).toMatchObject({
+      watch_dir: '/watch',
+      vault_dir: '/vault',
+      work_dir: '/work',
+      output_dir: '/deliver',
+      media_roots: [],
+    })
+  })
+
+  it('reveals the folder only once separate is saved, keeping the stored value', async () => {
+    const user = userEvent.setup()
+    const fetchMock = mockMuxFetch('replace')
+    renderWithProviders(<SettingsPage />, { route: '/settings' })
+    expect(await screen.findByRole('heading', { name: 'Mux options' })).toBeInTheDocument()
+
+    // The unsaved draft does not move the control: it follows the saved mode.
+    await user.selectOptions(screen.getByLabelText('Output mode'), 'separate')
+    expect(screen.queryByLabelText('Mux output folder')).toBeNull()
+
+    await user.click(screen.getByLabelText('Save Mux options'))
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.some(([, init]) => isMethod(init, 'PUT'))).toBe(true),
+    )
+
+    expect(await screen.findByLabelText('Mux output folder')).toHaveValue('/deliver')
   })
 })
 

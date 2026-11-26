@@ -445,7 +445,7 @@ func (w *Worker) processJob(ctx context.Context, id int64) error {
 		return err
 	}
 
-	opts, optsOK := w.muxOptions(ctx)
+	opts, _ := w.muxOptions(ctx)
 	mode, outputDir, err := w.outputDestination(ctx, opts)
 	if err != nil {
 		return err
@@ -458,7 +458,6 @@ func (w *Worker) processJob(ctx context.Context, id int64) error {
 		AudioPath:      audio,
 		SyncOffsetMS:   offset,
 		TrackTitle:     w.trackTitle(opts),
-		KeepBak:        keepBak(opts, optsOK),
 		OutputMode:     mode,
 		OutputDir:      outputDir,
 		Gate:           rule,
@@ -681,7 +680,7 @@ func (w *Worker) trackTitle(opts settings.MuxOptions) string {
 
 // muxOptions reads settings mux.options once per job. ok=false means the
 // settings are unavailable, and the caller falls back to the shipped defaults
-// (empty track title, backups kept).
+// (empty track title, replace mode).
 func (w *Worker) muxOptions(ctx context.Context) (settings.MuxOptions, bool) {
 	if w.settings == nil {
 		return settings.MuxOptions{}, false
@@ -775,17 +774,6 @@ func (w *Worker) transcodeStaged(ctx context.Context, jobID int64, audio string,
 	}
 	w.logf("syncworker: job %d transcoded rule %d to %s (%d ch, %d bps)", jobID, plan.RuleIndex+1, res.Codec, res.Channels, res.BitrateBPS)
 	return res.Path, nil
-}
-
-// keepBak maps mux.options.keep_bak onto mux.Job.KeepBak: only an explicit
-// false becomes a pointer, so the muxer's default (keep) survives a missing or
-// unreadable settings row.
-func keepBak(opts settings.MuxOptions, ok bool) *bool {
-	if ok && !opts.KeepBak {
-		discard := false
-		return &discard
-	}
-	return nil
 }
 
 // outputDestination resolves mux.options.output_mode and re-validates

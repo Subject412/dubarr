@@ -274,8 +274,8 @@ func TestProcessOnceRunsRealExecuteMuxRescanChain(t *testing.T) {
 	if n := len(strings.Fields(string(out))); n != 2 {
 		t.Fatalf("published target audio streams = %d, want 2", n)
 	}
-	if _, err := os.Stat(target + ".bak"); err != nil {
-		t.Fatalf("backup beside target: %v", err)
+	if _, err := os.Stat(target + ".bak"); !os.IsNotExist(err) {
+		t.Fatalf("publish wrote a backup beside the target (stat err = %v)", err)
 	}
 
 	bodies := capture.snapshot()

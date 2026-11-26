@@ -49,7 +49,6 @@ export const DEFAULT_SETTINGS: DubarrSettings = {
     allow_force_tag_override: false,
   },
   'mux.options': {
-    keep_bak: true,
     track_title_in_mkv: 'Polski Dubbing',
     output_mode: 'replace',
   },

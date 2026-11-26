@@ -115,7 +115,7 @@ describe('settings section save', () => {
       'security.options': {
         allow_force_tag_override: false,
       },
-      'mux.options': { keep_bak: true, track_title_in_mkv: 'Polski Dubbing' },
+      'mux.options': { track_title_in_mkv: 'Polski Dubbing' },
       'watch.options': { scan_interval_sec: 10, stability_check_interval_sec: 4 },
       'arr.options': { poll_interval_sec: 300, manual_sync: true },
     }
@@ -304,7 +304,7 @@ describe('languages policy reference tokens', () => {
   })
 })
 
-describe('mux options keep_bak', () => {
+describe('mux options (retired keep_bak switch)', () => {
   function mockMuxFetch(): ReturnType<typeof vi.fn> {
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
@@ -313,7 +313,7 @@ describe('mux options keep_bak', () => {
       }
       if (url.includes('/api/settings')) {
         return jsonResponse({
-          settings: { 'mux.options': { keep_bak: true, track_title_in_mkv: 'Polski Dubbing' } },
+          settings: { 'mux.options': { track_title_in_mkv: 'Polski Dubbing' } },
         })
       }
       return jsonResponse({ error: 'unexpected' }, 404)
@@ -322,16 +322,16 @@ describe('mux options keep_bak', () => {
     return fetchMock
   }
 
-  it('defaults to keeping the backup and saves keep_bak=false after untoggling', async () => {
+  it('renders no backup switch and saves only the surviving mux fields', async () => {
     const user = userEvent.setup()
     const fetchMock = mockMuxFetch()
     renderWithProviders(<SettingsPage />, { route: '/settings' })
     expect(await screen.findByRole('heading', { name: 'Mux options' })).toBeInTheDocument()
 
-    const toggle = screen.getByRole('switch', { name: 'Keep .bak backup' })
-    expect(toggle.getAttribute('aria-checked')).toBe('true')
+    expect(screen.queryByRole('switch', { name: /keep \.bak/i })).toBeNull()
+    expect(screen.queryByLabelText(/about keep \.bak/i)).toBeNull()
+    expect(screen.queryByText(/\.bak/i)).toBeNull()
 
-    await user.click(toggle)
     await user.click(screen.getByLabelText('Save Mux options'))
     await waitFor(() => {
       expect(fetchMock.mock.calls.some(([, init]) => isMethod(init, 'PUT'))).toBe(true)
@@ -339,9 +339,9 @@ describe('mux options keep_bak', () => {
 
     const put = fetchMock.mock.calls.find(([, init]) => isMethod(init, 'PUT'))
     const body = JSON.parse(String(put?.[1]?.body)) as {
-      settings: { 'mux.options': { keep_bak: boolean; track_title_in_mkv: string } }
+      settings: { 'mux.options': Record<string, unknown> }
     }
-    expect(body.settings['mux.options'].keep_bak).toBe(false)
+    expect(body.settings['mux.options']).not.toHaveProperty('keep_bak')
     expect(body.settings['mux.options'].track_title_in_mkv).toBe('Polski Dubbing')
   })
 })
@@ -498,7 +498,6 @@ describe('mux output destination', () => {
       media_roots: [],
     },
     'mux.options': {
-      keep_bak: true,
       track_title_in_mkv: 'Polski Dubbing',
       output_mode: 'replace',
     },
@@ -543,7 +542,6 @@ describe('mux output destination', () => {
 
     await waitFor(() => expect(fetchMock.mock.calls.some(([, init]) => isMethod(init, 'PUT'))).toBe(true))
     expect(savedSection(fetchMock, 'mux.options')).toMatchObject({
-      keep_bak: true,
       track_title_in_mkv: 'Polski Dubbing',
       output_mode: 'separate',
     })
@@ -569,17 +567,6 @@ describe('mux output destination', () => {
       output_dir: '/deliver/new',
       media_roots: [],
     })
-  })
-
-  it('explains that keep_bak does not apply in separate mode', async () => {
-    const user = userEvent.setup()
-    mockMuxFetch()
-    renderWithProviders(<SettingsPage />, { route: '/settings' })
-
-    const help = await screen.findByLabelText('About Keep .bak backup')
-    await user.hover(help)
-    const tip = await screen.findByRole('tooltip')
-    expect(tip).toHaveTextContent(/ignored when the output mode writes to the mux output folder/i)
   })
 })
 

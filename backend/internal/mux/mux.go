@@ -74,12 +74,6 @@ type Job struct {
 	// TrackTitle is the Matroska track name (settings mux.options
 	// track_title_in_mkv). Empty selects [DefaultTrackTitle].
 	TrackTitle string
-	// KeepBak mirrors settings mux.options.keep_bak: nil or true leaves the
-	// original beside the target as <target>.bak. A pointer to false removes
-	// the backup again after the post-mux ffprobe validation passed and the
-	// atomic rename published. The pointer keeps the zero value meaning "keep",
-	// matching the shipped setting default.
-	KeepBak *bool
 	// SetDefault marks the appended track as the container default.
 	SetDefault bool
 	// Gate is the target.tag_filter rule re-checked against the base filename
@@ -111,9 +105,6 @@ type Job struct {
 // Result describes a successful publish.
 type Result struct {
 	OutputPath string
-	// BackupPath is <target>.bak when the original was kept, and empty when
-	// Job.KeepBak was false and the backup was removed after publishing.
-	BackupPath string
 	// WorkCopy is the Copy-on-Work target copy mkvmerge read. With AudioPath
 	// it names an input of this call, not an artifact: the job staging
 	// directory is removed before Mux returns, so both paths are already gone
@@ -142,7 +133,7 @@ type Dependencies struct {
 	Run func(ctx context.Context, name string, args ...string) ([]byte, error)
 	// Timeout bounds one invocation; 0 selects DefaultTimeout.
 	Timeout time.Duration
-	// Warnf receives non-fatal diagnostics such as a failed .bak removal;
+	// Warnf receives non-fatal diagnostics such as a failed staging removal;
 	// nil uses log.Printf with a "WARN" prefix.
 	Warnf func(format string, args ...any)
 }
@@ -154,9 +145,6 @@ type Muxer struct {
 	lookPath     func(string) (string, error)
 	run          func(ctx context.Context, name string, args ...string) ([]byte, error)
 	timeout      time.Duration
-	// remove deletes the sidecar backup when Job.KeepBak is false. Overridable
-	// so tests can exercise the WARN-but-succeed path.
-	remove func(string) error
 	// rename publishes the validated temp. It is os.Rename in production,
 	// same-directory on both sides, and overridable so tests can prove a
 	// cross-device failure aborts instead of falling back to copy+delete.
@@ -172,7 +160,6 @@ func New(deps Dependencies) *Muxer {
 		lookPath:     deps.LookPath,
 		run:          deps.Run,
 		timeout:      deps.Timeout,
-		remove:       os.Remove,
 		rename:       os.Rename,
 		warnf:        deps.Warnf,
 	}
@@ -202,16 +189,15 @@ func New(deps Dependencies) *Muxer {
 // <basename>.dubarr.mkv in Job.OutputDir and refuses to overwrite an existing
 // file. The target is then copied into {WORK_DIR}/jobs/{id}/, mkvmerge writes a
 // uniquely named hidden temp in the destination directory (same filesystem),
-// ffprobe validates the result, and only then is the temp renamed into place —
-// after a backup copy of the original in replace mode. Any failure removes only
+// ffprobe validates the result, and only then is the temp renamed into place
+// (ADR-0018). No .bak sidecar is ever written. Any failure removes only
 // the temp this call created and leaves the original bytes in place. In replace
 // mode the target is re-identified immediately before the swap: if the media
-// manager replaced it while mkvmerge ran, the temp is discarded, nothing — not
-// even a .bak — is written, and the call fails with [ErrTargetChanged]
-// (ADR-0018). Staging is owned by this call: once {WORK_DIR}/jobs/{id} has been
-// created, every return path removes it again, so no caller has to. That
-// removal is idempotent, which keeps a second cleanup by the sync worker a
-// no-op.
+// manager replaced it while mkvmerge ran, the temp is discarded and the call
+// fails with [ErrTargetChanged] (ADR-0018). Staging is owned by this call: once
+// {WORK_DIR}/jobs/{id} has been created, every return path removes it again, so
+// no caller has to. That removal is idempotent, which keeps a second cleanup by
+// the sync worker a no-op.
 func (m *Muxer) Mux(ctx context.Context, job Job) (Result, error) {
 	target, _, jobDir, lang, err := job.normalize()
 	if err != nil {
@@ -358,8 +344,8 @@ func (m *Muxer) Mux(ctx context.Context, job Job) (Result, error) {
 	// replaced the target meanwhile; renaming this temp would then destroy a
 	// brand-new release and still look like a successful mux. The check is as
 	// late as it can be — mkvmerge has finished and the temp has validated —
-	// and a mismatch publishes nothing: the temp and the staging go, the
-	// target and any .bak stay exactly as they are.
+	// and a mismatch publishes nothing: the temp and the staging go and the
+	// target and every other file beside it stay exactly as they are.
 	//
 	// Separate mode reads the target but never replaces it (ADR-0011), so a
 	// target that moved underneath is harmless there and must not abort the
@@ -374,37 +360,22 @@ func (m *Muxer) Mux(ctx context.Context, job Job) (Result, error) {
 		}
 	}
 
-	bak := ""
-	if mode == OutputModeReplace {
-		bak = target + ".bak"
-		if err := writeBackup(target, bak, info.Mode().Perm()); err != nil {
-			return Result{}, fmt.Errorf("%w: backup: %v", ErrPublish, err)
-		}
-	}
 	// Same directory as the destination, so this rename is atomic on one
 	// filesystem. The temp is flushed above; in replace mode the original is
 	// still intact until this succeeds. A cross-device rename is a hard error:
 	// there is no copy+delete fallback (ADR-0011).
+	//
+	// No sidecar is written: safety comes from validating the temp before the
+	// swap (ADR-0018), not from a copy beside the target. A pre-existing
+	// <target>.bak — created by an older dubarr or by the operator — is never
+	// touched: this call only ever renames the temp it created.
 	if err := m.publish(temp, dest); err != nil {
 		return Result{}, err
 	}
 	published = true
 
-	// mux.options.keep_bak=false: the validated, published target is the only
-	// artifact left. The backup is a convenience, so a failed removal is a WARN
-	// and never undoes a successful publish. Separate mode ignores keep_bak:
-	// nothing was replaced, so there is no backup.
-	if mode == OutputModeReplace && job.KeepBak != nil && !*job.KeepBak {
-		if err := m.remove(bak); err != nil {
-			m.warnf("mux: keep the backup at %s: %v", bak, err)
-		} else {
-			bak = ""
-		}
-	}
-
 	return Result{
 		OutputPath: dest,
-		BackupPath: bak,
 		WorkCopy:   workCopy,
 		AudioPath:  audio,
 		Language:   lang,
@@ -718,27 +689,6 @@ func yesNo(v bool) string {
 		return "yes"
 	}
 	return "no"
-}
-
-// writeBackup copies the original to <name>.bak through a uniquely named
-// same-directory temp, preserving its permission bits (0644-ish for library
-// files). The .bak itself is intentionally overwritten: it is the previous
-// good copy, not a per-run artifact.
-func writeBackup(src, dst string, perm os.FileMode) error {
-	tmp, f, err := createTempBeside(dst, "bak", perm)
-	if err != nil {
-		return err
-	}
-	_ = f.Close()
-	if err := copyFile(src, tmp, perm); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	if err := os.Rename(tmp, dst); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
 }
 
 // copyFile copies src to dst, creating dst with perm. The source is opened

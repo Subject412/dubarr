@@ -28,10 +28,10 @@
 //     [ErrPublish] with the original untouched.
 //  8. Publish atomically: mkvmerge wrote a uniquely named hidden temp
 //     (<target>.mkv.dubarr-<rand>.tmp) in the target's directory (same
-//     filesystem), the original is copied to <target>.mkv.bak through its own
-//     unique temp, then the muxed temp is renamed over the original. The .bak
-//     is the previous good copy and is overwritten by design; cleaning it is an
-//     opt-in later step.
+//     filesystem), then the validated muxed temp is renamed over the original.
+//     No .bak sidecar is written: the pre-rename ffprobe validation in step 7
+//     is the safety net, and a pre-existing backup file beside the target is
+//     never created, replaced or deleted by this call.
 //
 // Any failure removes only the temp files this call created and leaves the
 // original untouched. Mux owns its job staging directory and removes

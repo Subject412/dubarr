@@ -9,15 +9,15 @@
 //	target.tag_filter  Processing Gate: filename tags + optional arr tags/roots (ADR-0005, ADR-0009)
 //	sync.defaults      max offset, checkpoint/preview sampling positions
 //	security.options   tag override
-//	mux.options        keep .bak, track title written into Matroska
+//	mux.options        track title written into Matroska
 //	audio.options      opt-in Transcode Rules: codec/channels/bitrate/sample rate (ADR-0010)
 //	watch.options      watch-folder scan cadence and stability window
 //	arr.options        Radarr/Sonarr polling cadence
 //	arr.connections    Radarr/Sonarr instances (API keys live in internal/secrets)
 //
 // mux/watch/arr sections are an extension of the original key list: the spec
-// only names the first five, but the settled defaults for keep_bak, the track
-// title, the 10 s watch scan and the 300 s *arr poll need a home. They live as
+// only names the first five, but the settled defaults for the track title,
+// the 10 s watch scan and the 300 s *arr poll need a home. They live as
 // separate sections rather than being smuggled into sync.defaults.
 //
 // Secret material NEVER belongs in a served section: auth.session_key and any
@@ -206,7 +206,6 @@ const (
 
 // MuxOptions control atomic muxing side effects.
 type MuxOptions struct {
-	KeepBak         bool   `json:"keep_bak"`
 	TrackTitleInMKV string `json:"track_title_in_mkv"`
 	// OutputMode is "replace" (atomically replace the Target, current
 	// behaviour) or "separate" (write <basename>.dubarr.mkv into
@@ -365,7 +364,6 @@ func Defaults(dataDir string) map[string]any {
 			AllowForceTagOverride: false,
 		},
 		KeyMuxOptions: MuxOptions{
-			KeepBak:         true,
 			TrackTitleInMKV: "Polski Dubbing",
 			OutputMode:      MuxOutputReplace,
 		},
@@ -438,8 +436,9 @@ func (s *Store) Get(ctx context.Context, key string) (json.RawMessage, bool, err
 // the UI/API/export all decode the served JSON directly, so absence has to be
 // materialized as the agreed default here too.
 //
-// It also canonicalises sections that lost a field: security.options must not
-// keep serving a retired key from a row stored before it was deleted.
+// It also canonicalises sections that lost a field: security.options and
+// mux.options must not keep serving a retired key from a row stored before it
+// was deleted.
 func serveable(key, value string) json.RawMessage {
 	raw := json.RawMessage(value)
 	switch key {
@@ -454,8 +453,30 @@ func serveable(key, value string) json.RawMessage {
 		}
 		return blob
 	case KeyMuxOptions:
+		// A row written before keep_bak was retired still carries it, and
+		// MuxOptions.UnmarshalJSON is strict about unknown fields, so the key
+		// is dropped before decoding. Re-marshalling the current schema then
+		// guarantees the API never serves a setting that no longer exists.
+		// The stored row is left untouched.
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &fields); err != nil {
+			return raw // a malformed legacy row keeps its raw bytes
+		}
+		// encoding/json matches object keys to struct fields case-insensitively,
+		// so Keep_Bak/KEEP_BAK are just as "known" to the decoder as keep_bak is
+		// unknown to it. Every spelling has to go, otherwise the strict decode
+		// below rejects the row and it is served raw with the retired key in it.
+		for name := range fields {
+			if strings.EqualFold(name, "keep_bak") {
+				delete(fields, name)
+			}
+		}
+		cleaned, err := json.Marshal(fields)
+		if err != nil {
+			return raw
+		}
 		var p MuxOptions
-		if err := json.Unmarshal(raw, &p); err != nil {
+		if err := json.Unmarshal(cleaned, &p); err != nil {
 			return raw
 		}
 		blob, err := json.Marshal(p)
@@ -827,8 +848,7 @@ func pathWithin(root, target string) bool {
 }
 
 func validateMuxOptions(p *MuxOptions) error {
-	// An absent or empty mode keeps the historical in-place behaviour; a
-	// caller that sends only keep_bak must not be rejected.
+	// An absent or empty mode keeps the historical in-place behaviour.
 	if p.OutputMode == "" {
 		p.OutputMode = MuxOutputReplace
 	}

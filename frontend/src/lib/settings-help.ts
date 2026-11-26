@@ -66,11 +66,9 @@ export const SETTINGS_HELP: Record<SettingsSectionKey, Record<string, string>> =
     preview_positions_pct: 'Timeline positions where Preview Slices start.',
   },
   'mux.options': {
-    keep_bak:
-      'Keep a .bak copy of the replaced Target. Off replaces the original atomically with no backup. Ignored when the output mode writes to the mux output folder, because nothing is replaced.',
     track_title_in_mkv: 'Track title written into the Matroska container for the muxed audio.',
     output_mode:
-      'Replace: atomically overwrite the library file (optional .bak). Write to the mux output folder: save <name>.dubarr.mkv in the Mux output folder instead, refuse to overwrite an existing file and skip the *arr rescan.',
+      'Replace: atomically overwrite the library file. Write to the mux output folder: save <name>.dubarr.mkv in the Mux output folder instead, refuse to overwrite an existing file and skip the *arr rescan.',
   },
   'audio.options': {
     rules:

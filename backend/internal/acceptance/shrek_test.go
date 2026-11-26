@@ -179,13 +179,14 @@ func TestShrekEndToEnd(t *testing.T) {
 		t.Fatalf("video stream hash changed: %s → %s (target video must never be transcoded)", preVideo, got)
 	}
 
-	// 6. Backup beside the target is byte-identical to the pre-mux original.
-	bak := target + ".bak"
-	if _, err := os.Stat(bak); err != nil {
-		t.Fatalf("missing .bak: %v", err)
+	// 6. No backup sidecar: the temp was validated before the atomic rename,
+	// so the target was replaced in place (its bytes changed) and no
+	// <target>.bak appeared.
+	if got := sha256File(t, target); got == preTargetSHA {
+		t.Fatalf("published target sha256 = %s, unchanged from the pre-mux original", got)
 	}
-	if got := sha256File(t, bak); got != preTargetSHA {
-		t.Fatalf(".bak sha256 = %s, want the pre-mux target %s", got, preTargetSHA)
+	if _, err := os.Stat(target + ".bak"); !os.IsNotExist(err) {
+		t.Fatalf("publish created a .bak beside the target (stat err = %v)", err)
 	}
 
 	// 7. Vault is write-once: both archives are byte-identical across the run.

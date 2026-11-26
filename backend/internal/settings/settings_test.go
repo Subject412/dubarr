@@ -76,7 +76,7 @@ func TestSeedDefaults(t *testing.T) {
 	}
 
 	mux := decode[MuxOptions](t, all[KeyMuxOptions])
-	if !mux.KeepBak || mux.TrackTitleInMKV != "Polski Dubbing" {
+	if mux.TrackTitleInMKV != "Polski Dubbing" || mux.OutputMode != MuxOutputReplace {
 		t.Errorf("mux options = %+v", mux)
 	}
 
@@ -211,7 +211,7 @@ func TestSetRejectsInvalidValues(t *testing.T) {
 		KeyWatchOptions:    `{"scan_interval_sec":0}`,
 		KeySecurityOptions: `{"allow_force_tag_override":"yes"}`,
 		KeyStoragePaths:    `{"media_roots":"not-a-list"}`,
-		KeyMuxOptions:      `{"keep_bak":true,"track_title_in_mkv":""}`,
+		KeyMuxOptions:      `{"track_title_in_mkv":""}`,
 	}
 	for key, body := range cases {
 		if err := s.Set(ctx, key, json.RawMessage(body)); err == nil {
@@ -484,7 +484,7 @@ func TestMuxOutputMode(t *testing.T) {
 	}
 
 	for _, mode := range []string{MuxOutputReplace, MuxOutputSeparate} {
-		raw := json.RawMessage(`{"keep_bak":true,"track_title_in_mkv":"Polski Dubbing","output_mode":"` + mode + `"}`)
+		raw := json.RawMessage(`{"track_title_in_mkv":"Polski Dubbing","output_mode":"` + mode + `"}`)
 		if err := s.Set(ctx, KeyMuxOptions, raw); err != nil {
 			t.Fatalf("Set(%s): %v", mode, err)
 		}
@@ -493,13 +493,13 @@ func TestMuxOutputMode(t *testing.T) {
 		}
 	}
 
-	bad := json.RawMessage(`{"keep_bak":true,"track_title_in_mkv":"Polski Dubbing","output_mode":"elsewhere"}`)
+	bad := json.RawMessage(`{"track_title_in_mkv":"Polski Dubbing","output_mode":"elsewhere"}`)
 	if err := s.Set(ctx, KeyMuxOptions, bad); err == nil {
 		t.Fatal("Set accepted an unknown output_mode")
 	}
 
 	// A row written before the field existed must read back as replace, both
-	// from All (serveable) and from a direct decode.
+	// from Get and from All (both pass through serveable).
 	legacy := `{"keep_bak":true,"track_title_in_mkv":"Polski Dubbing"}`
 	if _, err := s.db.ExecContext(ctx, `UPDATE settings SET value = ? WHERE key = ?`, legacy, KeyMuxOptions); err != nil {
 		t.Fatalf("write legacy row: %v", err)
@@ -513,6 +513,107 @@ func TestMuxOutputMode(t *testing.T) {
 	}
 	if got := decode[MuxOptions](t, all[KeyMuxOptions]); got.OutputMode != MuxOutputReplace {
 		t.Errorf("served legacy output_mode = %q, want %q", got.OutputMode, MuxOutputReplace)
+	}
+}
+
+// TestMuxOptionsRetiredKeepBak covers the stored-row half of retiring the .bak
+// option: a row written before keep_bak was deleted still loads, but the key is
+// dropped before the API serves it and the stored bytes stay untouched. A PUT
+// that still carries the retired key is rejected naming the field.
+func TestMuxOptionsRetiredKeepBak(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	if err := s.Seed(ctx, t.TempDir()); err != nil {
+		t.Fatalf("Seed: %v", err)
+	}
+	legacy := `{"keep_bak":true,"track_title_in_mkv":"Polski Dubbing"}`
+	if _, err := s.db.ExecContext(ctx, `UPDATE settings SET value = ? WHERE key = ?`, legacy, KeyMuxOptions); err != nil {
+		t.Fatalf("write legacy row: %v", err)
+	}
+
+	served, ok, err := s.Get(ctx, KeyMuxOptions)
+	if err != nil || !ok {
+		t.Fatalf("Get = %v ok=%v", err, ok)
+	}
+	if strings.Contains(string(served), "keep_bak") {
+		t.Errorf("served mux.options still exposes keep_bak: %s", served)
+	}
+	if got := decode[MuxOptions](t, served); got.TrackTitleInMKV != "Polski Dubbing" || got.OutputMode != MuxOutputReplace {
+		t.Errorf("served mux.options = %+v", got)
+	}
+
+	all, err := s.All(ctx)
+	if err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	if strings.Contains(string(all[KeyMuxOptions]), "keep_bak") {
+		t.Errorf("All still exposes keep_bak: %s", all[KeyMuxOptions])
+	}
+	exp, err := s.Export(ctx)
+	if err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+	if strings.Contains(string(exp.Settings[KeyMuxOptions]), "keep_bak") {
+		t.Errorf("Export still exposes keep_bak: %s", exp.Settings[KeyMuxOptions])
+	}
+
+	var stored string
+	if err := s.db.QueryRowContext(ctx, `SELECT value FROM settings WHERE key = ?`, KeyMuxOptions).Scan(&stored); err != nil {
+		t.Fatalf("read stored row: %v", err)
+	}
+	if stored != legacy {
+		t.Errorf("stored row = %s, want it untouched at %s", stored, legacy)
+	}
+
+	if err := s.Set(ctx, KeyMuxOptions, json.RawMessage(legacy)); err == nil {
+		t.Fatal("Set accepted the retired keep_bak field")
+	} else if !strings.Contains(err.Error(), "keep_bak") {
+		t.Errorf("Set error %q should name keep_bak", err)
+	}
+}
+
+// TestMuxOptionsRetiredKeepBakCaseInsensitive pins the encoding/json trap
+// behind the strip: object keys match struct fields case-insensitively, so a
+// row spelling the retired key as Keep_Bak would slip past an exact lookup,
+// fail the strict decode and be served raw. No letter case may survive.
+func TestMuxOptionsRetiredKeepBakCaseInsensitive(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	if err := s.Seed(ctx, t.TempDir()); err != nil {
+		t.Fatalf("Seed: %v", err)
+	}
+	for _, variant := range []string{"Keep_Bak", "KEEP_BAK", "keep_Bak"} {
+		legacy := `{"` + variant + `":true,"track_title_in_mkv":"Polski Dubbing"}`
+		if _, err := s.db.ExecContext(ctx, `UPDATE settings SET value = ? WHERE key = ?`, legacy, KeyMuxOptions); err != nil {
+			t.Fatalf("write legacy row: %v", err)
+		}
+
+		served, ok, err := s.Get(ctx, KeyMuxOptions)
+		if err != nil || !ok {
+			t.Fatalf("Get = %v ok=%v", err, ok)
+		}
+		if strings.Contains(strings.ToLower(string(served)), "keep_bak") {
+			t.Errorf("%s: served mux.options still exposes the retired key: %s", variant, served)
+		}
+		if got := decode[MuxOptions](t, served); got.TrackTitleInMKV != "Polski Dubbing" || got.OutputMode != MuxOutputReplace {
+			t.Errorf("%s: served mux.options = %+v", variant, got)
+		}
+
+		all, err := s.All(ctx)
+		if err != nil {
+			t.Fatalf("All: %v", err)
+		}
+		if strings.Contains(strings.ToLower(string(all[KeyMuxOptions])), "keep_bak") {
+			t.Errorf("%s: All still exposes the retired key: %s", variant, all[KeyMuxOptions])
+		}
+
+		exp, err := s.Export(ctx)
+		if err != nil {
+			t.Fatalf("Export: %v", err)
+		}
+		if strings.Contains(strings.ToLower(string(exp.Settings[KeyMuxOptions])), "keep_bak") {
+			t.Errorf("%s: Export still exposes the retired key: %s", variant, exp.Settings[KeyMuxOptions])
+		}
 	}
 }
 

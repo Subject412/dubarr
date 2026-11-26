@@ -920,7 +920,7 @@ func TestMeasureSyncResources(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mux: %v", err)
 	}
-	t.Logf("MUX|output=%s|backup=%s|workcopy=%s", res.OutputPath, res.BackupPath, res.WorkCopy)
+	t.Logf("MUX|output=%s|workcopy=%s", res.OutputPath, res.WorkCopy)
 
 	// ---- Publish validation (fresh prober: the pre-mux cache entry is stale) --
 	afterTracks := 0

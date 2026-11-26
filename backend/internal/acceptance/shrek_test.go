@@ -286,7 +286,7 @@ func (h *harness) assertUntaggedGateBlocksMux(t *testing.T, tagged string) {
 		t.Fatalf("RecordImportCandidate(control) = %v/%v, want created", created, err)
 	}
 
-	svc := gate.NewService(rule, h.st)
+	svc := gate.NewServiceWithRule(rule, h.st)
 	res, err := svc.ClassifyCandidate(ctx, control, control)
 	if err != nil {
 		t.Fatalf("ClassifyCandidate(control): %v", err)

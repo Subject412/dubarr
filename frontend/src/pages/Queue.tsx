@@ -287,8 +287,25 @@ function DonorLine({ item }: { item: QueueItem }) {
   )
 }
 
-/** Explains an identify failure in the operator's terms, not arr's. */
-function IdentifyFailure({ error }: { error: Error }) {
+/** Capitalises a server-named arr kind for its button: radarr → Radarr. */
+function kindLabel(kind: string): string {
+  return kind.charAt(0).toUpperCase() + kind.slice(1)
+}
+
+/**
+ * Explains an identify failure in the operator's terms, not arr's. An ambiguous
+ * appliance is a choice, not a dead end: the server names the libraries and the
+ * panel offers exactly those, so the UI can never invent one.
+ */
+function IdentifyFailure({
+  error,
+  identifyingKind,
+  onChooseKind,
+}: {
+  error: Error
+  identifyingKind?: string
+  onChooseKind: (kind: string) => void
+}) {
   const notConfigured = error instanceof ApiError && error.code === 'not_configured'
   if (notConfigured) {
     return (
@@ -297,6 +314,45 @@ function IdentifyFailure({ error }: { error: Error }) {
         <span className="text-zinc-500">({error.message})</span>
       </p>
     )
+  }
+  if (error instanceof ApiError && error.code === 'ambiguous_kind') {
+    // The buttons come from the server's own array: no array, no buttons.
+    const kinds = error.kinds ?? []
+    return (
+      <div
+        className="mt-2 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3"
+        data-testid="identify-ambiguous"
+      >
+        <p className="text-xs text-amber-300/90">{error.message}</p>
+        {kinds.length > 0 && (
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            {kinds.map((kind) => (
+              <Button
+                key={kind}
+                variant="secondary"
+                size="sm"
+                disabled={identifyingKind !== undefined}
+                onClick={() => onChooseKind(kind)}
+              >
+                {kindLabel(kind)}
+              </Button>
+            ))}
+          </div>
+        )}
+        {identifyingKind && (
+          <p className="mt-2 text-xs text-zinc-400" data-testid="identify-kind-in-flight">
+            Identifying against {kindLabel(identifyingKind)}…
+          </p>
+        )}
+      </div>
+    )
+  }
+  // These are refusals the operator can act on, so the server's own sentence is
+  // the whole message: no "Identify failed" wrapper to make it look opaque.
+  const refusal =
+    error instanceof ApiError && (error.code === 'kind_conflict' || error.code === 'invalid_kind')
+  if (refusal) {
+    return <p className="mt-2 text-xs text-amber-300/90">{error.message}</p>
   }
   return <p className="mt-2 text-xs text-red-400">Identify failed: {error.message}</p>
 }
@@ -375,15 +431,18 @@ function QueueCard({
   approving,
   rejecting,
   identifying,
+  identifyingKind,
 }: {
   item: QueueItem
   onApprove: (id: number, libraryCacheId?: number) => void
   onReject: (id: number) => void
-  onIdentify: (id: number) => Promise<QueueIdentifyResponse>
+  onIdentify: (id: number, kind?: string) => Promise<QueueIdentifyResponse>
   onMatch: (id: number, candidate: QueueIdentifyCandidate) => Promise<unknown>
   approving: boolean
   rejecting: boolean
   identifying: boolean
+  /** The arr library the in-flight identify request named, when it named one. */
+  identifyingKind?: string
 }) {
   const view = eligibilityView[item.eligibility] ?? eligibilityView.missing_target
   // A missing or unexpected match_state must not mislabel a matched row, so the
@@ -408,6 +467,19 @@ function QueueCard({
     setPickError(null)
     onIdentify(item.id)
       .then(setIdentified)
+      .catch(setIdentifyError)
+  }
+
+  // The operator's answer to the server's choice. The ambiguous panel stays up
+  // while this runs so the card can say which library it is asking; nothing is
+  // retried unless the operator clicks again.
+  const runIdentifyAs = (kind: string) => {
+    setPickError(null)
+    onIdentify(item.id, kind)
+      .then((result) => {
+        setIdentifyError(null)
+        setIdentified(result)
+      })
       .catch(setIdentifyError)
   }
 
@@ -461,7 +533,13 @@ function QueueCard({
                   {identifying ? 'Identifying…' : 'Identify with arr'}
                 </Button>
               </div>
-              {identifyError && <IdentifyFailure error={identifyError} />}
+              {identifyError && (
+                <IdentifyFailure
+                  error={identifyError}
+                  identifyingKind={identifyingKind}
+                  onChooseKind={runIdentifyAs}
+                />
+              )}
               {identified && (
                 <IdentifyResult
                   result={identified}
@@ -779,7 +857,7 @@ export function QueuePage() {
             item={item}
             onApprove={(id, libraryCacheId) => approve.mutate({ id, libraryCacheId })}
             onReject={(id) => reject.mutate(id)}
-            onIdentify={(id) => identify.mutateAsync(id)}
+            onIdentify={(id, kind) => identify.mutateAsync({ id, kind })}
             onMatch={(id, candidate) =>
               match.mutateAsync({
                 id,
@@ -789,7 +867,15 @@ export function QueuePage() {
             }
             approving={approve.isPending && approve.variables?.id === item.id}
             rejecting={reject.isPending && reject.variables === item.id}
-            identifying={identify.isPending && identify.variables === item.id}
+            // The mutation's variables are an object now: the id must be read
+            // off them. Comparing the object to the bare id is always false and
+            // silently drops the row's in-flight state.
+            identifying={identify.isPending && identify.variables?.id === item.id}
+            identifyingKind={
+              identify.isPending && identify.variables?.id === item.id
+                ? identify.variables?.kind
+                : undefined
+            }
           />
         ))}
       </div>

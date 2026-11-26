@@ -486,14 +486,27 @@ export class ApiError extends Error {
   readonly status: number
   /** Machine-readable reason from the error body, when the route sends one. */
   readonly code?: string
+  /**
+   * The arr libraries the server asks the operator to choose between. Only the
+   * `ambiguous_kind` envelope carries it, and the UI must render exactly these —
+   * never a list of its own making.
+   */
+  readonly kinds?: string[]
   /** Parsed JSON error body when the server sent one; otherwise undefined. */
   readonly payload: unknown
 
-  constructor(status: number, message: string, code?: string, payload: unknown = undefined) {
+  constructor(
+    status: number,
+    message: string,
+    code?: string,
+    payload: unknown = undefined,
+    kinds?: string[],
+  ) {
     super(message)
     this.name = 'ApiError'
     this.status = status
     this.code = code
+    this.kinds = kinds
     this.payload = payload
   }
 }
@@ -519,6 +532,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   if (!response.ok) {
     let message = `Request failed (${response.status})`
     let code: string | undefined
+    let kinds: string[] | undefined
     let payload: unknown
     try {
       payload = await response.json()
@@ -531,15 +545,30 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
           const raw = (payload as { code?: unknown }).code
           if (typeof raw === 'string' && raw !== '') code = raw
         }
+        if ('kinds' in payload) {
+          const raw = (payload as { kinds?: unknown }).kinds
+          if (Array.isArray(raw)) {
+            kinds = raw.filter(
+              (entry): entry is string => typeof entry === 'string' && entry !== '',
+            )
+          }
+        }
       }
     } catch {
       // Non-JSON error bodies fall back to the status message.
     }
-    throw new ApiError(response.status, message, code, payload)
+    throw new ApiError(response.status, message, code, payload, kinds)
   }
 
   if (response.status === 204) return undefined as T
   return (await response.json()) as T
+}
+
+export type IdentifyQueueOptions = {
+  /** Release name override; the server falls back to the filename stem. */
+  title?: string
+  /** The arr library the operator picked after a 409 ambiguous_kind. */
+  kind?: string
 }
 
 export const api = {
@@ -604,12 +633,21 @@ export const api = {
         libraryCacheId == null ? undefined : JSON.stringify({ library_cache_id: libraryCacheId }),
     }),
   rejectQueueItem: (id: number) => request<QueueTransition>(`/api/queue/${id}/reject`, { method: 'POST' }),
-  /** Asks arr's own parser to identify the release; title overrides the filename stem. */
-  identifyQueueItem: (id: number, title?: string) =>
-    request<QueueIdentifyResponse>(`/api/queue/${id}/identify`, {
+  /**
+   * Asks arr's own parser to identify the release; title overrides the filename
+   * stem, and kind names the arr library when the server asked the operator to
+   * choose (409 ambiguous_kind). Absent keys are omitted, never sent as
+   * undefined: an empty body still means "parse it in the only library there is".
+   */
+  identifyQueueItem: (id: number, opts: IdentifyQueueOptions = {}) => {
+    const body: { title?: string; kind?: string } = {}
+    if (opts.title) body.title = opts.title
+    if (opts.kind) body.kind = opts.kind
+    return request<QueueIdentifyResponse>(`/api/queue/${id}/identify`, {
       method: 'POST',
-      body: title ? JSON.stringify({ title }) : undefined,
-    }),
+      body: Object.keys(body).length === 0 ? undefined : JSON.stringify(body),
+    })
+  },
   /** Persists the operator's pick; the server reports the resulting match state. */
   matchQueueItem: (id: number, libraryCacheId: number, confidence?: number) =>
     request<QueueMatchResponse>(`/api/queue/${id}/match`, {

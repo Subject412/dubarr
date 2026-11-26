@@ -55,7 +55,6 @@ type errorBody struct {
 //	202 {"accepted": true, "kind": "radarr"|"sonarr"|"all"}
 //	400 malformed JSON or an unknown kind
 //	409 code "busy"                 a pass is already running
-//	409 code "manual_sync_disabled" arr.options.manual_sync is off
 //	409 code "not_configured"       no poller/instance is configured
 //	409 code "stopped"              the poller is not running or is shutting down
 func (s *Service) handleRefresh(w http.ResponseWriter, r *http.Request) {
@@ -99,11 +98,6 @@ func (s *Service) handleRefresh(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusConflict, errorBody{
 			Error: "a sync pass is already running",
 			Code:  "busy",
-		})
-	case errors.Is(err, arrsync.ErrManualSyncDisabled):
-		writeJSON(w, http.StatusConflict, errorBody{
-			Error: "manual sync is disabled",
-			Code:  "manual_sync_disabled",
 		})
 	case errors.Is(err, arrsync.ErrPollerStopped):
 		// Shutdown, or a poller that was never started: the request cannot

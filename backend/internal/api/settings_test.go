@@ -460,6 +460,70 @@ func TestSettingsPutRejectsLegacyVaultReadOnly(t *testing.T) {
 	}
 }
 
+// TestSettingsServesLegacyArrOptionsWithoutManualSync pins the read path: a row
+// stored before arr.options.manual_sync was retired still loads (200) and is
+// served without the removed key, because the section decodes into the current
+// schema.
+func TestSettingsServesLegacyArrOptionsWithoutManualSync(t *testing.T) {
+	h := newHarness(t)
+	h.setupAdmin()
+	if _, err := h.db.Exec(
+		`INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`,
+		settings.KeyArrOptions, `{"poll_interval_sec":120,"manual_sync":false}`,
+	); err != nil {
+		t.Fatalf("seed legacy arr.options: %v", err)
+	}
+
+	env := h.getSettings() // fails on any non-200
+	raw, ok := env.Settings[settings.KeyArrOptions]
+	if !ok {
+		t.Fatal("GET /api/settings dropped arr.options")
+	}
+	var opts map[string]any
+	if err := json.Unmarshal(raw, &opts); err != nil {
+		t.Fatalf("decode arr.options: %v (%s)", err, raw)
+	}
+	if _, ok := opts["manual_sync"]; ok {
+		t.Errorf("arr.options still serves manual_sync: %s", raw)
+	}
+	if got, _ := opts["poll_interval_sec"].(float64); got != 120 {
+		t.Errorf("poll_interval_sec = %v, want the stored 120", opts["poll_interval_sec"])
+	}
+}
+
+// TestSettingsPutRejectsLegacyManualSync pins the write path: the retired key
+// is not silently ignored, the API answers 400 and names the unknown field, so
+// a client cannot keep writing a setting that no longer exists.
+func TestSettingsPutRejectsLegacyManualSync(t *testing.T) {
+	h := newHarness(t)
+	h.setupAdmin()
+
+	code, body := h.do(http.MethodPut, "/api/settings", map[string]any{
+		"settings": map[string]any{
+			settings.KeyArrOptions: map[string]any{
+				"poll_interval_sec": 300,
+				"manual_sync":       false,
+			},
+		},
+	})
+	if code != http.StatusBadRequest {
+		t.Fatalf("PUT arr.options with manual_sync = %d, want 400: %s", code, body)
+	}
+	if !bytes.Contains(body, []byte("manual_sync")) {
+		t.Errorf("400 body does not name the unknown field: %s", body)
+	}
+
+	// Nothing was written: the stored section keeps its seeded interval.
+	env := h.getSettings()
+	var opts settings.ArrOptions
+	if err := json.Unmarshal(env.Settings[settings.KeyArrOptions], &opts); err != nil {
+		t.Fatalf("decode arr.options: %v", err)
+	}
+	if opts.PollIntervalSec != 300 {
+		t.Errorf("poll_interval_sec = %d, want the untouched 300", opts.PollIntervalSec)
+	}
+}
+
 func newBareServer(t *testing.T, deps Dependencies) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()

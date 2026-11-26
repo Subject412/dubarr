@@ -17,6 +17,12 @@
 //     (a target or destination that is not Matroska) and the other mux
 //     sentinels surface unchanged from Mux, so the job is marked failed once
 //     with the sentinel's own message and no second attempt is made.
+//   - A target the media manager replaced mid-mux ([mux.ErrTargetChanged],
+//     ADR-0018) is not a failure: nothing was published, so the job returns to
+//     queued with one log line and is skipped for the rest of that pass. The
+//     drain keeps running the jobs behind it and ends only when no queued job
+//     is left unvisited; a later pass picks the requeued row up against the new
+//     file. Attempt caps and backoff are a later unit.
 //   - A rescan failure is logged and never changes a good mux result
 //     (M5-4 contract: best-effort, non-fatal).
 //   - Staging is removed once the job finishes, on success and on failure
@@ -72,6 +78,11 @@ var (
 	// ffmpeg encoder this host does not provide (ADR-0010). The job fails
 	// before any analysis, staging or mux work starts.
 	ErrEncoderUnavailable = errors.New("syncworker: required audio encoder is unavailable")
+	// errRequeued is an internal signal, never surfaced to a caller: the job
+	// was put back on the queue (a target that changed mid-mux, ADR-0018)
+	// instead of failing. The drain pass records the id as visited and moves on
+	// to the next queued job rather than re-running the same row.
+	errRequeued = errors.New("syncworker: job requeued")
 )
 
 // Executor is the M4-6 analysis seam. *syncjob.Service satisfies it.
@@ -266,13 +277,18 @@ func (w *Worker) runLoop(ctx context.Context) {
 
 // drain processes queued jobs back-to-back until the queue is empty or the
 // context is cancelled. A job failure is recorded on the row and never stops
-// the loop.
+// the loop. A job that went back on the queue (a target that changed mid-mux)
+// keeps its low id, so the pass remembers every id it visited and excludes
+// them from the next selection: the requeued row cannot be picked up again in
+// the same pass, and the jobs behind it still run instead of starving until a
+// whole interval has passed.
 func (w *Worker) drain(ctx context.Context) {
+	visited := make(map[int64]bool)
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		processed, err := w.ProcessOnce(ctx)
+		processed, err := w.processOnce(ctx, visited)
 		if err != nil {
 			w.logf("syncworker: pass: %v", err)
 			return
@@ -286,21 +302,35 @@ func (w *Worker) drain(ctx context.Context) {
 // ProcessOnce picks and processes at most one queued job (lowest id first).
 // processed is false when the queue is empty. A job-level failure is recorded
 // on the row and reported as processed with a nil error; only store failures
-// while recording the outcome are returned.
+// while recording the outcome are returned. A job returned to the queue (a
+// target that changed mid-mux) is handled — requeued and logged once — and
+// still reported as processed, because this call did run a job; a one-shot
+// caller simply finds the row queued again.
 func (w *Worker) ProcessOnce(ctx context.Context) (processed bool, err error) {
+	return w.processOnce(ctx, nil)
+}
+
+// processOnce is ProcessOnce restricted to the queued jobs a drain pass has
+// not handled yet: every id it handles is recorded in visited (nil outside a
+// pass), so a requeued row with the same low id is not selected twice.
+func (w *Worker) processOnce(ctx context.Context, visited map[int64]bool) (bool, error) {
 	if ctx.Err() != nil {
 		return false, nil
 	}
-	id, ok, err := w.nextQueued(ctx)
+	id, ok, err := w.nextQueued(ctx, visited)
 	if err != nil {
 		return false, err
 	}
 	if !ok {
 		return false, nil
 	}
+	if visited != nil {
+		visited[id] = true
+	}
 	// Issue #23: whatever happens to the job, its staging directory is
-	// removed once the worker is done with it - completed (after mux) or
-	// failed (Execute's own failure path is idempotent with this).
+	// removed once the worker is done with it - completed (after mux), failed
+	// (Execute's own failure path is idempotent with this) or requeued (a
+	// changed target; the next attempt re-stages from scratch).
 	defer w.cleanup(id)
 
 	// A panic in any stage must fail only this job.
@@ -315,6 +345,13 @@ func (w *Worker) ProcessOnce(ctx context.Context) (processed bool, err error) {
 	}()
 
 	if jobErr != nil {
+		// The job was put back on the queue, not failed: its status and its one
+		// log line are already written, and the id is in visited, so this pass
+		// moves on to the next queued job instead of re-running the same row
+		// (ADR-0018).
+		if errors.Is(jobErr, errRequeued) {
+			return true, nil
+		}
 		w.logf("syncworker: job %d failed: %v", id, jobErr)
 		// Execute may already have recorded its own failure; overwriting with
 		// the same first line is idempotent.
@@ -326,6 +363,7 @@ func (w *Worker) ProcessOnce(ctx context.Context) (processed bool, err error) {
 }
 
 const (
+	statusQueued    = "queued"
 	statusMuxing    = "muxing"
 	statusCompleted = "completed"
 	statusFailed    = "failed"
@@ -430,6 +468,21 @@ func (w *Worker) processJob(ctx context.Context, id int64) error {
 		Candidates:     candidates,
 	})
 	if err != nil {
+		// ADR-0018: the media manager replaced the target while the mux ran, so
+		// Mux published nothing (no temp, no .bak, target untouched). That is
+		// not a failure of this job — the upgrade has to be analysed against
+		// the new file — so the row goes back to queued, with one log line, and
+		// the pass skips it for the rest of its run instead of re-running it at
+		// once.
+		if errors.Is(err, mux.ErrTargetChanged) {
+			// The requeue must outlive a shutdown cancellation: leaving the row
+			// in "muxing" would strand it, since nothing reaps that status.
+			if rerr := w.store.SetSyncJobStatus(context.WithoutCancel(ctx), id, statusQueued, ""); rerr != nil {
+				return rerr
+			}
+			w.logf("syncworker: job %d target changed during the mux; requeued to run again against the new file", id)
+			return errRequeued
+		}
 		// A mux sentinel — a non-Matroska container (mux.ErrUnsupportedContainer)
 		// included — is terminal: it is returned unwrapped and ProcessOnce
 		// records it as the job's failed status once, with no retry.
@@ -474,17 +527,30 @@ func muxableVerdict(verdict string) bool {
 	}
 }
 
-func (w *Worker) nextQueued(ctx context.Context) (int64, bool, error) {
-	var id int64
-	err := w.store.DB.QueryRowContext(ctx,
-		`SELECT id FROM sync_mux_jobs WHERE status = 'queued' ORDER BY id ASC LIMIT 1`).Scan(&id)
-	if errors.Is(err, sql.ErrNoRows) {
-		return 0, false, nil
-	}
+// nextQueued returns the lowest-id queued job that this pass has not visited
+// yet. The exclusion is the whole point: a requeued row keeps its id and would
+// otherwise be selected first on every iteration, starving everything behind
+// it for the rest of the pass.
+func (w *Worker) nextQueued(ctx context.Context, visited map[int64]bool) (int64, bool, error) {
+	rows, err := w.store.DB.QueryContext(ctx,
+		`SELECT id FROM sync_mux_jobs WHERE status = 'queued' ORDER BY id ASC`)
 	if err != nil {
 		return 0, false, fmt.Errorf("syncworker: read queued jobs: %w", err)
 	}
-	return id, true, nil
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return 0, false, fmt.Errorf("syncworker: read queued jobs: %w", err)
+		}
+		if !visited[id] {
+			return id, true, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, false, fmt.Errorf("syncworker: read queued jobs: %w", err)
+	}
+	return 0, false, nil
 }
 
 // stagedAudio finds the single target .mka Execute left under

@@ -187,6 +187,13 @@ func (r *rig) stage(t *testing.T, jobID int64) string {
 
 func newWorker(t *testing.T, r *rig, ex Executor, mx Muxer, rs Rescanner) *Worker {
 	t.Helper()
+	return newWorkerLogging(t, r, ex, mx, rs, t.Logf)
+}
+
+// newWorkerLogging is newWorker with a caller-supplied log sink, so a test can
+// assert on the exact lines one job produces.
+func newWorkerLogging(t *testing.T, r *rig, ex Executor, mx Muxer, rs Rescanner, logf func(string, ...any)) *Worker {
+	t.Helper()
 	w, err := New(Dependencies{
 		Store:     r.store,
 		Settings:  r.settings,
@@ -195,7 +202,7 @@ func newWorker(t *testing.T, r *rig, ex Executor, mx Muxer, rs Rescanner) *Worke
 		Rescanner: rs,
 		WorkDir:   r.workDir,
 		Interval:  time.Millisecond,
-		Logf:      t.Logf,
+		Logf:      logf,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -925,5 +932,143 @@ func TestProcessOnceContainerRefusalIsTerminalFailure(t *testing.T) {
 	}
 	if len(ex.calls) != 1 || len(mx.jobs) != 1 {
 		t.Fatalf("job was retried: executor %d, mux %d calls", len(ex.calls), len(mx.jobs))
+	}
+}
+
+// TestProcessOnceTargetChangedRequeuesJob pins the worker half of ADR-0018: a
+// mux that refused to publish because the media manager replaced the target
+// mid-run did not fail the job. The row goes back to queued with exactly one
+// log line, the drain pass it ran in ends instead of immediately re-running it,
+// and a later pass does run it again against the new file.
+func TestProcessOnceTargetChangedRequeuesJob(t *testing.T) {
+	r := newRig(t)
+	jobID := r.newJob(t)
+	audio := r.stage(t, jobID)
+
+	var logs []string
+	ex := &fakeExecutor{report: stableReport()}
+	mx := &fakeMuxer{err: fmt.Errorf("%w: %s", mux.ErrTargetChanged, r.target)}
+	w := newWorkerLogging(t, r, ex, mx, &fakeRescanner{}, func(format string, args ...any) {
+		logs = append(logs, fmt.Sprintf(format, args...))
+	})
+
+	// One drain pass: the requeued job must not be picked up again inside it.
+	w.drain(context.Background())
+
+	if len(ex.calls) != 1 || len(mx.jobs) != 1 {
+		t.Fatalf("executor %d, mux %d calls in one drain pass, want one each", len(ex.calls), len(mx.jobs))
+	}
+	rec, _, err := r.store.SyncJobByID(context.Background(), jobID)
+	if err != nil {
+		t.Fatalf("SyncJobByID: %v", err)
+	}
+	if rec.Status != statusQueued {
+		t.Fatalf("status = %q, want %q (a changed target must not fail the job)", rec.Status, statusQueued)
+	}
+	if rec.ErrorMessage != "" {
+		t.Fatalf("error_message = %q, want it cleared", rec.ErrorMessage)
+	}
+	if len(logs) != 1 {
+		t.Fatalf("log lines = %v, want exactly one", logs)
+	}
+	if !strings.Contains(logs[0], "target changed") || !strings.Contains(logs[0], "requeued") {
+		t.Fatalf("log line = %q, want it to explain the changed target and the requeue", logs[0])
+	}
+	// Issue #23: the staging goes with the pass; the next attempt re-stages.
+	if _, err := os.Stat(filepath.Dir(audio)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("staging should be cleaned after a requeue: %v", err)
+	}
+
+	// A later pass does run it again: the fake executor does not re-stage, so
+	// recreate what Execute would have left behind. A one-shot ProcessOnce
+	// reports the requeued job as processed: this call did run it, and the row
+	// is simply queued again for a later pass.
+	r.stage(t, jobID)
+	if processed, err := w.ProcessOnce(context.Background()); err != nil || !processed {
+		t.Fatalf("second ProcessOnce = %v/%v, want true/nil (run again, still queued)", processed, err)
+	}
+	if len(ex.calls) != 2 || len(mx.jobs) != 2 {
+		t.Fatalf("executor %d, mux %d calls, want the job to run again in a later pass", len(ex.calls), len(mx.jobs))
+	}
+}
+
+// scriptedMuxer fails the job ids in errs (mapping them to a mux sentinel) and
+// publishes everything else, so one drain pass can cover a mixed queue.
+type scriptedMuxer struct {
+	jobs []mux.Job
+	errs map[int64]error
+}
+
+func (f *scriptedMuxer) Mux(_ context.Context, job mux.Job) (mux.Result, error) {
+	f.jobs = append(f.jobs, job)
+	if err, ok := f.errs[job.ID]; ok {
+		return mux.Result{}, err
+	}
+	return mux.Result{OutputPath: job.TargetPath}, nil
+}
+
+func (f *scriptedMuxer) count(id int64) int {
+	n := 0
+	for _, job := range f.jobs {
+		if job.ID == id {
+			n++
+		}
+	}
+	return n
+}
+
+// TestDrainSkipsRequeuedJobAndRunsTheJobsBehindIt pins the head-of-line fix: a
+// job put back on the queue keeps its low id, so the pass must remember it as
+// visited and carry on with the next queued job. Without the exclusion the
+// requeued row is selected first on every iteration and the job behind it
+// waits a whole interval - and, with repeated churn, starves.
+func TestDrainSkipsRequeuedJobAndRunsTheJobsBehindIt(t *testing.T) {
+	r := newRig(t)
+	requeuedID := r.newJob(t)
+	r.stage(t, requeuedID)
+	laterID := r.newJob(t)
+	r.stage(t, laterID)
+
+	ex := &fakeExecutor{report: stableReport()}
+	mx := &scriptedMuxer{errs: map[int64]error{
+		requeuedID: fmt.Errorf("%w: %s", mux.ErrTargetChanged, r.target),
+	}}
+	w := newWorker(t, r, ex, mx, &fakeRescanner{})
+
+	w.drain(context.Background())
+
+	if got := mx.count(requeuedID); got != 1 {
+		t.Fatalf("requeued job muxed %d times in one pass, want exactly 1", got)
+	}
+	if got := mx.count(laterID); got != 1 {
+		t.Fatalf("job behind the requeued one muxed %d times in one pass, want exactly 1 (it must not be starved)", got)
+	}
+	if len(ex.calls) != 2 {
+		t.Fatalf("executor calls = %v, want both jobs", ex.calls)
+	}
+
+	rec, _, err := r.store.SyncJobByID(context.Background(), requeuedID)
+	if err != nil {
+		t.Fatalf("SyncJobByID(requeued): %v", err)
+	}
+	if rec.Status != statusQueued {
+		t.Fatalf("requeued job status = %q, want %q", rec.Status, statusQueued)
+	}
+	rec, _, err = r.store.SyncJobByID(context.Background(), laterID)
+	if err != nil {
+		t.Fatalf("SyncJobByID(later): %v", err)
+	}
+	if rec.Status != statusCompleted {
+		t.Fatalf("later job status = %q, want %q", rec.Status, statusCompleted)
+	}
+
+	// The pass ended on an empty unvisited set, not by re-running anything: a
+	// fresh pass (visited starts empty) still selects the requeued row.
+	r.stage(t, requeuedID)
+	if processed, err := w.ProcessOnce(context.Background()); err != nil || !processed {
+		t.Fatalf("next ProcessOnce = %v/%v, want true/nil for the requeued row in a new pass", processed, err)
+	}
+	if got := mx.count(requeuedID); got != 2 {
+		t.Fatalf("requeued job muxed %d times over two passes, want 2", got)
 	}
 }

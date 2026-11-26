@@ -136,7 +136,7 @@ func TestTranscodeOpusStereoFromPCM(t *testing.T) {
 	if res.Codec != "opus" || res.Channels != 2 {
 		t.Fatalf("result = %+v, want opus stereo", res)
 	}
-	// The input is never modified: transcode reads the Work Area copy only.
+	// The input is never modified: transcode reads the temp folder copy only.
 	if after := hashFile(t, src); after != before {
 		t.Fatalf("input hash changed: %s -> %s", before, after)
 	}

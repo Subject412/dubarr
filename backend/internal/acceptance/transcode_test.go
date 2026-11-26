@@ -41,7 +41,7 @@ type noRescan struct{}
 func (noRescan) RescanAfterMux(context.Context, arrrescan.LibraryCacheRow) error { return nil }
 
 // TestTranscodeRulePublishesRequestedStream is the issue #11 acceptance path:
-// a matched rule encodes the Work Area copy once, ffprobe verifies it, mux
+// a matched rule encodes the temp folder copy once, ffprobe verifies it, mux
 // publishes it, and the FINAL MKV carries the requested codec/channels/bitrate
 // while the Audio Vault file is byte-identical and the video stream untouched.
 func TestTranscodeRulePublishesRequestedStream(t *testing.T) {

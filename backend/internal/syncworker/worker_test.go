@@ -721,8 +721,8 @@ func setAudioRules(t *testing.T, r *rig, body string) {
 }
 
 // TestProcessOnceAppliesTranscodeRule pins the ADR-0010 job path: the first
-// matching rule encodes the Work Area copy (never the vault file), and the mux
-// receives the encoded .mka instead of the staged original.
+// matching rule encodes the copy in the temp folder (never the vault file), and
+// the mux receives the encoded .mka instead of the staged original.
 func TestProcessOnceAppliesTranscodeRule(t *testing.T) {
 	r := newRig(t)
 	setAudioRules(t, r, `{"rules":[

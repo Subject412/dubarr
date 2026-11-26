@@ -26,12 +26,12 @@ _Avoid_: group_uuid
 The dropzone scanned for new donors; a file is only picked up once its size is stable across two checks.
 _Avoid_: inbox
 
-**Work Area**:
-The isolated scratch space where every job operates on verified copies of vault tracks; nothing is ever modified in place in the Vault.
-_Avoid_: temp, staging
+**Temp Folder**:
+The scratch space named by `work_dir` where every job operates on verified copies of vault tracks; it holds files only while a job runs and is cleared afterwards. Nothing is ever modified in place in the Audio Vault.
+_Avoid_: work area, workspace, staging, scratch dir
 
 **Copy-on-Work**:
-The contract that every sync, preview, tempo adjustment and mux first copies the needed vault tracks into the Work Area and verifies their checksums before any processing.
+The contract that every sync, preview, tempo adjustment and mux first copies the needed vault tracks into the temp folder and verifies their checksums before any processing.
 _Avoid_: in-place editing
 
 **Approval Queue**:
@@ -156,7 +156,7 @@ The policy making the arr-reported Original Language the first-choice Reference 
 _Avoid_: original-first flag
 
 **Transcode Rule**:
-An ordered condition/action pair applied to the Work Area copy of a vault track before muxing. The first matching rule selects the output codec, channels, bitrate and sample rate; with no rules the track is copied untouched. Rules never modify the Audio Vault.
+An ordered condition/action pair applied to the temp-folder copy of a vault track before muxing. The first matching rule selects the output codec, channels, bitrate and sample rate; with no rules the track is copied untouched. Rules never modify the Audio Vault.
 _Avoid_: profile, preset (when meaning a single rule)
 
 **Log Sink**:

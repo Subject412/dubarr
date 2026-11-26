@@ -97,7 +97,7 @@ These hold in every version, regardless of what the version number promises:
    explicit, previewed operator decision.
 2. **Trash before purge.** A removed vault track, or audio replaced by a better
    source, moves to the Vault Trash. Purging is a separate, explicit step.
-3. **Processing never mutates the vault.** Jobs copy out to the Work Area and
+3. **Processing never mutates the vault.** Jobs copy out to the temp folder and
    verify SHA-256. The only writes into the vault are archiving and
    operator-initiated lifecycle actions (ADR-0015).
 4. **Publish by validated temp, then swap.** mkvmerge writes a hidden temp in

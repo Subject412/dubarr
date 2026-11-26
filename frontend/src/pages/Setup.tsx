@@ -292,13 +292,14 @@ export function SetupPage() {
                   onChange={(watch_dir) => setStorage({ ...storage, watch_dir })}
                 />
                 <PathField
-                  label="Vault folder"
-                  hint="Read-only source of original tracks."
+                  label="Audio Vault"
+                  hint="The Audio Vault: the library dubarr owns — a read-only source of original tracks."
                   value={storage.vault_dir}
                   onChange={(vault_dir) => setStorage({ ...storage, vault_dir })}
                 />
                 <PathField
-                  label="Work folder"
+                  label="Temp folder"
+                  hint="Temporary scratch space — files live here only while a job runs, then it is cleared."
                   value={storage.work_dir}
                   onChange={(work_dir) => setStorage({ ...storage, work_dir })}
                 />

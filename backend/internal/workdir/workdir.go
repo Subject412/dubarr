@@ -96,7 +96,7 @@ func (e *ChecksumError) Error() string {
 // Is lets callers branch with errors.Is(err, ErrChecksumMismatch).
 func (e *ChecksumError) Is(target error) bool { return target == ErrChecksumMismatch }
 
-// Stager copies vault tracks into per-job Work Area directories.
+// Stager copies vault tracks into per-job temp folders.
 type Stager struct {
 	workDir string
 	tracks  TrackReader
@@ -206,7 +206,7 @@ func (s *Stager) stageOne(ctx context.Context, kind string, id int64, dir string
 }
 
 // copyVerified streams src into dst (which must not exist), hashing the bytes
-// actually written to the Work Area. The source is only ever opened read-only.
+// actually written to the temp folder. The source is only ever opened read-only.
 // A digest mismatch removes the copy and returns a *ChecksumError; the caller
 // wipes the whole staging directory.
 func copyVerified(id int64, src, dst, want string) (StagedTrack, error) {

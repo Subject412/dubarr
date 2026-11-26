@@ -23,7 +23,7 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   {
     key: 'storage.paths',
     title: 'Storage paths',
-    description: 'Watch folder, vault, working area and media roots (absolute paths).',
+    description: 'Watch folder, Audio Vault, temp folder and media roots (absolute paths).',
   },
   {
     key: 'languages.policy',

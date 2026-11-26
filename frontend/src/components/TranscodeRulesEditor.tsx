@@ -161,8 +161,8 @@ export function TranscodeRulesEditor({
       </div>
       <p className="text-xs text-zinc-500">
         Rules run top to bottom against the archived track&apos;s metadata. The first enabled
-        rule that matches re-encodes a Work Area copy before muxing; everything else is copied
-        untouched. The Audio Vault is never modified.
+        rule that matches re-encodes a copy in the temp folder before muxing; everything else
+        is copied untouched. The Audio Vault is never modified.
       </p>
       {rules.length === 0 && <span className="text-xs text-zinc-500">No rules — audio is copied losslessly.</span>}
       {rules.map((rule, index) => {

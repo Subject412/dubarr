@@ -296,13 +296,13 @@ export function SettingsPage() {
                     onChange={(watch_dir) => update({ watch_dir })}
                   />
                   <PathField
-                    label="Vault folder"
+                    label="Audio Vault"
                     help={settingsHelp('storage.paths', 'vault_dir')}
                     value={draft.vault_dir}
                     onChange={(vault_dir) => update({ vault_dir })}
                   />
                   <PathField
-                    label="Work folder"
+                    label="Temp folder"
                     help={settingsHelp('storage.paths', 'work_dir')}
                     value={draft.work_dir}
                     onChange={(work_dir) => update({ work_dir })}

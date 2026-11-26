@@ -16,7 +16,7 @@
 //  4. Refuse a non-Matroska target or destination before any write: mkvmerge
 //     always writes Matroska, so anything but .mkv/.mka returns
 //     [ErrUnsupportedContainer] and leaves the target, the destination
-//     directory and the Work Area byte-identical.
+//     directory and the temp folder byte-identical.
 //  5. Copy the target into {WORK_DIR}/jobs/{id}/ (Copy-on-Work, ADR-0002) and
 //     let mkvmerge read only that copy plus the staged .mka. The target itself
 //     is opened read-only.

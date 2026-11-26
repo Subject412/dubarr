@@ -11,9 +11,9 @@ export const SETTINGS_HELP: Record<SettingsSectionKey, Record<string, string>> =
     watch_dir:
       'Watch Folder: the dropzone scanned for new donors. A file is only picked up once its size is stable across two checks.',
     vault_dir:
-      'Audio Vault: the write-once archive of extracted tracks, kept outside the video library so replacing a video never deletes its audio.',
+      'Audio Vault: the library Dubarr owns — the write-once archive of extracted tracks, kept outside the video library so replacing a video never deletes its audio.',
     work_dir:
-      'Work Area: isolated scratch space. Every job copies vault tracks here and verifies their checksums before processing.',
+      'Temp folder: the workspace a job runs in. It holds copies only while the job is running and is cleared afterwards. On the same pool as your media the finished file moves into place as an atomic rename; on a faster separate pool the job runs quicker, but publishing has to copy the file across filesystems.',
     output_dir:
       'Destination for the "write to the mux output folder" mode: the muxed file lands here as <name>.dubarr.mkv and the library file is left untouched. Must not be the Audio Vault or inside it.',
     media_roots:
@@ -72,7 +72,7 @@ export const SETTINGS_HELP: Record<SettingsSectionKey, Record<string, string>> =
   },
   'audio.options': {
     rules:
-      'Ordered, opt-in Transcode Rules. The first enabled rule whose conditions all match the PRE-TEMPO vault track is applied to a copy in the Work Area; with no rules the audio is copied losslessly and nothing is re-encoded.',
+      'Ordered, opt-in Transcode Rules. The first enabled rule whose conditions all match the PRE-TEMPO vault track is applied to a copy in the temp folder; with no rules the audio is copied losslessly and nothing is re-encoded.',
     when_source_codecs:
       'Source codec names (ffmpeg codec_name values such as pcm_s16le or ac3). The track matches if its codec appears anywhere in this list; entries are compared case-insensitively.',
     when_source_codec_regex:
@@ -90,7 +90,7 @@ export const SETTINGS_HELP: Record<SettingsSectionKey, Record<string, string>> =
     when_variant:
       'Only match tracks with this variant label, e.g. dubbing or commentary.',
     then_codec:
-      'Output format. keep copies the track untouched; opus, aac, flac and PCM re-encode it in the Work Area only — the Audio Vault file is never modified.',
+      'Output format. keep copies the track untouched; opus, aac, flac and PCM re-encode it in the temp folder only — the Audio Vault file is never modified.',
     then_bitrate_bps:
       'Target bitrate for Opus or AAC. Lossless formats (FLAC/PCM) ignore this field.',
     then_channels: 'Downmix/upmix to this channel count; a matching layout is chosen automatically.',

@@ -116,7 +116,7 @@ describe('watch scanner restart notice', () => {
     renderWithProviders(<SettingsPage />, { route: '/settings' })
 
     expect(await screen.findByRole('heading', { name: 'Storage paths' })).toBeInTheDocument()
-    const vault = screen.getByLabelText('Vault folder')
+    const vault = screen.getByLabelText('Audio Vault')
     await user.clear(vault)
     await user.type(vault, '/new/vault')
     await user.click(screen.getByLabelText('Save Storage paths'))

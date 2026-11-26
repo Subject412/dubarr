@@ -84,7 +84,7 @@ describe('info tooltip (issue #3)', () => {
     expect(screen.getAllByRole('button', { name: /^About / })).toHaveLength(helpCount)
 
     // Every control kind wires help, not just text inputs.
-    expect(screen.getByLabelText('Vault folder')).toHaveAttribute('aria-describedby')
+    expect(screen.getByLabelText('Audio Vault')).toHaveAttribute('aria-describedby')
     expect(screen.getByLabelText('Export mode')).toHaveAttribute('aria-describedby')
     expect(screen.getByLabelText('Output mode')).toHaveAttribute('aria-describedby')
     expect(screen.getByLabelText('Add target language')).toHaveAttribute('aria-describedby')
@@ -118,13 +118,13 @@ describe('info tooltip (issue #3)', () => {
     const user = userEvent.setup()
     await renderSettings()
 
-    const trigger = screen.getByRole('button', { name: 'About Vault folder' })
+    const trigger = screen.getByRole('button', { name: 'About Audio Vault' })
     expect(screen.queryByRole('tooltip')).not.toBeInTheDocument()
 
     await user.hover(trigger)
     const tooltip = await screen.findByRole('tooltip')
     expect(tooltip).toHaveTextContent(/write-once/i)
-    expect(screen.getByLabelText('Vault folder')).toHaveAttribute('aria-describedby', tooltip.id)
+    expect(screen.getByLabelText('Audio Vault')).toHaveAttribute('aria-describedby', tooltip.id)
 
     await user.unhover(trigger)
     expect(screen.queryByRole('tooltip')).not.toBeInTheDocument()
@@ -158,8 +158,8 @@ describe('info tooltip (issue #3)', () => {
     const user = userEvent.setup()
     await renderSettings()
 
-    const trigger = screen.getByRole('button', { name: 'About Vault folder' })
-    const control = screen.getByLabelText('Vault folder')
+    const trigger = screen.getByRole('button', { name: 'About Audio Vault' })
+    const control = screen.getByLabelText('Audio Vault')
     const box = {
       top: 300,
       bottom: 316,
@@ -186,8 +186,8 @@ describe('info tooltip (issue #3)', () => {
     const user = userEvent.setup()
     await renderSettings()
 
-    const trigger = screen.getByRole('button', { name: 'About Vault folder' })
-    const control = screen.getByLabelText('Vault folder')
+    const trigger = screen.getByRole('button', { name: 'About Audio Vault' })
+    const control = screen.getByLabelText('Audio Vault')
 
     const viewport = { width: 1024, height: 800 }
     vi.spyOn(window, 'innerWidth', 'get').mockReturnValue(viewport.width)

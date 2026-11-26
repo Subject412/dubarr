@@ -22,6 +22,7 @@ Each `internal/<pkg>` exposes `RegisterRoutes(mux *http.ServeMux, deps Dependenc
 ## Rules
 - Conventional commits. Work on a branch and merge via PR — never commit straight to `main`. Never commit media (`testfiles/`), `data/`, or secrets.
 - Protected (orchestrator-only writes): `AGENTS.md`, `PLAN.md`, `GLOSSARY.md`, `docs/adr/**`, `LICENSE`, applied migrations.
+- Applied migrations are frozen once shipped, and `backend/schema.sql` must stay byte-identical to `0001_initial.sql`. A few comments in `schema.sql`, `0001_initial.sql` and `0002_auth.sql` therefore still cite the deleted `IDEA.md`. That is a historical artefact of the freeze, not a live reference — do not "fix" it by editing an applied migration.
 - Metadata is delegated: dubarr mirrors Radarr/Sonarr and has no TMDB/TVDB client, so a working media manager is a prerequisite (ADR-0014). The mirror is read-only; dubarr never writes it.
 - Vault write-once against the pipeline: every job Copy-on-Works into WORK_DIR and verifies SHA-256; the pipeline never modifies VAULT_DIR in place. The only other vault writes are operator lifecycle actions — remove a track to Trash, replace it with better audio — both previewed and audited (ADR-0015).
 - Linux only. Windows is dropped, not deferred: no Windows build, no Windows docs (ADR-0016).

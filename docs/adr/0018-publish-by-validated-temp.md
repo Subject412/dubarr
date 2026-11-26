@@ -31,7 +31,9 @@ file from ever becoming the target.
 The `.bak` is a convenience copy, kept only when configured, and it is
 overwritten by design on each publish — it is the previous good copy, not a
 history. With automatic re-application (ADR-0017) a `.bak` would be created on
-every arr upgrade, so it defaults to off.
+every arr upgrade, so it should default to off — the code currently seeds
+`KeepBak: true`, which is the discrepancy noted in the status line, not a
+description of intended behaviour.
 
 ### Where it would live, and why that is a problem
 
@@ -79,4 +81,9 @@ original in place. A crash or power loss mid-write leaves the original plus a
   new media, or arr will import a partial file. The hidden `.dubarr-*.tmp` name
   keeps it out of the media-extension set.
 
-Status: accepted — describes the implemented protocol in `internal/mux`.
+Status: accepted. **Steps 1-4 are implemented** in `internal/mux` (temp beside
+the target, `ffprobe` validation, rename, cleanup). **The staleness check is not
+implemented**: `mux.go:216` stats the target once and `mux.go:355` renames
+unconditionally. **`.bak` removal is not implemented**: `settings.go:386` seeds
+`KeepBak: true`, so the current default is the opposite of what this ADR argues
+for. Both are outstanding work, not finished behaviour.

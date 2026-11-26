@@ -56,3 +56,22 @@ decision about dubarr's archive.
 - Nothing is purged without an explicit second decision.
 
 Status: accepted. Amends ADR-0002.
+
+## What this needs before it can be built
+
+None of the following exists today, and the ADR is a decision rather than a
+description of the schema:
+
+- **No `edition` column, no orphan marker, no trash table.** `arr_library_cache`
+  and `audio_tracks` have no concept of any of them, so this needs a migration
+  (0007) covering: edition, an orphaned flag, a trash table, and the identity
+  columns.
+- **Identity collides with `variant`.** The schema already distinguishes tracks
+  by `variant` (`schema.sql:155-156`) — dubbing versus lektor. An identity of
+  `(tmdb/tvdb id, language, edition)` would treat a lektor and a dub of the same
+  language as the same track. `variant` belongs in the identity, and this ADR
+  should be amended when that is decided.
+- **Removal cannot delete the row as written.** `sync_mux_jobs.target_track_id`
+  is `ON DELETE CASCADE` (`schema.sql:179`), so deleting a track erases the job
+  history that ADR-0017 requires in order to explain why a mux ran. The foreign
+  key must stop cascading, or removal must tombstone the row instead.

@@ -1,6 +1,6 @@
 # Dubarr — Implementation Plan
 
-Spec: `VISION.md`. Domain: `GLOSSARY.md`. Decisions: `docs/adr/0001–0016`. Contract: `AGENTS.md`.
+Spec: `VISION.md`. Domain: `GLOSSARY.md`. Decisions: `docs/adr/0001–0018`. Contract: `AGENTS.md`.
 Execution: subagent-driven-development (fresh implementer per task → spec review → quality review). Gate protocol: **stop for user OK at each milestone gate (M1→M5)**. For issues #1–#13 (M7–M10 below) the user settled on continuous execution with **no stop-for-OK gates**; milestones remain work batches only.
 
 ## Status (2026-11-26)

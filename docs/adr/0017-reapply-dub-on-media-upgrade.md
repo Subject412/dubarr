@@ -29,8 +29,12 @@ The decision above is settled. These parameters are not yet:
 1. **Gate interaction — settled: the gate always applies.** Eligibility is a policy
    question — which targets dubarr may touch at all — and the operator answers it
    with a filename tag (in the reference setup, the marker that the upstream video
-   pipeline has finished) or with arr tags on the title. Both are supported; the
-   code already models arr tags as an eligibility source.
+   pipeline has finished) or with arr tags on the title. **Only the filename path
+   is wired today**: `tag_filter.source_mode = "filename"` is implemented and
+   enforced, while `required_arr_tags` / `excluded_arr_tags` exist in settings and
+   `arr_tag_ids_json` is stored, but no non-test code consumes them
+   (`gate.ArrMetadata` is constructed only in tests). The arr-tag path is
+   unscoped work, not existing behaviour.
 
    Muxing before the upstream stage is not destructive: a well-built pipeline keeps
    the audio the operator wants. It is simply wasted, because the pipeline replaces

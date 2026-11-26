@@ -488,8 +488,10 @@ type scannerWiring struct {
 // scanned for donors. With no watch_dir configured it returns (nil, nil) after
 // logging once, so a fresh install can serve the setup wizard.
 //
-// watch_dir, tag_filter and scan_interval are read once at boot; changing them
-// in the UI at runtime requires a restart to take effect.
+// watch_dir, tag_filter and the stability window are read at boot; watch_dir
+// and tag_filter still need a restart to change. scan_interval_sec and
+// stability_check_interval_sec are re-read every scan iteration through
+// watchSettingsProvider, so edits to them apply live.
 func wireScanner(ctx context.Context, deps scannerWiring) (*watch.Scanner, error) {
 	logf := deps.Logf
 	if logf == nil {
@@ -513,12 +515,8 @@ func wireScanner(ctx context.Context, deps scannerWiring) (*watch.Scanner, error
 	if err != nil {
 		return nil, err
 	}
-	interval, err := loadWatchInterval(ctx, deps.Settings)
-	if err != nil {
-		return nil, err
-	}
 
-	scanner, err := watch.New(deps.Store, []string{watchDir}, interval)
+	scanner, err := watch.New(deps.Store, []string{watchDir}, watchSettingsProvider{settings: deps.Settings})
 	if err != nil {
 		return nil, fmt.Errorf("watch scanner: %w", err)
 	}
@@ -908,24 +906,64 @@ func defaultTagFilter() settings.TargetTagFilter {
 	return tf
 }
 
-// loadWatchInterval reads watch.options.scan_interval_sec, defaulting to the
-// settled 10 s cadence when the section is missing or not positive.
-func loadWatchInterval(ctx context.Context, st *settings.Store) (time.Duration, error) {
-	raw, ok, err := st.Get(ctx, settings.KeyWatchOptions)
+// watchSettingsProvider is the watch scanner's live settings source. Every
+// call re-reads watch.options, so editing scan_interval_sec or
+// stability_check_interval_sec in the UI changes the cadence on the scanner's
+// next iteration — no restart (the #53 class of bug).
+type watchSettingsProvider struct {
+	settings *settings.Store
+}
+
+// watchOptions reads and decodes the current watch.options section, falling
+// back to the seeded defaults when the row is absent (a hand-built store
+// before Seed).
+func (p watchSettingsProvider) watchOptions() (settings.WatchOptions, error) {
+	raw, ok, err := p.settings.Get(context.Background(), settings.KeyWatchOptions)
 	if err != nil {
-		return 0, fmt.Errorf("read watch.options: %w", err)
+		return settings.WatchOptions{}, fmt.Errorf("read watch.options: %w", err)
 	}
 	if !ok {
-		return watch.DefaultInterval, nil
+		return defaultWatchOptions(), nil
 	}
 	var opts settings.WatchOptions
 	if err := json.Unmarshal(raw, &opts); err != nil {
-		return 0, fmt.Errorf("decode watch.options: %w", err)
+		return settings.WatchOptions{}, fmt.Errorf("decode watch.options: %w", err)
+	}
+	return opts, nil
+}
+
+// ScanInterval implements watch.OptionsProvider.
+func (p watchSettingsProvider) ScanInterval() (time.Duration, error) {
+	opts, err := p.watchOptions()
+	if err != nil {
+		return 0, err
 	}
 	if opts.ScanIntervalSec <= 0 {
 		return watch.DefaultInterval, nil
 	}
 	return time.Duration(opts.ScanIntervalSec) * time.Second, nil
+}
+
+// StabilityWindow implements watch.OptionsProvider. A non-positive stored
+// value is clamped to the settled 4 s default rather than disabling the
+// stability gate: settings validation rejects it, but a hand-written row must
+// not make the scanner enqueue a file mid-copy.
+func (p watchSettingsProvider) StabilityWindow() (time.Duration, error) {
+	opts, err := p.watchOptions()
+	if err != nil {
+		return 0, err
+	}
+	if opts.StabilityCheckIntervalSec <= 0 {
+		return watch.DefaultStabilityWindow, nil
+	}
+	return time.Duration(opts.StabilityCheckIntervalSec) * time.Second, nil
+}
+
+// defaultWatchOptions is the seeded watch.options value, used when the row is
+// absent (fresh DATA_DIR before Seed, e.g. a hand-built test store).
+func defaultWatchOptions() settings.WatchOptions {
+	opts, _ := settings.Defaults("")[settings.KeyWatchOptions].(settings.WatchOptions)
+	return opts
 }
 
 // Handler exposes the wired mux (used by tests and embed checks).

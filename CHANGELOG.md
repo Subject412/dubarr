@@ -28,6 +28,12 @@ change.
   leaves arr. Amends ADR-0002: write-once still protects the vault from the
   pipeline, not from the operator.
 - ADR-0016: Linux only.
+- ADR-0017: a target that the media manager replaces is re-muxed automatically,
+  because an arr upgrade (WEBDL to BluRay to remux) discards the dub every time.
+  A mux is additive, so the worst case is a wrong audio track, not lost video.
+- ADR-0018: publish by validated temp and atomic rename, written beside the
+  target so the swap is atomic across pools. The `.bak` is a convenience copy,
+  not the safety mechanism.
 
 
 ## [0.3.0]

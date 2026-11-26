@@ -48,12 +48,13 @@ configured, and the vault can still be browsed.
 
 ## Two libraries, two sets of rules
 
-|  | Audio Vault | Mirror |
-|---|---|---|
-| Owned by dubarr | yes | no — a read-only view of arr |
-| May be organised | yes | never |
-| May be deleted | only by explicit operator action | never |
-| Written by | archiving, and operator lifecycle actions | nothing |
+|  | Audio Vault | Mirror Library | Target media files |
+|---|---|---|---|
+| What it is | the audio tracks dubarr archives | arr's catalogue, as arr reports it | the `.mkv` files themselves |
+| Owned by dubarr | yes | no | no — arr's, and yours |
+| May be organised | yes | never | never: dubarr does not rename or move them |
+| Written by | archiving and operator lifecycle actions | arr's rescan; dubarr only reads it | dubarr, deliberately — a validated mux replaces the file. This is the core job |
+| May be deleted | only by explicit operator action | never | never by dubarr |
 
 ## Automation posture
 
@@ -61,12 +62,32 @@ Dubarr is an automated application. It acts without asking wherever an action is
 reversible, and stops for an explicit decision wherever data could be lost.
 
 - **Automatic:** mirroring, matching, identification, extraction, offset
-  analysis, orphan detection.
-- **Gated:** replacing a target file, removing a vault track, purging the trash,
-  reorganising the vault, overriding the Processing Gate.
+  analysis, orphan detection, and **re-applying a dub to a target the media
+  manager replaced**.
+- **Gated:** removing a vault track, purging the Vault Trash, reorganising the
+  vault, overriding the Processing Gate.
 
 Per-row approval for routine matching is not the goal; approval is reserved for
 the steps that cannot be undone.
+
+### Why replacing a target file is automatic
+
+An arr upgrades media constantly: a WEBDL becomes a BluRay, the BluRay becomes a
+remux, and every new file arrives with only the original audio. Each upgrade
+silently throws away the dub that was muxed into the previous file. If dubarr
+waited for a human after every upgrade, the operator would be reopening it
+forever — which defeats the point of having an arr stack at all. The operator
+wants to open Jellyfin, not dubarr.
+
+So a target that changed is re-muxed automatically, because a mux is **additive
+and therefore not destructive**: the video and every existing track are copied
+as-is, the result is validated before it is published, and the worst outcome is a
+container carrying the wrong or a duplicate audio track — recoverable by muxing
+again, with the video never at risk. That is media-container damage, not data
+loss, and the distinction is what decides the automation boundary.
+
+Automatic re-application is still subject to the guardrails in ADR-0017: a proven
+track pair, a fresh offset analysis, and no loop when a file keeps changing.
 
 ## Data-safety invariants
 
@@ -79,10 +100,21 @@ These hold in every version, regardless of what the version number promises:
 3. **Processing never mutates the vault.** Jobs copy out to the Work Area and
    verify SHA-256. The only writes into the vault are archiving and
    operator-initiated lifecycle actions (ADR-0015).
-4. **Atomic publication.** A muxed file replaces the target only after it
-   validates, and the original is kept as `.bak`.
+4. **Publish by validated temp, then swap.** mkvmerge writes a hidden temp in
+   the target's own directory, so the result is on the same filesystem as the
+   file it replaces. That temp is validated with `ffprobe` — the probe must
+   succeed and exactly one audio track must have been appended — and only then is
+   it renamed over the target, which is atomic. A crash leaves the original plus
+   a temp file, never a half-written target. An optional `.bak` may be kept as a
+   convenience copy; it is **not** the safety mechanism, and validation before the
+   rename is.
 5. **Video is never re-encoded.**
-6. **The mirror is never written.** Arr owns the metadata; dubarr only reads it.
+6. **Dubarr never writes arr's metadata.** It writes media files, then asks arr to
+   rescan. Arr re-probes the file, sees the new audio track and updates its own
+   catalogue; the mirror changes because arr changed it, not because dubarr
+   pushed anything. That rescan is also the **confirmation loop**: the next mirror
+   sync showing the muxed track is how dubarr knows the job really landed, rather
+   than trusting its own success report.
 
 ## Versioning
 

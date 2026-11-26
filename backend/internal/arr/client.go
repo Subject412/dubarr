@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -41,11 +42,18 @@ type Radarr interface {
 	Client
 	// Movies lists the Radarr library.
 	Movies(ctx context.Context) ([]Movie, error)
+	// MovieByID reads one movie (GET /api/v3/movie/{id}). It is the read
+	// half of a per-item rescan: the command is accepted asynchronously, so
+	// the caller re-reads the item to see what arr now holds.
+	MovieByID(ctx context.Context, movieID int) (Movie, error)
 	// RescanMovie asks Radarr to rescan one movie's files (command
 	// RescanMovie). It is the movieId-scoped rescan: DownloadedMoviesScan
 	// only accepts path/downloadClientId/importMode and cannot target a
 	// single movie.
 	RescanMovie(ctx context.Context, movieID int) error
+	// Parse asks Radarr's own parser to identify one release name
+	// (POST /api/v3/parse), normalised onto ParseResult.
+	Parse(ctx context.Context, title string) (ParseResult, error)
 }
 
 // Sonarr is the Sonarr-specific client surface.
@@ -53,8 +61,14 @@ type Sonarr interface {
 	Client
 	// Series lists the Sonarr library.
 	Series(ctx context.Context) ([]Series, error)
+	// SeriesByID reads one series (GET /api/v3/series/{id}). It is the read
+	// half of a per-item rescan for an episode row.
+	SeriesByID(ctx context.Context, seriesID int) (Series, error)
 	// RescanSeries asks Sonarr to rescan one series (command RescanSeries).
 	RescanSeries(ctx context.Context, seriesID int) error
+	// Parse asks Sonarr's own parser to identify one release name
+	// (POST /api/v3/parse), normalised onto ParseResult.
+	Parse(ctx context.Context, title string) (ParseResult, error)
 }
 
 // core performs authenticated JSON GETs against one base URL.
@@ -191,6 +205,21 @@ func (c *SonarrClient) Series(ctx context.Context) ([]Series, error) {
 	return out, err
 }
 
+// MovieByID implements Radarr. A missing movie is a 404 from arr, which the
+// shared error model reports as a StatusError.
+func (c *RadarrClient) MovieByID(ctx context.Context, movieID int) (Movie, error) {
+	var out Movie
+	err := c.get(ctx, "/api/v3/movie/"+strconv.Itoa(movieID), &out)
+	return out, err
+}
+
+// SeriesByID implements Sonarr.
+func (c *SonarrClient) SeriesByID(ctx context.Context, seriesID int) (Series, error) {
+	var out Series
+	err := c.get(ctx, "/api/v3/series/"+strconv.Itoa(seriesID), &out)
+	return out, err
+}
+
 // RescanMovie implements Radarr. It posts the RescanMovie command; Radarr's
 // DownloadedMoviesScan command is path-based and takes no movieId.
 func (c *RadarrClient) RescanMovie(ctx context.Context, movieID int) error {
@@ -242,6 +271,13 @@ func (c *core) get(ctx context.Context, path string, out any) error {
 // post performs one authenticated JSON POST. A 2xx response is success; the
 // body is discarded. Errors are scrubbed of the API key and response body.
 func (c *core) post(ctx context.Context, path string, payload any) error {
+	return c.postJSON(ctx, path, payload, nil)
+}
+
+// postJSON is post plus an optional 2xx response body decoded into out (nil
+// discards it). Both products answer /api/v3/parse with a payload, so the
+// decode shares this one request/error path instead of copying it.
+func (c *core) postJSON(ctx context.Context, path string, payload any, out any) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("arr: encode POST %s body: %w", path, err)
@@ -265,6 +301,12 @@ func (c *core) post(ctx context.Context, path string, payload any) error {
 		return fmt.Errorf("%w: POST %s: HTTP %d", ErrAuth, path, resp.StatusCode)
 	case resp.StatusCode < 200 || resp.StatusCode > 299:
 		return &StatusError{Code: resp.StatusCode, Method: http.MethodPost, Path: path}
+	}
+	if out == nil {
+		return nil
+	}
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		return fmt.Errorf("arr: decode POST %s response: %w", path, err)
 	}
 	return nil
 }

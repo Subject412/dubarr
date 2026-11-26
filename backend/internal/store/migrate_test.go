@@ -74,7 +74,9 @@ func columnExists(t *testing.T, db *sql.DB, table, column string) bool {
 
 // TestMigration0005Additive applies 0005 to a COPY of an existing database, so
 // the pre-migration fixture stays untouched, and pins that the revision is
-// purely additive (four new columns) and that re-running it is a no-op.
+// purely additive (four new columns) and that re-running it is a no-op. Later
+// revisions (0006) ride along on the same copy, so the expected end version is
+// the highest embedded one.
 func TestMigration0005Additive(t *testing.T) {
 	dir := t.TempDir()
 	livePath := filepath.Join(dir, "live.db")
@@ -123,12 +125,20 @@ func TestMigration0005Additive(t *testing.T) {
 	defer copied.Close()
 	copied.SetMaxOpenConns(1)
 
+	// Converting the pre-0005 baseline applies 0005 and every later revision on
+	// top of it, so the expected result is the highest embedded version.
+	wantLatest := 0
+	for _, m := range all {
+		if m.Version > wantLatest {
+			wantLatest = m.Version
+		}
+	}
 	latest, err := migrate(copied, embeddedMigrations)
 	if err != nil {
 		t.Fatalf("migrate copy: %v", err)
 	}
-	if latest != 5 {
-		t.Fatalf("migrated copy version = %d, want 5", latest)
+	if latest != wantLatest {
+		t.Fatalf("migrated copy version = %d, want %d", latest, wantLatest)
 	}
 
 	for _, tc := range []struct{ table, column string }{

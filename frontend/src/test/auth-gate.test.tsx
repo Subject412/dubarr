@@ -35,11 +35,14 @@ describe('auth gate routing', () => {
     expect(await screen.findByRole('heading', { name: /sign in/i })).toBeInTheDocument()
   })
 
-  it('renders the shell and library placeholder when authenticated', async () => {
+  it('renders the shell and library page when authenticated', async () => {
     mockStatus({ initialized: true, authenticated: true })
     renderWithProviders(<App />, { route: '/library' })
 
-    expect(await screen.findByText(/Library — coming in M2/)).toBeInTheDocument()
+    expect(await screen.findByRole('heading', { name: 'Library' })).toBeInTheDocument()
+    expect(
+      screen.getByText('Browse titles, inspect tracks and start a sync job.'),
+    ).toBeInTheDocument()
     expect(screen.getAllByRole('link', { name: /Settings/i }).length).toBeGreaterThan(0)
   })
 })

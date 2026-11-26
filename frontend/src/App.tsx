@@ -6,9 +6,9 @@ import { Alert, Button, Spinner } from './components/ui'
 import { UNAUTHORIZED_EVENT, type AuthStatus } from './lib/api'
 import { queryKeys, useAuthStatus, useMe } from './lib/hooks'
 import { ThemeProvider } from './lib/ThemeProvider'
+import { LibraryPage } from './pages/Library'
 import { LoginPage } from './pages/Login'
 import { LogsPage } from './pages/Logs'
-import { PlaceholderPage } from './pages/Placeholder'
 import { QueuePage } from './pages/Queue'
 import { SettingsPage } from './pages/Settings'
 import { SetupPage } from './pages/Setup'
@@ -96,16 +96,7 @@ function App() {
         <Route element={<AuthGate />}>
           <Route element={<AppShell />}>
             <Route index element={<Navigate to="/library" replace />} />
-            <Route
-              path="/library"
-              element={
-                <PlaceholderPage
-                  title="Library"
-                  milestone="M2"
-                  description="Browse titles, inspect tracks and start a sync job."
-                />
-              }
-            />
+            <Route path="/library" element={<LibraryPage />} />
             <Route
               path="/queue"
               element={<QueuePage />}

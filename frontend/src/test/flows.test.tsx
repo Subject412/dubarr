@@ -64,7 +64,10 @@ describe('session expiry (IMP-2, MIN-2)', () => {
     })
     renderWithProviders(<App />, { route: '/login' })
 
-    expect(await screen.findByText(/Library — coming in M2/)).toBeInTheDocument()
+    expect(await screen.findByRole('heading', { name: 'Library' })).toBeInTheDocument()
+    expect(
+      screen.getByText('Browse titles, inspect tracks and start a sync job.'),
+    ).toBeInTheDocument()
   })
 
   it('clears the query cache on logout', async () => {

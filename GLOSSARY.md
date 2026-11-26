@@ -101,6 +101,42 @@ _Avoid_: gate mode
 A target's state: eligible (all required criteria present), waiting_for_tags (criteria missing, blocked while enforced), or missing_target (no file found).
 _Avoid_: tag status
 
+### Arr connections & library
+
+**Draft Test**:
+A connection check run against the values currently typed into the form rather than the saved connection, so an operator can validate a base URL and API key before committing them. Nothing is persisted by a Draft Test.
+_Avoid_: test connection, ping
+
+**Library Health**:
+The per-instance sync state shown to the operator: never synced, failed (the last attempt did not succeed), or up to date. It answers whether the cached arr library can be trusted, separately from whether any donors are waiting.
+_Avoid_: sync status, arr status
+
+**Last Seen At**:
+The time an arr library item was last present in a completed sync pass; an item missing from the cache has not been observed, which is distinct from having been deleted in arr.
+_Avoid_: last updated, synced at
+
+**Manual Refresh**:
+An operator-triggered sync pass that shares the single pass slot with the scheduled poller: whichever starts second is refused rather than queued, and a skipped scheduled tick re-arms shortly instead of waiting a full interval.
+_Avoid_: force sync, resync
+
+### Queue triage
+
+**Match State**:
+A queue card's readiness: unmatched (no arr title identified), matched_no_donor (a target exists but the card is not actionable), or ready (approvable now). `ready` requires everything approval requires, so the state never advertises an action the server would refuse.
+_Avoid_: match status, confidence
+
+**Match Blocker**:
+The machine-readable reason a card is not ready: no match, no target file, missing or excluded gate tags, an unreadable target folder, or no eligible donor. It exists so the interface never has to infer meaning from the human-readable reason sentence.
+_Avoid_: reason, error code
+
+**Identify**:
+An operator-initiated lookup that asks the card's own arr instance to parse the release name and returns ranked library candidates. Identify only suggests; a separate explicit pick persists the match, and the server never chooses on the operator's behalf.
+_Avoid_: auto-match, guess
+
+**Parse Confidence**:
+How a queue row's library match was established. The only value recorded today is `manual` — an operator chose the item by hand — and that is deliberately distinct from a parser-derived match. The other values the schema reserves (`exact`, `ambiguous`, `unmatched`) name parser outcomes and no code path writes them yet.
+_Avoid_: score, match percent
+
 ### Output and processing
 
 **Output Mode**:

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Subject412/dubarr/backend/internal/gate"
 	"github.com/Subject412/dubarr/backend/internal/settings"
 	"github.com/Subject412/dubarr/backend/internal/store"
 )
@@ -40,10 +41,11 @@ func TestMatchesDonorPattern(t *testing.T) {
 }
 
 type harness struct {
-	t     *testing.T
-	db    *sql.DB
-	mux   *http.ServeMux
-	media string
+	t        *testing.T
+	db       *sql.DB
+	mux      *http.ServeMux
+	media    string
+	settings *settings.Store
 }
 
 func newHarness(t *testing.T) *harness {
@@ -68,7 +70,21 @@ func newHarness(t *testing.T) *harness {
 			return h
 		},
 	})
-	return &harness{t: t, db: st.DB, mux: mux, media: t.TempDir()}
+	return &harness{t: t, db: st.DB, mux: mux, media: t.TempDir(), settings: settingsStore}
+}
+
+// enableForceTagOverride turns settings.security.options.allow_force_tag_override
+// on the way the Settings screen does, so the approval gate reads a real
+// section instead of a test-invented flag.
+func (h *harness) enableForceTagOverride(t *testing.T) {
+	t.Helper()
+	raw, err := json.Marshal(settings.SecurityOptions{VaultReadOnly: true, AllowForceTagOverride: true})
+	if err != nil {
+		t.Fatalf("marshal security options: %v", err)
+	}
+	if err := h.settings.Set(context.Background(), settings.KeySecurityOptions, raw); err != nil {
+		t.Fatalf("enable force override: %v", err)
+	}
 }
 
 func (h *harness) request(method, path string) *httptest.ResponseRecorder {
@@ -137,6 +153,37 @@ func (h *harness) seedCandidate(t *testing.T, targetName, gateStatus string, aud
 		t.Fatalf("candidate id: %v", err)
 	}
 	return id
+}
+
+// applyGate persists a gate classification for the seeded candidate the way the
+// gate service does, so the queue reads a real verdict instead of the bare
+// status seedCandidate writes.
+func (h *harness) applyGate(t *testing.T, id int64, targetPath string, res gate.Result) {
+	t.Helper()
+	var source string
+	if err := h.db.QueryRow(
+		`SELECT source_file_path FROM import_queue WHERE id = ?`, id).Scan(&source); err != nil {
+		t.Fatalf("gate row: %v", err)
+	}
+	st := &store.Store{DB: h.db}
+	if err := st.SetImportCandidateGate(context.Background(), source, store.ImportGateStatus{
+		Status:      string(res.Status),
+		TargetPath:  targetPath,
+		MatchedTags: res.Matched,
+		MissingTags: res.Missing,
+	}); err != nil {
+		t.Fatalf("SetImportCandidateGate: %v", err)
+	}
+}
+
+// clearGateVerdict drops the stored gate record while leaving the arr library
+// row's eligibility_status in place: the shape arrsync writes for a target it
+// classified without the gate service.
+func (h *harness) clearGateVerdict(t *testing.T, id int64) {
+	t.Helper()
+	if _, err := h.db.Exec(`UPDATE import_queue SET parsed_raw_json = '{}' WHERE id = ?`, id); err != nil {
+		t.Fatalf("clear gate verdict: %v", err)
+	}
 }
 
 var donorName = "Minions and Monsters 2026 PL.DUB.MD.1080p.AMZN.WEB-DL.XviD-MAXX.mp4"
@@ -419,6 +466,778 @@ func TestListQueueExposesMatchState(t *testing.T) {
 	}
 }
 
+func TestQueueMatchStateUnmatched(t *testing.T) {
+	h := newHarness(t)
+	h.seedUnmatchedCandidate(t)
+
+	item := onlyMatchItem(t, h.listMatchItems(t))
+	if item.Matched {
+		t.Errorf("matched = true, want false")
+	}
+	if item.MatchState != MatchStateUnmatched {
+		t.Errorf("match_state = %q, want %q", item.MatchState, MatchStateUnmatched)
+	}
+	if !strings.Contains(strings.ToLower(item.MatchReason), "no arr title matched") {
+		t.Errorf("match_reason = %q, want it to say no arr title matched", item.MatchReason)
+	}
+	if item.MatchBlocker != MatchBlockerNoMatch {
+		t.Errorf("match_blocker = %q, want %q", item.MatchBlocker, MatchBlockerNoMatch)
+	}
+}
+
+func TestQueueMatchStateMatchedNoDonor(t *testing.T) {
+	h := newHarness(t)
+	h.seedCandidate(t, "Shrek (2001) [Remux].mkv", "eligible", `["en"]`)
+
+	item := onlyMatchItem(t, h.listMatchItems(t))
+	if !item.Matched {
+		t.Errorf("matched = false, want true")
+	}
+	if item.MatchState != MatchStateMatchedNoDonor {
+		t.Errorf("match_state = %q, want %q", item.MatchState, MatchStateMatchedNoDonor)
+	}
+	if len(item.Donors) != 0 {
+		t.Errorf("donor candidates = %d, want 0", len(item.Donors))
+	}
+	if !strings.Contains(item.MatchReason, "PL.DUB") {
+		t.Errorf("match_reason = %q, want it to name the dubbing marker", item.MatchReason)
+	}
+	if item.MatchBlocker != MatchBlockerNoDonor {
+		t.Errorf("match_blocker = %q, want %q", item.MatchBlocker, MatchBlockerNoDonor)
+	}
+}
+
+func TestQueueMatchStateReady(t *testing.T) {
+	h := newHarness(t)
+	h.seedCandidate(t, "Target [ArcA310].mkv", "eligible", `["en"]`)
+	h.writeDonor(t)
+
+	item := onlyMatchItem(t, h.listMatchItems(t))
+	if !item.Matched {
+		t.Errorf("matched = false, want true")
+	}
+	if item.MatchState != MatchStateReady {
+		t.Errorf("match_state = %q, want %q", item.MatchState, MatchStateReady)
+	}
+	if len(item.Donors) == 0 {
+		t.Errorf("donor candidates = 0, want at least one")
+	}
+	if item.MatchReason != "Ready to approve." {
+		t.Errorf("match_reason = %q, want %q", item.MatchReason, "Ready to approve.")
+	}
+	if item.MatchBlocker != MatchBlockerNone {
+		t.Errorf("match_blocker = %q, want %q", item.MatchBlocker, MatchBlockerNone)
+	}
+}
+
+func TestQueueMatchStateIneligibleTarget(t *testing.T) {
+	h := newHarness(t)
+	h.seedCandidate(t, "Shrek (2001) [Remux].mkv", "waiting_for_tags", `["en"]`)
+	// A donor exists, but the target is not gate-eligible: the row must not
+	// claim `ready`. handleApprove refuses exactly this row (ADR-0005/ADR-0009:
+	// an ineligible target is left completely alone and rejected at sync-job
+	// creation), so the card must not advertise it as approvable either — the
+	// ready verdict is a claim about the gate, not about the donor listing, and
+	// donors are never tag-gated.
+	h.writeDonor(t)
+
+	item := onlyMatchItem(t, h.listMatchItems(t))
+	if !item.Matched {
+		t.Errorf("matched = false, want true")
+	}
+	if len(item.Donors) == 0 {
+		t.Fatalf("donor candidates = 0, want at least one so eligibility alone decides")
+	}
+	if item.MatchState == MatchStateReady {
+		t.Errorf("match_state = %q, want it not to be %q for an ineligible target", item.MatchState, MatchStateReady)
+	}
+	if item.MatchState != MatchStateMatchedNoDonor {
+		t.Errorf("match_state = %q, want %q", item.MatchState, MatchStateMatchedNoDonor)
+	}
+	if !strings.Contains(item.MatchReason, "not eligible") {
+		t.Errorf("match_reason = %q, want it to explain the eligibility verdict", item.MatchReason)
+	}
+	// The seed records no missing tag, so a waiting verdict can only come from
+	// an exclusion: the reason must not invent a missing tag.
+	if strings.Contains(strings.ToLower(item.MatchReason), "missing") {
+		t.Errorf("match_reason = %q, want no missing-tag claim when the gate recorded none", item.MatchReason)
+	}
+	if !strings.Contains(strings.ToLower(item.MatchReason), "excluded") {
+		t.Errorf("match_reason = %q, want it to name the excluded tag that blocked the target", item.MatchReason)
+	}
+	if item.MatchBlocker != MatchBlockerGateExcluded {
+		t.Errorf("match_blocker = %q, want %q", item.MatchBlocker, MatchBlockerGateExcluded)
+	}
+}
+
+// TestQueueMatchStateExcludedTagReason classifies a target that carries an
+// excluded tag with the real gate rule, so the stored verdict has every
+// required tag matched and nothing missing: the queue must blame the exclusion.
+func TestQueueMatchStateExcludedTagReason(t *testing.T) {
+	h := newHarness(t)
+	target := "Shrek (2001) [ArcA310] [X].mkv"
+	id := h.seedCandidate(t, target, "waiting_for_tags", `["en"]`)
+
+	rule := gate.Rule{Required: []string{"[ArcA310]"}, Excluded: []string{"[X]"}, Mode: gate.MatchAny, Enforce: true}
+	res := rule.Classify(target)
+	if res.Status != gate.StatusWaitingForTags || len(res.Missing) != 0 {
+		t.Fatalf("gate verdict = %+v, want waiting_for_tags with no missing tag", res)
+	}
+	h.applyGate(t, id, filepath.Join(h.media, target), res)
+
+	item := onlyMatchItem(t, h.listMatchItems(t))
+	if item.MatchState != MatchStateMatchedNoDonor {
+		t.Errorf("match_state = %q, want %q", item.MatchState, MatchStateMatchedNoDonor)
+	}
+	lower := strings.ToLower(item.MatchReason)
+	if !strings.Contains(lower, "excluded") {
+		t.Errorf("match_reason = %q, want it to name the exclusion", item.MatchReason)
+	}
+	if strings.Contains(lower, "missing") {
+		t.Errorf("match_reason = %q, want no missing-tag claim for an excluded tag", item.MatchReason)
+	}
+	if item.MatchBlocker != MatchBlockerGateExcluded {
+		t.Errorf("match_blocker = %q, want %q", item.MatchBlocker, MatchBlockerGateExcluded)
+	}
+}
+
+// TestQueueMatchStateMissingTagReason covers the other proven cause: the gate
+// recorded the required tags it could not find.
+func TestQueueMatchStateMissingTagReason(t *testing.T) {
+	h := newHarness(t)
+	target := "Shrek (2001) [Remux].mkv"
+	id := h.seedCandidate(t, target, "waiting_for_tags", `["en"]`)
+
+	rule := gate.Rule{Required: []string{"[ArcA310]"}, Mode: gate.MatchAny, Enforce: true}
+	res := rule.Classify(target)
+	if res.Status != gate.StatusWaitingForTags || len(res.Missing) != 1 {
+		t.Fatalf("gate verdict = %+v, want waiting_for_tags naming one missing tag", res)
+	}
+	h.applyGate(t, id, filepath.Join(h.media, target), res)
+
+	item := onlyMatchItem(t, h.listMatchItems(t))
+	lower := strings.ToLower(item.MatchReason)
+	if !strings.Contains(item.MatchReason, "[ArcA310]") {
+		t.Errorf("match_reason = %q, want it to name the missing tag", item.MatchReason)
+	}
+	if !strings.Contains(lower, "missing") {
+		t.Errorf("match_reason = %q, want it to say the required tag is missing", item.MatchReason)
+	}
+	if strings.Contains(lower, "excluded") {
+		t.Errorf("match_reason = %q, want no exclusion claim when the gate recorded a missing tag", item.MatchReason)
+	}
+	if item.MatchBlocker != MatchBlockerGateTags {
+		t.Errorf("match_blocker = %q, want %q", item.MatchBlocker, MatchBlockerGateTags)
+	}
+}
+
+// TestQueueMatchStateNoGateVerdictIsNeutral covers a row whose eligibility came
+// from the arr library row (arrsync writes waiting_for_tags for a missing arr
+// tag or a target outside the root-folder allowlist) with no gate record: the
+// queue cannot tell those causes apart and must not name one.
+func TestQueueMatchStateNoGateVerdictIsNeutral(t *testing.T) {
+	h := newHarness(t)
+	id := h.seedCandidate(t, "Shrek (2001) [Remux].mkv", "waiting_for_tags", `["en"]`)
+	h.clearGateVerdict(t, id)
+
+	item := onlyMatchItem(t, h.listMatchItems(t))
+	if item.MatchState != MatchStateMatchedNoDonor {
+		t.Errorf("match_state = %q, want %q", item.MatchState, MatchStateMatchedNoDonor)
+	}
+	lower := strings.ToLower(item.MatchReason)
+	if !strings.Contains(lower, "waiting for tags") {
+		t.Errorf("match_reason = %q, want the cause-neutral gate wording", item.MatchReason)
+	}
+	for _, forbidden := range []string{"missing", "excluded"} {
+		if strings.Contains(lower, forbidden) {
+			t.Errorf("match_reason = %q, want no %q claim without a gate record", item.MatchReason, forbidden)
+		}
+	}
+	// The cause is real but not provable from this row: the blocker must say
+	// so instead of picking one of the candidate causes.
+	if item.MatchBlocker != MatchBlockerUnknown {
+		t.Errorf("match_blocker = %q, want %q", item.MatchBlocker, MatchBlockerUnknown)
+	}
+}
+
+// TestQueueMatchStateUnreadableTargetFolder pins that an unlistable folder is
+// reported as such: an unmounted library has no donors to see, so claiming that
+// no sibling carries the marker would be a confident falsehood.
+func TestQueueMatchStateUnreadableTargetFolder(t *testing.T) {
+	h := newHarness(t)
+	h.seedCandidate(t, "Target [ArcA310].mkv", "eligible", `["en"]`)
+	h.writeDonor(t)
+	// Simulate the mount going away after ingest: the target path survives in
+	// the row, its folder does not.
+	if err := os.RemoveAll(h.media); err != nil {
+		t.Fatalf("remove media dir: %v", err)
+	}
+
+	item := onlyMatchItem(t, h.listMatchItems(t))
+	if item.MatchState != MatchStateMatchedNoDonor {
+		t.Errorf("match_state = %q, want %q", item.MatchState, MatchStateMatchedNoDonor)
+	}
+	if len(item.Donors) != 0 {
+		t.Errorf("donor candidates = %d, want 0", len(item.Donors))
+	}
+	if !strings.Contains(item.MatchReason, "could not be read") {
+		t.Errorf("match_reason = %q, want it to report the unreadable folder", item.MatchReason)
+	}
+	if !strings.Contains(item.MatchReason, "library mount") {
+		t.Errorf("match_reason = %q, want it to point at the library mount", item.MatchReason)
+	}
+	if strings.Contains(item.MatchReason, "dubbing marker") {
+		t.Errorf("match_reason = %q, want no marker claim for a folder it could not list", item.MatchReason)
+	}
+	if item.MatchBlocker != MatchBlockerMount {
+		t.Errorf("match_blocker = %q, want %q", item.MatchBlocker, MatchBlockerMount)
+	}
+}
+
+// TestQueueMatchStateBlankDonorPattern pins that a blank pattern list produces
+// no marker claim: there is no marker to look for, so the reason only says no
+// sibling file is eligible.
+func TestQueueMatchStateBlankDonorPattern(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "Target [ArcA310].mkv")
+	if err := os.WriteFile(target, []byte("target"), 0o644); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	donors, err := pairDonors(target, []string{""})
+	if err != nil {
+		t.Fatalf("pairDonors: %v", err)
+	}
+	if len(donors) != 0 {
+		t.Fatalf("donor candidates = %d, want 0", len(donors))
+	}
+
+	row := store.ImportCandidateSummary{Matched: true, TargetPath: target, Eligibility: "eligible"}
+	state, reason, blocker := deriveMatchState(row, donors, err, []string{""}, false)
+	if state != MatchStateMatchedNoDonor {
+		t.Errorf("match_state = %q, want %q", state, MatchStateMatchedNoDonor)
+	}
+	if reason != "No sibling file is eligible as a donor." {
+		t.Errorf("match_reason = %q, want the neutral donor wording", reason)
+	}
+	if blocker != MatchBlockerNoDonor {
+		t.Errorf("match_blocker = %q, want %q", blocker, MatchBlockerNoDonor)
+	}
+}
+
+// TestQueueMatchStateNoTargetFileBlocker pins the machine-readable side of the
+// no-target case: a matched row without a target file reports no_target, and a
+// gate-recorded missing target file is the same operator-side blocker.
+func TestQueueMatchStateNoTargetFileBlocker(t *testing.T) {
+	tests := []struct {
+		name string
+		row  store.ImportCandidateSummary
+		want string
+	}{
+		{
+			name: "matched without target path",
+			row:  store.ImportCandidateSummary{Matched: true, Eligibility: "eligible"},
+			want: MatchBlockerNoTarget,
+		},
+		{
+			name: "gate recorded a missing target file",
+			row:  store.ImportCandidateSummary{Matched: true, TargetPath: "/media/Target.mkv", Eligibility: "missing_target"},
+			want: MatchBlockerNoTarget,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			state, reason, blocker := deriveMatchState(tc.row, nil, nil, defaultDonorPatterns, false)
+			if state != MatchStateMatchedNoDonor {
+				t.Errorf("match_state = %q, want %q", state, MatchStateMatchedNoDonor)
+			}
+			if strings.TrimSpace(reason) == "" {
+				t.Errorf("match_reason is empty, want a human explanation")
+			}
+			if blocker != tc.want {
+				t.Errorf("match_blocker = %q, want %q", blocker, tc.want)
+			}
+		})
+	}
+}
+
+// TestApproveUnreadableTargetFolderReportsMount pins that approve words the
+// same failure as the card: an unlistable folder is a mount problem, not proof
+// that no donor exists.
+func TestApproveUnreadableTargetFolderReportsMount(t *testing.T) {
+	h := newHarness(t)
+	id := h.seedCandidate(t, "Target [ArcA310].mkv", "eligible", `["en"]`)
+	h.writeDonor(t)
+	if err := os.RemoveAll(h.media); err != nil {
+		t.Fatalf("remove media dir: %v", err)
+	}
+
+	rec := h.request(http.MethodPost, "/api/queue/"+itoa(id)+"/approve")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("approve with unreadable folder = %d, want 409, body %s", rec.Code, rec.Body.String())
+	}
+	if body := rec.Body.String(); !strings.Contains(body, "library mount") {
+		t.Errorf("body = %s, want it to point at the library mount", body)
+	}
+	var status string
+	if err := h.db.QueryRow(`SELECT status FROM import_queue WHERE id = ?`, id).Scan(&status); err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if status != "pending_approval" {
+		t.Errorf("status after refused approve = %q, want pending_approval", status)
+	}
+}
+
+// TestQueueMatchStateReadyRequiresEligibility pins that ready means approvable
+// now: it is produced only for a matched, gate-eligible target that has a donor.
+func TestQueueMatchStateReadyRequiresEligibility(t *testing.T) {
+	tests := []struct {
+		name       string
+		target     string
+		seedElig   string
+		withDonor  bool
+		wantReady  bool
+		wantReason string
+		// wantReasonAny accepts any of several phrasings of the same blocker;
+		// used where the wording is not pinned (the reason may name either the
+		// missing donor or the dubbing marker the donor must carry).
+		wantReasonAny []string
+	}{
+		{
+			name:      "eligible with donor",
+			target:    "Target [ArcA310].mkv",
+			seedElig:  "eligible",
+			withDonor: true,
+			wantReady: true,
+		},
+		{
+			name:      "eligible without donor",
+			target:    "Target [ArcA310].mkv",
+			seedElig:  "eligible",
+			wantReady: false,
+			// The reason must blame the missing donor, naming either the donor
+			// itself or the dubbing marker a donor release has to carry.
+			wantReasonAny: []string{"no donor", "dubbing marker", "sibling"},
+		},
+		{
+			name:       "waiting for tags with donor",
+			target:     "Target [ArcA310].mkv",
+			seedElig:   "waiting_for_tags",
+			withDonor:  true,
+			wantReady:  false,
+			wantReason: "not eligible",
+		},
+		{
+			name:       "missing target with donor",
+			target:     "Target [ArcA310].mkv",
+			seedElig:   "missing_target",
+			withDonor:  true,
+			wantReady:  false,
+			wantReason: "not eligible",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			h.seedCandidate(t, tc.target, tc.seedElig, `["en"]`)
+			if tc.withDonor {
+				h.writeDonor(t)
+			}
+
+			item := onlyMatchItem(t, h.listMatchItems(t))
+			if !item.Matched {
+				t.Fatalf("matched = false, want true")
+			}
+			if gotReady := item.MatchState == MatchStateReady; gotReady != tc.wantReady {
+				t.Errorf("match_state = %q, want ready=%v", item.MatchState, tc.wantReady)
+			}
+			if !tc.wantReady {
+				if item.MatchState != MatchStateMatchedNoDonor {
+					t.Errorf("match_state = %q, want %q", item.MatchState, MatchStateMatchedNoDonor)
+				}
+				lowerReason := strings.ToLower(item.MatchReason)
+				if len(tc.wantReasonAny) > 0 {
+					mentioned := false
+					for _, want := range tc.wantReasonAny {
+						if strings.Contains(lowerReason, want) {
+							mentioned = true
+							break
+						}
+					}
+					if !mentioned {
+						t.Errorf("match_reason = %q, want it to name the missing donor (any of %v)", item.MatchReason, tc.wantReasonAny)
+					}
+					// The target is eligible here: the reason must blame the donor,
+					// not the gate verdict.
+					if strings.Contains(lowerReason, "not eligible") {
+						t.Errorf("match_reason = %q, want it to blame the missing donor, not eligibility", item.MatchReason)
+					}
+				}
+				if tc.wantReason != "" && !strings.Contains(lowerReason, tc.wantReason) {
+					t.Errorf("match_reason = %q, want it to mention %q", item.MatchReason, tc.wantReason)
+				}
+			}
+		})
+	}
+}
+
+// TestQueueMatchStateConsistentWithMatched pins the invariant the UI relies on:
+// match_state is unmatched exactly when matched is false.
+func TestQueueMatchStateConsistentWithMatched(t *testing.T) {
+	tests := []struct {
+		name        string
+		seed        func(*harness)
+		wantMatched bool
+		wantState   string
+	}{
+		{
+			name:        "no arr target",
+			seed:        func(h *harness) { h.seedUnmatchedCandidate(h.t) },
+			wantMatched: false,
+			wantState:   MatchStateUnmatched,
+		},
+		{
+			name:        "target without donor",
+			seed:        func(h *harness) { h.seedCandidate(h.t, "Shrek (2001).mkv", "eligible", `["en"]`) },
+			wantMatched: true,
+			wantState:   MatchStateMatchedNoDonor,
+		},
+		{
+			name: "target with donor",
+			seed: func(h *harness) {
+				h.seedCandidate(h.t, "Target [ArcA310].mkv", "eligible", `["en"]`)
+				h.writeDonor(h.t)
+			},
+			wantMatched: true,
+			wantState:   MatchStateReady,
+		},
+		{
+			name:        "ineligible target",
+			seed:        func(h *harness) { h.seedCandidate(h.t, "Shrek (2001).mkv", "waiting_for_tags", `["en"]`) },
+			wantMatched: true,
+			wantState:   MatchStateMatchedNoDonor,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			tc.seed(h)
+
+			item := onlyMatchItem(t, h.listMatchItems(t))
+			if item.Matched != tc.wantMatched {
+				t.Errorf("matched = %v, want %v", item.Matched, tc.wantMatched)
+			}
+			if gotUnmatched := item.MatchState == MatchStateUnmatched; gotUnmatched != !item.Matched {
+				t.Errorf("invariant broken: matched=%v match_state=%q", item.Matched, item.MatchState)
+			}
+			if item.MatchState != tc.wantState {
+				t.Errorf("match_state = %q, want %q", item.MatchState, tc.wantState)
+			}
+			if strings.TrimSpace(item.MatchReason) == "" {
+				t.Errorf("match_reason is empty, want a human explanation")
+			}
+		})
+	}
+}
+
+// TestQueueMatchBlockerConsistentWithState pins the invariant clients rely on:
+// match_blocker is "none" exactly when match_state is "ready", and every other
+// row names a blocker.
+func TestQueueMatchBlockerConsistentWithState(t *testing.T) {
+	tests := []struct {
+		name string
+		seed func(*harness)
+	}{
+		{
+			name: "ready",
+			seed: func(h *harness) {
+				h.seedCandidate(h.t, "Target [ArcA310].mkv", "eligible", `["en"]`)
+				h.writeDonor(h.t)
+			},
+		},
+		{
+			name: "no arr target",
+			seed: func(h *harness) { h.seedUnmatchedCandidate(h.t) },
+		},
+		{
+			name: "target without donor",
+			seed: func(h *harness) { h.seedCandidate(h.t, "Shrek (2001).mkv", "eligible", `["en"]`) },
+		},
+		{
+			name: "excluded tag",
+			seed: func(h *harness) { h.seedCandidate(h.t, "Shrek (2001) [X].mkv", "waiting_for_tags", `["en"]`) },
+		},
+		{
+			name: "missing required tag",
+			seed: func(h *harness) {
+				target := "Shrek (2001) [Remux].mkv"
+				id := h.seedCandidate(h.t, target, "waiting_for_tags", `["en"]`)
+				rule := gate.Rule{Required: []string{"[ArcA310]"}, Mode: gate.MatchAny, Enforce: true}
+				h.applyGate(h.t, id, filepath.Join(h.media, target), rule.Classify(target))
+			},
+		},
+		{
+			name: "unreadable target folder",
+			seed: func(h *harness) {
+				h.seedCandidate(h.t, "Target [ArcA310].mkv", "eligible", `["en"]`)
+				if err := os.RemoveAll(h.media); err != nil {
+					h.t.Fatalf("remove media dir: %v", err)
+				}
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			tc.seed(h)
+
+			item := onlyMatchItem(t, h.listMatchItems(t))
+			if strings.TrimSpace(item.MatchBlocker) == "" {
+				t.Fatalf("match_blocker is empty, want a machine-readable blocker")
+			}
+			if gotReady := item.MatchState == MatchStateReady; gotReady != (item.MatchBlocker == MatchBlockerNone) {
+				t.Errorf("match_state = %q with match_blocker = %q: %q must hold exactly for %q",
+					item.MatchState, item.MatchBlocker, MatchBlockerNone, MatchStateReady)
+			}
+		})
+	}
+}
+
+// queueMatchItem is the match-state slice of one GET /api/queue item.
+type queueMatchItem struct {
+	ID           int64  `json:"id"`
+	Filename     string `json:"filename"`
+	Matched      bool   `json:"matched"`
+	MatchState   string `json:"match_state"`
+	MatchReason  string `json:"match_reason"`
+	MatchBlocker string `json:"match_blocker"`
+	Donors       []struct {
+		Path string `json:"path"`
+	} `json:"donor_candidates"`
+}
+
+func (h *harness) listMatchItems(t *testing.T) []queueMatchItem {
+	t.Helper()
+	rec := h.request(http.MethodGet, "/api/queue")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/queue = %d, body %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Items []queueMatchItem `json:"items"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	return body.Items
+}
+
+func onlyMatchItem(t *testing.T, items []queueMatchItem) queueMatchItem {
+	t.Helper()
+	if len(items) != 1 {
+		t.Fatalf("items = %d, want 1", len(items))
+	}
+	return items[0]
+}
+
+// queueDiagnosticsBody is the diagnostics slice of GET /api/queue. LastPassAt
+// is a pointer so JSON null and a real timestamp stay distinguishable.
+type queueDiagnosticsBody struct {
+	Diagnostics struct {
+		InstancesConfigured int64   `json:"instances_configured"`
+		NeverSynced         int64   `json:"never_synced"`
+		SyncFailed          int64   `json:"sync_failed"`
+		LastPassAt          *string `json:"last_pass_at"`
+		CacheItems          int64   `json:"cache_items"`
+		HealthAvailable     *bool   `json:"sync_health_available"`
+		ForceTagOverride    *bool   `json:"force_tag_override"`
+	} `json:"diagnostics"`
+}
+
+// listDiagnostics reads the diagnostics object alongside the (possibly empty)
+// item list and asserts the envelope still answers 200.
+func (h *harness) listDiagnostics(t *testing.T) queueDiagnosticsBody {
+	t.Helper()
+	rec := h.request(http.MethodGet, "/api/queue")
+	if rec.Code != http.StatusOK {
+		h.t.Fatalf("GET /api/queue = %d, body %s", rec.Code, rec.Body.String())
+	}
+	var body queueDiagnosticsBody
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		h.t.Fatalf("decode: %v", err)
+	}
+	return body
+}
+
+// seedArrInstance inserts an arr_instances row with no recorded attempt, the
+// state of a configured instance the sync layer has not polled yet.
+func (h *harness) seedArrInstance(t *testing.T, kind string) int64 {
+	t.Helper()
+	res, err := h.db.ExecContext(context.Background(),
+		`INSERT INTO arr_instances (name, type, base_url, api_key_enc, api_key_last4)
+		 VALUES (?, ?, 'http://arr.invalid', x'00', '0000')`, kind, kind)
+	if err != nil {
+		t.Fatalf("insert arr instance: %v", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		t.Fatalf("arr instance id: %v", err)
+	}
+	return id
+}
+
+// TestQueueDiagnosticsNoInstances pins the "no instances configured" shape:
+// nothing configured means nothing to count and no pass time.
+func TestQueueDiagnosticsNoInstances(t *testing.T) {
+	h := newHarness(t)
+
+	diag := h.listDiagnostics(t).Diagnostics
+	if diag.InstancesConfigured != 0 {
+		t.Errorf("instances_configured = %d, want 0", diag.InstancesConfigured)
+	}
+	if diag.NeverSynced != 0 || diag.SyncFailed != 0 || diag.CacheItems != 0 {
+		t.Errorf("never_synced=%d sync_failed=%d cache_items=%d, want all 0",
+			diag.NeverSynced, diag.SyncFailed, diag.CacheItems)
+	}
+	if diag.LastPassAt != nil {
+		t.Errorf("last_pass_at = %q, want null", *diag.LastPassAt)
+	}
+}
+
+// TestQueueDiagnosticsNeverSynced pins "configured but never attempted": one
+// instance with no recorded attempt, so no pass time exists.
+func TestQueueDiagnosticsNeverSynced(t *testing.T) {
+	h := newHarness(t)
+	h.seedArrInstance(t, "radarr")
+
+	diag := h.listDiagnostics(t).Diagnostics
+	if diag.InstancesConfigured != 1 {
+		t.Errorf("instances_configured = %d, want 1", diag.InstancesConfigured)
+	}
+	if diag.NeverSynced != 1 {
+		t.Errorf("never_synced = %d, want 1", diag.NeverSynced)
+	}
+	if diag.SyncFailed != 0 {
+		t.Errorf("sync_failed = %d, want 0", diag.SyncFailed)
+	}
+	if diag.LastPassAt != nil {
+		t.Errorf("last_pass_at = %q, want null", *diag.LastPassAt)
+	}
+}
+
+// TestQueueDiagnosticsSyncFailed pins the failed-pass shape. RecordArrInstanceSyncFailure
+// stamps last_attempt_at and clears last_sync_ok but deliberately leaves
+// last_sync_at (the last SUCCESS) untouched, so with no earlier success the
+// attempt exists yet there is still no pass: last_pass_at stays null.
+func TestQueueDiagnosticsSyncFailed(t *testing.T) {
+	h := newHarness(t)
+	id := h.seedArrInstance(t, "radarr")
+	st := &store.Store{DB: h.db}
+	if err := st.RecordArrInstanceSyncFailure(context.Background(), id, "connection refused"); err != nil {
+		t.Fatalf("RecordArrInstanceSyncFailure: %v", err)
+	}
+
+	diag := h.listDiagnostics(t).Diagnostics
+	if diag.SyncFailed != 1 {
+		t.Errorf("sync_failed = %d, want 1", diag.SyncFailed)
+	}
+	if diag.NeverSynced != 0 {
+		t.Errorf("never_synced = %d, want 0 (the attempt happened)", diag.NeverSynced)
+	}
+	if diag.InstancesConfigured != 1 {
+		t.Errorf("instances_configured = %d, want 1", diag.InstancesConfigured)
+	}
+	if diag.LastPassAt != nil {
+		t.Errorf("last_pass_at = %q, want null: a failure is not a pass", *diag.LastPassAt)
+	}
+}
+
+// TestQueueDiagnosticsCountsCacheItems pins that a synced-but-empty queue still
+// reports how much of the library is cached (all kinds, all instances).
+func TestQueueDiagnosticsCountsCacheItems(t *testing.T) {
+	h := newHarness(t)
+	h.seedLibraryRow(t, "Kraina Lodu", 2013)
+	h.seedLibraryRow(t, "Shrek", 2001)
+
+	diag := h.listDiagnostics(t).Diagnostics
+	if diag.CacheItems != 2 {
+		t.Errorf("cache_items = %d, want 2", diag.CacheItems)
+	}
+	if diag.InstancesConfigured != 2 {
+		t.Errorf("instances_configured = %d, want 2", diag.InstancesConfigured)
+	}
+}
+
+// TestQueueDiagnosticsSurvivesStoreError pins that an unreadable library cache
+// cannot take the approval queue down: the list still answers 200 with its
+// rows and zeroed diagnostics.
+func TestQueueDiagnosticsSurvivesStoreError(t *testing.T) {
+	h := newHarness(t)
+	h.seedCandidate(t, "Target [ArcA310].mkv", "eligible", `["en"]`)
+	// Simulate the health projection being unreadable while the approval
+	// queue itself stays intact (arr_instances is not part of the list query,
+	// so the queue rows still load).
+	if _, err := h.db.Exec(`ALTER TABLE arr_instances RENAME TO arr_instances_unreadable`); err != nil {
+		t.Fatalf("rename arr_instances: %v", err)
+	}
+
+	rec := h.request(http.MethodGet, "/api/queue")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/queue with unreadable health = %d, want 200, body %s",
+			rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Items       []json.RawMessage `json:"items"`
+		Diagnostics struct {
+			InstancesConfigured int64   `json:"instances_configured"`
+			NeverSynced         int64   `json:"never_synced"`
+			SyncFailed          int64   `json:"sync_failed"`
+			LastPassAt          *string `json:"last_pass_at"`
+			CacheItems          int64   `json:"cache_items"`
+		} `json:"diagnostics"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(body.Items) != 1 {
+		t.Errorf("items = %d, want the queue rows intact", len(body.Items))
+	}
+	diag := body.Diagnostics
+	if diag.InstancesConfigured != 0 || diag.NeverSynced != 0 || diag.SyncFailed != 0 || diag.CacheItems != 0 {
+		t.Errorf("diagnostics = %+v, want zeroed", diag)
+	}
+	if diag.LastPassAt != nil {
+		t.Errorf("last_pass_at = %q, want null", *diag.LastPassAt)
+	}
+}
+
+// TestQueueDiagnosticsMarksUnavailableOnStoreError pins the explicit signal an
+// unreadable health read owes the UI: the counts are zeroed, so without a flag
+// an empty queue cannot be told apart from "no arr instance is configured". The
+// healthy path must claim the opposite, or the flag would be useless.
+func TestQueueDiagnosticsMarksUnavailableOnStoreError(t *testing.T) {
+	h := newHarness(t)
+	h.seedArrInstance(t, "radarr")
+
+	healthy := h.listDiagnostics(t).Diagnostics
+	if healthy.HealthAvailable == nil || !*healthy.HealthAvailable {
+		t.Fatalf("sync_health_available = %v, want true on a readable health projection", healthy.HealthAvailable)
+	}
+
+	// Break the health projection only: the queue rows still load.
+	if _, err := h.db.Exec(`ALTER TABLE arr_instances RENAME TO arr_instances_unreadable`); err != nil {
+		t.Fatalf("rename arr_instances: %v", err)
+	}
+	unavailable := h.listDiagnostics(t).Diagnostics
+	if unavailable.HealthAvailable == nil {
+		t.Fatal("sync_health_available missing from the unavailable payload")
+	}
+	if *unavailable.HealthAvailable {
+		t.Errorf("sync_health_available = true, want false when the health read failed")
+	}
+	if unavailable.InstancesConfigured != 0 || unavailable.NeverSynced != 0 || unavailable.SyncFailed != 0 {
+		t.Errorf("diagnostics = %+v, want zeroed counts alongside the flag", unavailable)
+	}
+}
+
 func TestSearchLibraryEndpoint(t *testing.T) {
 	h := newHarness(t)
 	want, _ := h.seedLibraryRow(t, "Kraina Lodu", 2013)
@@ -543,5 +1362,138 @@ func TestApproveRejectsForeignLibraryMatch(t *testing.T) {
 	unmatched := h.seedUnmatchedCandidate(t)
 	if rec := h.postJSON(t, "/api/queue/"+itoa(unmatched)+"/approve", `{"library_cache_id":99999}`); rec.Code != http.StatusNotFound {
 		t.Errorf("approve unmatched row with unknown library = %d, want 404", rec.Code)
+	}
+}
+
+// TestApproveRejectsIneligibleTarget pins ADR-0005 (as amended by ADR-0009): an
+// ineligible target is left completely alone — no sync, no Studio preview, no
+// mux — and the pair is rejected at sync-job creation. Approve must therefore
+// refuse it too, or the operator is left with a row that is approved and can
+// never run. The refusal names the blocker with the card's own wording, and a
+// donor next to the target must not admit the pair (donors are never tag-gated,
+// but the TARGET is).
+func TestApproveRejectsIneligibleTarget(t *testing.T) {
+	h := newHarness(t)
+	target := "Shrek (2001) [ArcA310] [X].mkv"
+	id := h.seedCandidate(t, target, "waiting_for_tags", `["en"]`)
+	// A real gate verdict: required tag present, excluded tag carried, so the
+	// row proves the exclusion rather than a missing tag.
+	rule := gate.Rule{Required: []string{"[ArcA310]"}, Excluded: []string{"[X]"}, Mode: gate.MatchAny, Enforce: true}
+	h.applyGate(t, id, filepath.Join(h.media, target), rule.Classify(target))
+	h.writeDonor(t)
+
+	rec := h.request(http.MethodPost, "/api/queue/"+itoa(id)+"/approve")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("approve ineligible target = %d, want 409, body %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "not eligible") || !strings.Contains(rec.Body.String(), "excluded tag") {
+		t.Errorf("body = %s, want the gate's excluded-tag wording", rec.Body.String())
+	}
+
+	var status string
+	if err := h.db.QueryRow(`SELECT status FROM import_queue WHERE id = ?`, id).Scan(&status); err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if status != "pending_approval" {
+		t.Errorf("status after refused approve = %q, want pending_approval", status)
+	}
+}
+
+// TestApproveIneligibleTargetWithForceOverride pins the one escape hatch: with
+// settings.security.options.allow_force_tag_override on, approve admits a target
+// it refuses with the setting off, because approving may not be stricter than
+// the job-creation gate it anticipates.
+//
+// The SAME fixture row as TestApproveRejectsIneligibleTarget is used — the same
+// target path with its real gate verdict (required tag present, excluded tag
+// carried) and the same donor — so the flip is the only difference between the
+// two requests: refused 409 and left pending with the override off, accepted and
+// moved out of pending_approval with it on. A different row would prove only
+// that some other shape is acceptable.
+func TestApproveIneligibleTargetWithForceOverride(t *testing.T) {
+	h := newHarness(t)
+	target := "Shrek (2001) [ArcA310] [X].mkv"
+	id := h.seedCandidate(t, target, "waiting_for_tags", `["en"]`)
+	// The same verdict TestApproveRejectsIneligibleTarget records: the
+	// exclusion is proven, not a missing required tag.
+	rule := gate.Rule{Required: []string{"[ArcA310]"}, Excluded: []string{"[X]"}, Mode: gate.MatchAny, Enforce: true}
+	h.applyGate(t, id, filepath.Join(h.media, target), rule.Classify(target))
+	h.writeDonor(t)
+
+	statusOf := func() string {
+		t.Helper()
+		var status string
+		if err := h.db.QueryRow(`SELECT status FROM import_queue WHERE id = ?`, id).Scan(&status); err != nil {
+			t.Fatalf("status: %v", err)
+		}
+		return status
+	}
+
+	// Override OFF: this exact row is refused, so the row itself is proven
+	// ineligible rather than the test merely taking a different fixture.
+	refused := h.request(http.MethodPost, "/api/queue/"+itoa(id)+"/approve")
+	if refused.Code != http.StatusConflict {
+		t.Fatalf("approve with the override off = %d, want 409, body %s", refused.Code, refused.Body.String())
+	}
+	if body := refused.Body.String(); !strings.Contains(body, "not eligible") || !strings.Contains(body, "excluded tag") {
+		t.Errorf("body = %s, want the gate's excluded-tag wording", body)
+	}
+	if status := statusOf(); status != "pending_approval" {
+		t.Fatalf("status with the override off = %q, want pending_approval", status)
+	}
+
+	// Override ON: the same row is now accepted and leaves the queue.
+	h.enableForceTagOverride(t)
+
+	rec := h.request(http.MethodPost, "/api/queue/"+itoa(id)+"/approve")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("approve with force override = %d, want 200, body %s", rec.Code, rec.Body.String())
+	}
+	if status := statusOf(); status != "extracting" {
+		t.Errorf("status = %q, want extracting once the override admits the target", status)
+	}
+}
+
+// TestQueueMatchStateReadyUnderForceOverride pins that the card agrees with the
+// server once the override is on: an otherwise-ready row (a target file and a
+// paired donor) whose only blocker is the gate verdict reports ready, because
+// approve WILL accept it. Hiding the control the server would honour is the bug
+// this rules out. With the override off the same row keeps today's verdict.
+func TestQueueMatchStateReadyUnderForceOverride(t *testing.T) {
+	h := newHarness(t)
+	target := "Shrek (2001) [ArcA310] [X].mkv"
+	id := h.seedCandidate(t, target, "waiting_for_tags", `["en"]`)
+	rule := gate.Rule{Required: []string{"[ArcA310]"}, Excluded: []string{"[X]"}, Mode: gate.MatchAny, Enforce: true}
+	h.applyGate(t, id, filepath.Join(h.media, target), rule.Classify(target))
+	h.writeDonor(t)
+
+	// Override OFF: unchanged — an ineligible target with a donor is not ready.
+	off := onlyMatchItem(t, h.listMatchItems(t))
+	if off.MatchState != MatchStateMatchedNoDonor {
+		t.Errorf("override off: match_state = %q, want %q", off.MatchState, MatchStateMatchedNoDonor)
+	}
+	if off.MatchBlocker != MatchBlockerGateExcluded {
+		t.Errorf("override off: match_blocker = %q, want %q", off.MatchBlocker, MatchBlockerGateExcluded)
+	}
+	if diag := h.listDiagnostics(t).Diagnostics; diag.ForceTagOverride == nil || *diag.ForceTagOverride {
+		t.Errorf("override off: force_tag_override = %v, want false", diag.ForceTagOverride)
+	}
+
+	h.enableForceTagOverride(t)
+
+	// Override ON: ready, with no blocker and a reason that says why.
+	on := onlyMatchItem(t, h.listMatchItems(t))
+	if on.MatchState != MatchStateReady {
+		t.Errorf("override on: match_state = %q, want %q", on.MatchState, MatchStateReady)
+	}
+	if on.MatchBlocker != MatchBlockerNone {
+		t.Errorf("override on: match_blocker = %q, want %q", on.MatchBlocker, MatchBlockerNone)
+	}
+	lowerReason := strings.ToLower(on.MatchReason)
+	if !strings.Contains(lowerReason, "ready") || !strings.Contains(lowerReason, "force") {
+		t.Errorf("override on: match_reason = %q, want it to say ready under the force override", on.MatchReason)
+	}
+	if diag := h.listDiagnostics(t).Diagnostics; diag.ForceTagOverride == nil || !*diag.ForceTagOverride {
+		t.Errorf("override on: force_tag_override = %v, want true", diag.ForceTagOverride)
 	}
 }

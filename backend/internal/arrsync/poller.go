@@ -28,6 +28,23 @@ const DefaultInterval = 300 * time.Second
 // secret store. The pass skips that instance and keeps its cache.
 var ErrMissingAPIKey = errors.New("arrsync: arr instance has no API key")
 
+// ErrSyncBusy reports that a pass (scheduled or manual) already owns the
+// poller. A second pass is never queued: the caller gets this sentinel instead.
+var ErrSyncBusy = errors.New("arrsync: a sync pass is already running")
+
+// ErrManualSyncDisabled reports that arr.options.manual_sync is off. A manual
+// trigger then makes no arr request at all; only the poll loop may sync.
+var ErrManualSyncDisabled = errors.New("arrsync: manual sync is disabled")
+
+// ErrPollerStopped rejects a trigger that arrives before Start or after Stop:
+// shutdown wins, and there is no cancellable loop context to run a pass on.
+var ErrPollerStopped = errors.New("arrsync: poller is stopped")
+
+// maxSkipRetryDelay bounds how long a skipped scheduled tick waits before it
+// re-attempts. A skipped tick used to wait a full interval, so an admin who
+// repeatedly refreshed one kind could defer the other kind's pass forever.
+const maxSkipRetryDelay = 30 * time.Second
+
 // syncFailureWriteTimeout bounds the detached health UPDATE: the write runs
 // after a cancelled pass, so it needs its own short deadline instead of an
 // unbounded context.
@@ -123,7 +140,13 @@ type Poller struct {
 	started bool
 	stopped bool
 	cancel  context.CancelFunc
-	wg      sync.WaitGroup
+	// runCtx is the loop's context (nil before Start). A manual pass runs on
+	// it, not on the caller's request context, so Stop cancels the pass and
+	// Wait drains it.
+	runCtx context.Context
+	// inFlight is the single pass slot shared by the loop and Trigger.
+	inFlight bool
+	wg       sync.WaitGroup
 }
 
 // New builds a Poller. It fails closed when a collaborator is missing so a
@@ -180,6 +203,13 @@ func (p *Poller) Interval() time.Duration { return p.interval }
 // aggregated stats and a joined error; a failing instance never stops the rest
 // and never touches its own previous cache rows.
 func (p *Poller) Sync(ctx context.Context) (Stats, error) {
+	return p.syncKind(ctx, "")
+}
+
+// syncKind is Sync restricted to one instance kind ("" = all). Both the
+// scheduled loop and a manual Trigger go through it, so a manual pass records
+// health exactly like a scheduled one.
+func (p *Poller) syncKind(ctx context.Context, kind string) (Stats, error) {
 	rule, err := p.gateRule(ctx)
 	if err != nil {
 		return Stats{}, err
@@ -193,6 +223,9 @@ func (p *Poller) Sync(ctx context.Context) (Stats, error) {
 	var errs []error
 	for _, conn := range conns {
 		if !conn.Enabled || strings.TrimSpace(conn.BaseURL) == "" {
+			continue
+		}
+		if kind != "" && conn.Kind != kind {
 			continue
 		}
 		stats.Instances++
@@ -373,6 +406,7 @@ func (p *Poller) listItems(ctx context.Context, conn settings.ArrConnection, api
 				ExternalItemID:       int64(movie.ID),
 				TMDBID:               int64(movie.TmdbID),
 				Title:                movie.Title,
+				OriginalTitle:        movie.OriginalTitle,
 				OriginalLanguageISO2: probe.ISO639_1(movie.OriginalLanguage.Name),
 				Year:                 movie.Year,
 				MediaFolderPath:      movie.Path,
@@ -427,6 +461,7 @@ func (p *Poller) listItems(ctx context.Context, conn settings.ArrConnection, api
 					SeriesID:             int64(show.ID),
 					TVDBID:               int64(show.TvdbID),
 					Title:                show.Title,
+					OriginalTitle:        show.OriginalTitle,
 					OriginalLanguageISO2: lang,
 					Year:                 show.Year,
 					SeasonNumber:         &season,
@@ -559,6 +594,7 @@ func (p *Poller) Start(ctx context.Context) {
 	p.started = true
 	ctx, cancel := context.WithCancel(ctx)
 	p.cancel = cancel
+	p.runCtx = ctx
 	p.wg.Add(1)
 	p.mu.Unlock()
 
@@ -577,25 +613,186 @@ func (p *Poller) run(ctx context.Context) {
 	ticker := time.NewTicker(p.interval)
 	defer ticker.Stop()
 
+	// retry carries a skipped pass back to the loop after a short delay
+	// instead of making it wait a whole interval. It is buffered and the
+	// timer below is reused, so repeated skips never stack up.
+	retry := make(chan struct{}, 1)
+	var retryTimer *time.Timer
+	defer func() {
+		if retryTimer != nil {
+			retryTimer.Stop()
+		}
+	}()
+	retryIn := func(delay time.Duration) {
+		if retryTimer == nil {
+			retryTimer = time.AfterFunc(delay, func() {
+				// A timer that fires while Stop is running must not keep
+				// the pass alive: the loop has already left.
+				if ctx.Err() != nil {
+					return
+				}
+				select {
+				case retry <- struct{}{}:
+				default:
+				}
+			})
+			return
+		}
+		retryTimer.Reset(delay)
+	}
+	clearRetry := func() {
+		if retryTimer != nil {
+			retryTimer.Stop()
+		}
+		// A retry that already fired must not spin the loop into one extra
+		// immediate pass.
+		select {
+		case <-retry:
+		default:
+		}
+	}
+
 	for {
-		p.syncPass(ctx)
+		if p.syncPass(ctx) {
+			clearRetry()
+		} else {
+			retryIn(min(p.interval, maxSkipRetryDelay))
+		}
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+		case <-retry:
 		}
 	}
 }
 
-// syncPass runs one pass and swallows panics: the loop must outlive a broken
+// syncPass runs one pass, swallowing panics: the loop must outlive a broken
 // pass. Errors are already logged per instance by Sync.
-func (p *Poller) syncPass(ctx context.Context) {
+//
+// A pass is exclusive. When a manual Trigger already owns the slot this tick
+// is skipped rather than queued: the caller re-attempts shortly instead of
+// waiting the full interval, so one busy kind cannot starve the others, and
+// the two passes can never race on the same cache rows. The return value
+// reports whether the pass actually ran.
+func (p *Poller) syncPass(ctx context.Context) bool {
+	if !p.beginPass() {
+		p.logf("arrsync: debug: skipping scheduled pass, a sync pass is already running")
+		return false
+	}
+	defer p.endPass()
 	defer func() {
 		if r := recover(); r != nil {
 			p.logf("arrsync: pass panic: %v", r)
 		}
 	}()
 	_, _ = p.Sync(ctx)
+	return true
+}
+
+// beginPass takes the poller's single pass slot. false means a pass already
+// owns it, so the caller skips instead of queueing.
+func (p *Poller) beginPass() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.inFlight {
+		return false
+	}
+	p.inFlight = true
+	return true
+}
+
+// endPass releases the slot. It must run exactly once per successful
+// beginPass or per Trigger.
+func (p *Poller) endPass() {
+	p.mu.Lock()
+	p.inFlight = false
+	p.mu.Unlock()
+}
+
+// Trigger starts one manual pass over a single instance kind ("" = every
+// enabled connection) and returns immediately; the pass runs in a detached
+// goroutine on the poller's own context, so Stop cancels it and Wait drains it.
+//
+// The slot is shared with the scheduled loop: a manual pass makes the loop
+// skip its tick, and a Trigger while any pass runs reports ErrSyncBusy instead
+// of queueing. When arr.options.manual_sync is off the trigger is refused with
+// ErrManualSyncDisabled before any arr request is made. A poller that has not
+// been started (or has been stopped) refuses with ErrPollerStopped: there is
+// no cancellable loop context, so the pass could never be drained.
+func (p *Poller) Trigger(ctx context.Context, kind string) error {
+	enabled, err := p.manualSyncEnabled(ctx)
+	if err != nil {
+		return err
+	}
+	if !enabled {
+		return ErrManualSyncDisabled
+	}
+
+	p.mu.Lock()
+	if p.stopped {
+		p.mu.Unlock()
+		return ErrPollerStopped
+	}
+	if p.inFlight {
+		p.mu.Unlock()
+		return ErrSyncBusy
+	}
+	runCtx := p.runCtx
+	if runCtx == nil {
+		// Not started yet (or never Start-ed): a pass on a background
+		// context could not be cancelled by Stop, so refuse instead.
+		p.mu.Unlock()
+		return ErrPollerStopped
+	}
+	p.inFlight = true
+	// Add under the same lock Stop takes before Wait, so a trigger racing a
+	// shutdown is either drained or refused — never a stray goroutine.
+	p.wg.Add(1)
+	p.mu.Unlock()
+
+	go func() {
+		defer p.wg.Done()
+		defer p.endPass()
+		defer func() {
+			if r := recover(); r != nil {
+				p.logf("arrsync: manual pass panic: %v", r)
+			}
+		}()
+		if _, err := p.syncKind(runCtx, kind); err != nil {
+			p.logf("arrsync: manual pass (%s): %v", kindOrAll(kind), err)
+		}
+	}()
+	return nil
+}
+
+// manualSyncEnabled reads arr.options.manual_sync for the poller's own settings.
+func (p *Poller) manualSyncEnabled(ctx context.Context) (bool, error) {
+	return ManualSyncEnabled(ctx, p.settings)
+}
+
+// ManualSyncEnabled reads arr.options.manual_sync. An absent section (or a
+// section written before the key existed) means the seeded default, true.
+// Exported so the Library health API can report the same decision the poller
+// enforces instead of keeping its own copy of the rule.
+func ManualSyncEnabled(ctx context.Context, st *settings.Store) (bool, error) {
+	raw, ok, err := st.Get(ctx, settings.KeyArrOptions)
+	if err != nil {
+		return false, fmt.Errorf("arrsync: read %s: %w", settings.KeyArrOptions, err)
+	}
+	if !ok {
+		return true, nil
+	}
+	var opts struct {
+		ManualSync *bool `json:"manual_sync"`
+	}
+	if err := json.Unmarshal(raw, &opts); err != nil {
+		return false, fmt.Errorf("arrsync: decode %s: %w", settings.KeyArrOptions, err)
+	}
+	if opts.ManualSync == nil {
+		return true, nil
+	}
+	return *opts.ManualSync, nil
 }
 
 // Stop cancels the loop and waits for it to exit. Safe to call more than once
@@ -625,4 +822,12 @@ func displayName(kind string) string {
 		return ""
 	}
 	return strings.ToUpper(kind[:1]) + kind[1:]
+}
+
+// kindOrAll labels a manual pass in logs.
+func kindOrAll(kind string) string {
+	if kind == "" {
+		return "all"
+	}
+	return kind
 }

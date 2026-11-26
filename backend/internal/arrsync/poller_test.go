@@ -1121,3 +1121,330 @@ func TestSyncArrSourceEligibility(t *testing.T) {
 		t.Errorf("series-tagged episode = %q, want eligible", got.EligibilityStatus)
 	}
 }
+
+// blockingRadarr holds the pass inside Movies until release is closed, so a
+// test can observe the exclusive pass slot while one pass is in flight.
+type blockingRadarr struct {
+	fakeRadarr
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+	mu      sync.Mutex
+	calls   int
+}
+
+func newBlockingRadarr() *blockingRadarr {
+	return &blockingRadarr{
+		fakeRadarr: singleMovieRadarr(),
+		started:    make(chan struct{}),
+		release:    make(chan struct{}),
+	}
+}
+
+func (b *blockingRadarr) Movies(ctx context.Context) ([]arr.Movie, error) {
+	b.mu.Lock()
+	b.calls++
+	b.mu.Unlock()
+	b.once.Do(func() { close(b.started) })
+	select {
+	case <-b.release:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return b.fakeRadarr.Movies(ctx)
+}
+
+func (b *blockingRadarr) listCalls() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.calls
+}
+
+// waitForList blocks until the in-flight pass has reached the listing.
+func (b *blockingRadarr) waitForList(t *testing.T) {
+	t.Helper()
+	select {
+	case <-b.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the sync pass never reached the arr listing")
+	}
+}
+
+// newBlockingPoller builds a poller over one enabled Radarr connection whose
+// client blocks inside Movies.
+func newBlockingPoller(t *testing.T, r *rig) (*Poller, *blockingRadarr) {
+	t.Helper()
+	r.configure(settings.ArrConnection{Kind: "radarr", BaseURL: "http://radarr.invalid", Enabled: true})
+	r.key("radarr", "key-radarr")
+	src := newBlockingRadarr()
+	p, err := New(Deps{
+		Store: r.store, Settings: r.settings, Secrets: r.secrets,
+		Interval:  time.Minute,
+		NewRadarr: func(baseURL, apiKey string) (RadarrSource, error) { return src, nil },
+		Logf:      t.Logf,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	p.startManualOnly(t)
+	return p, src
+}
+
+// startManualOnly marks the poller as running without launching the poll loop,
+// so a manual Trigger is accepted without a scheduled pass holding the slot.
+// Stop is registered, so a blocked pass is cancelled when the test ends.
+func (p *Poller) startManualOnly(t *testing.T) {
+	t.Helper()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.started || p.stopped {
+		t.Fatal("startManualOnly: poller is already started or stopped")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	p.started = true
+	p.runCtx = ctx
+	p.cancel = cancel
+	t.Cleanup(p.Stop)
+}
+
+// TestTriggerAfterStopIsRefused pins the shutdown seam: a poller that was never
+// started, and one whose Stop already ran, both refuse a manual pass instead of
+// running one on an uncancellable context.
+func TestTriggerAfterStopIsRefused(t *testing.T) {
+	r := newRig(t)
+	p, src := newBlockingPoller(t, r)
+
+	// Not started: refused before any arr request.
+	unstarted := r.newPoller(time.Minute)
+	if err := unstarted.Trigger(context.Background(), "radarr"); !errors.Is(err, ErrPollerStopped) {
+		t.Fatalf("Trigger before Start = %v, want ErrPollerStopped", err)
+	}
+
+	// Started, then stopped: refused as well.
+	p.Stop()
+	if err := p.Trigger(context.Background(), "radarr"); !errors.Is(err, ErrPollerStopped) {
+		t.Fatalf("Trigger after Stop = %v, want ErrPollerStopped", err)
+	}
+	p.Wait()
+	if got := src.listCalls(); got != 0 {
+		t.Errorf("arr listings = %d, want 0: a refused trigger must not reach arr", got)
+	}
+}
+
+// TestStopDrainsManualPass pins the shutdown drain: a manual pass blocked
+// mid-listing is cancelled by Stop, Wait returns, and the cancellation is not
+// recorded as a sync failure.
+func TestStopDrainsManualPass(t *testing.T) {
+	r := newRig(t)
+	p, src := newBlockingPoller(t, r)
+
+	if err := p.Trigger(context.Background(), "radarr"); err != nil {
+		t.Fatalf("Trigger: %v", err)
+	}
+	src.waitForList(t)
+
+	stopped := make(chan struct{})
+	go func() {
+		p.Stop()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop did not return: the in-flight manual pass was not drained")
+	}
+	p.Wait()
+
+	// The instance row exists (ensureInstance ran before the listing), but a
+	// shutdown cancellation must leave its health untouched.
+	var ok sql.NullInt64
+	var cause sql.NullString
+	if err := r.store.DB.QueryRow(
+		`SELECT last_sync_ok, last_sync_error FROM arr_instances WHERE type = 'radarr'`).
+		Scan(&ok, &cause); err != nil {
+		t.Fatalf("read sync health: %v", err)
+	}
+	if ok.Valid {
+		t.Errorf("last_sync_ok = %v, want NULL: a drained pass is not a failure", ok)
+	}
+	if cause.Valid {
+		t.Errorf("last_sync_error = %v, want empty: a drained pass records no cause", cause)
+	}
+
+	if err := p.Trigger(context.Background(), "radarr"); !errors.Is(err, ErrPollerStopped) {
+		t.Errorf("Trigger after the drained stop = %v, want ErrPollerStopped", err)
+	}
+}
+
+// TestTriggerRejectsConcurrentPass pins the single pass slot: a manual pass in
+// flight makes a second Trigger report ErrSyncBusy instead of queueing.
+func TestTriggerRejectsConcurrentPass(t *testing.T) {
+	r := newRig(t)
+	p, src := newBlockingPoller(t, r)
+
+	if err := p.Trigger(context.Background(), "radarr"); err != nil {
+		t.Fatalf("first Trigger: %v", err)
+	}
+	src.waitForList(t)
+
+	if err := p.Trigger(context.Background(), "radarr"); !errors.Is(err, ErrSyncBusy) {
+		t.Fatalf("second Trigger = %v, want ErrSyncBusy", err)
+	}
+	if err := p.Trigger(context.Background(), ""); !errors.Is(err, ErrSyncBusy) {
+		t.Fatalf("all-kinds Trigger during a pass = %v, want ErrSyncBusy", err)
+	}
+	if got := src.listCalls(); got != 1 {
+		t.Errorf("arr listings = %d, want 1: a refused trigger must not reach arr", got)
+	}
+
+	// Once the pass lands the slot is free again.
+	close(src.release)
+	p.Wait()
+	if err := p.Trigger(context.Background(), "radarr"); err != nil {
+		t.Fatalf("Trigger after the pass = %v, want nil", err)
+	}
+	p.Wait()
+}
+
+// TestScheduledPassSkipsWhileManualRuns proves the loop shares the slot with
+// manual triggers: a scheduled tick during a manual pass returns without
+// contacting arr, rather than queueing a second pass.
+func TestScheduledPassSkipsWhileManualRuns(t *testing.T) {
+	r := newRig(t)
+	p, src := newBlockingPoller(t, r)
+
+	if err := p.Trigger(context.Background(), "radarr"); err != nil {
+		t.Fatalf("Trigger: %v", err)
+	}
+	src.waitForList(t)
+
+	done := make(chan struct{})
+	go func() {
+		p.syncPass(context.Background())
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the scheduled pass waited for the manual pass instead of skipping its tick")
+	}
+	if got := src.listCalls(); got != 1 {
+		t.Errorf("arr listings = %d, want 1: the skipped tick must not list anything", got)
+	}
+
+	close(src.release)
+	p.Wait()
+}
+
+// TestTriggerRefusedWhenManualSyncDisabled pins arr.options.manual_sync = false:
+// the trigger is refused and no arr client is ever built, i.e. zero requests.
+func TestTriggerRefusedWhenManualSyncDisabled(t *testing.T) {
+	r := newRig(t)
+	r.configure(settings.ArrConnection{Kind: "radarr", BaseURL: "http://radarr.invalid", Enabled: true})
+	r.key("radarr", "key-radarr")
+
+	raw, err := json.Marshal(settings.ArrOptions{PollIntervalSec: 300, ManualSync: false})
+	if err != nil {
+		t.Fatalf("marshal arr options: %v", err)
+	}
+	if err := r.settings.Set(context.Background(), settings.KeyArrOptions, raw); err != nil {
+		t.Fatalf("set arr options: %v", err)
+	}
+
+	src := singleMovieRadarr()
+	clients := 0
+	p, err := New(Deps{
+		Store: r.store, Settings: r.settings, Secrets: r.secrets,
+		Interval: time.Minute,
+		NewRadarr: func(baseURL, apiKey string) (RadarrSource, error) {
+			clients++
+			return &src, nil
+		},
+		Logf: t.Logf,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	if err := p.Trigger(context.Background(), "radarr"); !errors.Is(err, ErrManualSyncDisabled) {
+		t.Fatalf("Trigger = %v, want ErrManualSyncDisabled", err)
+	}
+	p.Wait()
+	if clients != 0 {
+		t.Errorf("arr clients built = %d, want 0 (a disabled manual sync must not touch arr)", clients)
+	}
+	rows := readCache(t, r.store)
+	if len(rows) != 0 {
+		t.Errorf("cache rows = %d, want 0 (the pass must never run)", len(rows))
+	}
+}
+
+// TestManualPassRecordsHealth pins that a manual pass writes sync health
+// exactly like a scheduled one: green on success, red with the cause on
+// failure, and the cached snapshot untouched by the failure.
+func TestManualPassRecordsHealth(t *testing.T) {
+	r := newRig(t)
+	r.configure(settings.ArrConnection{Kind: "radarr", BaseURL: "http://radarr.invalid", Enabled: true})
+	r.key("radarr", "key-radarr")
+
+	src := singleMovieRadarr()
+	p, err := New(Deps{
+		Store: r.store, Settings: r.settings, Secrets: r.secrets,
+		Interval:  time.Minute,
+		NewRadarr: func(baseURL, apiKey string) (RadarrSource, error) { return &src, nil },
+		Logf:      t.Logf,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	p.startManualOnly(t)
+
+	if err := p.Trigger(context.Background(), "radarr"); err != nil {
+		t.Fatalf("Trigger: %v", err)
+	}
+	p.Wait()
+
+	var instanceID int64
+	if err := r.store.DB.QueryRow(`SELECT id FROM arr_instances WHERE type = 'radarr'`).Scan(&instanceID); err != nil {
+		t.Fatalf("read instance id: %v", err)
+	}
+	readHealth := func() (ok sql.NullInt64, cause, attempt sql.NullString) {
+		t.Helper()
+		if err := r.store.DB.QueryRow(
+			`SELECT last_sync_ok, last_sync_error, last_attempt_at
+			 FROM arr_instances WHERE id = ?`, instanceID).
+			Scan(&ok, &cause, &attempt); err != nil {
+			t.Fatalf("read sync health: %v", err)
+		}
+		return ok, cause, attempt
+	}
+
+	ok, cause, attempt := readHealth()
+	if !ok.Valid || ok.Int64 != 1 || cause.Valid {
+		t.Fatalf("health after a manual pass = ok %v cause %v, want green with no cause", ok, cause)
+	}
+	if !attempt.Valid || attempt.String == "" {
+		t.Error("last_attempt_at not stamped by a manual pass")
+	}
+	if _, still := readCache(t, r.store)["movie|7"]; !still {
+		t.Fatal("the manual pass cached no rows")
+	}
+
+	// A failing manual pass turns the instance red with the cause.
+	src.tagsErr = errors.New("radarr unavailable")
+	if err := p.Trigger(context.Background(), "radarr"); err != nil {
+		t.Fatalf("second Trigger: %v", err)
+	}
+	p.Wait()
+
+	ok, cause, attempt = readHealth()
+	if !ok.Valid || ok.Int64 != 0 {
+		t.Errorf("last_sync_ok = %v, want 0 after a failed manual pass", ok)
+	}
+	if !cause.Valid || !strings.Contains(cause.String, "radarr unavailable") {
+		t.Errorf("last_sync_error = %v, want the manual pass cause", cause)
+	}
+	if !attempt.Valid || attempt.String == "" {
+		t.Error("last_attempt_at not stamped by a failed manual pass")
+	}
+}

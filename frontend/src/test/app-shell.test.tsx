@@ -57,7 +57,10 @@ describe('AppShell top bar', () => {
     mockAuthenticatedAdmin()
     renderWithProviders(<App />, { route: '/library' })
 
-    expect(await screen.findByText(/Library — coming in M2/)).toBeInTheDocument()
+    expect(await screen.findByRole('heading', { name: 'Library' })).toBeInTheDocument()
+    expect(
+      screen.getByText('Browse titles, inspect tracks and start a sync job.'),
+    ).toBeInTheDocument()
     expect(await screen.findByText('Administrator')).toBeInTheDocument()
     // The username badge stays, but the bare role badge no longer duplicates it.
     expect(screen.getAllByText('admin')).toHaveLength(1)

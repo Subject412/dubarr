@@ -7,17 +7,46 @@ how `dubarr-sync` must be installed next to the `dubarr` binary.
 
 Dubarr is pre-1.0, so the usual SemVer rules are read as:
 
-- `0.MINOR.PATCH` — `MINOR` may contain breaking changes (API, config/schema,
-  CLI, archive layout). `PATCH` is for backwards-compatible fixes only.
-- While the major version is `0`, do not expect stability between `MINOR`
-  bumps; pin an exact tag for production and read the release notes before
-  upgrading.
-- `1.0.0` is reserved for the point where the HTTP API, settings schema and
+- `0.MINOR.PATCH` — `MINOR` may contain breaking changes (HTTP API, settings
+  schema, CLI, archive layout). `PATCH` is for backwards-compatible fixes only.
+- While the major version is `0`, do not expect stability between `MINOR` bumps:
+  pin an exact tag for production and read the release notes before upgrading.
+- `1.0.0` is reserved for the point at which the HTTP API, settings schema and
   on-disk data layout are considered stable.
+
+The next release is `0.3.0`. Being prepared for release is not the same as
+leaving beta: the version number describes how stable the API is, not how ready
+the software is to run.
 
 Pre-release identifiers (`v0.3.0-rc.1`) are permitted and publish a GitHub
 pre-release via the normal tag flow. Build metadata (`+...`) is not used in
 tags.
+
+## What every 0.x release guarantees
+
+The version number says how much the API may move. It says nothing about how
+carefully data is treated — these hold in every release, 0.x included:
+
+- No silent destruction: a target must be matched, tag-eligible and paired with
+  a donor before it can be approved; a mux is validated with `ffprobe` before it
+  replaces anything; the Audio Vault is write-once after first archive.
+- The database schema is migrated forward automatically on start, and a
+  migration that cannot complete rolls back rather than leaving a half-applied
+  database.
+- An upgrade does not require re-importing media or rebuilding the Audio Vault.
+
+What 0.x does **not** promise:
+
+- **API and on-disk stability.** The HTTP API, settings schema and on-disk
+  layout may change between minor releases.
+- **Windows builds.** The code is kept cross-platform, but Windows compilation
+  and CI are deferred and untested.
+- **Automatic vault reorganisation** — moving or renaming files inside the
+  Audio Vault. Deliberately unimplemented rather than approximated: any future
+  version must gate it the way the arr applications gate media moves, so nothing
+  is ever deleted without an explicit approval.
+- **Stable internal Go packages.** Only the HTTP API is a contract; `internal/`
+  packages may be restructured between minor releases.
 
 ## Tag format
 
@@ -157,26 +186,36 @@ workflow does not rewrite `Cargo.toml`.
 
 1. `main` is green in `.github/workflows/ci.yml` (backend vet/tests, Rust
    fmt/clippy/tests, frontend lint/tests/build).
-2. Update `sync-engine/Cargo.toml` version if the engine changed, and any
-   changelog/release notes.
-3. Confirm the working tree is clean and commit with a conventional message.
-4. Create the annotated tag and push it (maintainer, from `main`):
+2. Write the `CHANGELOG.md` entry for this version: what changed, what breaks,
+   and the upgrade steps if any. A `MAJOR` entry must state the migration step
+   explicitly.
+3. Update `sync-engine/Cargo.toml` version if the engine changed.
+4. Confirm the working tree is clean and commit with a conventional message.
+5. Create the annotated tag and push it (maintainer, from `main`):
    ```sh
-   git tag -a v0.2.0 -m "dubarr v0.2.0"
-   git push origin v0.2.0
+   git tag -a v0.3.0 -m "dubarr v0.3.0"
+   git push origin v0.3.0
    ```
-5. Watch the `release` workflow; it fails if the tag is malformed or an
+6. Watch the `release` workflow; it fails if the tag is malformed or an
    expected archive is missing.
-6. Download the archives, run `sha256sum -c`, and smoke-test at least
+7. Download the archives, run `sha256sum -c`, and smoke-test at least
    `linux/amd64`: `./dubarr --data-dir ./data` then check `/api/health` shows
    `dubarr-sync`, `ffmpeg`, `ffprobe` and `mkvmerge`.
-7. Publish/announce the generated release notes; do not edit published assets
+8. Publish/announce the generated release notes; do not edit published assets
    in place.
-8. Watch the `Docker Release` workflow; confirm both registries show the
+9. Watch the `Docker Release` workflow; confirm both registries show the
    multi-arch manifest (`docker buildx imagetools inspect
    subject928/dubarr:<version>`), then `docker pull subject928/dubarr:<version>`
    on the target host and check `/api/health` reports `dubarr-sync`,
    `ffmpeg`, `ffprobe` and `mkvmerge` available.
+
+### Cutting 0.3.0 specifically
+
+Before tagging, confirm the guarantees in "What every 0.x release guarantees" still
+hold. The 0.3.0 `CHANGELOG.md` entry is what users read to decide whether to
+upgrade from 0.2.0, so it must name every breaking change since that release
+rather than summarising them — the approve-eligibility refusal and the Compose
+changes are the two that can surprise an existing install.
 
 ## CI prerequisites
 

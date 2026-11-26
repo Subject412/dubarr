@@ -30,7 +30,7 @@ function mockApi(
 
 /** Renders the shell and opens the account menu from the username button. */
 async function openAccountMenu(user: ReturnType<typeof userEvent.setup>) {
-  await screen.findByText(/Library — coming in M2/)
+  await screen.findByRole('heading', { name: 'Library' })
   const trigger = await screen.findByRole('button', { name: 'admin' })
   await user.click(trigger)
   return trigger

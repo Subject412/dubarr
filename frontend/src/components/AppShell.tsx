@@ -26,9 +26,9 @@ type NavItem = {
 }
 
 const navItems: NavItem[] = [
-  { to: '/queue', label: 'Approval Queue', icon: '✓', hint: 'M2' },
+  { to: '/queue', label: 'Approval Queue', icon: '✓' },
   { to: '/vault', label: 'Audio Vault', icon: '♫', hint: 'M3' },
-  { to: '/library', label: 'Library', icon: '▤', hint: 'M2' },
+  { to: '/library', label: 'Library', icon: '▤' },
   { to: '/sync', label: 'Sync Studio', icon: '◉', hint: 'M5' },
   {
     to: '/settings',

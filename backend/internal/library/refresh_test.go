@@ -141,20 +141,28 @@ func TestLibraryRefreshBusyIsConflict(t *testing.T) {
 	}
 }
 
-// TestLibraryRefreshDisabledIsConflict pins arr.options.manual_sync = false.
-func TestLibraryRefreshDisabledIsConflict(t *testing.T) {
-	h := newRefreshHarness(t, &fakeRefresher{err: arrsync.ErrManualSyncDisabled})
+// TestLibraryRefreshIgnoresRetiredManualSync pins that a legacy stored
+// arr.options row carrying manual_sync = false no longer refuses a refresh:
+// the operator clicking Refresh is the intent, and there is no gate left.
+func TestLibraryRefreshIgnoresRetiredManualSync(t *testing.T) {
+	refresher := &fakeRefresher{}
+	h := newRefreshHarness(t, refresher)
 
-	rec := h.post("/api/library/refresh", "")
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("status = %d, want 409 (body %s)", rec.Code, rec.Body.String())
+	// Write the row directly: the settings API rejects the retired key, but a
+	// row stored before it was removed still has it.
+	if _, err := h.db.DB.Exec(
+		`INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`,
+		settings.KeyArrOptions, `{"poll_interval_sec":300,"manual_sync":false}`,
+	); err != nil {
+		t.Fatalf("seed legacy arr.options: %v", err)
 	}
-	body := decodeRefreshError(t, rec)
-	if body.Code != "manual_sync_disabled" {
-		t.Errorf("code = %q, want manual_sync_disabled", body.Code)
+
+	rec := h.post("/api/library/refresh", `{"kind":"radarr"}`)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 (body %s)", rec.Code, rec.Body.String())
 	}
-	if body.Error != "manual sync is disabled" {
-		t.Errorf("error = %q, want the disabled message", body.Error)
+	if len(refresher.kinds) != 1 || refresher.kinds[0] != "radarr" {
+		t.Errorf("Trigger kinds = %v, want [radarr]", refresher.kinds)
 	}
 }
 

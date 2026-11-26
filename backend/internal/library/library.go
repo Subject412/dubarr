@@ -39,6 +39,10 @@ type Dependencies struct {
 	// RequireAdmin wraps every route. When nil the API answers 503 rather than
 	// running unauthenticated (same contract as the queue API).
 	RequireAdmin func(http.Handler) http.Handler
+	// Logf reports the refresh decision at info (accepted or refused, with the
+	// kind) so /logs?component=library answers "what did the click do". Nil
+	// keeps the API silent.
+	Logf func(format string, args ...any)
 }
 
 // Service holds the resolved dependencies for the registered handlers.
@@ -51,6 +55,7 @@ type Service struct {
 	refresher    Refresher
 	secrets      Decrypter
 	requireAdmin func(http.Handler) http.Handler
+	logf         func(format string, args ...any)
 }
 
 // RegisterRoutes mounts:
@@ -66,6 +71,7 @@ func RegisterRoutes(mux *http.ServeMux, deps Dependencies) *Service {
 		refresher:    deps.Refresher,
 		secrets:      deps.Secrets,
 		requireAdmin: deps.RequireAdmin,
+		logf:         deps.Logf,
 	}
 	admin := func(h http.HandlerFunc) http.Handler {
 		if svc.requireAdmin == nil {

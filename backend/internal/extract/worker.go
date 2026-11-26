@@ -90,8 +90,12 @@ type Dependencies struct {
 	// VaultHook archives a successful extraction (M3-4). Optional: nil leaves
 	// the validated output staged under WORK_DIR for a later consumer.
 	VaultHook VaultHook
-	// Logf receives worker diagnostics. Nil uses the standard logger.
+	// Logf receives worker diagnostics at info: job claimed, job finished.
+	// Nil uses the standard logger.
 	Logf func(format string, args ...any)
+	// Debugf receives per-item detail (one line per probe). Nil discards; it
+	// must never carry a decision, only the evidence behind one.
+	Debugf func(format string, args ...any)
 }
 
 // Worker consumes extracting rows serially. Lifecycle mirrors the watch
@@ -106,6 +110,7 @@ type Worker struct {
 	interval   time.Duration
 	vaultHook  VaultHook
 	logf       func(string, ...any)
+	debugf     func(string, ...any)
 
 	// run executes mkvtoolnix commands; overridable for unit tests.
 	run func(ctx context.Context, name string, args ...string) ([]byte, error)
@@ -139,6 +144,10 @@ func New(deps Dependencies) (*Worker, error) {
 	if logf == nil {
 		logf = log.Printf
 	}
+	debugf := deps.Debugf
+	if debugf == nil {
+		debugf = func(string, ...any) {}
+	}
 	return &Worker{
 		store:      deps.Store,
 		settings:   deps.Settings,
@@ -149,6 +158,7 @@ func New(deps Dependencies) (*Worker, error) {
 		interval:   interval,
 		vaultHook:  deps.VaultHook,
 		logf:       logf,
+		debugf:     debugf,
 		run:        execRun,
 	}, nil
 }
@@ -260,6 +270,7 @@ func (w *Worker) ProcessOnce(ctx context.Context) (processed bool, err error) {
 		// Another actor finished the row between the read and the claim.
 		return true, nil
 	}
+	w.logf("extract: job %d claimed: donor %s", job.ID, job.DonorPath)
 
 	// A panic in extraction must not kill the loop; record it as a failure.
 	func() {
@@ -280,6 +291,7 @@ func (w *Worker) ProcessOnce(ctx context.Context) (processed bool, err error) {
 		w.logf("extract: job %d: record %s: %v", job.ID, status, ferr)
 		return true, ferr
 	}
+	w.logf("extract: job %d finished: %s", job.ID, status)
 	return true, nil
 }
 

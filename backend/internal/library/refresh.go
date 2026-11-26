@@ -69,6 +69,7 @@ func (s *Service) handleRefresh(w http.ResponseWriter, r *http.Request) {
 	// request, not a server fault, and it must never panic here.
 	refresher := s.refresherRef()
 	if refresher == nil {
+		s.refreshLogf("library: refresh refused (kind=%s): no arr instance is configured yet", kindLabel(kind))
 		writeJSON(w, http.StatusConflict, errorBody{
 			Error: "no arr instance is configured yet",
 			Code:  "not_configured",
@@ -80,6 +81,7 @@ func (s *Service) handleRefresh(w http.ResponseWriter, r *http.Request) {
 	// them off after boot). That is "not running", not a fresh install: name
 	// the missing configuration instead of repeating the message above.
 	if state, ok := refresher.(InstanceState); ok && !state.HasEnabledInstance(r.Context()) {
+		s.refreshLogf("library: refresh refused (kind=%s): every arr instance is disabled", kindLabel(kind))
 		writeJSON(w, http.StatusConflict, errorBody{
 			Error: "no enabled arr instance: enable Radarr or Sonarr under Settings → Connections",
 			Code:  "not_configured",
@@ -90,11 +92,15 @@ func (s *Service) handleRefresh(w http.ResponseWriter, r *http.Request) {
 	err := refresher.Trigger(r.Context(), kind)
 	switch {
 	case err == nil:
+		// The pass itself logs its start/finish counts under component
+		// "arrsync"; this line ties the click to the request that caused it.
+		s.refreshLogf("library: refresh accepted (kind=%s): the sync pass runs in the background", kindLabel(kind))
 		writeJSON(w, http.StatusAccepted, refreshResponse{
 			Accepted: true,
 			Kind:     kindLabel(kind),
 		})
 	case errors.Is(err, arrsync.ErrSyncBusy):
+		s.refreshLogf("library: refresh skipped (kind=%s): a sync pass is already running", kindLabel(kind))
 		writeJSON(w, http.StatusConflict, errorBody{
 			Error: "a sync pass is already running",
 			Code:  "busy",
@@ -102,13 +108,23 @@ func (s *Service) handleRefresh(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, arrsync.ErrPollerStopped):
 		// Shutdown, or a poller that was never started: the request cannot
 		// be served but it is not a server fault.
+		s.refreshLogf("library: refresh refused (kind=%s): the sync poller is stopping", kindLabel(kind))
 		writeJSON(w, http.StatusConflict, errorBody{
 			Error: "the sync poller is stopping",
 			Code:  "stopped",
 		})
 	default:
+		s.refreshLogf("library: refresh failed (kind=%s): %v", kindLabel(kind), err)
 		writeError(w, http.StatusInternalServerError, "could not start a sync pass")
 	}
+}
+
+// refreshLogf emits one refresh-decision line; a nil seam keeps the API silent.
+func (s *Service) refreshLogf(format string, args ...any) {
+	if s.logf == nil {
+		return
+	}
+	s.logf(format, args...)
 }
 
 // decodeRefreshKind reads the optional body and validates the kind. It writes

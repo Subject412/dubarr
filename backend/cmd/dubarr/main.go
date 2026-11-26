@@ -272,6 +272,7 @@ func newServerWithSecrets(cfg Config, secOpts secrets.Options) (*server, error) 
 		Store:    st,
 		Secrets:  sec,
 		Logf:     logger.Logf("arrsync"),
+		Debugf:   logger.Debugf("arrsync"),
 	})
 	if libraryErr != nil {
 		logger.Logger().Warn("arr library sync disabled", "component", "arrsync", "error", libraryErr)
@@ -317,6 +318,7 @@ func newServerWithSecrets(cfg Config, secOpts secrets.Options) (*server, error) 
 		Refresher:    libraryRefresher,
 		Secrets:      sec,
 		RequireAdmin: authSvc.RequireAdmin,
+		Logf:         logger.Logf("library"),
 	})
 
 	syncjob.RegisterRoutes(mux, syncjob.Dependencies{
@@ -359,6 +361,7 @@ func newServerWithSecrets(cfg Config, secOpts secrets.Options) (*server, error) 
 		Settings: settingsStore,
 		Store:    st,
 		Logf:     logger.Logf("watch"),
+		Debugf:   logger.Debugf("watch"),
 	})
 	if scanErr != nil {
 		// A broken watch path must not take the HTTP API down: the operator
@@ -385,6 +388,7 @@ func newServerWithSecrets(cfg Config, secOpts secrets.Options) (*server, error) 
 		Store:    st,
 		DataDir:  cfg.DataDir,
 		Logf:     logger.Logf("extract"),
+		Debugf:   logger.Debugf("extract"),
 	})
 	if extractErr != nil {
 		logger.Logger().Warn("extraction worker disabled", "component", "extract", "error", extractErr)
@@ -406,6 +410,7 @@ func newServerWithSecrets(cfg Config, secOpts secrets.Options) (*server, error) 
 		Store:    st,
 		Secrets:  sec,
 		Logf:     logger.Logf("syncworker"),
+		Errorf:   logger.Errorf("syncworker"),
 	})
 	if syncErr != nil {
 		logger.Logger().Warn("sync worker disabled", "component", "syncworker", "error", syncErr)
@@ -475,8 +480,11 @@ func newServerWithSecrets(cfg Config, secOpts secrets.Options) (*server, error) 
 type scannerWiring struct {
 	Settings *settings.Store
 	Store    *store.Store
-	// Logf reports why the scanner stays disabled. Nil means log.Printf.
+	// Logf reports why the scanner stays disabled, and carries the per-scan
+	// info line. Nil means log.Printf.
 	Logf func(format string, args ...any)
+	// Debugf carries the per-path scan detail. Nil keeps it silent.
+	Debugf func(format string, args ...any)
 }
 
 // wireScanner builds the M2 ingest pipeline: watch scanner over the configured
@@ -523,6 +531,7 @@ func wireScanner(ctx context.Context, deps scannerWiring) (*watch.Scanner, error
 	if err != nil {
 		return nil, fmt.Errorf("watch scanner: %w", err)
 	}
+	scanner.SetLogging(logf, deps.Debugf)
 
 	gateSvc := gate.NewService(func(ctx context.Context) (gate.Rule, error) {
 		return loadGateRule(ctx, deps.Settings)
@@ -546,8 +555,11 @@ type extractWiring struct {
 	DataDir  string
 	// Interval overrides the idle cadence; 0 keeps extract.DefaultInterval.
 	Interval time.Duration
-	// Logf reports why the worker stays disabled. Nil means log.Printf.
+	// Logf reports why the worker stays disabled, and carries the per-job
+	// claim/finish lines. Nil means log.Printf.
 	Logf func(format string, args ...any)
+	// Debugf carries the per-probe detail. Nil keeps it silent.
+	Debugf func(format string, args ...any)
 }
 
 // wireExtractWorker builds the M3-4 pipeline: the M3-1 extraction worker over
@@ -592,6 +604,7 @@ func wireExtractWorker(ctx context.Context, deps extractWiring) (*extract.Worker
 		Interval:  deps.Interval,
 		VaultHook: newVaultHook(writer),
 		Logf:      logf,
+		Debugf:    deps.Debugf,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("extraction worker: %w", err)
@@ -607,8 +620,12 @@ type syncWiring struct {
 	Secrets arrrescan.Decrypter
 	// Interval overrides the idle cadence; 0 keeps syncworker.DefaultInterval.
 	Interval time.Duration
-	// Logf reports why the worker stays disabled. Nil means log.Printf.
+	// Logf reports why the worker stays disabled, and carries the per-job
+	// claim/publish lines. Nil means log.Printf.
 	Logf func(format string, args ...any)
+	// Errorf carries a job failure at error level (job id + stage). Nil falls
+	// back to Logf.
+	Errorf func(format string, args ...any)
 }
 
 // wireSyncWorker builds the M5-3 chain: queued sync jobs are analysed by the
@@ -674,6 +691,7 @@ func wireSyncWorker(ctx context.Context, deps syncWiring) (*syncworker.Worker, e
 		WorkDir:   paths.WorkDir,
 		Interval:  deps.Interval,
 		Logf:      logf,
+		Errorf:    deps.Errorf,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("sync worker: %w", err)
@@ -691,8 +709,11 @@ type arrSyncWiring struct {
 	// setting; a negative value disables the poller (test seam, like the other
 	// workers' Interval field).
 	Interval time.Duration
-	// Logf reports why the poller stays disabled. Nil means log.Printf.
+	// Logf reports why the poller stays disabled, and carries the pass
+	// start/finish lines. Nil means log.Printf.
 	Logf func(format string, args ...any)
+	// Debugf carries the per-cache-row detail. Nil keeps it silent.
+	Debugf func(format string, args ...any)
 }
 
 // wireArrSync builds the M6-1 poller over the enabled arr.connections.
@@ -746,6 +767,7 @@ func wireArrSync(ctx context.Context, deps arrSyncWiring) (*arrsync.Poller, erro
 		Secrets:  deps.Secrets,
 		Interval: interval,
 		Logf:     logf,
+		Debugf:   deps.Debugf,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("arr library sync: %w", err)

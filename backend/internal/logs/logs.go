@@ -140,10 +140,30 @@ func (l *Logger) SetLevel(name string) error {
 }
 
 // Logf returns a printf-style adapter tagged with component, for the workers
-// that still take a `Logf func(string, ...any)` seam.
+// that still take a `Logf func(string, ...any)` seam. It logs at Info: it is
+// the pipeline-decision seam, not a per-item one.
 func (l *Logger) Logf(component string) func(format string, args ...any) {
 	return func(format string, args ...any) {
 		l.logger.Info(fmt.Sprintf(format, args...), "component", component)
+	}
+}
+
+// Debugf returns a printf-style adapter tagged with component that logs at
+// Debug, for per-item pipeline detail. A nil-safe no-op is the caller's job:
+// the seamed packages fall back to a discard function. The level switch is the
+// only filter, so a debug line is dropped at the info threshold and appears
+// after PUT /api/logs/level {"level":"debug"} without a restart.
+func (l *Logger) Debugf(component string) func(format string, args ...any) {
+	return func(format string, args ...any) {
+		l.logger.Debug(fmt.Sprintf(format, args...), "component", component)
+	}
+}
+
+// Errorf returns a printf-style adapter tagged with component that logs at
+// Error, for a failed pipeline step (a job verdict, not a diagnostic).
+func (l *Logger) Errorf(component string) func(format string, args ...any) {
+	return func(format string, args ...any) {
+		l.logger.Error(fmt.Sprintf(format, args...), "component", component)
 	}
 }
 

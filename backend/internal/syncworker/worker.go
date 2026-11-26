@@ -13,6 +13,10 @@
 //     out_of_range), a mux failure: the job is marked failed with the first
 //     line of the reason, staging under {WORK_DIR}/jobs/{id}/ is removed and
 //     no mux is attempted.
+//   - A mux refusal is terminal, never retried: [mux.ErrUnsupportedContainer]
+//     (a target or destination that is not Matroska) and the other mux
+//     sentinels surface unchanged from Mux, so the job is marked failed once
+//     with the sentinel's own message and no second attempt is made.
 //   - A rescan failure is logged and never changes a good mux result
 //     (M5-4 contract: best-effort, non-fatal).
 //   - Staging is removed once the job finishes, on success and on failure
@@ -426,6 +430,9 @@ func (w *Worker) processJob(ctx context.Context, id int64) error {
 		Candidates:     candidates,
 	})
 	if err != nil {
+		// A mux sentinel — a non-Matroska container (mux.ErrUnsupportedContainer)
+		// included — is terminal: it is returned unwrapped and ProcessOnce
+		// records it as the job's failed status once, with no retry.
 		return err
 	}
 

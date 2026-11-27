@@ -29,6 +29,15 @@ change.
 
 ### Changed
 
+- **The shipped analysis mode is now windowed.** `sync.defaults.analysis_source`
+  defaults to `windows`: a sync job analyses 190 s windows with a 2.0 s pre-roll
+  instead of decoding both tracks whole, so it finishes sooner and decodes about
+  4.7× less audio — measured 3.5× and 3.6× faster end-to-end on the two
+  reference films, with the same verdict as before (same offsets, same drift,
+  |Δquality| 0.000 on both). When a window plan cannot be built, or a window
+  still looks wrong after its one re-decode, the job falls back to a whole-track
+  decode rather than failing; `full` stays selectable for operators who would
+  rather never fall back.
 - The correlator is now pure Go and runs in-process. It reproduces the previous
   engine's offsets exactly on the committed fixtures and on both real films
   through the whole pipeline — the recorded reference values live in

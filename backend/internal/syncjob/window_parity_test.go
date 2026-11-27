@@ -242,8 +242,26 @@ func (e parityGoldenEntry) windowSec(t *testing.T) float64 {
 // audio". It is printed here — Δgolden — so the quirk stays visible rather
 // than being absorbed into a widened bound. Do not "fix" this test by widening
 // oneSampleMS: it is the property under proof.
+
+// requireParityOptIn keeps the real-film parity proof out of the default
+// `go test ./...` gate. It decodes both films four times per entry and takes
+// about nine minutes, which does not fit the package's default timeout; CI has
+// no media, so it would skip there anyway. Run it deliberately:
+//
+//	DUBARR_PARITY=1 go test ./internal/syncjob -run Windowed
+func requireParityOptIn(t *testing.T) {
+	t.Helper()
+	if os.Getenv("DUBARR_PARITY") == "1" {
+		return
+	}
+	t.Skip("real-film parity proof: set DUBARR_PARITY=1 to run it")
+}
+
+// TestWindowedGoldenParityOnBothFixtures is proof 1: the seek reads the audio
+// the timestamp names.
 func TestWindowedGoldenParityOnBothFixtures(t *testing.T) {
 	requireTools(t, "ffmpeg")
+	requireParityOptIn(t)
 	for _, fixture := range []string{"shrek", "minions"} {
 		t.Run(fixture, func(t *testing.T) {
 			golden := readParityGolden(t, fixture)

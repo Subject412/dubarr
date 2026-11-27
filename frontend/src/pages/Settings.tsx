@@ -294,15 +294,14 @@ function NumberField({
 
 /**
  * Seeds the analysis mode a `sync.defaults` row written before U-WIN.6 does not
- * carry, and repairs an empty one. 'full' is the compiled default
- * (settings.DefaultAnalysisSource) and changes with it in U-WIN.9, together
- * with DEFAULTS['sync.defaults'] and the select's own fallback. Anything that
- * is not a real mode renders as the default, so the control is never blank —
- * the finding-4 symptom.
+ * carry, and repairs an empty one. 'windows' is the compiled default
+ * (settings.DefaultAnalysisSource), mirrored by DEFAULTS['sync.defaults'] and
+ * the select's own fallback. Anything that is not a real mode renders as the
+ * default, so the control is never blank — the finding-4 symptom.
  */
 function withAnalysisSource(section: SyncDefaults): SyncDefaults {
   const mode = section.analysis_source
-  return { ...section, analysis_source: mode === 'windows' || mode === 'full' ? mode : 'full' }
+  return { ...section, analysis_source: mode === 'windows' || mode === 'full' ? mode : 'windows' }
 }
 
 export function SettingsPage() {
@@ -318,7 +317,7 @@ export function SettingsPage() {
 
   // The analysis mode is a `sync.defaults` field, and a row stored before
   // U-WIN.6 carries no analysis_source. The card is seeded with the compiled
-  // default (the same 'full' the select falls back to, and the same value as
+  // default (the same 'windows' the select falls back to, and the same value as
   // DEFAULTS['sync.defaults'] / settings.DefaultAnalysisSource) so the control
   // is never blank and an untouched save sends the mode it displays instead of
   // leaving the key out of the section. The memo keeps the object identity
@@ -670,10 +669,10 @@ export function SettingsPage() {
                   >
                     <Select
                       id="sync-analysis-source"
-                      value={draft.analysis_source ?? 'full'}
+                      value={draft.analysis_source ?? 'windows'}
                       onChange={(event) =>
                         update({
-                          analysis_source: event.target.value === 'windows' ? 'windows' : 'full',
+                          analysis_source: event.target.value === 'full' ? 'full' : 'windows',
                         })
                       }
                     >

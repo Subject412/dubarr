@@ -1008,8 +1008,9 @@ const legacySyncDefaults = `{"max_offset_sec":180,"checkpoint_positions_pct":[10
 	`"checkpoint_window_sec":150,"preview_positions_pct":[10,25,50,75,90],"preview_window_sec":60}`
 
 // analysis_source follows the parallel_checkpoints contract: absent is the
-// compiled default (so a legacy row keeps analysing whole tracks), a present ""
-// stays empty so the boundary — not the decoder — decides what it means.
+// compiled default (now the windowed mode, which falls back to a whole-track
+// decode when a plan cannot be built), a present "" stays empty so the
+// boundary — not the decoder — decides what it means.
 func TestSyncDefaultsAnalysisSourceDecode(t *testing.T) {
 	var absent SyncDefaults
 	if err := json.Unmarshal([]byte(legacySyncDefaults), &absent); err != nil {
@@ -1041,18 +1042,18 @@ func TestSyncDefaultsAnalysisSourceDecode(t *testing.T) {
 	}
 }
 
-// The compiled default is 'full' in this unit; U-WIN.9 flips the constant and
-// this test with it.
+// The compiled default is 'windows': a job analyses windows and falls back to a
+// whole-track decode when the plan cannot be built.
 func TestDefaultsAnalysisSource(t *testing.T) {
 	sd, ok := Defaults("")[KeySyncDefaults].(SyncDefaults)
 	if !ok {
 		t.Fatalf("Defaults()[%s] is not a SyncDefaults", KeySyncDefaults)
 	}
-	if sd.AnalysisSource != analyze.AnalysisSourceFull {
-		t.Errorf("default analysis_source = %q, want %q", sd.AnalysisSource, analyze.AnalysisSourceFull)
+	if sd.AnalysisSource != analyze.AnalysisSourceWindows {
+		t.Errorf("default analysis_source = %q, want %q", sd.AnalysisSource, analyze.AnalysisSourceWindows)
 	}
-	if DefaultAnalysisSource != analyze.AnalysisSourceFull {
-		t.Errorf("DefaultAnalysisSource = %q, want the compiled default %q", DefaultAnalysisSource, analyze.AnalysisSourceFull)
+	if DefaultAnalysisSource != analyze.AnalysisSourceWindows {
+		t.Errorf("DefaultAnalysisSource = %q, want the compiled default %q", DefaultAnalysisSource, analyze.AnalysisSourceWindows)
 	}
 }
 
@@ -1099,8 +1100,8 @@ func TestSyncDefaultsAnalysisSourceLegacyRow(t *testing.T) {
 	if err := json.Unmarshal(served, &fields); err != nil {
 		t.Fatalf("decode served section: %v (%s)", err, served)
 	}
-	if got := string(fields["analysis_source"]); got != `"full"` {
-		t.Fatalf("served analysis_source = %s, want \"full\" (%s)", got, served)
+	if got := string(fields["analysis_source"]); got != `"windows"` {
+		t.Fatalf("served analysis_source = %s, want \"windows\" (%s)", got, served)
 	}
 	sd := decode[SyncDefaults](t, served)
 	if sd.ParallelCheckpoints != DefaultParallelCheckpoints || sd.CheckpointWindowSec != 150 {
@@ -1132,8 +1133,8 @@ func TestSyncDefaultsAnalysisSourceLegacyRow(t *testing.T) {
 	if err := json.Unmarshal(after, &rewritten); err != nil {
 		t.Fatalf("decode rewritten row: %v", err)
 	}
-	if got := string(rewritten["analysis_source"]); got != `"full"` {
-		t.Errorf("stored analysis_source = %s, want \"full\"", got)
+	if got := string(rewritten["analysis_source"]); got != `"windows"` {
+		t.Errorf("stored analysis_source = %s, want \"windows\"", got)
 	}
 	round := decode[SyncDefaults](t, after)
 	if round.CheckpointWindowSec != 150 || round.MaxOffsetSec != 180 ||
@@ -1161,8 +1162,8 @@ func TestSetMaterialisesEmptyAnalysisSource(t *testing.T) {
 		if err := json.Unmarshal(raw, &fields); err != nil {
 			t.Fatalf("decode stored row: %v (%s)", err, raw)
 		}
-		if got := string(fields["analysis_source"]); got != `"full"` {
-			t.Errorf("stored analysis_source = %s, want \"full\" (%s)", got, raw)
+		if got := string(fields["analysis_source"]); got != `"windows"` {
+			t.Errorf("stored analysis_source = %s, want \"windows\" (%s)", got, raw)
 		}
 	}
 }

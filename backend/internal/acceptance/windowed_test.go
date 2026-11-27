@@ -131,8 +131,14 @@ type windowedRun struct {
 }
 
 // TestWindowedParity is proof 2: whole-job equivalence on both fixtures.
+//
+// It is opt-in (DUBARR_PARITY=1) because it runs four whole jobs over the real
+// films and takes about five minutes, which does not belong in `go test ./...`.
 func TestWindowedParity(t *testing.T) {
 	requireAcceptanceTools(t)
+	if os.Getenv("DUBARR_PARITY") != "1" {
+		t.Skip("real-film parity proof: set DUBARR_PARITY=1 to run it")
+	}
 	for _, fx := range windowedFixtures() {
 		fx := fx
 		t.Run(fx.name, func(t *testing.T) {

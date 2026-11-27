@@ -13,6 +13,7 @@ Self-hosted **arr for audio**: a curated vault of extracted audio tracks for the
 - Backend: `cd backend && go build ./cmd/dubarr && go test ./... && go vet ./...`
 - Run native: `./dubarr --data-dir ./data --listen 127.0.0.1:8080`
 - DSP: `cd backend && go test ./internal/dsp/...` (goldens live in `internal/dsp/testdata`; `-check` re-runs the capture)
+- Windowed-decode parity (needs `testfiles/`; ~14 min, so it is opt-in and outside `go test ./...`): `DUBARR_PARITY=1 go test ./internal/syncjob ./internal/acceptance -run Windowed`
 - Frontend: `cd frontend && npm install && npm run dev|build|lint` (build output → `backend/web`)
 - Docker: `docker compose -f docker/docker-compose.yml up --build`
 

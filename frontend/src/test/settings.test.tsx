@@ -1180,7 +1180,7 @@ describe('analysis source (U-WIN.6)', () => {
 
     // Never a blank control: the compiled default is what the operator sees.
     const field = analysisSelect()
-    expect(field).toHaveValue('full')
+    expect(field).toHaveValue('windows')
     expect(field.value).not.toBe('')
 
     // An untouched save PATCHes the mode it displays, so the section is
@@ -1189,6 +1189,6 @@ describe('analysis source (U-WIN.6)', () => {
     await waitFor(() =>
       expect(fetchMock.mock.calls.some(([, init]) => isMethod(init, 'PUT'))).toBe(true),
     )
-    expect(savedSync(fetchMock)).toEqual({ ...legacySync, analysis_source: 'full' })
+    expect(savedSync(fetchMock)).toEqual({ ...legacySync, analysis_source: 'windows' })
   })
 })

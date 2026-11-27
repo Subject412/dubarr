@@ -9,6 +9,32 @@ change.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.4.0] - 2026-11-27
+
+Pre-1.0. This is a minor release and the largest internal change since 0.2.0:
+the sync engine is no longer a separate program, and a sync job no longer
+decodes the whole film.
+
+Nothing has to be migrated. Settings rows load unchanged, the two new keys are
+served with their defaults when absent, and `sync-engine/` was never part of the
+installed application — if you put `dubarr-sync` on `PATH` yourself, delete it;
+nothing reads it.
+
+The correlator is now Go code inside `dubarr`, reproducing the previous engine's
+offsets exactly on the committed fixtures and on both real films through the
+whole pipeline — and it is **faster than the engine it replaced**: a 190 s
+checkpoint costs ~425 ms against the Rust engine's 687 ms, because the median
+lag score is now selected instead of found by sorting 2.9 M values.
+
+A sync job now analyses 190 s windows by default. Measured on the two reference
+films: **3.5× and 3.6× faster** end to end, **4.7× less audio decoded**, with the
+same verdict, the same checkpoint plan and |Δquality| 0.000. When a plan cannot
+be built, or a window still looks wrong after its one re-decode, the job falls
+back to a whole-track decode rather than failing; `full` stays selectable for an
+operator who would rather never fall back.
+
 ### Upgrade notes
 
 - **The DSP engine is no longer a separate program.** Dubarr is now a single

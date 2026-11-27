@@ -51,13 +51,16 @@ const (
 	statusFailed    = "failed"
 )
 
-// Public status vocabulary of GET /api/sync/jobs (PLAN.md M4-6). The schema
-// status is mapped onto it so the API never leaks M5-internal states.
+// Public status vocabulary of GET /api/sync/jobs (PLAN.md M4-6, #48). The
+// schema status is mapped onto it so the API never leaks M5-internal states;
+// held and cancelled are public states of their own and pass through unmapped.
 const (
-	StatusQueued  = "queued"
-	StatusRunning = "running"
-	StatusDone    = "done"
-	StatusFailed  = "failed"
+	StatusQueued    = "queued"
+	StatusRunning   = "running"
+	StatusDone      = "done"
+	StatusFailed    = "failed"
+	StatusHeld      = "held"
+	StatusCancelled = "cancelled"
 )
 
 // SourceTiming is what the container says about one analysis input before it
@@ -147,7 +150,7 @@ type Service struct {
 // RegisterRoutes mounts:
 //
 //	POST /api/sync/jobs         create a queued job (eligibility gate)
-//	GET  /api/sync/jobs         list jobs, newest first
+//	GET  /api/sync/jobs         list jobs, newest first; ?status= narrows
 //	GET  /api/sync/jobs/{id}    one job with its DriftReport
 func RegisterRoutes(mux *http.ServeMux, deps Dependencies) *Service {
 	svc := &Service{
@@ -202,8 +205,18 @@ type JobInfo struct {
 	AnalysisSource   string `json:"analysis_source,omitempty"`
 	AnalysisFallback string `json:"analysis_fallback,omitempty"`
 	ErrorMessage     string `json:"error_message,omitempty"`
-	CreatedAt        string `json:"created_at,omitempty"`
-	UpdatedAt        string `json:"updated_at,omitempty"`
+	// HeldReason is why a held (or cancelled) job is not queued: the closed
+	// vocabulary code (#48), empty on a job that is neither. The list and the
+	// detail must agree, so both come from jobInfo.
+	HeldReason string `json:"held_reason,omitempty"`
+	// ForceIgnoreTagFilter reports that the operator approved this job past
+	// the tag gate: it is born queued and is never re-held.
+	ForceIgnoreTagFilter bool `json:"force_ignore_tag_filter"`
+	// OriginQueueID is the import_queue row whose approval created the job;
+	// absent for a manual Studio job.
+	OriginQueueID int64  `json:"origin_queue_id,omitempty"`
+	CreatedAt     string `json:"created_at,omitempty"`
+	UpdatedAt     string `json:"updated_at,omitempty"`
 }
 
 func (s *Service) handleCreate(w http.ResponseWriter, r *http.Request) {
@@ -316,6 +329,11 @@ func (s *Service) handleList(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "sync job store is not configured")
 		return
 	}
+	filter, ok := statusFilter(r.URL.Query().Get("status"))
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid status filter")
+		return
+	}
 	recs, err := s.store.ListSyncJobs(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "could not read sync jobs")
@@ -323,9 +341,28 @@ func (s *Service) handleList(w http.ResponseWriter, r *http.Request) {
 	}
 	items := make([]JobInfo, 0, len(recs))
 	for _, rec := range recs {
-		items = append(items, jobInfo(rec))
+		info := jobInfo(rec)
+		// The filter compares the public status, so ?status=running still
+		// covers the M5-internal states publicStatus folds into it.
+		if filter != "" && info.Status != filter {
+			continue
+		}
+		items = append(items, info)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+// statusFilter validates the optional ?status= narrowing of the job list.
+// "" is the whole list. Anything outside the public vocabulary is refused
+// rather than silently returning everything, which would make a typo look
+// like "no held jobs". One value only: the query is a single narrowing.
+func statusFilter(raw string) (string, bool) {
+	status := strings.TrimSpace(raw)
+	switch status {
+	case "", StatusQueued, StatusRunning, StatusDone, StatusFailed, StatusHeld, StatusCancelled:
+		return status, true
+	}
+	return "", false
 }
 
 func (s *Service) handleGet(w http.ResponseWriter, r *http.Request) {
@@ -364,6 +401,9 @@ func jobInfo(rec store.SyncJobRecord) JobInfo {
 		AnalysisSource:       rec.AnalysisSource,
 		AnalysisFallback:     rec.AnalysisFallback,
 		ErrorMessage:         rec.ErrorMessage,
+		HeldReason:           rec.HeldReason,
+		ForceIgnoreTagFilter: rec.ForceIgnoreTagFilter,
+		OriginQueueID:        rec.OriginQueueID,
 		CreatedAt:            rec.CreatedAt,
 		UpdatedAt:            rec.UpdatedAt,
 	}
@@ -386,6 +426,12 @@ func publicStatus(status string) string {
 		return StatusFailed
 	case statusAnalyzing, "ready_for_review", "muxing":
 		return StatusRunning
+	case "held":
+		// A held job is waiting, not finished: it is its own public state and
+		// must never be folded into done or failed.
+		return StatusHeld
+	case "cancelled":
+		return StatusCancelled
 	default:
 		return status
 	}

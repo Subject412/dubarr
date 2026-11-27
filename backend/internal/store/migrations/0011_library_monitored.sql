@@ -1,0 +1,14 @@
+-- 0011: record whether the *arr still monitors the item in the library mirror.
+--
+-- The library lists monitored and available side by side. Availability is
+-- derived (a target path exists), but monitored comes from Radarr/Sonarr and
+-- the mirror never stored it, so the read side had nothing to report. This is
+-- the one column that changes that.
+--
+-- Additive column with a default, no data rewrite, no index (the column is not
+-- a filter, only a field on a row already being read). Existing rows read 0
+-- until the next sync pass writes the real value; arrsync owns that write.
+--
+-- schema.sql is NOT edited: it mirrors 0001_initial.sql (TestSchemaSQLMirrorsMigration),
+-- exactly like 0002-0010; this forward migration is the authoritative change.
+ALTER TABLE arr_library_cache ADD COLUMN monitored INTEGER NOT NULL DEFAULT 0;

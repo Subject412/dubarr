@@ -41,6 +41,13 @@ release notes before upgrading.
   offset; a line fitted through the checkpoint offsets separates a speed **drift**
   (corrected in one ffmpeg pass with the tempo factor) from a **cut**, where the
   film was edited differently.
+- **Vault organising** — arr-style templates for films, episodes and season
+  folders. Setting a template moves nothing: a preview lists every move and
+  refuses a conflicting plan outright, and an apply is the only thing that ever
+  touches a path — preflighted (no swaps, nothing outside the vault, nothing
+  cross-device, nothing occupied), applied in three phases with the renames
+  undone in reverse on the first error, and reconciled into an audit run if even
+  that fails. No file is ever deleted or rewritten.
 - **Techniques** — choose which matchers run, in what order, and when: waveform,
   or MFCC for a codec-degraded pair, always or only after a weaker answer.
   Presets `balanced`, `fast` and `maximum_accuracy` are named starting points —

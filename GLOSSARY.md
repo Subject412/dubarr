@@ -30,6 +30,14 @@ _Avoid_: inbox
 The scratch space named by `work_dir` where every job operates on verified copies of vault tracks; it holds files only while a job runs and is cleared afterwards. Nothing is ever modified in place in the Audio Vault.
 _Avoid_: work area, workspace, staging, scratch dir
 
+**Organise Plan**:
+A previewed list of moves inside the Audio Vault — one row per track, with the source and destination path — produced from the naming templates. It writes nothing; a plan with any conflict has no id, so it cannot be applied.
+_Avoid_: rename batch, move job
+
+**Organise Run**:
+The record of one applied (or attempted) organise plan: how many tracks moved, and whether it completed, was rolled back, or **needs attention** — meaning a file moved but the database could not be updated to match and the listed paths must be checked by hand.
+_Avoid_: migration, reorg log
+
 **Copy-on-Work**:
 The contract that every sync, preview, tempo adjustment and mux first copies the needed vault tracks into the temp folder and verifies their checksums before any processing.
 _Avoid_: in-place editing

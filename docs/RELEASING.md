@@ -43,11 +43,15 @@ What 0.x does **not** promise:
   layout may change between minor releases.
 - **Windows.** Not supported and not built: no Windows archive is published and
   nothing is tested there (ADR-0016).
-- **Automatic vault reorganisation** — moving or renaming files inside the
-  Audio Vault. Planned, not implemented (issue #47). When it lands it must gate
-  the way the arr applications gate media moves: a previewed plan, applied only
-  on approval. Operator-initiated removal and replacement are already defined
-  (ADR-0015) and always go through the Vault Trash.
+- **Automatic vault reorganisation.** 0.5.0 ships vault organising (ADR-0022),
+  but never automatically: a template change moves nothing, and a move happens
+  only when an operator previews a plan and applies it. That gating is a
+  guarantee, not a convenience — the plan is previewed, preflighted (no swaps,
+  nothing outside the vault, nothing cross-device, nothing occupied), applied in
+  three phases with the renames undone in reverse on the first error, and
+  reconciled with an audit run if even that fails. Operator-initiated removal and
+  replacement are already defined (ADR-0015) and always go through the Vault
+  Trash.
 - **Stable internal Go packages.** Only the HTTP API is a contract; `internal/`
   packages may be restructured between minor releases.
 

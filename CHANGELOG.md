@@ -18,7 +18,7 @@ from a cut, to run a chosen set of matchers, and to fix a dub that was cut
 differently from your copy. Approving a job stopped being a promise the app
 could not keep, and the library stopped being a flat list.
 
-Settings, jobs and the Audio Vault all migrate forward on start. One behaviour
+Settings, jobs, the library and the Audio Vault all migrate forward on start. One behaviour
 change is worth reading twice: **no preset turns the new piecewise sync on**,
 not even Maximum accuracy, because a saved preset must never start re-encoding
 dub copies behind your back.
@@ -95,11 +95,32 @@ head marker Δ0 ms, post-join marker Δ1 ms, video stream hash unchanged.
   0009 adds the three indexes the drill-down and search need.
 - The flat `/api/library/items` view is unchanged.
 
+### Vault
+
+- **Organise the Audio Vault with arr-style templates.** Film, episode and
+  season-folder patterns you can read, a preview that writes nothing, and an
+  apply that is the only thing that ever moves a file. When a plan has a
+  conflict there is no plan to submit; when a file changed since the preview the
+  apply refuses (`stale_plan`) instead of moving the wrong thing. Preflight
+  refuses a swap, a destination outside the vault, a cross-device move or an
+  occupied destination *before* touching anything. The apply itself is three
+  phases — create parents, rename (undone in reverse on the first error), then a
+  single transaction of guarded `UPDATE … WHERE file_path = <source>` with audit
+  rows; if a rename-back also fails it reconciles the database to whichever path
+  exists and records a run that needs attention, listing the paths to inspect.
+  No file is ever deleted or rewritten: the only removals target directories the
+  request itself created, deepest first, and only while empty. Migration 0010
+  adds the two audit tables.
+- A template that would produce `….mka.pl.mka`, a reserved name, or a stem over
+  200 bytes is refused when you type it, against the field that caused it.
+
 ### Upgrade notes
 
 - **Nothing to migrate by hand.** Settings rows load unchanged; missing keys are
-  served with their defaults. Migrations 0008 and 0009 run on start.
+  served with their defaults. Migrations 0008, 0009 and 0010 run on start.
 - **Piecewise sync is off** until you turn it on, in every preset.
+- **Vault organising is opt-in per action**: setting a template never moves a
+  file. Nothing inside the vault changes until you preview a plan and apply it.
 - **A held job is not a failure.** If the queue shows a job waiting for tags, it
   was approved and is waiting for its target to become eligible; it releases
   itself, no second press needed.

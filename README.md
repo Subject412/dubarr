@@ -11,9 +11,10 @@ Dubarr owns exactly one library — the vault. Everything else it shows is a
 read-only mirror of what Radarr/Sonarr report, so a working media manager is a
 prerequisite: it has no TMDB/TVDB client of its own.
 
-Nothing is destructive without an explicit decision: a target must be matched,
-tag-eligible and paired with a donor before it can be approved, and the Audio
-Vault is never written to after its first archive.
+Nothing is destructive without an explicit decision: a target must be matched and
+paired with a donor before it can be approved, the mux itself is tag-gated
+(unless you force it), and the Audio Vault is never written to after its first
+archive.
 
 Dubarr is pre-1.0: the HTTP API, settings schema and on-disk layout may still
 change between minor releases. Pin an exact tag for production and read the
@@ -21,16 +22,38 @@ release notes before upgrading.
 
 ## What it does
 
-- **Library** — browse what Radarr/Sonarr report, with per-instance sync health,
-  so a never-synced or failing connection is visible instead of looking empty.
-  Refresh on demand, or rescan a single item.
+- **Library** — browse what Radarr/Sonarr report: films as a flat list, and
+  television as series → seasons → episodes, with each season's share of
+  processed episodes and paging for a season too long to show at once. A series
+  carries the **worst** eligibility in its tree, so one unprocessable episode is
+  visible at series level. Per-instance sync health shows a never-synced or
+  failing connection instead of an empty library; refresh on demand, or rescan a
+  single item.
 - **Queue** — every donor release, with a state that says what it needs next
   (no match, no donor, waiting for tags, ready) and an identify action that asks
-  arr to parse the release name when the library cache is cold.
-- **Sync and mux** — offset detection, lossless vault archiving, tag-gated
-  muxing, `ffprobe` validation, atomic replace.
-- **Settings** — arr connections, storage roots, processing gate, mux output.
-  Connection tests validate values before you save them.
+  arr to parse the release name when the library cache is cold. Approving records
+  **intent**: extraction starts at once, and the sync job is created where the
+  track finally exists — `queued` when the target is eligible, `held` with a
+  reason when it is not. A held job releases itself when its tags arrive.
+- **Sync and mux** — offset detection over the whole film, lossless vault
+  archiving, tag-gated muxing, `ffprobe` validation, atomic replace. Each
+  checkpoint reports how sure the match is and how precisely it could place the
+  offset; a line fitted through the checkpoint offsets separates a speed **drift**
+  (corrected in one ffmpeg pass with the tempo factor) from a **cut**, where the
+  film was edited differently.
+- **Techniques** — choose which matchers run, in what order, and when: waveform,
+  or MFCC for a codec-degraded pair, always or only after a weaker answer.
+  Presets `balanced`, `fast` and `maximum_accuracy` are named starting points —
+  Fast measures fewer checkpoints rather than measuring them worse — and an
+  edited section is `custom`. A preset press writes the technique list and the
+  checkpoint positions in one save.
+- **Piecewise sync** — for a dub that was cut differently, the analysis samples
+  the whole film and shifts each part on its own, re-encoding the dub copy once;
+  the video is never re-encoded. Off in every preset, and a plan that cannot be
+  tiled across the film is refused rather than published.
+- **Settings** — arr connections, storage roots, processing gate, mux output,
+  sync techniques and checkpoint plan. Connection tests validate values before
+  you save them.
 
 ## Platform support
 

@@ -115,7 +115,8 @@ func TestBuildSegmentedArgsClampsAtTheEdges(t *testing.T) {
 }
 
 func TestSegmentsTotalMSIsTheSum(t *testing.T) {
-	if got, want := SegmentsTotalMS(segmentedPair()), int64(2100); got != want {
+	// 1200 s + 900 s of film time, reported in milliseconds.
+	if got, want := SegmentsTotalMS(segmentedPair()), int64(2100000); got != want {
 		t.Fatalf("SegmentsTotalMS = %d, want %d", got, want)
 	}
 	// A zero-length segment contributes nothing rather than shifting the
@@ -125,6 +126,22 @@ func TestSegmentsTotalMSIsTheSum(t *testing.T) {
 	}
 	if got := SegmentsTotalMS(nil); got != 0 {
 		t.Fatalf("SegmentsTotalMS(nil) = %d, want 0", got)
+	}
+}
+
+// TestSegmentsTotalMSIsMilliseconds pins the unit of the contract: segments are
+// seconds of film time, the total is milliseconds. A one-segment plan of 1.5 s
+// must report 1500, not 1 or 1.5.
+func TestSegmentsTotalMSIsMilliseconds(t *testing.T) {
+	if got, want := SegmentsTotalMS([]Segment{{StartSec: 0, EndSec: 1.5}}), int64(1500); got != want {
+		t.Fatalf("SegmentsTotalMS(1.5 s) = %d, want %d ms", got, want)
+	}
+	// Two segments: 1.5 s + 2.5 s = 4 s = 4000 ms.
+	if got, want := SegmentsTotalMS([]Segment{
+		{StartSec: 0, EndSec: 1.5},
+		{StartSec: 1.5, EndSec: 4},
+	}), int64(4000); got != want {
+		t.Fatalf("SegmentsTotalMS(1.5 s + 2.5 s) = %d, want %d ms", got, want)
 	}
 }
 
@@ -175,9 +192,9 @@ func (f *fakeTool) ffmpegCalls() []string {
 
 func segmentedRequest() Request {
 	return Request{
-		Input:   "/work/dub.mka",
-		Output:  "/tmp/out.mka",
-		Plan:    Plan{RuleIndex: NoRule, Codec: CodecFLAC, ChannelLayout: "stereo", SampleRate: 48000},
+		Input:  "/work/dub.mka",
+		Output: "/tmp/out.mka",
+		Plan:   Plan{RuleIndex: NoRule, Codec: CodecFLAC, ChannelLayout: "stereo", SampleRate: 48000},
 		Segments: []Segment{
 			{StartSec: 0, EndSec: 3000, OffsetMS: 0},
 			{StartSec: 3000, EndSec: 6000, OffsetMS: 0},
@@ -187,7 +204,9 @@ func segmentedRequest() Request {
 
 // TestSegmentedEncodeIsOnePass: three segments, one ffmpeg invocation.
 func TestSegmentedEncodeIsOnePass(t *testing.T) {
-	tool := &fakeTool{probeMS: 9000}
+	// The three runs add up to 9000 s of film time, so the fake probe reports
+	// 9 000 000 ms.
+	tool := &fakeTool{probeMS: 9000000}
 	tr := New(Dependencies{FFmpegPath: "/fake/ffmpeg", FFprobePath: "/fake/ffprobe", Run: tool.run})
 
 	req := segmentedRequest()
@@ -211,14 +230,15 @@ func TestSegmentedEncodeIsOnePass(t *testing.T) {
 
 // TestSegmentedEncodeVerifiesTheSegmentsTotal proves the verification compares
 // the output against what the segments add up to, not against the input's
-// duration: the dub is 20 s and the cut track it renders is 6 s.
+// duration: the segments ask for 6000 s (6 000 000 ms) while the fake probe
+// reports only 20 s for the input.
 func TestSegmentedEncodeVerifiesTheSegmentsTotal(t *testing.T) {
 	req := segmentedRequest()
 	req.Output = t.TempDir() + "/out.mka"
 	// The input is probed as 20 s on purpose: using it as the expected duration
-	// would reject the correct 6 s render by 14 s.
+	// would reject the correct 6000 s render by a wide margin.
 	tool := &fakeTool{
-		probeMS: 6000,
+		probeMS: 6000000,
 		byPath:  map[string]int64{req.Input: 20000},
 	}
 	tr := New(Dependencies{FFmpegPath: "/fake/ffmpeg", FFprobePath: "/fake/ffprobe", Run: tool.run})
@@ -227,17 +247,18 @@ func TestSegmentedEncodeVerifiesTheSegmentsTotal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Transcode rejected a render that matches SegmentsTotalMS: %v", err)
 	}
-	if res.DurationMS != 6000 {
-		t.Fatalf("result duration = %d ms, want the probed 6000", res.DurationMS)
+	if res.DurationMS != 6000000 {
+		t.Fatalf("result duration = %d ms, want the probed 6000000", res.DurationMS)
 	}
 }
 
 func TestSegmentedEncodeFailsWhenTheRenderIsShort(t *testing.T) {
 	req := segmentedRequest()
 	req.Output = t.TempDir() + "/out.mka"
-	// 1.5 s short of the 6 s the segments ask for, and far short of the 20 s dub.
+	// 1500 s short of the 6000 s the segments ask for, and far short of the
+	// input's probed duration.
 	tool := &fakeTool{
-		probeMS: 4500,
+		probeMS: 4500000,
 		byPath:  map[string]int64{req.Input: 20000},
 	}
 	tr := New(Dependencies{FFmpegPath: "/fake/ffmpeg", FFprobePath: "/fake/ffprobe", Run: tool.run})

@@ -351,6 +351,48 @@ func TestInterpolatedOffsetMovesOffTheSampleGrid(t *testing.T) {
 	}
 }
 
+// TestInterpolationAtTheFirstScoredLagIsNotFabricated pins the boundary of the
+// neighbour capture: the scan's first scored lag has no scored lag to its left,
+// so the parabolic fit must see a missing neighbour (NaN, which
+// [parabolicPeak] turns into delta 0) and never a zero value left over from the
+// previous-lag bookkeeping.
+//
+// The case puts the peak on that first lag by construction. A 0.1 s window at
+// 8000 Hz bounds the search at round(0.1*8000) = 800 samples, so the scan's
+// first iteration (i = 0) is lag -800 — the search bound, and the first lag
+// that passes the overlap rule. The donor is the same tone delayed by exactly
+// 800 samples, so that first lag is the global maximum and the peak never
+// moves: the integer answer is -800 and the sub-sample fit has no left
+// neighbour to read. A fabricated left neighbour of 0.0 pulls the fit half a
+// sample off it (-799.5015), which is the whole of the error guarded here.
+func TestInterpolationAtTheFirstScoredLagIsNotFabricated(t *testing.T) {
+	const (
+		rate  = uint32(8000)
+		hz    = 70.0
+		shift = 800
+		n     = 8000
+	)
+	target := make([]float32, n)
+	for i := range target {
+		target[i] = float32(0.5 * math.Sin(2*math.Pi*hz*float64(i)/float64(rate)))
+	}
+	donor := make([]float32, n)
+	copy(donor[shift:], target[:n-shift])
+
+	got, err := Analyze(context.Background(), target, donor, rate, 0.1)
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+	if got.OffsetSamples != -shift {
+		t.Fatalf("offset = %d samples, want %d: the peak is not on the first scored lag, so this case proves nothing",
+			got.OffsetSamples, -shift)
+	}
+	if got.OffsetSubSamples != float64(got.OffsetSamples) {
+		t.Fatalf("offset_sub_samples = %v, want exactly %d: the fit fabricated a left neighbour for the first scored lag",
+			got.OffsetSubSamples, got.OffsetSamples)
+	}
+}
+
 // TestAnalysisPrecisionIsTheAnalysisSample states the measurement precision
 // explicitly: one sample of the rate the correlation ran at.
 func TestAnalysisPrecisionIsTheAnalysisSample(t *testing.T) {

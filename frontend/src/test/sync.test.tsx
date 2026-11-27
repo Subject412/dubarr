@@ -1122,6 +1122,132 @@ describe('piecewise report (#84)', () => {
     expect(screen.getByTestId('sync-piecewise-boundaries')).toBeInTheDocument()
     expect(await screen.findAllByTestId(/^boundary-marker-/)).toHaveLength(1)
   })
+
+  it('says how much of the film the dub leaves silent (#129)', async () => {
+    // A 20-minute dub under a 22-minute film is a real finding, not a clean
+    // success: the render padded the tail, and the report says by how much.
+    const job = makeJob({
+      id: 46,
+      calculated_offset_ms: 0,
+      report: makeReport({
+        verdict: 'ok',
+        classification: 'piecewise',
+        checkpoints: denseCheckpoints(),
+        piecewise: {
+          segments: PIECEWISE_SEGMENTS,
+          boundaries: PIECEWISE_BOUNDARIES,
+          dominant_offset_ms: 0,
+          step_sec: 45,
+        },
+        application: {
+          mode: 'piecewise',
+          note: 're-encoded (piecewise, 2 segments)',
+          segment_count: 2,
+          segments: PIECEWISE_SEGMENTS,
+          tail_silence_ms: 12000,
+        },
+      }),
+    })
+    stubJob(job)
+    renderWithProviders(<SyncPage />, { route: '/sync' })
+
+    const tail = await screen.findByTestId('piecewise-tail-silence')
+    expect(tail).toHaveTextContent(
+      'The dub ends 12 s before the film, so the last 12 s of the film has no dub audio.',
+    )
+    // The sentence follows the count, which still describes the render.
+    const count = screen.getByTestId('piecewise-count')
+    expect(count.compareDocumentPosition(tail) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  })
+
+  it('names a fractional tail to one decimal (#129)', async () => {
+    // 12500 ms is not a whole number of seconds, so the sentence says 12.5
+    // rather than rounding to a figure the operator cannot reconcile.
+    const job = makeJob({
+      id: 49,
+      calculated_offset_ms: 0,
+      report: makeReport({
+        verdict: 'ok',
+        classification: 'piecewise',
+        checkpoints: denseCheckpoints(),
+        piecewise: {
+          segments: PIECEWISE_SEGMENTS,
+          boundaries: PIECEWISE_BOUNDARIES,
+          dominant_offset_ms: 0,
+          step_sec: 45,
+        },
+        application: {
+          mode: 'piecewise',
+          note: 're-encoded (piecewise, 2 segments)',
+          segment_count: 2,
+          segments: PIECEWISE_SEGMENTS,
+          tail_silence_ms: 12500,
+        },
+      }),
+    })
+    stubJob(job)
+    renderWithProviders(<SyncPage />, { route: '/sync' })
+
+    expect(await screen.findByTestId('piecewise-tail-silence')).toHaveTextContent(
+      'The dub ends 12.5 s before the film, so the last 12.5 s of the film has no dub audio.',
+    )
+  })
+
+  it('says nothing about a tail under a second (#129)', async () => {
+    // 500 ms is padding noise, not a finding: the worker would not record it,
+    // and a report that carried it anyway must not turn it into a sentence.
+    const job = makeJob({
+      id: 47,
+      calculated_offset_ms: 0,
+      report: makeReport({
+        verdict: 'ok',
+        classification: 'piecewise',
+        checkpoints: denseCheckpoints(),
+        piecewise: {
+          segments: PIECEWISE_SEGMENTS,
+          boundaries: PIECEWISE_BOUNDARIES,
+          dominant_offset_ms: 0,
+          step_sec: 45,
+        },
+        application: {
+          mode: 'piecewise',
+          note: 're-encoded (piecewise, 2 segments)',
+          segment_count: 2,
+          segments: PIECEWISE_SEGMENTS,
+          tail_silence_ms: 500,
+        },
+      }),
+    })
+    stubJob(job)
+    renderWithProviders(<SyncPage />, { route: '/sync' })
+
+    expect(await screen.findByTestId('piecewise-count')).toBeInTheDocument()
+    expect(screen.queryByTestId('piecewise-tail-silence')).toBeNull()
+  })
+
+  it('says nothing about a tail when the worker recorded no application (#129)', async () => {
+    // No application block means no render was recorded, so there is no tail
+    // to claim — the same gate that withholds the rejoin sentence.
+    const job = makeJob({
+      id: 48,
+      report: makeReport({
+        verdict: 'ok',
+        classification: 'piecewise',
+        checkpoints: denseCheckpoints(),
+        piecewise: {
+          segments: PIECEWISE_SEGMENTS,
+          boundaries: PIECEWISE_BOUNDARIES,
+          dominant_offset_ms: 0,
+          step_sec: 45,
+        },
+      }),
+    })
+    stubJob(job)
+    renderWithProviders(<SyncPage />, { route: '/sync' })
+
+    expect(await screen.findByTestId('piecewise-analysis-only')).toBeInTheDocument()
+    expect(screen.queryByTestId('piecewise-tail-silence')).toBeNull()
+  })
 })
 
 /** A held job (#48): approved, waiting for its target, no report yet. */

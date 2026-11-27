@@ -621,6 +621,32 @@ func TestReportJSONShapeCarriesMatchZ(t *testing.T) {
 	}
 }
 
+// TestApplicationJSONCarriesTailSilence is #129: a piecewise render that leaves
+// the film's end silent records how much, so a reader can tell the finding from
+// a clean success. A copy that covers the film carries no key at all, which is
+// what omitempty buys and why the frontend can treat absence as "covers".
+func TestApplicationJSONCarriesTailSilence(t *testing.T) {
+	raw, err := json.Marshal(Application{
+		Mode:          "piecewise",
+		Note:          "re-encoded (piecewise, 2 segments)",
+		TailSilenceMS: 12000,
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(raw), `"tail_silence_ms":12000`) {
+		t.Fatalf("application JSON missing the tail silence: %s", raw)
+	}
+
+	covered, err := json.Marshal(Application{Mode: "copy", Note: "copied untouched"})
+	if err != nil {
+		t.Fatalf("marshal covered: %v", err)
+	}
+	if strings.Contains(string(covered), "tail_silence_ms") {
+		t.Fatalf("application JSON carries a tail silence when the dub covers the film: %s", covered)
+	}
+}
+
 // TestReportCarriesFit: the report publishes the trend next to the spread.
 //
 // The fixture is the drifting one above, and it is a *step*: the offsets jump

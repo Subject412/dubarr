@@ -475,11 +475,48 @@ func (w *Worker) processJob(ctx context.Context, id int64) error {
 					ErrEncoderUnavailable, plan.Encoder(), rec.TargetTrackID, detail))
 			}
 		}
+		// #129: a dub shorter than the film leaves the film's end silent, and
+		// the render pads that tail (see analyze.Segment's tiling note). Say so
+		// in milliseconds instead of letting a 20-minute dub under a 22-minute
+		// film read as a clean success.
+		//
+		// The sign is the renderer's own convention, not a guess:
+		// BuildSegmentedArgs trims a run at [StartSec - OffsetMS/1000,
+		// EndSec - OffsetMS/1000) of the dub (backend/internal/transcode/
+		// segments.go), so the source window is the film span moved back by the
+		// offset and a film position t is dub position t - offset/1000. The
+		// dub's last sample therefore sits at film time dubSec + offset/1000,
+		// and the tail is what the last run's end leaves beyond it. Offsets are
+		// per-segment, so it is the LAST run's offset that places the dub's end;
+		// segment 0's offset belongs to a different part of the film.
+		//
+		// What this measures is the film's silent tail after the cut render: it
+		// is NOT the residual drift (that is Fit) and NOT the mux offset (0 for
+		// a tiled plan).
+		var tailMS int64
+		if track.DurationMS > 0 && len(report.Piecewise.Segments) > 0 {
+			last := report.Piecewise.Segments[0]
+			for _, seg := range report.Piecewise.Segments[1:] {
+				if seg.EndSec > last.EndSec {
+					last = seg
+				}
+			}
+			dubSec := float64(track.DurationMS) / 1000
+			tailSec := last.EndSec - (dubSec + last.OffsetMS/1000)
+			tailMS = int64(math.Round(tailSec * 1000))
+			// Under a second is padding noise and a negative tail means the
+			// dub covers the film: neither is a finding, so the field stays
+			// zero and omitempty drops the key.
+			if tailMS < 1000 {
+				tailMS = 0
+			}
+		}
 		report.Application = &analyze.Application{
-			Mode:         "piecewise",
-			Note:         fmt.Sprintf("re-encoded (piecewise, %d segments)", len(segments)),
-			SegmentCount: len(segments),
-			Segments:     report.Piecewise.Segments,
+			Mode:          "piecewise",
+			Note:          fmt.Sprintf("re-encoded (piecewise, %d segments)", len(segments)),
+			SegmentCount:  len(segments),
+			Segments:      report.Piecewise.Segments,
+			TailSilenceMS: tailMS,
 		}
 	case piecewiseRejected(report):
 		// Deliberately no cut and no tempo: the offset chosen below becomes the

@@ -1392,6 +1392,18 @@ func piecewiseCutReport() analyze.Report {
 	return r
 }
 
+// setDubDuration records the dub's own length on the rig's track (#129). The
+// fixture leaves duration_ms NULL, which is also the "unknown length" case the
+// worker must tolerate. Raw SQL is enough here: the production write path is
+// already asserted in backend/internal/store/vault_tracks_test.go, where
+// RecordVaultTrack must persist DurationMS.
+func setDubDuration(t *testing.T, r *rig, ms int64) {
+	t.Helper()
+	if _, err := r.store.DB.Exec(`UPDATE audio_tracks SET duration_ms = ? WHERE id = ?`, ms, r.trackID); err != nil {
+		t.Fatalf("set track duration: %v", err)
+	}
+}
+
 // TestProcessOncePiecewiseReencodesOnceWithZeroSync is #84 at the worker: an
 // accepted cut is rendered ONCE with the segments, as FLAC when no rule
 // matched, and muxed at offset 0 because the cut track is already aligned.
@@ -1468,6 +1480,106 @@ func TestProcessOncePiecewiseReencodesOnceWithZeroSync(t *testing.T) {
 	}
 	if stored.Application.Segments[1].OffsetMS != 2800 {
 		t.Fatalf("stored second segment = %+v, want the plan's 2800 ms offset", stored.Application.Segments[1])
+	}
+}
+
+// TestProcessOncePiecewiseReportsTailSilence is #129: a dub shorter than the
+// film leaves the film's end silent, and the report must say how much instead
+// of reading as a clean success.
+//
+// The derivation is the renderer's own sign convention. BuildSegmentedArgs
+// trims a run at [StartSec - OffsetMS/1000, EndSec - OffsetMS/1000) of the dub,
+// so a film position t is dub position t - offset/1000 and the dub's last
+// sample sits at film time dubSec + offset/1000 — the dub is moved *forward* by
+// a positive offset, not back. The reused cut is twoSegments' — film 0..2400 s,
+// last run 1500..2400 s at +2.8 s — so the last run reads dub
+// 1497.2..2397.2 s and the dub's audio ends at film 2390.6 s when the dub is
+// 2387.8 s long:
+//
+//	tail = last.EndSec - (dubSec + OffsetMS/1000)
+//
+//	dubSec 2387.8 s at +2.8 s -> audio to 2390.6 s ->  9.4 s tail ->  9400 ms
+//	dubSec 2397.2 s at +2.8 s -> audio to 2400.0 s -> no tail
+//	dubSec 2500.0 s at +2.8 s -> audio past the film -> no tail
+//	dubSec 2385.0 s at  0 s   -> audio to 2385.0 s -> 15.0 s tail -> 15000 ms
+//	dubSec 2390.0 s at -1.0 s -> audio to 2389.0 s -> 11.0 s tail -> 11000 ms
+//	unknown (0 ms)            -> nothing to measure  -> no tail
+//
+// The zero-offset case keeps the sign honest on its own: it never consults the
+// offset's value, so it fails only if the constant in the formula moves. The
+// negative-offset case pins the direction the other way.
+//
+// The duration is seeded with raw SQL (setDubDuration). That is deliberate and
+// already covered on the production path: vault_tracks_test.go asserts that
+// RecordVaultTrack persists DurationMS, so what is under test here is the
+// arithmetic, not the write.
+func TestProcessOncePiecewiseReportsTailSilence(t *testing.T) {
+	cases := []struct {
+		name       string
+		durationMS int64
+		segments   []analyze.Segment // nil keeps twoSegments
+		want       int64
+	}{
+		{"short dub leaves a 9.4 s tail", 2387800, nil, 9400},
+		{"dub ends exactly at the film's end", 2397200, nil, 0},
+		{"dub covers the film", 2500000, nil, 0},
+		{"unknown dub length", 0, nil, 0},
+		{"zero offset leaves a 15 s tail", 2385000, []analyze.Segment{
+			{StartSec: 0, EndSec: 1500, OffsetMS: 800, Confidence: 0.91, Points: 60},
+			{StartSec: 1500, EndSec: 2400, OffsetMS: 0, Confidence: 0.86, Points: 40},
+		}, 15000},
+		{"negative offset leaves an 11 s tail", 2390000, []analyze.Segment{
+			{StartSec: 0, EndSec: 1500, OffsetMS: 800, Confidence: 0.91, Points: 60},
+			{StartSec: 1500, EndSec: 2400, OffsetMS: -1000, Confidence: 0.86, Points: 40},
+		}, 11000},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRig(t)
+			jobID := r.newJob(t)
+			r.stage(t, jobID)
+			setDubDuration(t, r, tc.durationMS)
+
+			report := piecewiseCutReport()
+			if tc.segments != nil {
+				report.Piecewise.Segments = tc.segments
+			}
+
+			mx := &fakeMuxer{}
+			tr := &fakeTranscoder{}
+			w := newWorker(t, r, &fakeExecutor{report: report}, mx, &fakeRescanner{})
+			w.transcoder = tr
+
+			if processed, err := w.ProcessOnce(context.Background()); err != nil || !processed {
+				t.Fatalf("ProcessOnce = %v/%v, want true/nil", processed, err)
+			}
+			if len(mx.jobs) != 1 {
+				t.Fatalf("Mux calls = %d, want 1", len(mx.jobs))
+			}
+
+			rec, ok, err := r.store.SyncJobByID(context.Background(), jobID)
+			if err != nil || !ok {
+				t.Fatalf("SyncJobByID = %v/%v", ok, err)
+			}
+			if rec.Status != statusCompleted {
+				t.Fatalf("status = %q (%s), want completed", rec.Status, rec.ErrorMessage)
+			}
+			var stored analyze.Report
+			if err := json.Unmarshal([]byte(rec.CheckpointsJSON), &stored); err != nil {
+				t.Fatalf("unmarshal stored report: %v", err)
+			}
+			if stored.Application == nil {
+				t.Fatalf("stored report has no application block: %s", rec.CheckpointsJSON)
+			}
+			if got := stored.Application.TailSilenceMS; got != tc.want {
+				t.Fatalf("tail_silence_ms = %d, want %d (%s)", got, tc.want, rec.CheckpointsJSON)
+			}
+			// Absence is the contract for "covers the film": a zero must not
+			// survive into the stored JSON at all.
+			if tc.want == 0 && strings.Contains(rec.CheckpointsJSON, "tail_silence_ms") {
+				t.Fatalf("stored report carries a zero tail silence: %s", rec.CheckpointsJSON)
+			}
+		})
 	}
 }
 

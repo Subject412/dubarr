@@ -889,6 +889,12 @@ export type SyncApplication = {
   segment_count?: number
   /** The same runs the report segmented (`analyze.Application.Segments`). */
   segments?: SyncSegment[]
+  /**
+   * Milliseconds of the film's end that no dub audio covers after a piecewise
+   * render (#129). Absent means the dub covers the film (or its length was
+   * unknown), so the UI says nothing.
+   */
+  tail_silence_ms?: number
 }
 
 export type SyncReport = {

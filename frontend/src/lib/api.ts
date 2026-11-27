@@ -427,6 +427,14 @@ export type SyncJob = {
   sync_method?: string
   calculated_offset_ms: number
   report?: SyncReport
+  /**
+   * Which analysis mode the job actually used. `full` after a fallback, even if
+   * `windows` was requested. Absent on jobs analysed before windowing existed —
+   * render those as unknown, never as `full`.
+   */
+  analysis_source?: string
+  /** Why the requested mode was abandoned (e.g. `2-suspect-windows`); empty when it ran as asked. */
+  analysis_fallback?: string
   error_message?: string
   created_at?: string
   updated_at?: string

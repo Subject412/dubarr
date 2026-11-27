@@ -30,6 +30,14 @@ type SyncJobRecord struct {
 	// mode it is the Target; in separate mode it is the file inside
 	// storage.paths.output_dir. Empty until a mux has completed.
 	OutputPath string
+	// AnalysisSource is the analysis mode the job actually used
+	// (analyze.AnalysisSourceWindows or analyze.AnalysisSourceFull; full after
+	// a fallback). AnalysisFallback is why a windowed request did not run as
+	// windows ("2-suspect-windows", "1-short-window", ...), empty when the
+	// requested mode ran as requested. Both are empty on a row analysed before
+	// migration 0007.
+	AnalysisSource   string
+	AnalysisFallback string
 }
 
 // SyncJobCreate is the insert shape for POST /api/sync/jobs.
@@ -79,7 +87,8 @@ const syncJobColumns = `
 	       COALESCE(checkpoints_json, '[]'),
 	       COALESCE(error_message, ''),
 	       COALESCE(created_at, ''), COALESCE(updated_at, ''),
-	       COALESCE(work_dir_path, ''), COALESCE(output_path, '')
+	       COALESCE(work_dir_path, ''), COALESCE(output_path, ''),
+	       COALESCE(analysis_source, ''), COALESCE(analysis_fallback, '')
 	FROM sync_mux_jobs`
 
 func scanSyncJob(scanner interface{ Scan(...any) error }) (SyncJobRecord, error) {
@@ -87,7 +96,8 @@ func scanSyncJob(scanner interface{ Scan(...any) error }) (SyncJobRecord, error)
 	err := scanner.Scan(&rec.ID, &rec.TargetTrackID, &rec.TargetLibraryCacheID,
 		&rec.TargetVideoPath, &rec.TargetLangISO2, &rec.Status, &rec.SyncMethod,
 		&rec.CalculatedOffsetMS, &rec.CheckpointsJSON, &rec.ErrorMessage,
-		&rec.CreatedAt, &rec.UpdatedAt, &rec.WorkDirPath, &rec.OutputPath)
+		&rec.CreatedAt, &rec.UpdatedAt, &rec.WorkDirPath, &rec.OutputPath,
+		&rec.AnalysisSource, &rec.AnalysisFallback)
 	return rec, err
 }
 
@@ -126,7 +136,12 @@ func (s *Store) ListSyncJobs(ctx context.Context) ([]SyncJobRecord, error) {
 
 // FinishSyncJobAnalysis persists the terminal state of an analysis run.
 // checkpoints is marshalled as-is; a nil report stores an empty array.
-func (s *Store) FinishSyncJobAnalysis(ctx context.Context, id int64, status, syncMethod string, offsetMS int64, checkpoints any, errMessage string) error {
+//
+// analysisSource is the mode the job actually used (windows, or full after a
+// fallback) and analysisFallback is why a windowed request did not run as
+// windows ("" when it did). Both are written as NULL when empty, so a row that
+// predates migration 0007 and a job that ran its requested mode read the same.
+func (s *Store) FinishSyncJobAnalysis(ctx context.Context, id int64, status, syncMethod string, offsetMS int64, checkpoints any, errMessage, analysisSource, analysisFallback string) error {
 	raw, err := json.Marshal(checkpoints)
 	if err != nil {
 		return fmt.Errorf("store: marshal checkpoints: %w", err)
@@ -138,8 +153,12 @@ func (s *Store) FinishSyncJobAnalysis(ctx context.Context, id int64, status, syn
 		UPDATE sync_mux_jobs
 		SET status = ?, sync_method = NULLIF(?, ''),
 		    calculated_offset_ms = ?, checkpoints_json = ?,
-		    error_message = NULLIF(?, ''), updated_at = CURRENT_TIMESTAMP
-		WHERE id = ?`, status, syncMethod, offsetMS, string(raw), errMessage, id)
+		    error_message = NULLIF(?, ''),
+		    analysis_source = NULLIF(?, ''),
+		    analysis_fallback = NULLIF(?, ''),
+		    updated_at = CURRENT_TIMESTAMP
+		WHERE id = ?`, status, syncMethod, offsetMS, string(raw), errMessage,
+		analysisSource, analysisFallback, id)
 	if err != nil {
 		return fmt.Errorf("store: finish sync job %d: %w", id, err)
 	}

@@ -523,7 +523,12 @@ func (w *Worker) processJob(ctx context.Context, id int64) error {
 	// otherwise fail this write and leave ProcessOnce marking a published job
 	// failed. Only this last write is detached; the rescan above stays
 	// cancellable and best-effort.
-	return atStage("finish", w.store.FinishSyncJobAnalysis(context.WithoutCancel(ctx), id, statusCompleted, string(report.SyncMethod), offset, report, ""))
+	//
+	// The analysis source and its fallback travel from the row Execute wrote
+	// (re-read above): the worker's own finish must not erase how the report
+	// was produced.
+	return atStage("finish", w.store.FinishSyncJobAnalysis(context.WithoutCancel(ctx), id, statusCompleted,
+		string(report.SyncMethod), offset, report, "", rec.AnalysisSource, rec.AnalysisFallback))
 }
 
 // muxableVerdict accepts exactly the two verdicts M5-1 may publish. The

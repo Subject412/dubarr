@@ -7,7 +7,7 @@
 //	storage.paths      watch_dir, vault_dir, work_dir, output_dir, media_roots
 //	languages.policy   target/reference languages, commentary exclusion, export mode
 //	target.tag_filter  Processing Gate: filename tags + optional arr tags/roots (ADR-0005, ADR-0009)
-//	sync.defaults      max offset, checkpoint/preview sampling positions
+//	sync.defaults      max offset, checkpoint/preview sampling positions, parallel checkpoints
 //	security.options   tag override
 //	mux.options        track title written into Matroska
 //	audio.options      opt-in Transcode Rules: codec/channels/bitrate/sample rate (ADR-0010)
@@ -191,6 +191,40 @@ type SyncDefaults struct {
 	CheckpointWindowSec    int   `json:"checkpoint_window_sec"`
 	PreviewPositionsPct    []int `json:"preview_positions_pct"`
 	PreviewWindowSec       int   `json:"preview_window_sec"`
+	// ParallelCheckpoints is how many checkpoints one sync job analyses at
+	// the same time (1..8; see analyze.MaxParallelCheckpoints for the engine's
+	// hard bound). Absent in a row written before the key existed, which
+	// [SyncDefaults.UnmarshalJSON] resolves to [DefaultParallelCheckpoints].
+	ParallelCheckpoints int `json:"parallel_checkpoints"`
+}
+
+// DefaultParallelCheckpoints is the shipped worker count: one checkpoint at a
+// time, i.e. exactly the behaviour every install had before the setting
+// existed.
+const DefaultParallelCheckpoints = 1
+
+// UnmarshalJSON makes an absent parallel_checkpoints mean
+// [DefaultParallelCheckpoints]. Legacy rows written before the key existed must
+// keep analysing one checkpoint at a time; a plain decode would read them as 0
+// and fail validation. A *present* 0 is kept as 0 so validateSync rejects it:
+// treating it as "absent" would make an operator's explicit 0 silently mean 1.
+func (s *SyncDefaults) UnmarshalJSON(data []byte) error {
+	type plain SyncDefaults
+	aux := struct {
+		*plain
+		ParallelCheckpoints *int `json:"parallel_checkpoints"`
+	}{plain: (*plain)(s)}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&aux); err != nil {
+		return err
+	}
+	if aux.ParallelCheckpoints == nil {
+		s.ParallelCheckpoints = DefaultParallelCheckpoints
+	} else {
+		s.ParallelCheckpoints = *aux.ParallelCheckpoints
+	}
+	return nil
 }
 
 // SecurityOptions are appliance-wide safety switches.
@@ -358,6 +392,7 @@ func Defaults(dataDir string) map[string]any {
 			CheckpointWindowSec:    150,
 			PreviewPositionsPct:    []int{10, 25, 50, 75, 90},
 			PreviewWindowSec:       60,
+			ParallelCheckpoints:    DefaultParallelCheckpoints,
 		},
 		KeySecurityOptions: SecurityOptions{
 			AllowForceTagOverride: false,
@@ -1052,6 +1087,12 @@ func validateSync(p *SyncDefaults) error {
 	}
 	if p.PreviewWindowSec < 1 || p.PreviewWindowSec > 600 {
 		return errors.New("preview_window_sec must be 1..600")
+	}
+	// A present 0 is rejected rather than read as "absent": UnmarshalJSON only
+	// defaults a value the row does not carry, and an operator who typed 0 must
+	// be told it is out of range instead of silently getting 1.
+	if p.ParallelCheckpoints < 1 || p.ParallelCheckpoints > 8 {
+		return errors.New("parallel_checkpoints must be 1..8")
 	}
 	return nil
 }

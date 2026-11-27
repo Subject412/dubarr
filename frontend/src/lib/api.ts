@@ -118,6 +118,8 @@ export type SyncDefaults = {
   checkpoint_window_sec: number
   preview_positions_pct: number[]
   preview_window_sec: number
+  /** Absent in a row stored before U-DSP.8; the form falls back to 1. */
+  parallel_checkpoints?: number
 }
 
 export type SecurityOptions = {

@@ -857,3 +857,145 @@ func TestAudioOptionsValidation(t *testing.T) {
 		t.Fatalf("roundtrip second rule = %+v", got.Rules[1])
 	}
 }
+
+// sync.defaults gained parallel_checkpoints in U-DSP.8. Every row written
+// before that has no key, so the decode must resolve it to the shipped default;
+// a row that *does* carry 0 must not be read as "absent", or an operator's
+// explicit 0 would silently run one worker anyway.
+func TestSyncDefaultsParallelCheckpointsDecode(t *testing.T) {
+	const legacy = `{"max_offset_sec":180,"checkpoint_positions_pct":[10,25,40,55,70,85],` +
+		`"checkpoint_window_sec":150,"preview_positions_pct":[10,25,50,75,90],"preview_window_sec":60}`
+
+	var absent SyncDefaults
+	if err := json.Unmarshal([]byte(legacy), &absent); err != nil {
+		t.Fatalf("unmarshal legacy row: %v", err)
+	}
+	if absent.ParallelCheckpoints != DefaultParallelCheckpoints {
+		t.Errorf("absent parallel_checkpoints = %d, want %d", absent.ParallelCheckpoints, DefaultParallelCheckpoints)
+	}
+	if err := validateSync(&absent); err != nil {
+		t.Errorf("legacy row failed validation: %v", err)
+	}
+
+	var zero SyncDefaults
+	zeroBody := `{"max_offset_sec":180,"checkpoint_positions_pct":[10,25,40,55,70,85],` +
+		`"checkpoint_window_sec":150,"preview_positions_pct":[10,25,50,75,90],` +
+		`"preview_window_sec":60,"parallel_checkpoints":0}`
+	if err := json.Unmarshal([]byte(zeroBody), &zero); err != nil {
+		t.Fatalf("unmarshal zero: %v", err)
+	}
+	if zero.ParallelCheckpoints != 0 {
+		t.Fatalf("present 0 decoded as %d; it must stay 0 for validation to reject", zero.ParallelCheckpoints)
+	}
+	if err := validateSync(&zero); err == nil {
+		t.Error("validateSync accepted a present 0")
+	} else if err.Error() != "parallel_checkpoints must be 1..8" {
+		t.Errorf("message for a present 0 = %q", err.Error())
+	}
+
+	var five SyncDefaults
+	if err := json.Unmarshal([]byte(`{"parallel_checkpoints":5}`), &five); err != nil {
+		t.Fatalf("unmarshal five: %v", err)
+	}
+	if five.ParallelCheckpoints != 5 {
+		t.Fatalf("present 5 decoded as %d", five.ParallelCheckpoints)
+	}
+
+	// A stored legacy row decodes the same way through the store.
+	ctx := context.Background()
+	s := openStore(t)
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`,
+		KeySyncDefaults, legacy); err != nil {
+		t.Fatalf("insert legacy sync.defaults: %v", err)
+	}
+	if got := decode[SyncDefaults](t, mustGet(t, s, ctx, KeySyncDefaults)).ParallelCheckpoints; got != DefaultParallelCheckpoints {
+		t.Errorf("stored legacy row served %d, want %d", got, DefaultParallelCheckpoints)
+	}
+}
+
+func TestDefaultsParallelCheckpoints(t *testing.T) {
+	sd, ok := Defaults("")[KeySyncDefaults].(SyncDefaults)
+	if !ok {
+		t.Fatalf("Defaults()[%s] is not a SyncDefaults", KeySyncDefaults)
+	}
+	if sd.ParallelCheckpoints != 1 {
+		t.Errorf("default parallel_checkpoints = %d, want 1", sd.ParallelCheckpoints)
+	}
+}
+
+func TestValidateSyncRejectsParallelCheckpointsOutOfRange(t *testing.T) {
+	for _, workers := range []int{-1, 0, 9} {
+		p := validSyncDefaults()
+		p.ParallelCheckpoints = workers
+		err := validateSync(&p)
+		if err == nil {
+			t.Errorf("validateSync accepted parallel_checkpoints=%d", workers)
+			continue
+		}
+		if err.Error() != "parallel_checkpoints must be 1..8" {
+			t.Errorf("message for %d = %q, want %q", workers, err.Error(), "parallel_checkpoints must be 1..8")
+		}
+	}
+	for _, workers := range []int{1, 4, 8} {
+		p := validSyncDefaults()
+		p.ParallelCheckpoints = workers
+		if err := validateSync(&p); err != nil {
+			t.Errorf("validateSync rejected parallel_checkpoints=%d: %v", workers, err)
+		}
+	}
+}
+
+// The write path must reach the same verdict as validateSync, with the same
+// wording: a stored 0 is never quietly rewritten to 1.
+func TestSetRejectsZeroParallelCheckpoints(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	body := `{"max_offset_sec":180,"checkpoint_positions_pct":[10,25,40,55,70,85],` +
+		`"checkpoint_window_sec":150,"preview_positions_pct":[10,25,50,75,90],` +
+		`"preview_window_sec":60,"parallel_checkpoints":0}`
+	err := s.Set(ctx, KeySyncDefaults, json.RawMessage(body))
+	if err == nil {
+		t.Fatal("Set accepted parallel_checkpoints=0")
+	}
+	if !strings.Contains(err.Error(), "parallel_checkpoints must be 1..8") {
+		t.Fatalf("Set error %q does not carry the validation message", err)
+	}
+}
+
+func TestSyncDefaultsParallelCheckpointsRoundTrips(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	body := `{"max_offset_sec":180,"checkpoint_positions_pct":[10,25,40,55,70,85],` +
+		`"checkpoint_window_sec":150,"preview_positions_pct":[10,25,50,75,90],` +
+		`"preview_window_sec":60,"parallel_checkpoints":5}`
+	if err := s.Set(ctx, KeySyncDefaults, json.RawMessage(body)); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	raw := mustGet(t, s, ctx, KeySyncDefaults)
+	if got := decode[SyncDefaults](t, raw).ParallelCheckpoints; got != 5 {
+		t.Fatalf("stored parallel_checkpoints = %d, want 5 (%s)", got, raw)
+	}
+	// The stored row keeps the key, so a client that re-reads and PATCHes the
+	// section back cannot lose it.
+	var stored map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &stored); err != nil {
+		t.Fatalf("decode stored row: %v", err)
+	}
+	if string(stored["parallel_checkpoints"]) != "5" {
+		t.Errorf("stored row parallel_checkpoints = %s, want 5", stored["parallel_checkpoints"])
+	}
+}
+
+// validSyncDefaults is the settled section, used to exercise one validator rule
+// at a time without tripping another.
+func validSyncDefaults() SyncDefaults {
+	return SyncDefaults{
+		MaxOffsetSec:           180,
+		CheckpointPositionsPct: []int{10, 25, 40, 55, 70, 85},
+		CheckpointWindowSec:    150,
+		PreviewPositionsPct:    []int{10, 25, 50, 75, 90},
+		PreviewWindowSec:       60,
+		ParallelCheckpoints:    DefaultParallelCheckpoints,
+	}
+}

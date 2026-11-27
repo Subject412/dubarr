@@ -1,8 +1,9 @@
-import { screen, waitFor, within } from '@testing-library/react'
+import { act, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 import { DEFAULT_SETTINGS } from '../lib/defaults'
 import { settingsSectionId } from '../lib/settings-sections'
+import { SETTINGS_HELP } from '../lib/settings-help'
 import { SettingsPage } from '../pages/Settings'
 import { QueuePage } from '../pages/Queue'
 import { SetupPage } from '../pages/Setup'
@@ -951,5 +952,119 @@ describe('audio transcode rules', () => {
     for (const field of ['bitrate_bps', 'channels', 'channel_layout', 'sample_rate']) {
       expect(Object.prototype.hasOwnProperty.call(rule.then, field)).toBe(false)
     }
+  })
+})
+
+describe('parallel checkpoints (U-DSP.8)', () => {
+  const storedSync = {
+    max_offset_sec: 180,
+    checkpoint_positions_pct: [10, 25, 40, 55, 70, 85],
+    checkpoint_window_sec: 150,
+    preview_positions_pct: [10, 25, 50, 75, 90],
+    preview_window_sec: 60,
+    parallel_checkpoints: 1,
+  }
+
+  function mockSyncFetch(): ReturnType<typeof vi.fn> {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/api/settings') && isMethod(init, 'PUT')) {
+        return jsonResponse({ settings: { 'sync.defaults': storedSync } })
+      }
+      if (url.includes('/api/settings')) {
+        return jsonResponse({ settings: { 'sync.defaults': storedSync } })
+      }
+      return jsonResponse({ error: 'unexpected' }, 404)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    return fetchMock
+  }
+
+  function syncCard(): HTMLElement {
+    const element = document.getElementById(settingsSectionId('sync.defaults'))
+    expect(element).not.toBeNull()
+    return element as HTMLElement
+  }
+
+  function savedSync(fetchMock: ReturnType<typeof vi.fn>): Record<string, unknown> {
+    const put = fetchMock.mock.calls.find(([, init]) => isMethod(init, 'PUT'))
+    expect(put).toBeDefined()
+    const body = JSON.parse(String(put?.[1]?.body)) as {
+      settings: Record<string, Record<string, unknown>>
+    }
+    // Only the section that changed is sent; every other field goes back as it
+    // arrived, so a save cannot rewrite the operator's other sync defaults.
+    expect(Object.keys(body.settings)).toEqual(['sync.defaults'])
+    return body.settings['sync.defaults']
+  }
+
+  it('renders the field beside the checkpoint window with its help text', async () => {
+    mockSyncFetch()
+    renderWithProviders(<SettingsPage />, { route: '/settings' })
+    expect(await screen.findByRole('heading', { name: 'Sync defaults' })).toBeInTheDocument()
+
+    const field = within(syncCard()).getByLabelText('Parallel checkpoints')
+    expect(field).toHaveValue(1)
+    expect(field).toHaveAttribute('min', '1')
+    expect(field).toHaveAttribute('max', '8')
+
+    const trigger = screen.getByRole('button', { name: 'About Parallel checkpoints' })
+    const helpId = field.getAttribute('aria-describedby') ?? ''
+    expect(helpId).not.toBe('')
+    expect(trigger).toHaveAttribute('aria-describedby', helpId)
+    act(() => trigger.focus())
+    const tooltip = await screen.findByRole('tooltip')
+    expect(tooltip).toHaveTextContent(SETTINGS_HELP['sync.defaults'].parallel_checkpoints)
+    // The measured cost, not the earlier estimate that the plan corrected.
+    expect(tooltip).toHaveTextContent(/about 400 MB per extra worker/i)
+    expect(tooltip).toHaveTextContent(/4 GB container gets 4 workers/i)
+    expect(tooltip.textContent).not.toMatch(/170 MB/)
+  })
+
+  it('saves 4 and leaves every other sync default untouched', async () => {
+    const user = userEvent.setup()
+    const fetchMock = mockSyncFetch()
+    renderWithProviders(<SettingsPage />, { route: '/settings' })
+    expect(await screen.findByRole('heading', { name: 'Sync defaults' })).toBeInTheDocument()
+
+    const field = within(syncCard()).getByLabelText('Parallel checkpoints')
+    await user.clear(field)
+    await user.type(field, '4')
+    await user.click(screen.getByLabelText('Save Sync defaults'))
+
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.some(([, init]) => isMethod(init, 'PUT'))).toBe(true),
+    )
+    expect(savedSync(fetchMock)).toEqual({ ...storedSync, parallel_checkpoints: 4 })
+  })
+
+  it('refuses 0 and 9 with the validator message and keeps the last valid value', async () => {
+    const user = userEvent.setup()
+    const fetchMock = mockSyncFetch()
+    renderWithProviders(<SettingsPage />, { route: '/settings' })
+    expect(await screen.findByRole('heading', { name: 'Sync defaults' })).toBeInTheDocument()
+
+    const field = within(syncCard()).getByLabelText('Parallel checkpoints')
+
+    await user.clear(field)
+    await user.type(field, '0')
+    expect(await within(syncCard()).findByRole('alert')).toHaveTextContent(
+      'parallel_checkpoints must be 1..8',
+    )
+
+    // The refused entry stays visible, but the section saves the last value the
+    // engine can actually use.
+    await user.click(screen.getByLabelText('Save Sync defaults'))
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.some(([, init]) => isMethod(init, 'PUT'))).toBe(true),
+    )
+    expect(savedSync(fetchMock).parallel_checkpoints).toBe(1)
+
+    await user.clear(field)
+    await user.type(field, '9')
+    expect(within(syncCard()).getByRole('alert')).toHaveTextContent(
+      'parallel_checkpoints must be 1..8',
+    )
+    expect(field).toHaveValue(9)
   })
 })

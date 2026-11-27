@@ -557,6 +557,12 @@ func (s *Service) analysisPolicy(ctx context.Context) (reflang.Languages, analyz
 			if sd.MaxOffsetSec > 0 {
 				cfg.MaxOffsetSec = sd.MaxOffsetSec
 			}
+			// UnmarshalJSON already resolved an absent key to
+			// DefaultParallelCheckpoints; the clamp against 0 is defence in
+			// depth for a row that skipped validation.
+			if sd.ParallelCheckpoints > 0 {
+				cfg.ParallelCheckpoints = sd.ParallelCheckpoints
+			}
 		}
 	}
 	return policy, cfg

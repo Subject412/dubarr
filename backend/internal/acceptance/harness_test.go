@@ -157,9 +157,17 @@ func newHarness(t *testing.T) *harness {
 }
 
 // copyFixture copies one read-only fixture into dstDir and returns its path.
+//
+// The media itself is not in the repository, so a checkout without testfiles/
+// skips rather than fails: before the engine moved in-process these suites
+// skipped on a missing cargo, and that guard hid the fact that the fixtures were
+// the real prerequisite all along.
 func (h *harness) copyFixture(t *testing.T, name, dstDir string) string {
 	t.Helper()
 	src := filepath.Join("..", "..", "..", "testfiles", name)
+	if _, err := os.Stat(src); err != nil {
+		t.Skipf("media fixtures unavailable (%v); the acceptance suites need testfiles/", err)
+	}
 	dst := filepath.Join(dstDir, name)
 	if err := copyFile(src, dst); err != nil {
 		t.Fatalf("copy fixture %s: %v", name, err)

@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/Subject412/dubarr/backend/internal/analyze"
+	"github.com/Subject412/dubarr/backend/internal/naming"
 	"github.com/Subject412/dubarr/backend/internal/store"
 )
 
@@ -1896,5 +1897,151 @@ func TestSyncStrategyPiecewiseRangesRejected(t *testing.T) {
 				t.Fatalf("error = %v, want it prefixed with %q", err, KeySyncStrategy)
 			}
 		})
+	}
+}
+
+// TestVaultNamingDefaultsRenderTheDocumentedPaths pins acceptance criterion 1:
+// the seeded patterns render the two example vault paths byte for byte.
+func TestVaultNamingDefaultsRenderTheDocumentedPaths(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	if err := s.Seed(ctx, t.TempDir()); err != nil {
+		t.Fatalf("Seed: %v", err)
+	}
+	raw, ok, err := s.Get(ctx, KeyVaultNaming)
+	if err != nil || !ok {
+		t.Fatalf("Get(%s) = (ok=%v, err=%v)", KeyVaultNaming, ok, err)
+	}
+	section := decode[VaultNaming](t, raw)
+	if section.MovieTemplate != DefaultMovieTemplate ||
+		section.EpisodeTemplate != DefaultEpisodeTemplate ||
+		section.SeasonFolder != DefaultSeasonFolder {
+		t.Fatalf("seeded section = %+v", section)
+	}
+
+	movieTmpl, err := naming.Parse(section.MovieTemplate)
+	if err != nil {
+		t.Fatalf("Parse(movie_template): %v", err)
+	}
+	movie := naming.Track{
+		Title: "Spirited Away", Year: 2001, Variant: "dubbing", Codec: "eac3",
+		Channels: "5.1", LangISO2: "pl",
+	}
+	stem, err := movieTmpl.Render(movie)
+	if err != nil {
+		t.Fatalf("render movie: %v", err)
+	}
+	moviePath := naming.VaultPath("/vault/Spirited Away (2001)", "", movie, stem)
+	if want := "/vault/Spirited Away (2001)/Spirited Away (2001) [Dubbing EAC3 5.1].pl.mka"; moviePath != want {
+		t.Fatalf("movie path = %q, want %q", moviePath, want)
+	}
+
+	episodeTmpl, err := naming.Parse(section.EpisodeTemplate)
+	if err != nil {
+		t.Fatalf("Parse(episode_template): %v", err)
+	}
+	seasonTmpl, err := naming.Parse(section.SeasonFolder)
+	if err != nil {
+		t.Fatalf("Parse(season_folder): %v", err)
+	}
+	episode := naming.Track{
+		Title: "The Office", Year: 2005, Season: 2, Episode: 3,
+		EpisodeTitle: "Office Olympics", Variant: "lektor", Codec: "eac3",
+		Channels: "2.0", LangISO2: "pl",
+	}
+	stem, err = episodeTmpl.Render(episode)
+	if err != nil {
+		t.Fatalf("render episode: %v", err)
+	}
+	folder, err := seasonTmpl.RenderFolder(episode)
+	if err != nil {
+		t.Fatalf("render season folder: %v", err)
+	}
+	episodePath := naming.VaultPath("/vault/The Office (2005)", folder, episode, stem)
+	want := "/vault/The Office (2005)/Season 02/The Office - S02E03 - Office Olympics [Lektor EAC3 2.0].pl.mka"
+	if episodePath != want {
+		t.Fatalf("episode path = %q, want %q", episodePath, want)
+	}
+}
+
+// TestVaultNamingRejectsLanguageTemplate is acceptance criterion 2: the settings
+// write is the gate that refuses {Language}, at the same place every other
+// invalid section is refused, and the stored row is untouched.
+func TestVaultNamingRejectsLanguageTemplate(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	if err := s.Seed(ctx, t.TempDir()); err != nil {
+		t.Fatalf("Seed: %v", err)
+	}
+	before, _, err := s.Get(ctx, KeyVaultNaming)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	bad := `{"movie_template":"{Title} ({Year}) {Language}","episode_template":"` +
+		DefaultEpisodeTemplate + `","season_folder":"` + DefaultSeasonFolder + `"}`
+	err = s.Set(ctx, KeyVaultNaming, json.RawMessage(bad))
+	if err == nil {
+		t.Fatal("a {Language} pattern was accepted")
+	}
+	if !errors.Is(err, ErrInvalidValue) {
+		t.Fatalf("error = %v, want ErrInvalidValue", err)
+	}
+	if !strings.Contains(err.Error(), KeyVaultNaming) || !strings.Contains(err.Error(), "{Language}") {
+		t.Fatalf("error = %v, want it to name the section and the token", err)
+	}
+
+	after, _, err := s.Get(ctx, KeyVaultNaming)
+	if err != nil {
+		t.Fatalf("Get after refusal: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("stored section changed to %s after a refused write", after)
+	}
+}
+
+func TestVaultNamingRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	if err := s.Seed(ctx, t.TempDir()); err != nil {
+		t.Fatalf("Seed: %v", err)
+	}
+	// A blank season folder means "keep episodes beside the show folder" and
+	// must round-trip as blank rather than being defaulted back.
+	body := `{"movie_template":"{Title} ({Year})","episode_template":"` +
+		DefaultEpisodeTemplate + `","season_folder":"  "}`
+	if err := s.Set(ctx, KeyVaultNaming, json.RawMessage(body)); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	raw, _, err := s.Get(ctx, KeyVaultNaming)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	got := decode[VaultNaming](t, raw)
+	if got.SeasonFolder != "" {
+		t.Fatalf("season_folder = %q, want blank", got.SeasonFolder)
+	}
+	if got.MovieTemplate != "{Title} ({Year})" {
+		t.Fatalf("movie_template = %q", got.MovieTemplate)
+	}
+
+	// A season folder is one directory name, never a path.
+	bad := `{"movie_template":"` + DefaultMovieTemplate + `","episode_template":"` +
+		DefaultEpisodeTemplate + `","season_folder":"Season/{Season:00}"}`
+	if err := s.Set(ctx, KeyVaultNaming, json.RawMessage(bad)); err == nil {
+		t.Fatal("a season folder containing a path separator was accepted")
+	}
+}
+
+func TestVaultNamingRejectsUnknownField(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	if err := s.Seed(ctx, t.TempDir()); err != nil {
+		t.Fatalf("Seed: %v", err)
+	}
+	body := `{"movie_template":"` + DefaultMovieTemplate + `","episode_template":"` +
+		DefaultEpisodeTemplate + `","season_folder":"` + DefaultSeasonFolder + `","language":"pl"}`
+	if err := s.Set(ctx, KeyVaultNaming, json.RawMessage(body)); err == nil {
+		t.Fatal("an unknown field was accepted")
 	}
 }

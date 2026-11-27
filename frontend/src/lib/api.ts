@@ -416,6 +416,129 @@ export type LibrarySearchResponse = {
   items: LibrarySearchItem[]
 }
 
+// --- Library hierarchy (#56) -------------------------------------------------
+//
+// Radarr is one flat movie list; Sonarr is series -> seasons -> episodes, one
+// read per level. Every field below is optional-tolerant where the server can
+// legitimately omit it (an older row, a mirror column that is still null), so a
+// tab renders a dash instead of inventing a value.
+
+/** One Radarr movie (`GET /api/library/movies`). `id` is the cache row id. */
+export type LibraryMovieResource = {
+  id: number
+  /** Radarr's own movieId — never the same thing as `id`. */
+  arr_id?: number
+  instance_id?: number
+  instance?: string
+  title: string
+  original_title?: string
+  year?: number
+  /** The movie folder. */
+  path?: string
+  target_file_path?: string
+  has_file?: boolean
+  /** 0 until the mirror records a size; the UI hides the column while it is 0. */
+  size_on_disk?: number
+  eligibility?: string
+  video_codec?: string
+  updated_at?: string
+}
+
+/** One aggregated Sonarr series (`GET /api/library/series`). */
+export type LibrarySeriesResource = {
+  id: number
+  instance_id?: number
+  instance?: string
+  title: string
+  year?: number
+  path?: string
+  season_count?: number
+  episode_count?: number
+  episode_file_count?: number
+  /** The worst verdict across the series' episodes. */
+  eligibility?: string
+  updated_at?: string
+}
+
+/** One season's counts, computed by the server (`GROUP BY season_number`). */
+export type LibrarySeasonStatistics = {
+  episode_count?: number
+  episode_file_count?: number
+  percent_of_episodes?: number
+}
+
+export type LibrarySeasonResource = {
+  season_number: number
+  statistics?: LibrarySeasonStatistics
+}
+
+/** One episode row of one season (`.../seasons/{season}/episodes`). */
+export type LibraryEpisodeResource = {
+  id: number
+  series_id?: number
+  /** Sonarr's own episodeId — never the same thing as `id`. */
+  arr_id?: number
+  season_number?: number
+  episode_number?: number
+  title?: string
+  has_file?: boolean
+  target_file_path?: string
+  eligibility?: string
+}
+
+/** The paging envelope the movie and series lists share. */
+export type LibraryPagedResponse<T> = {
+  page?: number
+  /** Echoes the size actually applied after the server clamp. */
+  pageSize?: number
+  total?: number
+  items?: T[]
+}
+
+export type LibrarySeasonsResponse = {
+  items?: LibrarySeasonResource[]
+}
+
+export type LibrarySeasonEpisodesResponse = {
+  seasonNumber?: number
+  /** The whole season, so the page can say "showing 200 of 2001". */
+  total?: number
+  /** True when the season is longer than one payload can carry. */
+  truncated?: boolean
+  items?: LibraryEpisodeResource[]
+}
+
+/** Server-side query surface of the movie and series lists. */
+export type LibraryHierarchyQuery = {
+  q?: string
+  instanceId?: number
+  page?: number
+  pageSize?: number
+  sort?: 'title' | 'year' | 'updated'
+  dir?: 'asc' | 'desc'
+}
+
+/** Query surface of one season's episode page. */
+export type LibraryEpisodeQuery = {
+  page?: number
+  pageSize?: number
+}
+
+/** Every control is a query parameter; nothing is filtered in the browser. */
+function hierarchyQueryString(query: LibraryHierarchyQuery): string {
+  const params = new URLSearchParams()
+  if (query.q) params.set('q', query.q)
+  if (query.instanceId != null && query.instanceId > 0) {
+    params.set('instanceId', String(query.instanceId))
+  }
+  if (query.page != null) params.set('page', String(query.page))
+  if (query.pageSize != null) params.set('pageSize', String(query.pageSize))
+  if (query.sort) params.set('sort', query.sort)
+  if (query.dir) params.set('dir', query.dir)
+  const qs = params.toString()
+  return qs ? `?${qs}` : ''
+}
+
 export type QueueTransition = {
   id: number
   status: string
@@ -946,6 +1069,31 @@ export const api = {
   queue: () => request<QueueResponse>('/api/queue'),
   searchLibrary: (q: string) =>
     request<LibrarySearchResponse>(`/api/imports/search-library?q=${encodeURIComponent(q)}`),
+  /** Radarr as one flat, server-paged list. */
+  libraryMovies: (query: LibraryHierarchyQuery = {}) =>
+    request<LibraryPagedResponse<LibraryMovieResource>>(
+      `/api/library/movies${hierarchyQueryString(query)}`,
+    ),
+  /** Sonarr as one row per series, aggregated server-side. */
+  librarySeries: (query: LibraryHierarchyQuery = {}) =>
+    request<LibraryPagedResponse<LibrarySeriesResource>>(
+      `/api/library/series${hierarchyQueryString(query)}`,
+    ),
+  /** One series header; the list already carries these fields for an expanded row. */
+  librarySeriesDetail: (id: number) => request<LibrarySeriesResource>(`/api/library/series/${id}`),
+  /** Every season of one series with its statistics. */
+  librarySeriesSeasons: (id: number) =>
+    request<LibrarySeasonsResponse>(`/api/library/series/${id}/seasons`),
+  /** One page of one season; `truncated` says the season outgrew one payload. */
+  librarySeasonEpisodes: (id: number, season: number, query: LibraryEpisodeQuery = {}) => {
+    const params = new URLSearchParams()
+    if (query.page != null) params.set('page', String(query.page))
+    if (query.pageSize != null) params.set('pageSize', String(query.pageSize))
+    const qs = params.toString()
+    return request<LibrarySeasonEpisodesResponse>(
+      `/api/library/series/${id}/seasons/${season}/episodes${qs ? `?${qs}` : ''}`,
+    )
+  },
   vault: () => request<VaultResponse>('/api/vault'),
   syncJobs: (status?: SyncJobStatus) =>
     request<SyncJobsResponse>(

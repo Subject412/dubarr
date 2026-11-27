@@ -730,19 +730,59 @@ func analysisFilter(method reflang.Method) string {
 	return "highpass=f=80,lowpass=f=3500"
 }
 
-// decodeAudio extracts one audio stream as mono 8 kHz float PCM, the format the
-// Rust engine expects.
-func decodeAudio(ctx context.Context, ffmpeg, input string, stream int, filter, output string) error {
-	args := []string{
-		"-v", "error", "-nostdin", "-y",
-		"-i", input,
-		"-map", "0:" + strconv.Itoa(stream),
-		"-ac", "1", "-ar", "8000",
-		"-af", filter,
-		"-c:a", "pcm_f32le",
-		output,
+// decodeRequest is one analysis decode. SeekSec and DurationSec are nil for the
+// whole-track decode, which reads the input from its first sample to its last;
+// a window decode sets both.
+type decodeRequest struct {
+	Input  string
+	Stream int
+	Filter string
+	Output string
+	// SeekSec is an input-side seek: it goes before -i so ffmpeg jumps instead
+	// of decoding and discarding, which is the only affordable form on a 2160p
+	// remux. Nil means "from the start of the file".
+	SeekSec *float64
+	// DurationSec is the output limit (-t), counted from the produced file's
+	// first frame — i.e. from the seek, not from the file's start. Nil means
+	// "to the end of the input".
+	DurationSec *float64
+}
+
+// decodeArgs builds the ffmpeg argv for req. It is the only place this argv
+// exists: the whole-track decode and a window decode must hand the engine
+// identical samples (-ac 1 -ar 8000 -af <band> -c:a pcm_f32le), and two copies
+// of the list would drift apart one flag at a time.
+func decodeArgs(req decodeRequest) []string {
+	args := []string{"-v", "error", "-nostdin", "-y"}
+	if req.SeekSec != nil {
+		args = append(args, "-ss", decodeSeconds(*req.SeekSec))
 	}
-	cmd := exec.CommandContext(ctx, ffmpeg, args...)
+	args = append(args,
+		"-i", req.Input,
+		"-map", "0:"+strconv.Itoa(req.Stream),
+	)
+	if req.DurationSec != nil {
+		args = append(args, "-t", decodeSeconds(*req.DurationSec))
+	}
+	return append(args,
+		"-ac", "1", "-ar", strconv.Itoa(windowSampleRate),
+		"-af", req.Filter,
+		"-c:a", "pcm_f32le",
+		req.Output,
+	)
+}
+
+// decodeSeconds formats a seek or a duration for the argv: fixed six decimals,
+// because a planned boundary is a whole sample (125 µs) and a seek that rounds
+// to something else reads the wrong sample.
+func decodeSeconds(sec float64) string {
+	return strconv.FormatFloat(sec, 'f', 6, 64)
+}
+
+// runDecode runs one decode and turns ffmpeg's stderr into the error the job
+// status shows.
+func runDecode(ctx context.Context, ffmpeg string, req decodeRequest) error {
+	cmd := exec.CommandContext(ctx, ffmpeg, decodeArgs(req)...)
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -750,9 +790,20 @@ func decodeAudio(ctx context.Context, ffmpeg, input string, stream int, filter, 
 		if msg == "" {
 			msg = err.Error()
 		}
-		return fmt.Errorf("%s: %s", filepath.Base(input), msg)
+		return fmt.Errorf("%s: %s", filepath.Base(req.Input), msg)
 	}
 	return nil
+}
+
+// decodeAudio extracts one audio stream as mono 8 kHz float PCM, the format the
+// engine expects.
+func decodeAudio(ctx context.Context, ffmpeg, input string, stream int, filter, output string) error {
+	return runDecode(ctx, ffmpeg, decodeRequest{
+		Input:  input,
+		Stream: stream,
+		Filter: filter,
+		Output: output,
+	})
 }
 
 func medianOffset(offsets []float64) (int64, error) {

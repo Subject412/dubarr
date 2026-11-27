@@ -1,11 +1,14 @@
 package settings
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -1183,4 +1186,466 @@ func TestSyncDefaultsAnalysisSourceRoundTrips(t *testing.T) {
 	if got := decode[SyncDefaults](t, raw).AnalysisSource; got != analyze.AnalysisSourceWindows {
 		t.Fatalf("stored analysis_source = %q, want windows (%s)", got, raw)
 	}
+}
+
+// The sync.strategy section: the technique pipeline #82 adds.
+
+// defaultStrategyJSON is the shipped section, byte for byte what a fresh
+// install writes. It is a literal, not a re-marshalled constant: the SPA's
+// DEFAULT_SETTINGS['sync.strategy'] must match it, and a change here is a
+// migration, not a refactor.
+const defaultStrategyJSON = `{"preset":"balanced","techniques":[{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5}]}`
+
+func TestKnownKeysIncludesSyncStrategy(t *testing.T) {
+	if KeySyncStrategy != "sync.strategy" {
+		t.Fatalf("KeySyncStrategy = %q, want %q", KeySyncStrategy, "sync.strategy")
+	}
+	found := false
+	for _, key := range KnownKeys() {
+		if key == KeySyncStrategy {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("KnownKeys() = %v, want it to include %q", KnownKeys(), KeySyncStrategy)
+	}
+}
+
+// TestSyncStrategyDefaultsAreTheBalancedList pins the shipped section and the
+// D4 guarantee behind it: one waveform entry, on every checkpoint.
+func TestSyncStrategyDefaultsAreTheBalancedList(t *testing.T) {
+	defaults := Defaults(t.TempDir())
+	raw, ok := defaults[KeySyncStrategy]
+	if !ok {
+		t.Fatalf("Defaults() has no %q section", KeySyncStrategy)
+	}
+	blob, err := json.Marshal(raw)
+	if err != nil {
+		t.Fatalf("marshal default: %v", err)
+	}
+	if string(blob) != defaultStrategyJSON {
+		t.Fatalf("shipped %s =\n %s\nwant\n %s", KeySyncStrategy, blob, defaultStrategyJSON)
+	}
+
+	strategy := decode[StrategyOptions](t, blob)
+	if strategy.Preset != analyze.PresetBalanced {
+		t.Fatalf("preset = %q, want %q", strategy.Preset, analyze.PresetBalanced)
+	}
+	if len(strategy.Techniques) != 1 {
+		t.Fatalf("techniques = %+v, want exactly one", strategy.Techniques)
+	}
+	entry := strategy.Techniques[0]
+	if entry.ID != analyze.TechniqueWaveform || !entry.Enabled || entry.When != analyze.WhenAlways {
+		t.Fatalf("shipped entry = %+v, want waveform/always/enabled", entry)
+	}
+	if entry.MinConfidence != 0.10 || entry.MinMatchZ != 5.0 {
+		t.Fatalf("shipped thresholds = %v/%v, want 0.10/5.0", entry.MinConfidence, entry.MinMatchZ)
+	}
+}
+
+// TestSyncStrategyAbsentSectionMaterialises: a row written before 0.5.0 carries
+// neither key. Reading it must serve the whole default list, never
+// `"techniques": null` — a pipeline with nothing to run is not a setting.
+func TestSyncStrategyAbsentSectionMaterialises(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`,
+		KeySyncStrategy, `{}`); err != nil {
+		t.Fatalf("insert legacy %s: %v", KeySyncStrategy, err)
+	}
+
+	served := mustGet(t, s, ctx, KeySyncStrategy)
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(served, &fields); err != nil {
+		t.Fatalf("decode served section: %v (%s)", err, served)
+	}
+	if string(fields["techniques"]) == "null" || len(fields["techniques"]) == 0 {
+		t.Fatalf("served techniques = %s, want the default list (%s)", fields["techniques"], served)
+	}
+	if got := string(fields["preset"]); got != `"balanced"` {
+		t.Fatalf("served preset = %s, want \"balanced\" (%s)", got, served)
+	}
+
+	// The read must not rewrite the stored bytes.
+	var stored string
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT value FROM settings WHERE key = ?`, KeySyncStrategy).Scan(&stored); err != nil {
+		t.Fatalf("read stored row: %v", err)
+	}
+	if stored != `{}` {
+		t.Errorf("Get rewrote the stored row: %s", stored)
+	}
+	if got := len(decode[StrategyOptions](t, served).Techniques); got != 1 {
+		t.Fatalf("served techniques = %d entries, want 1", got)
+	}
+}
+
+// TestSyncStrategyValidationTable is one row per rule in the #82 validation
+// table, each through the write path the API uses, so a 400 comes back with the
+// message the operator reads.
+func TestSyncStrategyValidationTable(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct{ name, body, wantErr string }{
+		{"no techniques", `{"preset":"balanced","techniques":[]}`, "techniques must have 1..4 entries"},
+		{"five techniques", `{"preset":"custom","techniques":[` +
+			`{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5},` +
+			`{"id":"mfcc","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5},` +
+			`{"id":"waveform","enabled":true,"when":"below_confidence","min_confidence":0.1,"min_match_z":5},` +
+			`{"id":"mfcc","enabled":true,"when":"above_drift","min_confidence":0.1,"min_match_z":5},` +
+			`{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5}]}`, "techniques must have 1..4 entries"},
+		{"unknown technique", `{"preset":"custom","techniques":[{"id":"chroma","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5}]}`, `unknown technique "chroma"`},
+		{"duplicate technique", `{"preset":"custom","techniques":[` +
+			`{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5},` +
+			`{"id":"waveform","enabled":true,"when":"below_confidence","min_confidence":0.1,"min_match_z":5}]}`, `duplicate technique "waveform"`},
+		{"nothing enabled", `{"preset":"custom","techniques":[{"id":"waveform","enabled":false,"when":"always","min_confidence":0.1,"min_match_z":5}]}`, "at least one technique must be enabled"},
+		{"the first enabled step is not always", `{"preset":"custom","techniques":[` +
+			`{"id":"mfcc","enabled":true,"when":"above_drift","min_confidence":0.1,"min_match_z":5},` +
+			`{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5}]}`, "the first enabled technique must run always"},
+		{"below_confidence needs an earlier step", `{"preset":"custom","techniques":[{"id":"mfcc","enabled":true,"when":"below_confidence","min_confidence":0.1,"min_match_z":5}]}`, `technique "mfcc" needs an earlier step to react to`},
+		{"min_confidence above 1", `{"preset":"custom","techniques":[{"id":"waveform","enabled":true,"when":"always","min_confidence":1.5,"min_match_z":5}]}`, "min_confidence must be 0..1"},
+		{"min_match_z above 100", `{"preset":"custom","techniques":[{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":101}]}`, "min_match_z must be 0..100"},
+		{"unknown preset", `{"preset":"turbo","techniques":[{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5}]}`, "preset must be fast, balanced, maximum_accuracy or custom"},
+		{"unknown field", `{"preset":"balanced","technique":[]}`, "unknown field"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := openStore(t)
+			err := s.Set(ctx, KeySyncStrategy, json.RawMessage(tc.body))
+			if err == nil {
+				t.Fatalf("Set(%s) = nil, want %q", tc.body, tc.wantErr)
+			}
+			if !errors.Is(err, ErrInvalidValue) {
+				t.Fatalf("Set(%s) = %v, want ErrInvalidValue", tc.body, err)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Set(%s) = %q, want it to contain %q", tc.body, err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestSyncStrategyPresetBecomesCustomWhenEdited: the server never trusts the
+// label. The list is authoritative, and a list that is not the named preset's
+// canonical one is stored as custom, in one direction only.
+func TestSyncStrategyPresetBecomesCustomWhenEdited(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct{ name, body, wantPreset string }{
+		{
+			name: "an edited balanced list is custom",
+			body: `{"preset":"balanced","techniques":[` +
+				`{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5},` +
+				`{"id":"mfcc","enabled":true,"when":"below_confidence","min_confidence":0.15,"min_match_z":8}]}`,
+			wantPreset: analyze.PresetCustom,
+		},
+		{
+			name:       "an unedited balanced list keeps its label",
+			body:       `{"preset":"balanced","techniques":[{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5}]}`,
+			wantPreset: analyze.PresetBalanced,
+		},
+		{
+			// D4a: Fast keeps the waveform matcher and spends fewer
+			// checkpoints, so its technique list IS the balanced one. Only the
+			// label distinguishes them, and the server keeps that label.
+			name:       "fast keeps its own label with the balanced list",
+			body:       `{"preset":"fast","techniques":[{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5}]}`,
+			wantPreset: analyze.PresetFast,
+		},
+		{
+			name: "maximum accuracy keeps its canonical list",
+			body: `{"preset":"maximum_accuracy","techniques":[` +
+				`{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5},` +
+				`{"id":"mfcc","enabled":true,"when":"below_confidence","min_confidence":0.15,"min_match_z":8}]}`,
+			wantPreset: analyze.PresetMaximumAccuracy,
+		},
+		{
+			name: "a raised confidence makes maximum accuracy custom",
+			body: `{"preset":"maximum_accuracy","techniques":[` +
+				`{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5},` +
+				`{"id":"mfcc","enabled":true,"when":"below_confidence","min_confidence":0.2,"min_match_z":8}]}`,
+			wantPreset: analyze.PresetCustom,
+		},
+		{
+			name:       "an absent label is derived from the list",
+			body:       `{"techniques":[{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5}]}`,
+			wantPreset: analyze.PresetBalanced,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := openStore(t)
+			if err := s.Set(ctx, KeySyncStrategy, json.RawMessage(tc.body)); err != nil {
+				t.Fatalf("Set(%s): %v", tc.body, err)
+			}
+			stored := decode[StrategyOptions](t, mustGet(t, s, ctx, KeySyncStrategy))
+			if stored.Preset != tc.wantPreset {
+				t.Fatalf("stored preset = %q, want %q", stored.Preset, tc.wantPreset)
+			}
+			if err := analyze.Strategy(stored).Validate(); err != nil {
+				t.Fatalf("stored section does not validate: %v", err)
+			}
+		})
+	}
+}
+
+// TestPresetTechniques pins the three canonical lists. `fast` is deliberately
+// identical to `balanced` (D4a): the paid-for saving is fewer checkpoints, not
+// a coarser matcher, and MFCC is never a preset.
+func TestPresetTechniques(t *testing.T) {
+	balanced := PresetTechniques(analyze.PresetBalanced)
+	fast := PresetTechniques(analyze.PresetFast)
+	maximum := PresetTechniques(analyze.PresetMaximumAccuracy)
+
+	if len(balanced) != 1 || balanced[0].ID != analyze.TechniqueWaveform || balanced[0].When != analyze.WhenAlways {
+		t.Fatalf("balanced = %+v, want one waveform/always entry", balanced)
+	}
+	if len(fast) != 1 || fast[0] != balanced[0] {
+		t.Fatalf("fast = %+v, want the balanced list (D4a)", fast)
+	}
+	if len(maximum) != 2 {
+		t.Fatalf("maximum_accuracy = %+v, want two entries", maximum)
+	}
+	if maximum[1].ID != analyze.TechniqueMFCC || maximum[1].When != analyze.WhenBelowConfidence {
+		t.Fatalf("maximum_accuracy second entry = %+v, want mfcc/below_confidence", maximum[1])
+	}
+	if maximum[1].MinConfidence != 0.15 || maximum[1].MinMatchZ != 8.0 {
+		t.Fatalf("maximum_accuracy thresholds = %v/%v, want 0.15/8.0", maximum[1].MinConfidence, maximum[1].MinMatchZ)
+	}
+	if got := PresetTechniques(analyze.PresetCustom); got != nil {
+		t.Fatalf("custom = %+v, want no canonical list", got)
+	}
+	// No preset may name MFCC first or alone: D4a forbids a coarser default.
+	for _, preset := range []string{analyze.PresetFast, analyze.PresetBalanced} {
+		for _, entry := range PresetTechniques(preset) {
+			if entry.ID != analyze.TechniqueWaveform {
+				t.Fatalf("preset %q names %q, want waveform only", preset, entry.ID)
+			}
+		}
+	}
+}
+
+// spaDefaultsPath is the SPA's seeded defaults, relative to this package. A
+// Go-only checkout has no frontend directory, which is why the test below skips
+// rather than fails when it is absent.
+const spaDefaultsPath = "../../../frontend/src/lib/defaults.ts"
+
+// TestDefaultStrategyMatchesTheSPADefault is the cross-language half of D4.
+//
+// The SPA renders DEFAULT_SETTINGS['sync.strategy'] while the settings load, and
+// [PresetTechniques] promises a test that pins that value to the Go default, so
+// this is it: the same object literal is decoded through the same schema the
+// server saves it with, and must equal Defaults() and pass the Go validation.
+//
+// The literal is TypeScript, so it is extracted with a brace scan and normalised
+// to JSON here — no browser, no npm, and no second copy of the defaults to drift.
+func TestDefaultStrategyMatchesTheSPADefault(t *testing.T) {
+	source, err := os.ReadFile(spaDefaultsPath)
+	if err != nil {
+		t.Skipf("SPA defaults unreadable (%v): nothing to compare in a Go-only lane", err)
+	}
+	literal := spaObjectLiteral(t, string(source), KeySyncStrategy)
+	raw := tsObjectLiteralToJSON(t, literal)
+
+	var got StrategyOptions
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("decode the SPA's %s as StrategyOptions: %v (%s)", KeySyncStrategy, err, raw)
+	}
+	// StrategyOptions.UnmarshalJSON fills an absent key from the Go default, so
+	// the same literal is decoded once more without that safety net: a key the
+	// SPA forgot must fail below instead of being papered over with the value it
+	// was supposed to assert.
+	plain := decodeStrict[analyze.Strategy](t, raw)
+	if !reflect.DeepEqual(analyze.Strategy(got), plain) {
+		t.Fatalf("the SPA's literal is not the whole section:\n with Go defaults %+v\n as written %+v",
+			analyze.Strategy(got), plain)
+	}
+
+	want, ok := Defaults("")[KeySyncStrategy].(StrategyOptions)
+	if !ok {
+		t.Fatalf("Defaults()[%q] is %T, want StrategyOptions", KeySyncStrategy, Defaults("")[KeySyncStrategy])
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("the SPA's %s = %+v, want the Go default %+v", KeySyncStrategy, got, want)
+	}
+	if err := analyze.Strategy(got).Validate(); err != nil {
+		t.Fatalf("the SPA's %s fails the Go validation: %v", KeySyncStrategy, err)
+	}
+}
+
+// decodeStrict decodes raw into T with unknown fields rejected, mirroring the
+// server's own decoder.
+func decodeStrict[T any](t *testing.T, raw []byte) T {
+	t.Helper()
+	var v T
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&v); err != nil {
+		t.Fatalf("decode %s: %v", raw, err)
+	}
+	if dec.More() {
+		t.Fatalf("%s: trailing data", raw)
+	}
+	return v
+}
+
+// spaObjectLiteral returns the object literal that follows key in the SPA's
+// DEFAULT_SETTINGS, braces included.
+//
+// It is a balanced-brace scan that knows about string literals, so a brace in a
+// value (or in a comment) cannot end the object early. The scan starts at the
+// first `{` after the key and stops at the brace that closes it.
+func spaObjectLiteral(t *testing.T, source, key string) string {
+	t.Helper()
+	marker := "'" + key + "'"
+	at := strings.Index(source, marker)
+	if at < 0 {
+		t.Fatalf("%s: no %s entry", spaDefaultsPath, marker)
+	}
+	rest := source[at+len(marker):]
+	open := strings.Index(rest, "{")
+	if open < 0 {
+		t.Fatalf("%s: %s is not followed by an object literal", spaDefaultsPath, marker)
+	}
+	depth := 0
+	var quote byte
+	for i := open; i < len(rest); i++ {
+		c := rest[i]
+		if quote != 0 {
+			if c == '\\' {
+				i++
+				continue
+			}
+			if c == quote {
+				quote = 0
+			}
+			continue
+		}
+		switch c {
+		case '\'', '"', '`':
+			quote = c
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return rest[open : i+1]
+			}
+		}
+	}
+	t.Fatalf("%s: the %s object literal is not closed", spaDefaultsPath, marker)
+	return ""
+}
+
+// tsObjectLiteralToJSON normalises one TypeScript object literal into JSON:
+// unquoted keys are quoted, single-quoted strings become double-quoted, and
+// comments and trailing commas are dropped.
+//
+// Only the constructs DEFAULT_SETTINGS uses are handled. Anything else is left
+// as it stands, so json.Unmarshal — not this helper — rejects a literal the
+// normaliser did not understand.
+func tsObjectLiteralToJSON(t *testing.T, literal string) []byte {
+	t.Helper()
+	var out strings.Builder
+	out.Grow(len(literal))
+	for i := 0; i < len(literal); i++ {
+		c := literal[i]
+		switch {
+		case c == '\'' || c == '"' || c == '`':
+			value, next := tsString(t, literal, i)
+			out.WriteString(value)
+			i = next - 1
+		case c == '/' && i+1 < len(literal) && literal[i+1] == '/':
+			for i < len(literal) && literal[i] != '\n' {
+				i++
+			}
+			out.WriteByte(' ')
+		case c == '/' && i+1 < len(literal) && literal[i+1] == '*':
+			end := strings.Index(literal[i+2:], "*/")
+			if end < 0 {
+				t.Fatalf("unterminated block comment in %s", literal)
+			}
+			i += end + 3
+			out.WriteByte(' ')
+		case c == ',':
+			// A trailing comma is legal TypeScript and illegal JSON.
+			j := i + 1
+			for j < len(literal) && isTSSpace(literal[j]) {
+				j++
+			}
+			if j < len(literal) && (literal[j] == '}' || literal[j] == ']') {
+				continue
+			}
+			out.WriteByte(c)
+		case isTSIdentStart(c):
+			j := i
+			for j < len(literal) && isTSIdentPart(literal[j]) {
+				j++
+			}
+			word := literal[i:j]
+			k := j
+			for k < len(literal) && isTSSpace(literal[k]) {
+				k++
+			}
+			if k < len(literal) && literal[k] == ':' {
+				// An unquoted key: JSON wants it quoted.
+				out.WriteByte('"')
+				out.WriteString(word)
+				out.WriteByte('"')
+			} else {
+				// true, false and null: the only bare words a JSON value allows.
+				out.WriteString(word)
+			}
+			i = j - 1
+		default:
+			out.WriteByte(c)
+		}
+	}
+	return []byte(out.String())
+}
+
+// tsString converts the string literal starting at literal[at] to its JSON form
+// and returns it with the index just past the closing quote.
+func tsString(t *testing.T, literal string, at int) (string, int) {
+	t.Helper()
+	quote := literal[at]
+	var out strings.Builder
+	out.WriteByte('"')
+	for i := at + 1; i < len(literal); i++ {
+		c := literal[i]
+		switch {
+		case c == '\\':
+			if i+1 >= len(literal) {
+				t.Fatalf("unterminated escape in %s", literal)
+			}
+			if literal[i+1] == '\'' {
+				// `\'` is not a JSON escape; the apostrophe is plain there.
+				out.WriteByte('\'')
+			} else {
+				out.WriteByte(c)
+				out.WriteByte(literal[i+1])
+			}
+			i++
+		case c == quote:
+			out.WriteByte('"')
+			return out.String(), i + 1
+		case c == '"':
+			out.WriteString(`\"`)
+		default:
+			out.WriteByte(c)
+		}
+	}
+	t.Fatalf("unterminated string in %s", literal)
+	return "", len(literal)
+}
+
+func isTSSpace(c byte) bool {
+	return c == ' ' || c == '	' || c == '\n' || c == '\r'
+}
+
+func isTSIdentStart(c byte) bool {
+	return c == '_' || c == '$' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+func isTSIdentPart(c byte) bool {
+	return isTSIdentStart(c) || (c >= '0' && c <= '9')
 }

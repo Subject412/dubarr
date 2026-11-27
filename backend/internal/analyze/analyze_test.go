@@ -72,11 +72,21 @@ func echoResult(job sync.Job, offset, quality float64) sync.Result {
 
 // scriptedEngine is the aggregation seam: it returns canned offsets per job so
 // the classification logic is unit-tested without the Rust binary.
+//
+// The answers are consumed in call order, which is why the routing tests pin
+// one worker: with a single worker the call order is the checkpoint order, so
+// a scripted answer per call is a scripted answer per checkpoint.
+//
+// matchZ and precisions are the 0.5.0 diagnostics; an absent script leaves them
+// at 0, which is the documented "this engine does not report one" sentinel and
+// the shape every pre-change test was written against.
 type scriptedEngine struct {
-	offsets   []float64
-	qualities []float64
-	calls     []sync.Job
-	err       error
+	offsets    []float64
+	qualities  []float64
+	matchZ     []float64
+	precisions []float64
+	calls      []sync.Job
+	err        error
 }
 
 func (e *scriptedEngine) Run(_ context.Context, job sync.Job) (sync.Result, error) {
@@ -92,7 +102,14 @@ func (e *scriptedEngine) Run(_ context.Context, job sync.Job) (sync.Result, erro
 	if i < len(e.qualities) {
 		q = e.qualities[i]
 	}
-	return echoResult(job, e.offsets[i], q), nil
+	result := echoResult(job, e.offsets[i], q)
+	if i < len(e.matchZ) {
+		result.MatchZ = e.matchZ[i]
+	}
+	if i < len(e.precisions) {
+		result.PrecisionMS = e.precisions[i]
+	}
+	return result, nil
 }
 
 func sameLangRefs() ([]probe.AudioTrack, []probe.AudioTrack, reflang.Languages, string) {

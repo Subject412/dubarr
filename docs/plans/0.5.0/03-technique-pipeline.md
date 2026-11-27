@@ -238,15 +238,27 @@ expands a preset; the **UI** rewrites `techniques` when a preset button is
 pressed, and the server forces `preset = "custom"` when the incoming list differs
 from the named preset's canonical list. One rule, one direction:
 
-| Preset | `techniques` |
-|---|---|
-| `balanced` (default) | `[{waveform, always, 0.10, 5.0}]` |
-| `fast` | `[{mfcc, always, 0.10, 5.0}]` |
-| `maximum_accuracy` | `[{waveform, always, 0.10, 5.0}, {mfcc, below_confidence, 0.15, 8.0}]` |
+| Preset | `techniques` | checkpoint budget |
+|---|---|---|
+| `balanced` (default) | `[{waveform, always, 0.10, 5.0}]` | 6 (unchanged) |
+| `fast` | `[{waveform, always, 0.10, 5.0}]` | **3** |
+| `maximum_accuracy` | `[{waveform, always, 0.10, 5.0}, {mfcc, below_confidence, 0.15, 8.0}]` | 6 (unchanged) |
 
-`fast` is genuinely cheaper (MFCC works on 10 ms hop sequences, not a 2^21-point
-FFT per checkpoint) and genuinely coarser (±10 ms), which is what "Fast" means
-and what its tooltip says. `balanced` is 0.4.0's behaviour by construction.
+**Fast measures less, not worse** (ruling D4a): it keeps the waveform matcher, so
+offsets stay sample-exact, and spends fewer checkpoints. An operator who picks
+"Fast" must never silently accept a ±10 ms error on clean material, so MFCC is
+never a preset — it is only reachable by editing the list by hand.
+
+Because the checkpoint count lives in `sync.defaults` (it is a bounds/window
+setting, not a technique), pressing a preset button writes **both** sections:
+`sync.strategy` (the list + label) and, for `fast`/`balanced`, the checkpoint
+count. The tooltip says so in one sentence. The server never expands a preset —
+if the incoming list differs from the named preset's canonical list it forces
+`preset = "custom"`, exactly as below.
+
+`maximum_accuracy` references `mfcc` before slice 04 registers an MFCC engine:
+validation must accept the id, and a technique with no registered engine is
+skipped at run time with a note in the report rather than failing the job.
 
 ### Validation (`settings.validateStrategy`, called from `normalize`)
 
@@ -292,9 +304,9 @@ re-marshal" behaviour so an absent key is served materialised.
 
 | Field | Label | Tooltip (what / when / cost) | In presets |
 |---|---|---|---|
-| `preset` | **Starting point** | "Balanced matches the previous release: waveform correlation on every checkpoint, nothing else. Fast uses MFCC only — about ten times cheaper per checkpoint, accurate to ±10 ms. Maximum accuracy adds a second, different matcher when the first is unsure. You can edit the steps afterwards; the starting point then reads Custom." | all three |
+| `preset` | **Starting point** | "Balanced matches the previous release: waveform correlation on every checkpoint, nothing else. Fast keeps the same waveform method but spends three checkpoints instead of six, so a job finishes sooner and says less about cuts and drift — it also sets the checkpoint positions in Sync defaults. Maximum accuracy adds a second, different method when the first is unsure. You can edit the steps afterwards; the starting point then reads Custom." | all three |
 | `techniques[]` | **Matching steps** | "Each step runs on every checkpoint, in order. The first step that returns a confident match decides that checkpoint. A weak checkpoint is retried by the next step — the whole job is never re-run because one point was bad." | — |
-| `techniques[].id` | **Method** | "Waveform: compares the actual sound samples; sample-accurate, but fragile if the dub was re-encoded or broadcast-processed. MFCC: compares the shape of the sound instead of the samples; survives heavy compression and clipping, but is only accurate to about ±10 ms." | balanced/max = waveform; fast = mfcc |
+| `techniques[].id` | **Method** | "Waveform: compares the actual sound samples; sample-accurate, but fragile if the dub was re-encoded or broadcast-processed. MFCC: compares the shape of the sound instead of the samples; survives heavy compression and clipping, but is only accurate to about ±10 ms." | balanced/max/fast = waveform |
 | `techniques[].when` | **When it runs** | "Always: on every checkpoint. Only when the previous step was unsure: as a second opinion, when the match so far is weaker than the confidence below. Only on checkpoints that break the trend: on the points that do not sit on the straight line through the rest — the ones that a mid-film edit or a bad decode produces." | always in all presets |
 | `techniques[].enabled` | **Enabled** | "Disabled steps stay in the list but never run." | — |
 | `techniques[].min_confidence` (Advanced) | **Confidence needed** | "How good a match must be for this step's answer to be accepted. 0.10 is the shipped floor: lower accepts more matches, including wrong ones; higher sends more checkpoints to review. Cost of raising it: more checkpoints fall through to the next step." | 0.10; max accuracy 0.15 |

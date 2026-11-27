@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -508,5 +509,96 @@ func TestAnalysisPolicyAnalysisSource(t *testing.T) {
 				t.Errorf("cfg.AnalysisSource = %q, want %q for row %s", cfg.AnalysisSource, tc.want, tc.row)
 			}
 		})
+	}
+}
+
+// The sync.strategy section reaches analyze.Config unchanged when it is valid,
+// and never fails a job when it is not: a settings row is not a reason to stop
+// syncing.
+
+func TestAnalysisPolicyReadsStrategy(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	stored := `{"preset":"custom","techniques":[` +
+		`{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5},` +
+		`{"id":"mfcc","enabled":true,"when":"below_confidence","min_confidence":0.2,"min_match_z":8}]}`
+	if _, err := f.db.DB.ExecContext(ctx,
+		`INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`,
+		settings.KeySyncStrategy, stored); err != nil {
+		t.Fatalf("insert sync.strategy: %v", err)
+	}
+
+	_, cfg := f.svc.analysisPolicy(ctx)
+	want := []analyze.Technique{
+		{ID: analyze.TechniqueWaveform, Enabled: true, When: analyze.WhenAlways, MinConfidence: 0.1, MinMatchZ: 5},
+		{ID: analyze.TechniqueMFCC, Enabled: true, When: analyze.WhenBelowConfidence, MinConfidence: 0.2, MinMatchZ: 8},
+	}
+	if !reflect.DeepEqual(cfg.Strategy.Techniques, want) {
+		t.Fatalf("cfg.Strategy.Techniques = %+v, want %+v", cfg.Strategy.Techniques, want)
+	}
+	if cfg.Strategy.Preset != analyze.PresetCustom {
+		t.Fatalf("cfg.Strategy.Preset = %q, want %q", cfg.Strategy.Preset, analyze.PresetCustom)
+	}
+}
+
+// TestAnalysisPolicyFallsBackToDefaultOnGarbage: an unparseable row, or one
+// naming only techniques this build does not know, resolves to the shipped
+// default. An unknown id among valid ones is dropped and the rest kept — the
+// pipeline is never empty.
+func TestAnalysisPolicyFallsBackToDefaultOnGarbage(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	cases := []struct{ name, row string }{
+		{"not an object", `"garbage"`},
+		{"truncated json", `{"preset":"balanced","techniques":[`},
+		{"only unknown techniques", `{"preset":"balanced","techniques":[{"id":"bogus","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5}]}`},
+		{"an empty list", `{"preset":"balanced","techniques":[]}`},
+		{"a list with no enabled entry", `{"preset":"custom","techniques":[{"id":"waveform","enabled":false,"when":"always","min_confidence":0.1,"min_match_z":5}]}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := f.db.DB.ExecContext(ctx,
+				`INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`,
+				settings.KeySyncStrategy, tc.row); err != nil {
+				t.Fatalf("insert sync.strategy %s: %v", tc.row, err)
+			}
+			_, cfg := f.svc.analysisPolicy(ctx)
+			if !reflect.DeepEqual(cfg.Strategy, analyze.DefaultStrategy()) {
+				t.Fatalf("cfg.Strategy = %+v for row %s, want the shipped default", cfg.Strategy, tc.row)
+			}
+		})
+	}
+}
+
+// TestAnalysisPolicyDropsAnUnknownTechniqueOnly: the bad entry goes, the good
+// one stays, so a strategy naming a matcher this build lacks still runs.
+func TestAnalysisPolicyDropsAnUnknownTechniqueOnly(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	row := `{"preset":"custom","techniques":[` +
+		`{"id":"bogus","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5},` +
+		`{"id":"waveform","enabled":true,"when":"always","min_confidence":0.12,"min_match_z":5}]}`
+	if _, err := f.db.DB.ExecContext(ctx,
+		`INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`,
+		settings.KeySyncStrategy, row); err != nil {
+		t.Fatalf("insert sync.strategy: %v", err)
+	}
+	_, cfg := f.svc.analysisPolicy(ctx)
+	if len(cfg.Strategy.Techniques) != 1 {
+		t.Fatalf("cfg.Strategy.Techniques = %+v, want only the known entry", cfg.Strategy.Techniques)
+	}
+	if got := cfg.Strategy.Techniques[0]; got.ID != analyze.TechniqueWaveform || got.MinConfidence != 0.12 {
+		t.Fatalf("kept entry = %+v, want the waveform entry with its own threshold", got)
+	}
+}
+
+// TestAnalysisPolicySeededStrategyIsTheDefault: on a fresh install the seeded
+// section reaches the config unchanged, which is what keeps 0.5.0's offsets
+// identical to 0.4.0's.
+func TestAnalysisPolicySeededStrategyIsTheDefault(t *testing.T) {
+	f := newFixture(t)
+	_, cfg := f.svc.analysisPolicy(context.Background())
+	if !reflect.DeepEqual(cfg.Strategy, analyze.DefaultStrategy()) {
+		t.Fatalf("seeded cfg.Strategy = %+v, want %+v", cfg.Strategy, analyze.DefaultStrategy())
 	}
 }

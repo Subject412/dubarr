@@ -603,4 +603,179 @@ describe('sync studio', () => {
     expect(screen.queryByTestId('sync-precision')).toBeNull()
     expect(screen.queryByText(/^±/)).toBeNull()
   })
+
+  it('shows which method answered each checkpoint', async () => {
+    const job = makeJob({
+      id: 31,
+      report: makeReport({
+        checkpoints: [
+          { position_pct: 10, slice_start_sec: 60, slice_len_sec: 3, offset_ms: 120, correlation_quality: 0.92, technique: 'waveform' },
+          { position_pct: 50, slice_start_sec: 300, slice_len_sec: 3, offset_ms: 121, correlation_quality: 0.8, technique: 'mfcc' },
+          // A checkpoint whose stored answer names no method: a dash, not a guess.
+          { position_pct: 90, slice_start_sec: 540, slice_len_sec: 3, offset_ms: 120, correlation_quality: 0.9 },
+        ],
+      }),
+    })
+    stubJob(job)
+    renderWithProviders(<SyncPage />, { route: '/sync' })
+
+    const rows = await screen.findAllByTestId(/^checkpoint-row-/)
+    expect(within(rows[0].closest('table') as HTMLTableElement).getByText('Method')).toBeInTheDocument()
+    expect(screen.getByTestId('checkpoint-method-0')).toHaveTextContent('Waveform')
+    expect(screen.getByTestId('checkpoint-method-1')).toHaveTextContent('MFCC')
+    expect(screen.getByTestId('checkpoint-method-2')).toHaveTextContent('—')
+    // One method per checkpoint is not worth a disclosure.
+    expect(screen.queryByTestId('checkpoint-attempts-toggle-0')).toBeNull()
+  })
+
+  it('expands a checkpoint to show both attempts and why the second method ran', async () => {
+    const user = userEvent.setup()
+    const job = makeJob({
+      id: 32,
+      report: makeReport({
+        strategy: {
+          preset: 'maximum_accuracy',
+          techniques: [
+            { id: 'waveform', enabled: true, when: 'always', min_confidence: 0.1, min_match_z: 5 },
+            { id: 'mfcc', enabled: true, when: 'below_confidence', min_confidence: 0.15, min_match_z: 8 },
+          ],
+        },
+        checkpoints: [
+          {
+            position_pct: 10,
+            slice_start_sec: 60,
+            slice_len_sec: 3,
+            offset_ms: 120,
+            correlation_quality: 0.8,
+            technique: 'mfcc',
+            attempts: [
+              { technique: 'waveform', offset_ms: 118, quality: 0.05, match_z: 4.2, precision_ms: 0.125, accepted: false },
+              { technique: 'mfcc', offset_ms: 120, quality: 0.8, match_z: 12, precision_ms: 10, accepted: true },
+            ],
+          },
+        ],
+      }),
+    })
+    stubJob(job)
+    renderWithProviders(<SyncPage />, { route: '/sync' })
+
+    const row = await screen.findByTestId('checkpoint-row-0')
+    expect(within(row).getByTestId('checkpoint-method-0')).toHaveTextContent('MFCC')
+    // Collapsed until asked: the row stays one line on the happy path.
+    expect(screen.queryByTestId('checkpoint-attempts-0')).toBeNull()
+
+    await user.click(screen.getByTestId('checkpoint-attempts-toggle-0'))
+
+    const disclosure = await screen.findByTestId('checkpoint-attempts-0')
+    const attempts = within(disclosure).getAllByTestId(/^checkpoint-attempt-0-/)
+    expect(attempts).toHaveLength(2)
+    expect(attempts[0]).toHaveTextContent('Waveform')
+    expect(attempts[0]).toHaveTextContent('confidence 0.05')
+    expect(attempts[0]).toHaveTextContent('rejected')
+    expect(attempts[0]).toHaveTextContent('below the confidence gate (0.10)')
+    expect(attempts[0]).toHaveTextContent('peak under the z gate (5.0σ)')
+    expect(attempts[1]).toHaveTextContent('MFCC')
+    expect(attempts[1]).toHaveTextContent('accepted')
+  })
+
+  it('labels the shipped strategy as Balanced and lists its steps in order', async () => {
+    const job = makeJob({
+      id: 33,
+      report: makeReport({
+        strategy: {
+          preset: 'balanced',
+          techniques: [
+            { id: 'waveform', enabled: true, when: 'always', min_confidence: 0.1, min_match_z: 5 },
+          ],
+        },
+      }),
+    })
+    stubJob(job)
+    renderWithProviders(<SyncPage />, { route: '/sync' })
+
+    const summary = await screen.findByTestId('sync-strategy-summary')
+    expect(summary).toHaveTextContent('Balanced')
+    expect(summary).toHaveTextContent('Waveform always')
+    // Nothing to note on the shipped strategy.
+    expect(screen.queryByTestId('sync-strategy-notes')).toBeNull()
+  })
+
+  it('labels an edited strategy as Custom', async () => {
+    const job = makeJob({
+      id: 34,
+      report: makeReport({
+        strategy: {
+          preset: 'custom',
+          techniques: [
+            { id: 'waveform', enabled: true, when: 'always', min_confidence: 0.1, min_match_z: 5 },
+            { id: 'mfcc', enabled: true, when: 'below_confidence', min_confidence: 0.15, min_match_z: 8 },
+          ],
+        },
+      }),
+    })
+    stubJob(job)
+    renderWithProviders(<SyncPage />, { route: '/sync' })
+
+    const summary = await screen.findByTestId('sync-strategy-summary')
+    const text = summary.textContent ?? ''
+    expect(summary).toHaveTextContent('Custom')
+    expect(summary).toHaveTextContent('when the previous step was unsure')
+    expect(text.indexOf('Waveform')).toBeLessThan(text.indexOf('MFCC'))
+  })
+
+  it('renders the report notes inline', async () => {
+    const job = makeJob({
+      id: 35,
+      report: makeReport({
+        strategy: {
+          preset: 'maximum_accuracy',
+          techniques: [
+            { id: 'waveform', enabled: true, when: 'always', min_confidence: 0.1, min_match_z: 5 },
+            { id: 'mfcc', enabled: true, when: 'below_confidence', min_confidence: 0.15, min_match_z: 8 },
+          ],
+        },
+        notes: ['mfcc is configured but this build has no engine for it'],
+      }),
+    })
+    stubJob(job)
+    renderWithProviders(<SyncPage />, { route: '/sync' })
+
+    const notes = await screen.findByTestId('sync-strategy-notes')
+    expect(notes).toHaveTextContent('mfcc is configured but this build has no engine for it')
+    expect(within(notes).getAllByRole('listitem')).toHaveLength(1)
+  })
+
+  it('renders a 0.4.0 report without a method column or a strategy summary', async () => {
+    // A stored 0.4.0 report has no strategy, no notes and no attempts, so the
+    // table keeps its five columns and nothing new appears above it.
+    const legacy: SyncReport = {
+      verdict: 'ok',
+      offsets_ms: [120, 118, 121],
+      qualities: [0.92, 0.88, 0.9],
+      max_drift_ms: 3,
+      classification: 'stable',
+      checkpoints: [
+        { position_pct: 10, slice_start_sec: 60, slice_len_sec: 3, offset_ms: 120, correlation_quality: 0.92 },
+        { position_pct: 50, slice_start_sec: 300, slice_len_sec: 3, offset_ms: 121, correlation_quality: 0.9 },
+        { position_pct: 90, slice_start_sec: 540, slice_len_sec: 3, offset_ms: 120, correlation_quality: 0.91 },
+      ],
+      sync_method: 'correlation',
+    }
+    const job = makeJob({ id: 36, report: legacy })
+    stubJob(job)
+    renderWithProviders(<SyncPage />, { route: '/sync' })
+
+    const rows = await screen.findAllByTestId(/^checkpoint-row-/)
+    expect(rows).toHaveLength(3)
+    const table = rows[0].closest('table') as HTMLTableElement
+    expect(within(table).queryByText('Method')).toBeNull()
+    expect(table.querySelectorAll('thead th')).toHaveLength(5)
+    expect(screen.queryByTestId(/^checkpoint-method-/)).toBeNull()
+    expect(screen.queryByTestId(/^checkpoint-attempt/)).toBeNull()
+    expect(screen.queryByTestId('sync-strategy-summary')).toBeNull()
+    expect(screen.queryByTestId('sync-strategy-notes')).toBeNull()
+    expect(within(table).getByText('Match z')).toBeInTheDocument()
+    expect(screen.getByTestId('sync-trend')).toBeInTheDocument()
+    expect(screen.getByTestId('checkpoint-chart')).toBeInTheDocument()
+  })
 })

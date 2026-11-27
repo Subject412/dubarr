@@ -10,6 +10,7 @@ import type {
   SettingsKey,
   StoragePaths,
   SyncDefaults,
+  SyncStrategy,
   TargetTagFilter,
   WatchOptions,
 } from '../lib/api'
@@ -25,8 +26,10 @@ import {
   settingsSectionKeyFromId,
   type SettingsSectionKey,
 } from '../lib/settings-sections'
+import type { PresetPress } from '../lib/strategy'
 import { ArrConnectionsSection } from '../components/ArrConnections'
 import { PathField, PathListEditor } from '../components/PathPicker'
+import { StrategyEditor } from '../components/StrategyEditor'
 import { ThemeSelector } from '../components/ThemeSelector'
 import { TranscodeRulesEditor } from '../components/TranscodeRulesEditor'
 import {
@@ -139,6 +142,7 @@ function Section<T extends object>({
   value,
   save,
   onSaved,
+  errorInBody = false,
   children,
 }: {
   sectionKey: SettingsKey
@@ -146,7 +150,13 @@ function Section<T extends object>({
   save: (key: SettingsKey, value: T) => Promise<unknown>
   /** Runs after a successful save with the saved and pre-save values. */
   onSaved?: (saved: T, previous: T) => void
-  children: (draft: T, update: (patch: Partial<T>) => void) => ReactNode
+  /**
+   * Hand the save error to the card body (a third `children` argument) instead
+   * of rendering the generic alert below the form, for editors that place the
+   * server's message beside the control it rejected.
+   */
+  errorInBody?: boolean
+  children: (draft: T, update: (patch: Partial<T>) => void, error: string) => ReactNode
 }) {
   const [draft, setDraft] = useState<T>(value)
   const { title, description } = settingsSection(sectionKey)
@@ -206,8 +216,8 @@ function Section<T extends object>({
       }
     >
       <div className="space-y-4">
-        {children(draft, update)}
-        {status === 'error' && <Alert>{error}</Alert>}
+        {children(draft, update, status === 'error' ? error : '')}
+        {status === 'error' && !errorInBody && <Alert>{error}</Alert>}
       </div>
     </Card>
   )
@@ -315,6 +325,17 @@ export function SettingsPage() {
 
   const data = settings.data?.settings
 
+  // A preset press in the Matching techniques card also rewrites the checkpoint
+  // positions, and those belong to `sync.defaults` (D4a: Fast measures fewer
+  // points). The editor cannot reach another card's draft, so the press is held
+  // here: it seeds the Sync defaults card through its value, and whichever of the
+  // two cards saves next sends BOTH sections in one PUT. One payload is one
+  // transaction on the server (settings.Store.Apply validates everything before
+  // writing anything), so the stored state can never hold half a preset — the
+  // `preset:"fast"` over six points this replaced. The press is dropped once it
+  // is stored, or when the editor withdraws it (`onPreset(null)`).
+  const [presetPress, setPresetPress] = useState<PresetPress | null>(null)
+
   // The analysis mode is a `sync.defaults` field, and a row stored before
   // U-WIN.6 carries no analysis_source. The card is seeded with the compiled
   // default (the same 'windows' the select falls back to, and the same value as
@@ -322,12 +343,20 @@ export function SettingsPage() {
   // is never blank and an untouched save sends the mode it displays instead of
   // leaving the key out of the section. The memo keeps the object identity
   // stable: Section re-seeds its draft whenever the value prop changes.
-  const syncDefaults = useMemo(
+  const syncDefaultsBase = useMemo(
     () =>
       withAnalysisSource(
         (data?.['sync.defaults'] as SyncDefaults | undefined) ?? DEFAULTS['sync.defaults'],
       ),
     [data],
+  )
+
+  const syncDefaults = useMemo(
+    () =>
+      presetPress?.positions
+        ? { ...syncDefaultsBase, checkpoint_positions_pct: presetPress.positions }
+        : syncDefaultsBase,
+    [syncDefaultsBase, presetPress],
   )
 
   // The Mux output folder is a `storage.paths` setting, so its control stays in
@@ -392,6 +421,33 @@ export function SettingsPage() {
   }, [sectionsReady, setSearchParams])
 
   const save = (key: SettingsKey, value: object) => saveSettings.mutateAsync({ [key]: value })
+
+  /**
+   * The two cards a preset press can touch. With a press staged the save carries
+   * the pair — `sync.strategy` from whichever card is saving, the positions from
+   * the press — so one user action stores both sections or neither. The payload
+   * is one PUT because the store applies it in a single transaction; two PUTs
+   * would leave a window in which one half is stored.
+   */
+  const savePresetSection = (key: SettingsKey, value: object) => {
+    if (!presetPress) return save(key, value)
+    const strategy = key === 'sync.strategy' ? (value as SyncStrategy) : presetPress.strategy
+    // A press without positions (Maximum accuracy) still leaves the defaults
+    // section exactly as stored, so the pair stays complete either way.
+    const defaults =
+      key === 'sync.defaults'
+        ? (value as SyncDefaults)
+        : {
+            ...syncDefaultsBase,
+            checkpoint_positions_pct:
+              presetPress.positions ?? syncDefaultsBase.checkpoint_positions_pct,
+          }
+    return saveSettings.mutateAsync({ 'sync.strategy': strategy, 'sync.defaults': defaults })
+  }
+
+  /** A press that leaves the positions alone is complete on its own. */
+  const stagePreset = (press: PresetPress | null) =>
+    setPresetPress(press?.positions ? press : null)
 
   const downloadExport = async () => {
     setExporting(true)
@@ -641,7 +697,8 @@ export function SettingsPage() {
           <Section<SyncDefaults>
             sectionKey="sync.defaults"
             value={syncDefaults}
-            save={save}
+            save={savePresetSection}
+            onSaved={() => setPresetPress(null)}
           >
             {(draft, update) => (
               <>
@@ -712,6 +769,24 @@ export function SettingsPage() {
                   help={settingsHelp('sync.defaults', 'preview_positions_pct')}
                 />
               </>
+            )}
+          </Section>
+
+          <Section<SyncStrategy>
+            sectionKey="sync.strategy"
+            value={(data['sync.strategy'] as SyncStrategy) ?? DEFAULTS['sync.strategy']}
+            save={savePresetSection}
+            onSaved={() => setPresetPress(null)}
+            errorInBody
+          >
+            {(draft, update, error) => (
+              <StrategyEditor
+                draft={draft}
+                update={update}
+                error={error}
+                presetPending={presetPress !== null}
+                onPreset={stagePreset}
+              />
             )}
           </Section>
 

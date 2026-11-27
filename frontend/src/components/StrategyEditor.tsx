@@ -1,6 +1,14 @@
 import { useState } from 'react'
 import type { SyncPreset, SyncStrategy, SyncTechnique, SyncTechniqueID, SyncWhen } from '../lib/api'
 import { settingsHelp } from '../lib/settings-help'
+import {
+  PRESET_NAMES,
+  PRESET_POSITIONS_PCT,
+  PRESET_TECHNIQUES,
+  presetChoiceLabel,
+  type PresetName,
+  type PresetPress,
+} from '../lib/strategy'
 import { Badge, Button, Field, InfoTip, Input, Select, Toggle } from './ui'
 
 /**
@@ -9,23 +17,12 @@ import { Badge, Button, Field, InfoTip, Input, Select, Toggle } from './ui'
  *
  * Two rules shape the UI. The list is authoritative and the preset name is only
  * a label — the server stores `custom` whenever the list is not that preset's
- * canonical list — so every edit here sets `preset: 'custom'`. And a preset is
- * a shortcut, not a hidden write: Fast and Balanced also move the checkpoint
- * positions, which live in `sync.defaults`, so the change lands in that card's
- * visible draft and is persisted by that card's own Save button.
+ * canonical list — so every edit here sets `preset: 'custom'`. And a preset is a
+ * shortcut, not a hidden write: Fast and Balanced also move the checkpoint
+ * positions, which live in `sync.defaults`, so the press stages both sections
+ * through `onPreset` and the page saves the pair in one request. Until that save
+ * succeeds the card says the preset is not saved yet.
  */
-
-/** The three starting points, in the order the buttons are offered. */
-type PresetName = 'fast' | 'balanced' | 'maximum_accuracy'
-
-const PRESET_NAMES: readonly PresetName[] = ['fast', 'balanced', 'maximum_accuracy']
-
-const PRESET_LABELS: Record<SyncPreset, string> = {
-  fast: 'Fast',
-  balanced: 'Balanced (default)',
-  maximum_accuracy: 'Maximum accuracy',
-  custom: 'Custom',
-}
 
 /** A method in the operator's words — no filter names or hop sizes (D11). */
 const METHOD_OPTIONS: { value: SyncTechniqueID; label: string }[] = [
@@ -45,37 +42,6 @@ const METHOD_IDS: readonly SyncTechniqueID[] = ['waveform', 'mfcc']
 /** The server's bound on a strategy: 1..4 entries. */
 const MAX_STEPS = 4
 
-/**
- * The one waveform step the shipped strategy is: settings.PresetTechniques
- * "balanced", and "fast", which differs only in how many checkpoints it
- * measures (D4a — Fast is fewer points, never a coarser matcher). A function,
- * not a constant, so editing a list never reaches the next preset press.
- */
-function waveformStep(): SyncTechnique {
-  return { id: 'waveform', enabled: true, when: 'always', min_confidence: 0.1, min_match_z: 5 }
-}
-
-/** The second opinion `maximum_accuracy` adds: only where the first was unsure. */
-function secondOpinionStep(): SyncTechnique {
-  return { id: 'mfcc', enabled: true, when: 'below_confidence', min_confidence: 0.15, min_match_z: 8 }
-}
-
-const PRESET_TECHNIQUES: Record<PresetName, () => SyncTechnique[]> = {
-  fast: () => [waveformStep()],
-  balanced: () => [waveformStep()],
-  maximum_accuracy: () => [waveformStep(), secondOpinionStep()],
-}
-
-/**
- * What a preset does to `sync.defaults.checkpoint_positions_pct`. Fast measures
- * three points instead of six and Balanced puts the shipped six back; Maximum
- * accuracy only changes the method list, so it has no entry here.
- */
-const PRESET_POSITIONS_PCT: Partial<Record<PresetName, number[]>> = {
-  fast: [15, 50, 85],
-  balanced: [10, 25, 40, 55, 70, 85],
-}
-
 /** A row the operator added: off by default, so it changes nothing until switched on. */
 function newStep(id: SyncTechniqueID): SyncTechnique {
   return { id, enabled: false, when: 'below_confidence', min_confidence: 0.15, min_match_z: 8 }
@@ -94,14 +60,24 @@ export function StrategyEditor({
   draft,
   update,
   error = '',
-  onCheckpointPositions,
+  presetPending = false,
+  onPreset,
 }: {
   draft: SyncStrategy
   update: (patch: Partial<SyncStrategy>) => void
   /** The server's rejection of the last save, rendered next to the list. */
   error?: string
-  /** Hands the preset's checkpoint count to the `sync.defaults` card. */
-  onCheckpointPositions?: (positions: number[]) => void
+  /**
+   * A preset press is staged but not stored yet: the label must not read as if
+   * it were. The page owns the flag because the pair spans two cards.
+   */
+  presetPending?: boolean
+  /**
+   * Hands the press to the page, which stages the `sync.defaults` half and
+   * saves both sections in one request. `null` withdraws the pair (an edit makes
+   * the list no longer that preset, or the preset leaves positions alone).
+   */
+  onPreset?: (press: PresetPress | null) => void
 }) {
   const techniques = draft.techniques ?? []
   // Refusals are answered here, next to the button that was pressed: an empty
@@ -114,10 +90,13 @@ export function StrategyEditor({
     : 'custom'
 
   // Every edit makes the label `custom`: the server derives the name from the
-  // list, so the card must stop claiming a starting point it no longer is.
+  // list, so the card must stop claiming a starting point it no longer is. It
+  // also withdraws a staged preset pair — the checkpoint count a preset brings
+  // belongs to that preset's list, not to the operator's edited one.
   const writeSteps = (next: SyncTechnique[]) => {
     setNotice('')
     update({ preset: 'custom', techniques: next })
+    onPreset?.(null)
   }
 
   const updateStep = (index: number, patch: Partial<SyncTechnique>) =>
@@ -158,9 +137,12 @@ export function StrategyEditor({
   const applyPreset = (name: PresetName) => {
     setNotice('')
     setOpenAdvanced({})
-    update({ preset: name, techniques: PRESET_TECHNIQUES[name]() })
+    const next: SyncStrategy = { preset: name, techniques: PRESET_TECHNIQUES[name]() }
+    update(next)
+    // Fast and Balanced move the checkpoint positions as well, so the press is
+    // two sections; Maximum accuracy leaves them alone and needs no pair.
     const positions = PRESET_POSITIONS_PCT[name]
-    if (positions) onCheckpointPositions?.([...positions])
+    onPreset?.(positions ? { strategy: next, positions: [...positions] } : null)
   }
 
   return (
@@ -184,19 +166,28 @@ export function StrategyEditor({
               aria-pressed={preset === name}
               onClick={() => applyPreset(name)}
             >
-              {PRESET_LABELS[name]}
+              {presetChoiceLabel(name)}
             </Button>
           ))}
         </div>
         <p className="text-xs text-zinc-500">
           Current starting point:{' '}
           <span data-testid="strategy-preset" className="font-medium text-zinc-300">
-            {PRESET_LABELS[preset]}
+            {presetChoiceLabel(preset)}
+            {presetPending && (
+              // A press is a draft until its save lands; a refused save leaves
+              // this in place, so the card never claims a starting point the
+              // server does not hold.
+              <span data-testid="strategy-preset-pending" className="ml-1 text-amber-300">
+                (not saved yet)
+              </span>
+            )}
           </span>
         </p>
         <p className="text-xs text-zinc-500">
-          Fast and Balanced also set the checkpoint positions in Sync defaults, which that card saves;
-          Maximum accuracy leaves them alone.
+          Fast and Balanced also set the checkpoint positions in Sync defaults. Saving after a
+          preset press writes both in one go, so the starting point and the positions cannot
+          disagree; Maximum accuracy leaves the positions alone.
         </p>
       </div>
 

@@ -59,6 +59,11 @@ export const DEFAULT_SETTINGS: DubarrSettings = {
   // which is settings.PresetTechniques("balanced") — the same value the server
   // stores on a fresh install. Fast shares this list and differs only in how
   // many checkpoints it measures (D4a).
+  //
+  // This literal stays written out on purpose. TestDefaultStrategyMatchesTheSPADefault
+  // (backend/internal/settings) brace-scans *this file* and decodes the literal
+  // to prove it equals the Go default, so it cannot be replaced by a reference to
+  // ./strategy.ts — the shared tables the editors use live there.
   'sync.strategy': {
     preset: 'balanced',
     techniques: [

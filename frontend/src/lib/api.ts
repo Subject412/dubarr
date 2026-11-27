@@ -465,8 +465,11 @@ export type SyncCheckpoint = {
   /** One sample of the analysis rate (0.125 at 8 kHz). Absent before 0.5.0. */
   precision_ms?: number
   /**
-   * The technique whose answer was kept here (#82). Absent before 0.5.0, and on
-   * a job that ran the shipped single technique.
+   * The technique whose answer was kept here (`analyze.Checkpoint.Technique`).
+   * Every 0.5.0 report carries it: the Go field has no `omitempty` and the
+   * worker always sets it, even for the shipped single technique. Only a report
+   * written before 0.5.0 (or a partial object from a hand-edited store) leaves
+   * it out, which is the one case the Method column's dash is for.
    */
   technique?: string
   /** Every technique that ran on this checkpoint, in list order. Absent before 0.5.0. */

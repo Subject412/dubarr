@@ -26,6 +26,7 @@ import {
   settingsSectionKeyFromId,
   type SettingsSectionKey,
 } from '../lib/settings-sections'
+import type { PresetPress } from '../lib/strategy'
 import { ArrConnectionsSection } from '../components/ArrConnections'
 import { PathField, PathListEditor } from '../components/PathPicker'
 import { StrategyEditor } from '../components/StrategyEditor'
@@ -326,12 +327,14 @@ export function SettingsPage() {
 
   // A preset press in the Matching techniques card also rewrites the checkpoint
   // positions, and those belong to `sync.defaults` (D4a: Fast measures fewer
-  // points). The editor cannot reach another card's draft, so the positions it
-  // chose are held here and handed to the Sync defaults card through its value —
-  // the card shows them, and its own Save persists them. The override is
-  // dropped once that card saves, so the page falls back to what the server
-  // stored and a preset never writes a section the operator did not save.
-  const [presetPositions, setPresetPositions] = useState<number[] | null>(null)
+  // points). The editor cannot reach another card's draft, so the press is held
+  // here: it seeds the Sync defaults card through its value, and whichever of the
+  // two cards saves next sends BOTH sections in one PUT. One payload is one
+  // transaction on the server (settings.Store.Apply validates everything before
+  // writing anything), so the stored state can never hold half a preset — the
+  // `preset:"fast"` over six points this replaced. The press is dropped once it
+  // is stored, or when the editor withdraws it (`onPreset(null)`).
+  const [presetPress, setPresetPress] = useState<PresetPress | null>(null)
 
   // The analysis mode is a `sync.defaults` field, and a row stored before
   // U-WIN.6 carries no analysis_source. The card is seeded with the compiled
@@ -340,12 +343,21 @@ export function SettingsPage() {
   // is never blank and an untouched save sends the mode it displays instead of
   // leaving the key out of the section. The memo keeps the object identity
   // stable: Section re-seeds its draft whenever the value prop changes.
-  const syncDefaults = useMemo(() => {
-    const base = withAnalysisSource(
-      (data?.['sync.defaults'] as SyncDefaults | undefined) ?? DEFAULTS['sync.defaults'],
-    )
-    return presetPositions ? { ...base, checkpoint_positions_pct: presetPositions } : base
-  }, [data, presetPositions])
+  const syncDefaultsBase = useMemo(
+    () =>
+      withAnalysisSource(
+        (data?.['sync.defaults'] as SyncDefaults | undefined) ?? DEFAULTS['sync.defaults'],
+      ),
+    [data],
+  )
+
+  const syncDefaults = useMemo(
+    () =>
+      presetPress?.positions
+        ? { ...syncDefaultsBase, checkpoint_positions_pct: presetPress.positions }
+        : syncDefaultsBase,
+    [syncDefaultsBase, presetPress],
+  )
 
   // The Mux output folder is a `storage.paths` setting, so its control stays in
   // the Storage card, but it only applies when the SAVED mux options write to a
@@ -409,6 +421,33 @@ export function SettingsPage() {
   }, [sectionsReady, setSearchParams])
 
   const save = (key: SettingsKey, value: object) => saveSettings.mutateAsync({ [key]: value })
+
+  /**
+   * The two cards a preset press can touch. With a press staged the save carries
+   * the pair — `sync.strategy` from whichever card is saving, the positions from
+   * the press — so one user action stores both sections or neither. The payload
+   * is one PUT because the store applies it in a single transaction; two PUTs
+   * would leave a window in which one half is stored.
+   */
+  const savePresetSection = (key: SettingsKey, value: object) => {
+    if (!presetPress) return save(key, value)
+    const strategy = key === 'sync.strategy' ? (value as SyncStrategy) : presetPress.strategy
+    // A press without positions (Maximum accuracy) still leaves the defaults
+    // section exactly as stored, so the pair stays complete either way.
+    const defaults =
+      key === 'sync.defaults'
+        ? (value as SyncDefaults)
+        : {
+            ...syncDefaultsBase,
+            checkpoint_positions_pct:
+              presetPress.positions ?? syncDefaultsBase.checkpoint_positions_pct,
+          }
+    return saveSettings.mutateAsync({ 'sync.strategy': strategy, 'sync.defaults': defaults })
+  }
+
+  /** A press that leaves the positions alone is complete on its own. */
+  const stagePreset = (press: PresetPress | null) =>
+    setPresetPress(press?.positions ? press : null)
 
   const downloadExport = async () => {
     setExporting(true)
@@ -658,8 +697,8 @@ export function SettingsPage() {
           <Section<SyncDefaults>
             sectionKey="sync.defaults"
             value={syncDefaults}
-            save={save}
-            onSaved={() => setPresetPositions(null)}
+            save={savePresetSection}
+            onSaved={() => setPresetPress(null)}
           >
             {(draft, update) => (
               <>
@@ -736,7 +775,8 @@ export function SettingsPage() {
           <Section<SyncStrategy>
             sectionKey="sync.strategy"
             value={(data['sync.strategy'] as SyncStrategy) ?? DEFAULTS['sync.strategy']}
-            save={save}
+            save={savePresetSection}
+            onSaved={() => setPresetPress(null)}
             errorInBody
           >
             {(draft, update, error) => (
@@ -744,7 +784,8 @@ export function SettingsPage() {
                 draft={draft}
                 update={update}
                 error={error}
-                onCheckpointPositions={setPresetPositions}
+                presetPending={presetPress !== null}
+                onPreset={stagePreset}
               />
             )}
           </Section>

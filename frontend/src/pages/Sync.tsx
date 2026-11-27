@@ -21,6 +21,7 @@ import {
 import { Alert, Badge, Button, Card, InfoTip, Input, PageHeader, Spinner } from '../components/ui'
 import { CheckpointChart } from '../components/CheckpointChart'
 import { helpIdFor } from '../lib/help-id'
+import { presetLabel } from '../lib/strategy'
 
 type Tone = 'neutral' | 'success' | 'warning' | 'danger' | 'accent'
 
@@ -90,13 +91,6 @@ function whenLabel(when: string): string {
   return WHEN_LABELS[when] ?? when
 }
 
-const PRESET_LABELS: Record<string, string> = {
-  fast: 'Fast',
-  balanced: 'Balanced',
-  maximum_accuracy: 'Maximum accuracy',
-  custom: 'Custom',
-}
-
 /**
  * Why an attempt did not decide its checkpoint. The gates come from the
  * strategy the report recorded, so the sentence is the one the operator's own
@@ -125,7 +119,7 @@ function StrategySummary({ strategy, notes }: { strategy?: SyncStrategy; notes?:
   const hasNotes = (notes?.length ?? 0) > 0
   if (!strategy && !hasNotes) return null
   const steps = strategy?.techniques ?? []
-  const preset = strategy ? (PRESET_LABELS[strategy.preset] ?? strategy.preset) : ''
+  const preset = strategy ? presetLabel(strategy.preset) : ''
 
   return (
     <div className="space-y-1">

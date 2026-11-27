@@ -291,3 +291,52 @@ func TestValidateTempo(t *testing.T) {
 		}
 	}
 }
+
+// TestTempoOnlyPlanBuildsOnePass is the #86 encode contract: a plan no rule
+// produced (RuleIndex == NoRule) whose only job is the drift correction still
+// renders as ONE ffmpeg invocation — atempo first, then the codec — not a
+// tempo pass followed by an encode pass.
+func TestTempoOnlyPlanBuildsOnePass(t *testing.T) {
+	plan := Plan{RuleIndex: NoRule, Codec: CodecFLAC}.WithTempo(1.0427)
+	if !plan.Encode() {
+		t.Fatal("tempo-only plan does not encode")
+	}
+	if plan.Encoder() != "flac" {
+		t.Fatalf("encoder = %q, want flac", plan.Encoder())
+	}
+	args, err := BuildArgs(Request{Input: "in.mka", Output: "out.mka", Plan: plan})
+	if err != nil {
+		t.Fatalf("BuildArgs: %v", err)
+	}
+
+	var inputs int
+	for _, arg := range args {
+		if arg == "-i" {
+			inputs++
+		}
+	}
+	if inputs != 1 {
+		t.Fatalf("argv has %d inputs, want exactly 1: %v", inputs, args)
+	}
+
+	atempo, codec := -1, -1
+	var atempoCount int
+	for i, arg := range args {
+		switch arg {
+		case "atempo=1.042700":
+			atempo = i
+			atempoCount++
+		case "-c:a":
+			codec = i
+		}
+	}
+	if atempoCount != 1 || atempo < 0 {
+		t.Fatalf("argv has %d atempo filters, want exactly one atempo=1.042700: %v", atempoCount, args)
+	}
+	if codec < 0 || atempo > codec {
+		t.Fatalf("atempo at %d is not before -c:a at %d: %v", atempo, codec, args)
+	}
+	if codec+1 >= len(args) || args[codec+1] != "flac" {
+		t.Fatalf("argv does not encode to flac after -c:a: %v", args)
+	}
+}

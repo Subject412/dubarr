@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import type {
   SyncPiecewisePolicy,
   SyncPreset,
@@ -89,12 +89,87 @@ function newStep(id: SyncTechniqueID): SyncTechnique {
 }
 
 /**
- * A threshold keystroke. An unparseable (or cleared) box keeps the previous
- * number rather than silently saving a zero the operator never typed.
+ * A numeric keystroke as the number it stands for, or `null` while it does not
+ * stand for one yet — empty, just a minus sign, or a fraction mid-integer.
  */
-function thresholdFrom(raw: string, previous: number): number {
-  const next = Number.parseFloat(raw)
-  return Number.isFinite(next) ? next : previous
+function knobNumber(raw: string, integer: boolean): number | null {
+  const parsed = Number.parseFloat(raw)
+  if (!Number.isFinite(parsed)) return null
+  return integer ? Math.round(parsed) : parsed
+}
+
+/**
+ * A numeric knob the operator can clear before retyping it.
+ *
+ * The box holds the keystrokes as a string — empty and half-typed are legal
+ * intermediate states — so `clear()` followed by the new number lands as that
+ * number, not as the old digits with the new ones appended. A keystroke inside
+ * [min, max] reaches the draft at once (a save that never leaves the box still
+ * stores what was typed); a number outside the range waits, and leaving the box
+ * clamps it into the range and shows the clamped value. Blur is also what a
+ * press on Save does, so a save never stores a value the field could not show.
+ */
+function NumericKnob({
+  label,
+  value,
+  min,
+  max,
+  step,
+  integer = false,
+  onCommit,
+}: {
+  label: string
+  value: number
+  min: number
+  max: number
+  step: number
+  /** The knob counts things: a typed fraction commits as the nearest whole. */
+  integer?: boolean
+  onCommit: (next: number) => void
+}) {
+  const [draft, setDraft] = useState<string | null>(null)
+
+  // A preset press (or any edit from elsewhere) replaces the number: keystrokes
+  // typed against the old value must give way, or the box would keep showing a
+  // number the draft no longer holds.
+  // oxlint-disable react/set-state-in-effect
+  useEffect(() => {
+    setDraft((current) => {
+      if (current === null) return null
+      return knobNumber(current, integer) === value ? current : null
+    })
+  }, [value, integer])
+  // oxlint-enable react/set-state-in-effect
+
+  const commit = (raw: string) => {
+    const next = knobNumber(raw, integer)
+    if (next === null || next < min || next > max) return
+    if (next !== value) onCommit(next)
+  }
+
+  const clampOnBlur = () => {
+    const typed = draft === null ? value : knobNumber(draft, integer)
+    const next = typed === null ? value : Math.min(max, Math.max(min, typed))
+    setDraft(null)
+    if (next !== value) onCommit(next)
+  }
+
+  return (
+    <Input
+      type="number"
+      step={step}
+      min={min}
+      max={max}
+      aria-label={label}
+      value={draft ?? value}
+      onChange={(event) => {
+        const raw = event.target.value
+        setDraft(raw)
+        commit(raw)
+      }}
+      onBlur={clampOnBlur}
+    />
+  )
 }
 
 export function StrategyEditor({
@@ -503,21 +578,13 @@ export function StrategyEditor({
                         hint="0.10 is the shipped floor."
                         help={settingsHelp('sync.strategy', 'min_confidence')}
                       >
-                        <Input
-                          type="number"
-                          step="0.01"
+                        <NumericKnob
+                          label={`Step ${step} confidence needed`}
+                          step={0.01}
                           min={0}
                           max={1}
-                          aria-label={`Step ${step} confidence needed`}
                           value={entry.min_confidence}
-                          onChange={(event) =>
-                            updateStep(index, {
-                              min_confidence: thresholdFrom(
-                                event.target.value,
-                                entry.min_confidence,
-                              ),
-                            })
-                          }
+                          onCommit={(min_confidence) => updateStep(index, { min_confidence })}
                         />
                       </Field>
                       {gated && (
@@ -526,18 +593,13 @@ export function StrategyEditor({
                           hint="5 means a human should check the result."
                           help={settingsHelp('sync.strategy', 'min_match_z')}
                         >
-                          <Input
-                            type="number"
-                            step="0.5"
+                          <NumericKnob
+                            label={`Step ${step} peak must stand out by (σ)`}
+                            step={0.5}
                             min={0}
                             max={100}
-                            aria-label={`Step ${step} peak must stand out by (σ)`}
                             value={entry.min_match_z}
-                            onChange={(event) =>
-                              updateStep(index, {
-                                min_match_z: thresholdFrom(event.target.value, entry.min_match_z),
-                              })
-                            }
+                            onCommit={(min_match_z) => updateStep(index, { min_match_z })}
                           />
                         </Field>
                       )}
@@ -624,18 +686,13 @@ export function StrategyEditor({
               hint="15–300 s; the sample length may be at most twice this."
               help={settingsHelp('sync.strategy', 'piecewise_step_sec')}
             >
-              <Input
-                type="number"
-                step="1"
+              <NumericKnob
+                label="Check every (seconds)"
+                step={1}
                 min={15}
                 max={300}
-                aria-label="Check every (seconds)"
                 value={knob('step_sec')}
-                onChange={(event) =>
-                  writePiecewise({
-                    step_sec: thresholdFrom(event.target.value, knob('step_sec')),
-                  })
-                }
+                onCommit={(step_sec) => writePiecewise({ step_sec })}
               />
             </Field>
             <Field
@@ -643,18 +700,13 @@ export function StrategyEditor({
               hint="20–190 s, and at most twice the interval above."
               help={settingsHelp('sync.strategy', 'piecewise_window_sec')}
             >
-              <Input
-                type="number"
-                step="1"
+              <NumericKnob
+                label="Sample length (seconds)"
+                step={1}
                 min={20}
                 max={190}
-                aria-label="Sample length (seconds)"
                 value={knob('window_sec')}
-                onChange={(event) =>
-                  writePiecewise({
-                    window_sec: thresholdFrom(event.target.value, knob('window_sec')),
-                  })
-                }
+                onCommit={(window_sec) => writePiecewise({ window_sec })}
               />
             </Field>
             <Field
@@ -662,18 +714,13 @@ export function StrategyEditor({
               hint="50–5000 ms; 250 ms is the shipped value."
               help={settingsHelp('sync.strategy', 'piecewise_split_penalty_ms')}
             >
-              <Input
-                type="number"
-                step="10"
+              <NumericKnob
+                label="Evidence needed for another segment"
+                step={10}
                 min={50}
                 max={5000}
-                aria-label="Evidence needed for another segment"
                 value={knob('split_penalty_ms')}
-                onChange={(event) =>
-                  writePiecewise({
-                    split_penalty_ms: thresholdFrom(event.target.value, knob('split_penalty_ms')),
-                  })
-                }
+                onCommit={(split_penalty_ms) => writePiecewise({ split_penalty_ms })}
               />
             </Field>
             <Field
@@ -681,18 +728,13 @@ export function StrategyEditor({
               hint="30–3600 s; shorter runs are merged into their neighbour."
               help={settingsHelp('sync.strategy', 'piecewise_min_segment_sec')}
             >
-              <Input
-                type="number"
-                step="10"
+              <NumericKnob
+                label="Shortest segment (seconds)"
+                step={10}
                 min={30}
                 max={3600}
-                aria-label="Shortest segment (seconds)"
                 value={knob('min_segment_sec')}
-                onChange={(event) =>
-                  writePiecewise({
-                    min_segment_sec: thresholdFrom(event.target.value, knob('min_segment_sec')),
-                  })
-                }
+                onCommit={(min_segment_sec) => writePiecewise({ min_segment_sec })}
               />
             </Field>
             <Field
@@ -700,20 +742,14 @@ export function StrategyEditor({
               hint="2–40; a real re-cut has a handful of joins."
               help={settingsHelp('sync.strategy', 'piecewise_max_segments')}
             >
-              <Input
-                type="number"
-                step="1"
+              <NumericKnob
+                label="At most how many segments"
+                step={1}
                 min={2}
                 max={40}
-                aria-label="At most how many segments"
+                integer
                 value={knob('max_segments')}
-                onChange={(event) =>
-                  writePiecewise({
-                    max_segments: Math.round(
-                      thresholdFrom(event.target.value, knob('max_segments')),
-                    ),
-                  })
-                }
+                onCommit={(max_segments) => writePiecewise({ max_segments })}
               />
             </Field>
           </div>

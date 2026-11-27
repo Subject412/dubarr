@@ -1,0 +1,9 @@
+{
+  "offset_ms": 250,
+  "precision_ms": 10,
+  "mfcc_max_error_ms": 20,
+  "degraded_waveform_quality_max": 0.10,
+  "degraded_mfcc_min_confidence": 0.10,
+  "degraded_mfcc_max_error_ms": 30,
+  "sample_hash": ""
+}

@@ -39,6 +39,18 @@ function makeJob(overrides: Partial<SyncJob> = {}): SyncJob {
   }
 }
 
+function stubJob(job: SyncJob) {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.endsWith('/api/sync/jobs')) return jsonResponse({ items: [job] })
+      if (url.endsWith(`/api/sync/jobs/${job.id}`)) return jsonResponse(job)
+      return jsonResponse({ error: 'unexpected' }, 404)
+    }),
+  )
+}
+
 const vaultItems = [
   {
     id: 11,
@@ -401,5 +413,193 @@ describe('sync studio', () => {
 
     const dot = screen.getByTestId('checkpoint-dot-0')
     expect(dot.querySelector('title')).not.toHaveTextContent('z ')
+  })
+
+  it('renders the trend block with the slope, R² and the applied tempo', async () => {
+    const job = makeJob({
+      id: 21,
+      calculated_offset_ms: -340,
+      report: makeReport({
+        verdict: 'drifting',
+        classification: 'drifting',
+        fit: {
+          shape: 'drift',
+          slope_ms_per_sec: 42.7,
+          intercept_ms: -340,
+          residual_rms_ms: 3.2,
+          max_residual_ms: 7.9,
+          r2: 0.999,
+          points: 6,
+          tempo_factor: 1.0427,
+          tempo_applied: true,
+        },
+        application: { mode: 're-encoded', note: 're-encoded (tempo 1.0427)' },
+      }),
+    })
+    stubJob(job)
+    renderWithProviders(<SyncPage />, { route: '/sync' })
+
+    const trend = await screen.findByTestId('sync-trend')
+    expect(within(trend).getByText('Trend')).toBeInTheDocument()
+    expect(within(screen.getByTestId('sync-trend-shape')).getByText('drift')).toBeInTheDocument()
+    expect(screen.getByTestId('sync-trend-slope')).toHaveTextContent('+42.7 ms/s')
+    expect(screen.getByTestId('sync-trend-r2')).toHaveTextContent('0.999')
+    expect(screen.getByTestId('sync-trend-tempo')).toHaveTextContent('tempo 1.0427 · applied')
+    // The applied offset is the intercept once the tempo removes the slope.
+    expect(screen.getByText('applied offset: -340 ms')).toBeInTheDocument()
+
+    const row = await screen.findByTestId('sync-job-row-21')
+    expect(within(row).getByTestId('sync-job-application-21')).toHaveTextContent(
+      're-encoded (tempo 1.0427)',
+    )
+  })
+
+  it('renders an em-dash trend block for a report stored without a fit', async () => {
+    // A 0.4.0 row was never fitted: `fit` is absent, not zeroed. The block must
+    // say so with a dash instead of inventing a slope.
+    const job = makeJob({ id: 22 })
+    stubJob(job)
+    renderWithProviders(<SyncPage />, { route: '/sync' })
+
+    const trend = await screen.findByTestId('sync-trend')
+    expect(trend).toHaveTextContent('—')
+    expect(screen.queryByTestId('sync-trend-slope')).toBeNull()
+    expect(screen.queryByTestId('sync-trend-shape')).toBeNull()
+    expect(screen.getByTestId('verdict-badge')).toBeInTheDocument()
+    expect(screen.getByTestId('checkpoint-chart')).toBeInTheDocument()
+    expect(screen.queryByTestId('fit-line')).toBeNull()
+  })
+
+  it('shows the boundary when the shape is a cut', async () => {
+    const job = makeJob({
+      id: 23,
+      report: makeReport({
+        verdict: 'drifting',
+        classification: 'drifting',
+        fit: {
+          shape: 'cut',
+          slope_ms_per_sec: 1.4,
+          intercept_ms: 120,
+          r2: 0.51,
+          points: 6,
+          cut_at_sec: 1800,
+          cut_uncertainty_sec: 2.5,
+        },
+      }),
+    })
+    stubJob(job)
+    renderWithProviders(<SyncPage />, { route: '/sync' })
+
+    expect(within(await screen.findByTestId('sync-trend-shape')).getByText('cut')).toBeInTheDocument()
+    expect(screen.getByTestId('sync-trend-cut')).toHaveTextContent('cut at 1800.0 s ± 2.5 s')
+    // A cut is not a drift: no tempo was computed, so the row says nothing.
+    expect(screen.getByTestId('sync-trend-tempo')).toHaveTextContent('—')
+    expect(screen.queryByTestId('sync-job-application-23')).toBeNull()
+  })
+
+  it('draws the fitted line through the checkpoint dots when the report carries a fit', async () => {
+    const offsets = [1230, 1290, 1380, 1520, 1640]
+    const job = makeJob({
+      id: 24,
+      report: makeReport({
+        verdict: 'drifting',
+        classification: 'drifting',
+        offsets_ms: offsets,
+        max_drift_ms: 410,
+        checkpoints: [60, 180, 300, 420, 540].map((sliceStart, index) => ({
+          position_pct: 10 + index * 20,
+          slice_start_sec: sliceStart,
+          slice_len_sec: 3,
+          offset_ms: offsets[index],
+          correlation_quality: 0.9,
+        })),
+        fit: {
+          shape: 'drift',
+          slope_ms_per_sec: 0.9,
+          intercept_ms: 1180,
+          r2: 0.995,
+          points: 5,
+          tempo_factor: 1.0009,
+          tempo_applied: false,
+        },
+      }),
+    })
+    stubJob(job)
+    renderWithProviders(<SyncPage />, { route: '/sync' })
+
+    const line = await screen.findByTestId('fit-line')
+    const points = (line.getAttribute('points') ?? '').trim().split(/\s+/)
+    expect(points).toHaveLength(5)
+
+    // Same x as its dot; y from the reported line, on the chart's own scale.
+    const plotHeight = 220 - 18 - 56
+    const maxOffset = 1640
+    const expectedY = (sliceStart: number) =>
+      18 + plotHeight / 2 - ((1180 + 0.9 * sliceStart) / maxOffset) * (plotHeight / 2)
+    const dot = screen.getByTestId('checkpoint-dot-0')
+    const [x0, y0] = points[0].split(',').map(Number)
+    expect(x0).toBeCloseTo(Number(dot.getAttribute('cx')), 5)
+    expect(y0).toBeCloseTo(expectedY(60), 5)
+    expect(Number(points[4].split(',')[1])).toBeCloseTo(expectedY(540), 5)
+
+    // Dots keep their own geometry (positions and offsets untouched).
+    expect(Number(dot.getAttribute('cy'))).toBeCloseTo(
+      18 + plotHeight / 2 - (1230 / maxOffset) * (plotHeight / 2),
+      5,
+    )
+    expect(dot.getAttribute('data-offset-ms')).toBe('1230')
+  })
+
+  it('omits the fitted line when the fit is insufficient', async () => {
+    const job = makeJob({
+      id: 25,
+      report: makeReport({
+        verdict: 'unreliable',
+        classification: 'unreliable',
+        fit: {
+          shape: 'insufficient',
+          slope_ms_per_sec: 0.2,
+          intercept_ms: 120,
+          r2: 0.4,
+          points: 2,
+        },
+      }),
+    })
+    stubJob(job)
+    const { container } = renderWithProviders(<SyncPage />, { route: '/sync' })
+
+    const trend = await screen.findByTestId('sync-trend')
+    expect(within(within(trend).getByTestId('sync-trend-shape')).getByText('insufficient')).toBeInTheDocument()
+    expect(within(container).queryByTestId('fit-line')).toBeNull()
+    expect(within(container).getAllByTestId(/^checkpoint-dot-/)).toHaveLength(5)
+  })
+
+  it('hides the precision badge for the zero sentinel while keeping match z', async () => {
+    // A stored 0 means "not recorded", so it must not render as ±0 ms.
+    const job = makeJob({
+      id: 26,
+      report: makeReport({
+        precision_ms: 0,
+        match_z: [27.5, 24.2, 0, 18.4, 26.1],
+        checkpoints: [27.5, 24.2, 0, 18.4, 26.1].map((z, index) => ({
+          position_pct: 10 + index * 20,
+          slice_start_sec: 60 + index * 120,
+          slice_len_sec: 3,
+          offset_ms: 120,
+          correlation_quality: 0.9,
+          match_z: z,
+          precision_ms: 0,
+        })),
+      }),
+    })
+    stubJob(job)
+    renderWithProviders(<SyncPage />, { route: '/sync' })
+
+    const rows = await screen.findAllByTestId(/^checkpoint-row-/)
+    expect(within(rows[0]).getByText('27.5')).toBeInTheDocument()
+    expect(within(rows[1]).getByText('24.2')).toBeInTheDocument()
+    expect(within(rows[2]).getByText('—')).toBeInTheDocument()
+    expect(screen.queryByTestId('sync-precision')).toBeNull()
+    expect(screen.queryByText(/^±/)).toBeNull()
   })
 })

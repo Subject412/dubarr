@@ -26,51 +26,6 @@ import (
 	"github.com/Subject412/dubarr/backend/internal/syncjob"
 )
 
-var syncBinary string
-var syncBuildErr error
-
-func TestMain(m *testing.M) {
-	os.Exit(buildSyncEngine(m))
-}
-
-// buildSyncEngine compiles the real Rust engine once for the integration test,
-// mirroring the syncjob suite's TestMain. Unit tests do not need it.
-func buildSyncEngine(m *testing.M) int {
-	root, err := filepath.Abs(filepath.Join("..", "..", ".."))
-	if err != nil {
-		syncBuildErr = err
-		return m.Run()
-	}
-	manifest := filepath.Join(root, "sync-engine", "Cargo.toml")
-	if _, err := os.Stat(manifest); err != nil {
-		syncBuildErr = fmt.Errorf("sync-engine source missing: %w", err)
-		return m.Run()
-	}
-	cargo, err := exec.LookPath("cargo")
-	if err != nil {
-		syncBuildErr = fmt.Errorf("cargo not on PATH: %w", err)
-		return m.Run()
-	}
-	dir, err := os.MkdirTemp("", "dubarr-syncworker-build-")
-	if err != nil {
-		syncBuildErr = err
-		return m.Run()
-	}
-	defer os.RemoveAll(dir)
-	cmd := exec.Command(cargo, "build", "--offline", "--manifest-path", manifest, "--target-dir", dir)
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		syncBuildErr = fmt.Errorf("cargo build --offline: %w", err)
-		return m.Run()
-	}
-	syncBinary = filepath.Join(dir, "debug", syncengine.BinaryName)
-	if _, err := os.Stat(syncBinary); err != nil {
-		syncBuildErr = fmt.Errorf("built binary missing: %w", err)
-	}
-	return m.Run()
-}
-
 // fakeDecrypter stands in for the AES secret store; arrrescan only needs a
 // non-empty API key for the mock arr server.
 type fakeDecrypter struct{}
@@ -95,12 +50,9 @@ func (c *arrCapture) snapshot() []string {
 }
 
 // TestProcessOnceRunsRealExecuteMuxRescanChain is the M5-3 acceptance path:
-// the real Rust engine analyses staged synthetic audio, mkvmerge publishes the
+// the in-process engine analyses staged synthetic audio, mkvmerge publishes the
 // track into the target, and the real arr client posts a Radarr rescan.
 func TestProcessOnceRunsRealExecuteMuxRescanChain(t *testing.T) {
-	if syncBuildErr != nil {
-		t.Skipf("dubarr-sync build unavailable: %v", syncBuildErr)
-	}
 	for _, tool := range []string{"ffmpeg", "ffprobe", "mkvmerge"} {
 		if _, err := exec.LookPath(tool); err != nil {
 			t.Skipf("%s not on PATH", tool)
@@ -209,10 +161,7 @@ func TestProcessOnceRunsRealExecuteMuxRescanChain(t *testing.T) {
 		t.Fatalf("CreateSyncJob: %v", err)
 	}
 
-	engine, err := syncengine.New(syncBinary)
-	if err != nil {
-		t.Fatalf("sync.New: %v", err)
-	}
+	engine := syncengine.New()
 	jobSvc := syncjob.RegisterRoutes(http.NewServeMux(), syncjob.Dependencies{
 		DB:       st.DB,
 		Settings: ss,

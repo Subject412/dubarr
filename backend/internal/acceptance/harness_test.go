@@ -45,61 +45,11 @@ const (
 // machine indistinguishable from a broken correlation.
 const testJobTimeout = 10 * time.Minute
 
-var (
-	syncBinary   string
-	syncBuildErr error
-)
-
-func TestMain(m *testing.M) {
-	os.Exit(buildSyncEngine(m))
-}
-
-// buildSyncEngine compiles the real Rust engine once, mirroring the syncjob and
-// syncworker suites. When cargo or the sources are unavailable the tests skip
-// with the recorded error instead of failing the package build.
-func buildSyncEngine(m *testing.M) int {
-	root, err := filepath.Abs(filepath.Join("..", "..", ".."))
-	if err != nil {
-		syncBuildErr = err
-		return m.Run()
-	}
-	manifest := filepath.Join(root, "sync-engine", "Cargo.toml")
-	if _, err := os.Stat(manifest); err != nil {
-		syncBuildErr = fmt.Errorf("sync-engine source missing: %w", err)
-		return m.Run()
-	}
-	cargo, err := exec.LookPath("cargo")
-	if err != nil {
-		syncBuildErr = fmt.Errorf("cargo not on PATH: %w", err)
-		return m.Run()
-	}
-	dir, err := os.MkdirTemp("", "dubarr-acceptance-build-")
-	if err != nil {
-		syncBuildErr = err
-		return m.Run()
-	}
-	defer os.RemoveAll(dir)
-	cmd := exec.Command(cargo, "build", "--release", "--offline", "--manifest-path", manifest, "--target-dir", dir)
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		syncBuildErr = fmt.Errorf("cargo build --offline: %w", err)
-		return m.Run()
-	}
-	syncBinary = filepath.Join(dir, "release", syncengine.BinaryName)
-	if _, err := os.Stat(syncBinary); err != nil {
-		syncBuildErr = fmt.Errorf("built binary missing: %w", err)
-	}
-	return m.Run()
-}
-
 // requireAcceptanceTools skips (never silently passes) when the host cannot run
-// the acceptance chain at all.
+// the acceptance chain at all. The sync engine is compiled into the test
+// binary now, so only the external tools can be missing.
 func requireAcceptanceTools(t *testing.T) {
 	t.Helper()
-	if syncBuildErr != nil {
-		t.Skipf("dubarr-sync build unavailable: %v", syncBuildErr)
-	}
 	for _, tool := range []string{"ffmpeg", "ffprobe", "mkvmerge", "mkvextract"} {
 		if _, err := exec.LookPath(tool); err != nil {
 			t.Skipf("%s not on PATH", tool)
@@ -207,9 +157,17 @@ func newHarness(t *testing.T) *harness {
 }
 
 // copyFixture copies one read-only fixture into dstDir and returns its path.
+//
+// The media itself is not in the repository, so a checkout without testfiles/
+// skips rather than fails: before the engine moved in-process these suites
+// skipped on a missing cargo, and that guard hid the fact that the fixtures were
+// the real prerequisite all along.
 func (h *harness) copyFixture(t *testing.T, name, dstDir string) string {
 	t.Helper()
 	src := filepath.Join("..", "..", "..", "testfiles", name)
+	if _, err := os.Stat(src); err != nil {
+		t.Skipf("media fixtures unavailable (%v); the acceptance suites need testfiles/", err)
+	}
 	dst := filepath.Join(dstDir, name)
 	if err := copyFile(src, dst); err != nil {
 		t.Fatalf("copy fixture %s: %v", name, err)

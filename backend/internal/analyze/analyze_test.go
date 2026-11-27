@@ -5,10 +5,8 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"math"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -18,53 +16,7 @@ import (
 	"github.com/Subject412/dubarr/backend/internal/sync"
 )
 
-// builtBinary is the dubarr-sync executable compiled once by TestMain, using
-// the same build-once pattern as internal/sync.
-var builtBinary string
-var buildErr error
-
-func TestMain(m *testing.M) {
-	os.Exit(runWithBuiltBinary(m))
-}
-
-func runWithBuiltBinary(m *testing.M) int {
-	root, err := filepath.Abs(filepath.Join("..", "..", ".."))
-	if err != nil {
-		buildErr = err
-		return m.Run()
-	}
-	manifest := filepath.Join(root, "sync-engine", "Cargo.toml")
-	if _, err := os.Stat(manifest); err != nil {
-		buildErr = fmt.Errorf("sync-engine source missing: %w", err)
-		return m.Run()
-	}
-	cargo, err := exec.LookPath("cargo")
-	if err != nil {
-		buildErr = fmt.Errorf("cargo not on PATH: %w", err)
-		return m.Run()
-	}
-	dir, err := os.MkdirTemp("", "dubarr-analyze-build-")
-	if err != nil {
-		buildErr = err
-		return m.Run()
-	}
-	defer os.RemoveAll(dir)
-
-	cmd := exec.Command(cargo, "build", "--offline", "--manifest-path", manifest, "--target-dir", dir)
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		buildErr = fmt.Errorf("cargo build --offline: %w", err)
-		return m.Run()
-	}
-	builtBinary = filepath.Join(dir, "debug", sync.BinaryName)
-	if _, err := os.Stat(builtBinary); err != nil {
-		buildErr = fmt.Errorf("built binary missing: %w", err)
-	}
-	return m.Run()
-}
-
-// Wall-clock budgets for the integration tests that drive the real Rust engine.
+// Wall-clock budgets for the integration tests that drive the real engine.
 const (
 	// testJobTimeout is the explicit per-checkpoint engine budget handed to
 	// both the runner (sync.WithTimeout) and [Config.JobTimeout].
@@ -90,21 +42,13 @@ func testJobConfig() Config {
 	return cfg
 }
 
+// requireEngine returns the in-process engine. It needs no external toolchain:
+// the DSP code is compiled into the test binary.
 func requireEngine(t *testing.T) Engine {
 	t.Helper()
-	if buildErr != nil {
-		t.Skipf("dubarr-sync build unavailable: %v", buildErr)
-	}
-	if builtBinary == "" {
-		t.Skip("dubarr-sync binary not built")
-	}
 	// The runner's own timeout must match [Config.JobTimeout], otherwise it
 	// caps the job below the budget the analysis asks for.
-	r, err := sync.New(builtBinary, sync.WithTimeout(testJobTimeout))
-	if err != nil {
-		t.Fatalf("sync.New: %v", err)
-	}
-	return r
+	return sync.New(sync.WithTimeout(testJobTimeout))
 }
 
 // scriptedEngine is the aggregation seam: it returns canned offsets per job so

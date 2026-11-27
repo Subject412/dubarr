@@ -5,8 +5,10 @@
 // production seams as TestShrekEndToEnd, but invokes every stage individually
 // so each step's wall time, child CPU (user/sys) and child peak RSS
 // (getrusage maxrss) plus the {WORK_DIR}/jobs/{id} disk footprint can be
-// recorded. It is behind the `syncmeasure` build tag so normal `go test ./...`
-// never pays for it.
+// recorded. The six engine checkpoints are the exception: the engine is
+// in-process (internal/sync), so they carry wall time only and report no child
+// CPU or RSS — there is no child. It is behind the `syncmeasure` build tag so
+// normal `go test ./...` never pays for it.
 //
 // Emitted lines (all `KEY|field=value…`, see protocol §3):
 //
@@ -63,7 +65,9 @@ import (
 )
 
 // measureRow is one recorded stage. MaxRSS keeps its historical meaning (child
-// peak RSS in KiB, 0 when unknown) so old logs still parse.
+// peak RSS in KiB, 0 when unknown) so old logs still parse; the in-process
+// engine checkpoints report 0 because they have no child process to attribute
+// memory to.
 type measureRow struct {
 	Step        string
 	TStart      time.Duration
@@ -145,8 +149,8 @@ func (r *recorder) setStep(step string) {
 // probe/mux). Seam calls made by the active step are folded in here so the
 // step still yields exactly one STEP| row. The RUSAGE_CHILDREN delta is then
 // reduced by the directly measured CPU: what remains is the CPU of children
-// spawned *indirectly* by the step (M7 — extract_vault has no Run seam at all,
-// analyze_total owns the six engine spawns).
+// spawned *indirectly* by the step (M7 — extract_vault has no Run seam at all;
+// analyze_total's checkpoints run in-process and spawn no children).
 func (r *recorder) record(step string, wall time.Duration, cpuUserMS, cpuSysMS, maxRSS int64, ok bool, detail string) {
 	tEnd := time.Since(r.origin)
 	tStart := tEnd - wall
@@ -200,9 +204,9 @@ func (r *recorder) record(step string, wall time.Duration, cpuUserMS, cpuSysMS, 
 // childUsageDelta snapshots RUSAGE_CHILDREN and returns the per-step delta of
 // children reaped since the previous call, reduced by the CPU already measured
 // directly for this step. What remains is the cost of children spawned
-// *indirectly* (M7): extract_vault's ffmpeg has no Run seam at all, and
-// analyze_total owns the six engine spawns. ru_maxrss is never used here — it
-// is the max over every child ever reaped, not a per-step peak.
+// *indirectly* (M7): extract_vault's ffmpeg has no Run seam at all. The engine
+// checkpoints are in-process now and spawn nothing. ru_maxrss is never used
+// here — it is the max over every child ever reaped, not a per-step peak.
 func (r *recorder) childUsageDelta(directUserMS, directSysMS int64) (userMS, sysMS int64) {
 	now := readChildrenUsage()
 	userMS = now.userMS - r.prevChildren.userMS - directUserMS
@@ -494,30 +498,37 @@ func readStatusKV(path string) map[string]int64 {
 	return out
 }
 
-// measuredEngine is the production JSON-over-stdio contract with timing and RSS
-// capture, so each of the six engine spawns is measured individually.
+// measuredEngine times every checkpoint the production analyzer drives through
+// the engine seam, so each of the six checkpoint runs is measured separately.
+//
+// It used to spawn the Rust engine per checkpoint and record that child's CPU
+// and peak RSS. The engine is now in-process (internal/sync over internal/dsp),
+// so there is no child to measure: a step still records wall time under the same
+// engine_spawn_N label (the name is historical — nothing is spawned), and the
+// child CPU/RSS fields are recorded as 0 rather than a number that no longer
+// means what it says. Per-checkpoint memory has no process boundary to hang on
+// any more; the whole-test-process PT|/vmhwm series is what remains valid.
+//
+// The JSON marshal/unmarshal round-trip went with the stdio contract: in-process
+// the result is passed by value, so the trip would only test encoding/json.
 type measuredEngine struct {
-	bin string
-	rec *recorder
-	n   int
+	inner analyze.Engine
+	rec   *recorder
+	n     int
 }
 
 func (e *measuredEngine) Run(ctx context.Context, job syncengine.Job) (syncengine.Result, error) {
-	payload, err := json.Marshal(job)
-	if err != nil {
-		return syncengine.Result{}, err
-	}
 	e.n++
 	step := fmt.Sprintf("engine_spawn_%d", e.n)
-	out, err := e.rec.runCommand(ctx, step, e.bin, payload)
+	start := time.Now()
+	result, err := e.inner.Run(ctx, job)
+	wall := time.Since(start)
+	detail := ""
 	if err != nil {
-		return syncengine.Result{}, err
+		detail = "error=" + strings.ReplaceAll(strings.TrimSpace(err.Error()), "|", " ")
 	}
-	var result syncengine.Result
-	if err := json.Unmarshal(bytes.TrimSpace(out), &result); err != nil {
-		return syncengine.Result{}, fmt.Errorf("decode engine result: %w", err)
-	}
-	return result, nil
+	e.rec.record(step, wall, 0, 0, 0, err == nil, detail)
+	return result, err
 }
 
 // decodeAudio mirrors syncjob.decodeAudio exactly (same ffmpeg argv), measured.
@@ -844,13 +855,9 @@ func TestMeasureSyncResources(t *testing.T) {
 		t.Fatalf("decode donor: %v", err)
 	}
 
-	engine, err := syncengine.New(syncBinary)
-	if err != nil {
-		t.Fatalf("sync.New: %v", err)
-	}
-	_ = engine
+	engine := syncengine.New(syncengine.WithTimeout(testJobTimeout))
 
-	// ---- Six engine spawns driven by the production analyzer ----
+	// ---- Six in-process checkpoints driven by the production analyzer ----
 	req := analyze.Request{
 		TargetPath:       targetWAV,
 		DonorPath:        donorWAV,
@@ -864,7 +871,7 @@ func TestMeasureSyncResources(t *testing.T) {
 	// budgetEngine substitutes the shared acceptance budget (testJobTimeout) for
 	// the per-checkpoint deadline cfg derives, so this measurement run is bounded
 	// exactly like the other acceptance tests that drive the real engine.
-	measured := &measuredEngine{bin: syncBinary, rec: rec}
+	measured := &measuredEngine{inner: engine, rec: rec}
 	report, err := analyze.Analyze(ctx, budgetEngine{inner: measured}, cfg, req)
 	if err != nil {
 		t.Fatalf("Analyze: %v", err)

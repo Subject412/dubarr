@@ -1,42 +1,42 @@
 package sync
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
-	"os/exec"
-	"regexp"
+	"math"
+	"runtime"
 	"strings"
 	"time"
-)
 
-// BinaryName is the executable the bridge locates on PATH. /api/health probes
-// the same name (internal/health defaultTools).
-const BinaryName = "dubarr-sync"
+	"github.com/Subject412/dubarr/backend/internal/dsp/correlate"
+	"github.com/Subject412/dubarr/backend/internal/dsp/wav"
+)
 
 const (
 	// DefaultTimeout bounds one job unless the caller's context is tighter.
 	DefaultTimeout = 30 * time.Second
-	// versionProbeTimeout is a hang guard for the construction handshake.
-	versionProbeTimeout = 5 * time.Second
+
+	// DefaultWindowSec bounds the offset search when [Job.WindowSec] is nil,
+	// as DEFAULT_WINDOW_SEC does in the reference engine.
+	DefaultWindowSec = 5.0
 )
 
-// versionToken matches the clap banner "dubarr-sync 0.1.0".
-var versionToken = regexp.MustCompile(`\b([0-9]+\.[0-9][0-9A-Za-z.+-]*)`)
+// correlator is the correlation seam: [correlate.Analyze]'s shape. Tests
+// substitute it to reach the deadline and panic paths without a slow job.
+type correlator func(ctx context.Context, target, donor []float32, sampleRate uint32, windowSec float64) (correlate.Analysis, error)
 
-// Runner invokes the dubarr-sync binary for one job at a time.
+// Runner runs one job at a time in-process against the Go DSP engine.
 //
-// A Runner is immutable after [New] and safe for concurrent use; each Run owns
-// its own process, stdin pipe and buffers.
+// A Runner holds no per-job state — no child process, no pipes, no buffers — so
+// a failed or panicked Run leaves nothing behind for the next one. It is safe
+// for concurrent use to the extent the engine is: a caller that wants several
+// jobs at once builds one Runner per job (the queue runs one job anyway).
 type Runner struct {
-	path    string
-	timeout time.Duration
-	log     *slog.Logger
-	version string
+	timeout   time.Duration
+	log       *slog.Logger
+	correlate correlator
 }
 
 // Option customises [New].
@@ -52,7 +52,8 @@ func WithTimeout(timeout time.Duration) Option {
 	}
 }
 
-// WithLogger sets the logger used for the log-only version handshake.
+// WithLogger sets the logger that records a recovered engine panic. The panic
+// still fails the job; the log is for the operator.
 func WithLogger(log *slog.Logger) Option {
 	return func(r *Runner) {
 		if log != nil {
@@ -61,174 +62,180 @@ func WithLogger(log *slog.Logger) Option {
 	}
 }
 
-// New locates the engine and performs the version handshake.
+// New returns a runner backed by the in-process engine.
 //
-// binaryPath is an optional explicit override; empty means "search PATH with
-// exec.LookPath". Per ADR-0003 there is deliberately no environment override.
-// A missing binary is reported as [ErrUnavailable] so callers can mirror
-// /api/health's dubarr-sync:false. A failing --version is logged but never
-// fatal: the engine may still run jobs.
-func New(binaryPath string, opts ...Option) (*Runner, error) {
+// There is nothing to locate and nothing to handshake: the DSP code is compiled
+// into this binary, so construction cannot fail.
+func New(opts ...Option) *Runner {
 	r := &Runner{
-		path:    binaryPath,
-		timeout: DefaultTimeout,
-		log:     slog.Default(),
+		timeout:   DefaultTimeout,
+		log:       slog.Default(),
+		correlate: correlate.Analyze,
 	}
 	for _, opt := range opts {
 		opt(r)
 	}
-	if r.path == "" {
-		path, err := exec.LookPath(BinaryName)
-		if err != nil {
-			return nil, &Error{
-				Kind: KindUnavailable,
-				Err:  fmt.Errorf("%s not found on PATH: %w", BinaryName, err),
-			}
-		}
-		r.path = path
-	} else if err := checkExecutable(r.path); err != nil {
-		return nil, &Error{Kind: KindUnavailable, Err: err}
-	}
-	r.version = r.handshake()
-	return r, nil
+	return r
 }
-
-// checkExecutable validates an explicit binary override so a bad path fails at
-// construction with ErrUnavailable instead of on the first job.
-func checkExecutable(path string) error {
-	info, err := os.Stat(path)
-	if err != nil {
-		return fmt.Errorf("%s: %w", path, err)
-	}
-	if info.IsDir() || info.Mode()&0o111 == 0 {
-		return fmt.Errorf("%s is not an executable file", path)
-	}
-	return nil
-}
-
-// handshake asks the engine for its version. Failures are logged at debug/warn
-// level and yield an empty version; they never fail construction.
-func (r *Runner) handshake() string {
-	ctx, cancel := context.WithTimeout(context.Background(), versionProbeTimeout)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, r.path, "--version").Output()
-	if err != nil {
-		r.log.Warn("sync: dubarr-sync version handshake failed", "path", r.path, "error", err)
-		return ""
-	}
-	line := strings.TrimSpace(strings.SplitN(string(out), "\n", 2)[0])
-	version := ""
-	if m := versionToken.FindStringSubmatch(line); len(m) == 2 {
-		version = m[1]
-	}
-	r.log.Info("sync: dubarr-sync ready", "path", r.path, "version", version)
-	return version
-}
-
-// Path reports the resolved binary path.
-func (r *Runner) Path() string { return r.path }
-
-// Version reports the version parsed at construction, or "" if the handshake
-// failed.
-func (r *Runner) Version() string { return r.version }
 
 // String renders the runner for logs.
-func (r *Runner) String() string { return fmt.Sprintf("sync.Runner{%s %s}", r.path, r.version) }
+func (r *Runner) String() string { return fmt.Sprintf("sync.Runner{timeout: %s}", r.timeout) }
 
-// Run sends job to the engine and returns its result.
+// Run analyses job and returns its result.
 //
-// The job is JSON-encoded with the exact sync-engine/src/job.rs field names and
-// written to the child's stdin; stdout must hold exactly one result object.
-// Failures are typed: ErrInvalidJob (rejected locally), ErrTimeout,
-// ErrUsage / ErrAnalysis (exit codes 2/3), ErrMalformedOutput and
-// ErrExecution/ErrUnavailable for everything else.
-func (r *Runner) Run(ctx context.Context, job Job) (Result, error) {
-	if err := job.validate(); err != nil {
-		return Result{}, &Error{Kind: KindInvalidJob, Err: err}
+// The job is validated first, then both WAV headers are read, then the slice is
+// decoded from each and correlated. A sample-rate mismatch, an unreadable WAV, a
+// slice past the end of a file, a slice shorter than 64 samples and a silent
+// slice are all [ErrAnalysis]; a job the engine cannot accept is
+// [ErrInvalidJob] and is rejected before any file is opened.
+//
+// A panic anywhere below — the fft package panics by contract on a bad plan
+// size or an allocation it will not make — is recovered and returned as
+// [ErrExecution] with a one-line stack in *Error.Stderr. In-process a panic
+// would otherwise take the whole server down mid-job, with the SQLite WAL open;
+// only the return value changes, a panic is never a success.
+//
+// Cancellation is cooperative: there is no process to kill. The context is
+// checked after each open and each slice read, after each transform and every
+// 4096 lags inside the correlation ([correlate.Analyze]). The worst case past a
+// deadline is therefore one 2^22-point forward transform before the next check
+// — sub-second at production sizes. An expired deadline is [ErrTimeout]; any
+// other cancellation is [ErrExecution].
+func (r *Runner) Run(ctx context.Context, job Job) (out Result, err error) {
+	defer func() {
+		p := recover()
+		if p == nil {
+			return
+		}
+		if r.log != nil {
+			r.log.Error("sync: dsp panic recovered", "panic", p)
+		}
+		out = Result{}
+		err = &Error{
+			Kind:   KindExecution,
+			Stderr: panicTrace(),
+			Err:    fmt.Errorf("dsp: %v", p),
+		}
+	}()
+
+	if invalidErr := job.validate(); invalidErr != nil {
+		return Result{}, &Error{Kind: KindInvalidJob, Err: invalidErr}
 	}
-	payload, err := json.Marshal(job)
-	if err != nil {
-		return Result{}, &Error{Kind: KindInvalidJob, Err: fmt.Errorf("encode job: %w", err)}
+
+	// Opening reads the header only, so an unsupported or unreadable file and a
+	// rate mismatch fail before any window is decoded.
+	target, openErr := wav.Open(job.TargetPath)
+	if openErr != nil {
+		return Result{}, &Error{Kind: KindAnalysis, Err: openErr}
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return Result{}, contextFailure(ctxErr, r.timeout)
+	}
+	donor, openErr := wav.Open(job.DonorPath)
+	if openErr != nil {
+		return Result{}, &Error{Kind: KindAnalysis, Err: openErr}
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return Result{}, contextFailure(ctxErr, r.timeout)
+	}
+	rate := target.SampleRate()
+	if rate != donor.SampleRate() {
+		return Result{}, &Error{Kind: KindAnalysis, Err: &SampleRateMismatch{Target: rate, Donor: donor.SampleRate()}}
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, r.timeout)
 	defer cancel()
 
-	var stdout, stderr bytes.Buffer
-	cmd := exec.CommandContext(ctx, r.path)
-	isolateProcessGroup(cmd)
-	cmd.Stdin = bytes.NewReader(payload)
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	// Seconds to samples exactly as job.rs:162-163 does, then truncate at each
+	// file's end. Rounding both boundaries here (not in the engine) is what
+	// keeps `analyzed.start` and the analysed samples in agreement.
+	start := int64(math.Round(job.SliceStartSec * float64(rate)))
+	length := int64(math.Round(job.SliceLenSec * float64(rate)))
 
-	runErr := cmd.Run()
-	stderrText := strings.TrimSpace(stderr.String())
-
-	// A context expiry kills the child, which also surfaces as a non-nil
-	// runErr; classify it first so a timeout is not mistaken for a signal.
+	targetSlice, sliceErr := readSlice(target, start, length)
+	if sliceErr != nil {
+		return Result{}, &Error{Kind: KindAnalysis, Err: sliceErr}
+	}
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		if errors.Is(ctxErr, context.DeadlineExceeded) {
-			return Result{}, &Error{
-				Kind:   KindTimeout,
-				Stderr: stderrText,
-				Err:    fmt.Errorf("job exceeded %s", r.timeout),
-			}
-		}
-		return Result{}, &Error{Kind: KindExecution, Stderr: stderrText, Err: ctxErr}
+		return Result{}, contextFailure(ctxErr, r.timeout)
 	}
-	if runErr != nil {
-		var exitErr *exec.ExitError
-		if errors.As(runErr, &exitErr) {
-			code := exitErr.ExitCode()
-			return Result{}, &Error{
-				Kind:     kindForExit(code),
-				ExitCode: code,
-				Stderr:   stderrText,
-				Err:      fmt.Errorf("%s exited %d", BinaryName, code),
-			}
-		}
+	donorSlice, sliceErr := readSlice(donor, start, length)
+	if sliceErr != nil {
+		return Result{}, &Error{Kind: KindAnalysis, Err: sliceErr}
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return Result{}, contextFailure(ctxErr, r.timeout)
+	}
+
+	samples := min(len(targetSlice), len(donorSlice))
+	if samples < correlate.MinSliceSamples {
 		return Result{}, &Error{
-			Kind:   KindUnavailable,
-			Stderr: stderrText,
-			Err:    fmt.Errorf("start %s: %w", BinaryName, runErr),
+			Kind: KindAnalysis,
+			Err:  &correlate.SliceTooShort{Samples: samples, Min: correlate.MinSliceSamples},
 		}
 	}
 
-	raw := bytes.TrimSpace(stdout.Bytes())
-	if len(raw) == 0 {
-		return Result{}, &Error{
-			Kind:   KindMalformedOutput,
-			Stderr: stderrText,
-			Err:    errors.New("empty stdout"),
-		}
+	window := DefaultWindowSec
+	if job.WindowSec != nil {
+		window = *job.WindowSec
 	}
-	var result Result
-	if err := json.Unmarshal(raw, &result); err != nil {
-		return Result{}, &Error{
-			Kind:   KindMalformedOutput,
-			Stderr: stderrText,
-			Err:    fmt.Errorf("decode result: %w", err),
-		}
+	analysis, correlateErr := r.correlate(ctx, targetSlice, donorSlice, rate, window)
+	// The deadline is classified first, as the subprocess bridge did, so an
+	// engine that gives up on a cancelled context is not mistaken for an
+	// analysis failure.
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return Result{}, contextFailure(ctxErr, r.timeout)
 	}
-	if result.SampleRate == 0 {
-		return Result{}, &Error{
-			Kind:   KindMalformedOutput,
-			Stderr: stderrText,
-			Err:    errors.New("result has no sample rate"),
-		}
+	if correlateErr != nil {
+		return Result{}, &Error{Kind: KindAnalysis, Err: correlateErr}
+	}
+
+	result := Result{
+		OffsetMS:           roundMillis(float64(analysis.OffsetSamples) * 1000 / float64(rate)),
+		CorrelationQuality: roundMillis(float64(analysis.Quality)),
+		SampleRate:         rate,
+	}
+	result.Analyzed = Analyzed{
+		Start: float64(start) / float64(rate),
+		Len:   float64(samples) / float64(rate),
 	}
 	return result, nil
 }
 
-// kindForExit maps the documented engine exit codes onto typed kinds: 2 is a
-// usage error, 3 an analysis failure; anything else is an execution failure.
-func kindForExit(code int) Kind {
-	switch code {
-	case 2:
-		return KindUsage
-	case 3:
-		return KindAnalysis
-	default:
-		return KindExecution
+// readSlice decodes length frames from start, truncating at the end of the file.
+// A start at or past the end is out of range, as job.rs:107-112 reports.
+func readSlice(reader *wav.RangeReader, start, length int64) ([]float32, error) {
+	frames := reader.Frames()
+	rate := reader.SampleRate()
+	if start >= frames {
+		return nil, &SliceOutOfRange{
+			StartSec:    float64(start) / float64(rate),
+			DurationSec: float64(frames) / float64(rate),
+		}
 	}
+	return reader.ReadMono(start, length)
+}
+
+// contextFailure classifies an expired or cancelled context: a deadline is a
+// timeout, anything else (a parent cancel) is an execution failure.
+func contextFailure(ctxErr error, timeout time.Duration) *Error {
+	if errors.Is(ctxErr, context.DeadlineExceeded) {
+		return &Error{Kind: KindTimeout, Err: fmt.Errorf("job exceeded %s", timeout)}
+	}
+	return &Error{Kind: KindExecution, Err: ctxErr}
+}
+
+// roundMillis rounds to three decimals, as round_millis does in job.rs:121-123.
+func roundMillis(value float64) float64 { return math.Round(value*1000) / 1000 }
+
+// panicTrace renders the current goroutine's stack as one line, truncated, so
+// *Error.Stderr stays a single line in a job status row.
+func panicTrace() string {
+	buf := make([]byte, 4096)
+	line := strings.Join(strings.Fields(string(buf[:runtime.Stack(buf, false)])), " ")
+	const limit = 512
+	if len(line) > limit {
+		line = line[:limit] + "…"
+	}
+	return line
 }

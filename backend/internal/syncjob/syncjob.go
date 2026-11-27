@@ -478,11 +478,7 @@ func (s *Service) runAnalysis(ctx context.Context, rec store.SyncJobRecord) (ana
 
 	engine := s.engine
 	if engine == nil {
-		runner, err := sync.New("", sync.WithTimeout(analyze.JobTimeout(cfg)), sync.WithLogger(s.logger))
-		if err != nil {
-			return analyze.Report{}, err
-		}
-		engine = runner
+		engine = sync.New(sync.WithTimeout(analyze.JobTimeout(cfg)), sync.WithLogger(s.logger))
 	}
 	req := analyze.Request{
 		TargetPath:       targetWAV,

@@ -179,7 +179,7 @@ export function StrategyEditor({
               // this in place, so the card never claims a starting point the
               // server does not hold.
               <span data-testid="strategy-preset-pending" className="ml-1 text-amber-300">
-                (not saved yet)
+                {' '}(not saved yet)
               </span>
             )}
           </span>

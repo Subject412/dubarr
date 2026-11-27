@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"slices"
+	"math/bits"
 
 	"github.com/go-fft/fft"
 )
@@ -283,6 +283,8 @@ func correlate(ctx context.Context, s *Scratch, target, donor []float32, sampleR
 	if !found {
 		return result{}, &NoValidLag{}
 	}
+	// The scan is over, so peakProminence may select the median in place; it
+	// would otherwise clone ~23 MB of scores at nfft = 2^22 for one value.
 	return result{offset: best, peak: peak, quality: peakProminence(peak, scores)}, nil
 }
 
@@ -339,23 +341,164 @@ func energy(prefix []float64, start, length int) float64 {
 // as correlation.rs:188-202 does: `(peak - median) / (1 - median)`, clamped,
 // and 0 when there is no headroom above the median.
 //
-// The median is a plain sorted pick. That is safe without a NaN-handling
-// comparator — unlike the Rust version, which needs partial_cmp(...).unwrap_or
-// — because the scan skips every lag whose `denom <= 1e-12` before dividing, so
-// scores holds only finite values and slices.Sort is a total order over them.
+// The median is exactly the order statistic a full sort would have left at
+// `len(scores)/2` — the upper middle of an even-length slice, as the reference's
+// sort-then-index does — but it is picked by [selectOrderStatistic] instead of
+// by sorting ~2.9 M values to read one index. Selection is exact, so every
+// reported number stays the sorted pick's number.
+//
+// No NaN-handling comparator is needed — unlike the Rust version, which needs
+// partial_cmp(...).unwrap_or — because the scan skips every lag whose
+// `denom <= 1e-12` before dividing, so scores holds only finite values and both
+// the comparisons here and the selection are a total order over them.
+//
+// It reorders scores in place. Its one caller, [correlate], drops the slice as
+// soon as the quality is computed, so no copy is made; a caller that needs its
+// input intact must pass a clone.
 func peakProminence(peak float64, scores []float64) float32 {
 	if len(scores) == 0 {
 		return 0
 	}
-	sorted := slices.Clone(scores)
-	slices.Sort(sorted)
-	median := sorted[len(sorted)/2]
+	median := selectOrderStatistic(scores, len(scores)/2)
 
 	prominence := 0.0
 	if headroom := 1 - median; headroom > 1e-12 {
 		prominence = (peak - median) / headroom
 	}
 	return float32(min(max(prominence, 0), 1))
+}
+
+// selectInsertionLimit is the window size at which [selectOrderStatistic]
+// stops partitioning and finishes with a straight insertion sort: below it a
+// whole pass is cheaper than the branchy swap loop, and the window is then
+// fully ordered anyway.
+const selectInsertionLimit = 16
+
+// selectOrderStatistic returns the k-th smallest element of a, for
+// `0 <= k < len(a)`: the value a full sort would have left at index k, exactly
+// — no sampling, no interpolation, no approximation — without sorting the
+// slice. It reorders a in place and allocates nothing on any input it meets in
+// practice.
+//
+// It is introselect: quickselect with a median-of-three pivot, the insertion
+// finish below [selectInsertionLimit], and a depth limit of 2*ceil(log2 n)
+// partitions after which it falls back to [heapSelect], so an adversarial
+// ordering cannot drive it quadratic.
+//
+// Comparisons only (never arithmetic on the values), so it is a total order over
+// the finite scores of [peakProminence] and returns bit-identical elements.
+func selectOrderStatistic(a []float64, k int) float64 {
+	lo, hi := 0, len(a)-1
+	for depth := 2 * bits.Len(uint(len(a))); hi > lo; {
+		window := hi - lo + 1
+		if window <= selectInsertionLimit {
+			insertionSort(a[lo : hi+1])
+			break
+		}
+		if depth == 0 {
+			return heapSelect(a[lo:hi+1], k-lo)
+		}
+		depth--
+
+		// Median of three: order a[lo], a[mid] and a[hi] so the pivot is a
+		// value present in the window and neither extreme, which keeps the
+		// already-sorted and reverse-sorted inputs cheap.
+		mid := lo + window/2
+		if a[mid] < a[lo] {
+			a[mid], a[lo] = a[lo], a[mid]
+		}
+		if a[hi] < a[lo] {
+			a[hi], a[lo] = a[lo], a[hi]
+		}
+		if a[hi] < a[mid] {
+			a[hi], a[mid] = a[mid], a[hi]
+		}
+		pivot := a[mid]
+
+		// Hoare partition. Both scans have a sentinel: a[lo] <= pivot makes the
+		// left one stop at `mid` in the worst case, a[hi] >= pivot the right
+		// one. On a run of equal scores the two scans still meet in the middle,
+		// so duplicates cost one level per halving rather than a full pass.
+		i, j := lo, hi
+		for i <= j {
+			for a[i] < pivot {
+				i++
+			}
+			for a[j] > pivot {
+				j--
+			}
+			if i <= j {
+				a[i], a[j] = a[j], a[i]
+				i++
+				j--
+			}
+		}
+		// Now a[lo..j] <= pivot <= a[i..hi], and i == j+1, so k is on exactly
+		// one side of the split.
+		if k <= j {
+			hi = j
+		} else {
+			lo = i
+		}
+	}
+	return a[k]
+}
+
+// insertionSort sorts a ascending in place; the tail window of
+// [selectOrderStatistic] is short enough that a straight pass wins.
+func insertionSort(a []float64) {
+	for i := 1; i < len(a); i++ {
+		v := a[i]
+		j := i
+		for j > 0 && v < a[j-1] {
+			a[j] = a[j-1]
+			j--
+		}
+		a[j] = v
+	}
+}
+
+// heapSelect returns the k-th smallest element of a by keeping a max-heap over
+// the k+1 smallest values seen so far: the root is the answer once every value
+// has been offered. It is O(len(a) log(k+1)) whatever the input order, which is
+// the escape from a run of bad pivots at [selectOrderStatistic]'s depth limit;
+// it is the only path that allocates, and only when that limit is reached.
+func heapSelect(a []float64, k int) float64 {
+	h := make([]float64, 0, k+1)
+	for _, v := range a {
+		if len(h) <= k {
+			h = append(h, v)
+			for i := len(h) - 1; i > 0; {
+				parent := (i - 1) / 2
+				if h[parent] >= h[i] {
+					break
+				}
+				h[parent], h[i] = h[i], h[parent]
+				i = parent
+			}
+			continue
+		}
+		if v >= h[0] {
+			continue
+		}
+		h[0] = v
+		for i := 0; ; {
+			left, right := 2*i+1, 2*i+2
+			largest := i
+			if left < len(h) && h[left] > h[largest] {
+				largest = left
+			}
+			if right < len(h) && h[right] > h[largest] {
+				largest = right
+			}
+			if largest == i {
+				break
+			}
+			h[i], h[largest] = h[largest], h[i]
+			i = largest
+		}
+	}
+	return h[0]
 }
 
 // nextPow2 returns the smallest power of two that is >= n, as Rust's

@@ -42,6 +42,12 @@ change.
   engine's offsets exactly on the committed fixtures and on both real films
   through the whole pipeline — the recorded reference values live in
   `backend/internal/dsp/testdata` and are checked in CI.
+- **Correlation is ~2.3× cheaper.** The median lag score used to be found by
+  sorting ~2.9 M values, which was 51 % of a checkpoint and nearly three times
+  the transforms it summarises; it is now an exact selection that returns the
+  same value. A 190 s checkpoint went from ~981 ms to ~425 ms, faster than the
+  Rust engine's 687 ms rather than slower. No reported number changes: the
+  goldens still match with exact offsets.
 
 ### Removed
 

@@ -77,31 +77,31 @@ const (
 	// cost at most costRatioK times the reference checkpoint of the same nfft
 	// and the same score count.
 	//
-	// Calibrated once on the host recorded in ../PERF.md (AMD Ryzen 5 2500U,
-	// 2026-11-27): five runs of this test measured 1.23, 1.02, 1.14, 1.08 and
-	// 1.07, so the observation taken is the worst of them, 1.23, and
-	// K = ceil(1.23 * 1.25 * 10) / 10 = 1.6.
+	// Recalibrated after #95 replaced the median's clone-and-sort with an exact
+	// selection. Measured three times on the host recorded in ../PERF.md
+	// (2026-11-27): correlation 425/424/421 ms against a reference checkpoint of
+	// 910/897/894 ms, ratio 0.47 every time. The reference still contains the
+	// sort, which is the point: it is a fixed baseline, so the ratio falling
+	// from ~1.0 to 0.47 is the saving, not a moved goalpost.
 	//
-	// The 25 % headroom is for the difference a runner can legitimately show.
-	// It is narrower than the 25 % that used to sit on a transform-only
-	// reference: both sides now carry both dominant terms, so what is left is
-	// the ratio between the memory-bound median and the vectorised transforms,
-	// not the ratio between all the memory-bound work and none of it. That old
-	// mismatch is what made the gate travel downwards — 3.40 here against 4.84
-	// on CI for the same code.
+	// K = 0.75 rather than 0.47 * 1.25 = 0.59, because this gate's own history
+	// records a 42 % spread between this host and CI (3.40 against 4.84) for the
+	// same code; 60 % headroom is the honest response to that, and it still
+	// leaves the gate meaningful — putting the sort back lands production at
+	// ~1.0 of the reference, so K = 0.75 fails a regression long before the
+	// absolute time does.
 	//
-	// What that headroom buys and what it does not: at 1.6 a correlation that
-	// got ~30 % more expensive fails, and so does a second clone-and-sort of
-	// the scores (that alone is ~0.7x of the reference here). A regression
-	// confined to the lag scan alone would have to be ~3x to trip it, because
-	// the scan is a small part of the total — the median is the largest term
-	// and the reference now carries it too. Raising K is a decision that needs
-	// a fresh measurement in PERF.md, not a tweak to silence a red run.
+	// What that buys and what it does not: a correlation that got ~60 % more
+	// expensive fails, and so does any return to sorting the ~2.9 M scores. A
+	// regression confined to the lag scan alone would have to be large to trip
+	// it, because the scan is a small part of the total. Raising K is a decision
+	// that needs a fresh measurement in PERF.md, not a tweak to silence a red
+	// run.
 	//
 	// The number is per checkpoint, not per job. U-DSP.7 runs several
 	// checkpoints at once and they share the memory bus, so the ratio at N > 1
 	// will be a little worse; that unit makes this gate N-aware.
-	costRatioK = 1.6
+	costRatioK = 0.75
 )
 
 var (

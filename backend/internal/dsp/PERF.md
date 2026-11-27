@@ -127,7 +127,8 @@ The port plan expected 1.5-2.0 from "two forward transforms, one inverse and a
 3 M iteration scan" — a transform-and-scan model. The correlation is in fact
 dominated by an `O(n log n)` median the plan did not price, and that is why the
 transform-only ratio was 3.3-3.4. A CPU profile of `BenchmarkCorrelateProduction`
-(8.11 s of samples over five correlations) attributes the time like this:
+taken **as the port landed** (8.11 s of samples over five correlations)
+attributes the time like this:
 
 | term | cumulative | share |
 |---|---|---|
@@ -136,24 +137,41 @@ transform-only ratio was 3.3-3.4. A CPU profile of `BenchmarkCorrelateProduction
 | everything else (prepare, `X*conj(Y)`, prefix sums, lag scan) | ~2 s | 25 % |
 
 The median is taken over every scored lag — up to `2*maxLag+1` = 3.04 M values,
-2 888 001 after the overlap rule drops the outermost lags — by cloning 23 MB and
-sorting it. `correlation.rs:192-194` sorts too, so this is parity with the
-reference engine, not port damage. Both of the two largest terms are now in the
-reference, which is why the gate reads 1.2 instead of 3.4: the ~0.2 above 1.0 is
-the 25 % tail — prepare, the product, the prefix sums and the lag scan.
+2 888 001 after the overlap rule drops the outermost lags. `correlation.rs:192-194`
+sorts too, so this was parity with the reference engine, not port damage.
+
+### The sort is gone (#95)
+
+The port was committed to 1:1 arithmetic, so the sort stayed; #95 then replaced
+it with an exact introselect (median-of-three Hoare partition, insertion sort
+under 16, heap selection after `2*log2(n)` partitions). It returns **the same
+order statistic** — the upper middle, `sorted[len/2]` — so no reported number
+moved: all goldens still match with exact offsets and `|Δquality| <= 0.0002`.
+
+| | before #95 | after #95 |
+|---|---|---|
+| median | ~800 ms (clone 23 MB + pdqsort) | ~130 ms (in-place selection) |
+| correlation, one checkpoint | ~981 ms | 421-425 ms (three runs) |
+| reference checkpoint (still contains the sort) | 894-910 ms | unchanged |
+| `TestCorrelationCostRatio` | 1.2 | **0.47** |
+
+`costRatioK` was recalibrated 1.6 -> 0.75 for this. The reference deliberately
+still contains the sort: it is a fixed baseline, so the ratio falling to 0.47
+*is* the saving. K sits above the measured 0.47 by 60 % — this gate's own
+history records a 42 % spread between this host and CI for identical code — and
+below 1.0, which is where production lands if the sort ever comes back. So the
+gate fails a regression to sorting long before the absolute time does.
 
 Two consequences worth stating plainly:
 
-1. The sort, not the lag scan, is the largest single term in a checkpoint. A
-   future optimisation of the correlator should look there first (a selection or
-   a histogram median returns the same number in `O(n)`) — but that is a
-   behaviour-adjacent change and is out of scope for the port, which is
-   committed to 1:1 arithmetic.
+1. The sort was the largest single term in a checkpoint, and removing it made
+   the correlator ~2.3x cheaper than the Rust engine's 687 ms on the same
+   checkpoint, rather than 1.4x more expensive. What is left is dominated by
+   the transforms, which is the shape the plan originally assumed.
 2. The gate is calibrated against the total, so it is tight where the risk is: a
-   second clone-and-sort of the scores adds ~0.7x of the reference (`ratio` →
-   ~1.9) and fails, and so does ~30 % more total cost. A regression confined to
-   the lag scan alone would need to be ~3x to trip it, because the scan is a
-   small part of the total.
+   return to sorting the ~2.9 M scores fails, and so does ~60 % more total cost.
+   A regression confined to the lag scan alone would need to be large to trip
+   it, because the scan is a small part of the total.
 
 ## What this gate does not catch
 

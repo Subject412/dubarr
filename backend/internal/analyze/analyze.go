@@ -104,6 +104,24 @@ type Thresholds struct {
 	MatchZMaybe float64 `json:"match_z_maybe"`
 	// MatchZGood is the z at or above which a match is "likely correct".
 	MatchZGood float64 `json:"match_z_good"`
+	// FitR2Min is the coefficient of determination a timeline needs before the
+	// fit is allowed to call it a line (a drift or a constant shift) rather
+	// than a mixed timeline.
+	FitR2Min float64 `json:"fit_r2_min"`
+	// DriftSlopeFloorMSPerSec is the slope below which a good line is a
+	// constant shift, not a drift. 1 ms/s is 0.1 %: the six-point Theil–Sen
+	// estimate's standard error is orders of magnitude below an FPS mismatch
+	// (10 ms of noise over a 4050 s span is ~0.002 ms/s), so the floor only
+	// ever suppresses noise, never a real ramp.
+	DriftSlopeFloorMSPerSec float64 `json:"drift_slope_floor_ms_per_sec"`
+	// AboveDriftResidualMS is the residual above which a checkpoint's
+	// disagreement with the fitted trend is reported as a fact about the
+	// material rather than as decode noise: four times the stable band.
+	//
+	// Nothing reads it in 0.5.0 slice 02; it is the table's slot for the
+	// above_drift technique (slice 03), introduced here so the table stays the
+	// one place limits live.
+	AboveDriftResidualMS float64 `json:"above_drift_residual_ms"`
 }
 
 // DefaultThresholds is the table that judges every report, and the table a
@@ -113,6 +131,10 @@ var DefaultThresholds = Thresholds{
 	LowQuality:     LowQualityThreshold,
 	MatchZMaybe:    5.0,
 	MatchZGood:     10.0,
+
+	FitR2Min:                0.98,
+	DriftSlopeFloorMSPerSec: 1.0,
+	AboveDriftResidualMS:    4 * StableSpreadThresholdMS,
 }
 
 // Per-job engine timeout. One correlation job scans the whole widened slice
@@ -514,6 +536,13 @@ type Checkpoint struct {
 // coarsest precision among the checkpoints (the largest sample period, so a
 // report never claims more resolution than its worst checkpoint), and
 // Thresholds is the table that judged this report.
+//
+// Fit is the trend through the same offsets (#86) and is omitempty: a 0.4.0
+// row was never fitted, so the key is absent and a reader can tell "never
+// measured" from "measured as flat". Application records what was done to the
+// dub copy before the mux and is likewise absent on a plain copy, so the row
+// can say "re-encoded (tempo 1.0427)" instead of leaving the operator to infer
+// it from an offset of 0.
 type Report struct {
 	Verdict        string         `json:"verdict"`
 	OffsetsMS      []float64      `json:"offsets_ms"`
@@ -526,6 +555,38 @@ type Report struct {
 	MatchZ         []float64      `json:"match_z"`
 	PrecisionMS    float64        `json:"precision_ms"`
 	Thresholds     Thresholds     `json:"thresholds"`
+	Fit            *LineFit       `json:"fit,omitempty"`
+	Application    *Application   `json:"application,omitempty"`
+}
+
+// Application records what was done to the dub copy before the mux, so the job
+// row can say it in words instead of leaving the operator to infer it from an
+// offset of 0.
+//
+// The segment fields are part of the shape from the start (D2b): slice 05
+// populates them for a piecewise render and nothing here needs a second shape
+// or an additive pass on a shipped field. Slice 02 leaves them zero and fills
+// only Mode and Note for a tempo re-encode.
+type Application struct {
+	Mode string `json:"mode"` // "copy" | "re-encoded"
+	Note string `json:"note"` // "copied untouched", "re-encoded (tempo 1.0427)"
+	// SegmentCount and Segments describe a piecewise render: how many runs of
+	// the film were cut and placed separately.
+	SegmentCount int       `json:"segment_count,omitempty"`
+	Segments     []Segment `json:"segments,omitempty"`
+}
+
+// Segment is one run of the film during which the offset is constant. Its
+// StartSec/EndSec are positions in the target timeline, not in the dub: the
+// encoder shifts them by OffsetMS to find the source material. Slice 05
+// produces these; the type is fixed here so Application never grows a second
+// shape (D2b).
+type Segment struct {
+	StartSec   float64 `json:"start_sec"`
+	EndSec     float64 `json:"end_sec"`
+	OffsetMS   float64 `json:"offset_ms"`
+	Confidence float64 `json:"confidence"` // min confidence of its points
+	Points     int     `json:"points"`
 }
 
 // Analyze resolves the reference strategy, runs one correlation per checkpoint,
@@ -701,6 +762,12 @@ func Analyze(ctx context.Context, engine Engine, cfg Config, req Request) (Repor
 			report.PrecisionMS = run.checkpoint.PrecisionMS
 		}
 	}
+
+	// The trend is fitted after the checkpoints are aggregated and before the
+	// verdict is decided: it describes the same offsets the verdict is about,
+	// and the worker reads both together to decide whether the job is muxable.
+	fit := FitTimeline(plan, report.OffsetsMS, report.Qualities, report.MatchZ, DefaultThresholds)
+	report.Fit = &fit
 
 	verdict, classification, drift := classify(report.OffsetsMS, report.Qualities, report.MatchZ,
 		float64(cfg.MaxOffsetSec)*1000, DefaultThresholds)

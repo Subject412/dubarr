@@ -202,10 +202,16 @@ type TrackMeta struct {
 	Variant       string
 }
 
+// NoRule is the [Plan.RuleIndex] value of a plan no rule produced. A
+// tempo-only plan (a drift correction with no rule match, see [Plan.WithTempo])
+// carries it so the job log cannot claim rule 0 matched when none did.
+const NoRule = -1
+
 // Plan is the resolved action for one track. The zero Plan (Codec=="") means
 // "no rule matched": copy the track untouched.
 type Plan struct {
-	// RuleIndex is the zero-based index of the matching rule, for logs.
+	// RuleIndex is the zero-based index of the matching rule, for logs; it is
+	// [NoRule] when a plan carries a tempo correction but no rule matched.
 	RuleIndex int
 	// Codec is the canonical action (keep|opus|aac|flac|pcm_*).
 	Codec string
@@ -216,7 +222,9 @@ type Plan struct {
 	ChannelLayout string
 	SampleRate    int
 	// TempoFactor folds a drift correction into the same encode; 0 and 1 mean
-	// no tempo change.
+	// no tempo change. A tempo-only plan is materialised as FLAC — lossless, so
+	// a correction the operator never asked for cannot degrade the audio — but
+	// the choice belongs to the caller: Plan only carries the factor.
 	TempoFactor float64
 }
 
@@ -235,7 +243,9 @@ func (p Plan) ExpectedCodec() string {
 }
 
 // WithTempo returns the plan with a drift correction folded into the same
-// encode. The factor is validated by [ValidateTempo].
+// encode: atempo runs inside the one ffmpeg invocation this plan already
+// describes, as the first adjustment, so there is never a second generation of
+// loss. The factor is validated by [ValidateTempo], not here.
 func (p Plan) WithTempo(factor float64) Plan {
 	p.TempoFactor = factor
 	return p

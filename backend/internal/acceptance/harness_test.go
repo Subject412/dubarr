@@ -47,7 +47,15 @@ const testJobTimeout = 10 * time.Minute
 
 // requireAcceptanceTools skips (never silently passes) when the host cannot run
 // the acceptance chain at all. The sync engine is compiled into the test
-// binary now, so only the external tools can be missing.
+// binary now, so only the external tools and the media can be missing.
+//
+// The skip is the design, not a gap: testfiles/ is tens of GiB of real media
+// and is not in the repository, so these suites cannot run on a bare checkout
+// or in CI. The numeric gate that *cannot* skip is internal/dsp/correlate's
+// golden test over the committed excerpts in internal/dsp/testdata/wav (a few
+// MiB, in-repo, no external tool but the Go toolchain) — that is what CI runs,
+// and where a port regression must be caught. Never "fix" a skip here by
+// deleting that test or its goldens; it is the only branch that always runs.
 func requireAcceptanceTools(t *testing.T) {
 	t.Helper()
 	for _, tool := range []string{"ffmpeg", "ffprobe", "mkvmerge", "mkvextract"} {
@@ -160,8 +168,9 @@ func newHarness(t *testing.T) *harness {
 //
 // The media itself is not in the repository, so a checkout without testfiles/
 // skips rather than fails: before the engine moved in-process these suites
-// skipped on a missing cargo, and that guard hid the fact that the fixtures were
-// the real prerequisite all along.
+// skipped on a missing reference toolchain, and that guard hid the fact that
+// the fixtures were the real prerequisite all along. See requireAcceptanceTools
+// for why the skip is correct and which gate covers the same numbers in CI.
 func (h *harness) copyFixture(t *testing.T, name, dstDir string) string {
 	t.Helper()
 	src := filepath.Join("..", "..", "..", "testfiles", name)

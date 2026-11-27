@@ -32,6 +32,13 @@ jobs:
       - name: Test
         working-directory: backend
         run: go test ./... -timeout 30m
+      # U-DSP.7 promised this command. The worker pool, the cancellation path
+      # and the in-process engine are where a race hides, and the plain run
+      # above cannot see one. Scoped to the two packages that carry the
+      # concurrency so the job stays affordable.
+      - name: Race
+        working-directory: backend
+        run: go test -race ./internal/analyze ./internal/dsp/... -timeout 30m
 
   frontend:
     name: frontend (vite)

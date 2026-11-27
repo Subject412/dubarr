@@ -273,10 +273,21 @@ func bestOf(t *testing.T, n int, f func()) time.Duration {
 // same three unfused transforms plus one median over a lag-score slice of the
 // same length — measured best-of-perfRuns.
 //
-// It never skips. It is a few seconds of work, it needs no media and no
-// toolchain, and it is the only performance number in the normal `go test` run
-// — a gate that can skip is a gate that silently stops existing.
+// It is a few seconds of work, it needs no media and no toolchain, and it is
+// the only performance number in the normal `go test` run. It skips in a
+// -race build and nowhere else: CI runs this package twice, and the second run
+// (see the Race step in .github/workflows/ci.yml) checks correctness only.
 func TestCorrelationCostRatio(t *testing.T) {
+	// The gate is a ratio between two timings, so under -race both sides are
+	// instrumented and the instrumentation — which charges this package's
+	// memory-bound selection and the vectorised transforms differently —
+	// decides the comparison instead of the code. CI runs this package twice:
+	// plain for the gate, -race for correctness, where this skip keeps the
+	// race run meaningful rather than flaky.
+	if raceEnabled {
+		t.Skip("timing gate is meaningless under -race; the race build checks correctness only")
+	}
+
 	target, donor := productionSlices()
 	if len(target) != perfSamples || len(donor) != perfSamples {
 		t.Fatalf("production slices are %d and %d samples, want %d each",

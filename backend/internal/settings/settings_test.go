@@ -1,11 +1,14 @@
 package settings
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -1419,4 +1422,230 @@ func TestPresetTechniques(t *testing.T) {
 			}
 		}
 	}
+}
+
+// spaDefaultsPath is the SPA's seeded defaults, relative to this package. A
+// Go-only checkout has no frontend directory, which is why the test below skips
+// rather than fails when it is absent.
+const spaDefaultsPath = "../../../frontend/src/lib/defaults.ts"
+
+// TestDefaultStrategyMatchesTheSPADefault is the cross-language half of D4.
+//
+// The SPA renders DEFAULT_SETTINGS['sync.strategy'] while the settings load, and
+// [PresetTechniques] promises a test that pins that value to the Go default, so
+// this is it: the same object literal is decoded through the same schema the
+// server saves it with, and must equal Defaults() and pass the Go validation.
+//
+// The literal is TypeScript, so it is extracted with a brace scan and normalised
+// to JSON here — no browser, no npm, and no second copy of the defaults to drift.
+func TestDefaultStrategyMatchesTheSPADefault(t *testing.T) {
+	source, err := os.ReadFile(spaDefaultsPath)
+	if err != nil {
+		t.Skipf("SPA defaults unreadable (%v): nothing to compare in a Go-only lane", err)
+	}
+	literal := spaObjectLiteral(t, string(source), KeySyncStrategy)
+	raw := tsObjectLiteralToJSON(t, literal)
+
+	var got StrategyOptions
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("decode the SPA's %s as StrategyOptions: %v (%s)", KeySyncStrategy, err, raw)
+	}
+	// StrategyOptions.UnmarshalJSON fills an absent key from the Go default, so
+	// the same literal is decoded once more without that safety net: a key the
+	// SPA forgot must fail below instead of being papered over with the value it
+	// was supposed to assert.
+	plain := decodeStrict[analyze.Strategy](t, raw)
+	if !reflect.DeepEqual(analyze.Strategy(got), plain) {
+		t.Fatalf("the SPA's literal is not the whole section:\n with Go defaults %+v\n as written %+v",
+			analyze.Strategy(got), plain)
+	}
+
+	want, ok := Defaults("")[KeySyncStrategy].(StrategyOptions)
+	if !ok {
+		t.Fatalf("Defaults()[%q] is %T, want StrategyOptions", KeySyncStrategy, Defaults("")[KeySyncStrategy])
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("the SPA's %s = %+v, want the Go default %+v", KeySyncStrategy, got, want)
+	}
+	if err := analyze.Strategy(got).Validate(); err != nil {
+		t.Fatalf("the SPA's %s fails the Go validation: %v", KeySyncStrategy, err)
+	}
+}
+
+// decodeStrict decodes raw into T with unknown fields rejected, mirroring the
+// server's own decoder.
+func decodeStrict[T any](t *testing.T, raw []byte) T {
+	t.Helper()
+	var v T
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&v); err != nil {
+		t.Fatalf("decode %s: %v", raw, err)
+	}
+	if dec.More() {
+		t.Fatalf("%s: trailing data", raw)
+	}
+	return v
+}
+
+// spaObjectLiteral returns the object literal that follows key in the SPA's
+// DEFAULT_SETTINGS, braces included.
+//
+// It is a balanced-brace scan that knows about string literals, so a brace in a
+// value (or in a comment) cannot end the object early. The scan starts at the
+// first `{` after the key and stops at the brace that closes it.
+func spaObjectLiteral(t *testing.T, source, key string) string {
+	t.Helper()
+	marker := "'" + key + "'"
+	at := strings.Index(source, marker)
+	if at < 0 {
+		t.Fatalf("%s: no %s entry", spaDefaultsPath, marker)
+	}
+	rest := source[at+len(marker):]
+	open := strings.Index(rest, "{")
+	if open < 0 {
+		t.Fatalf("%s: %s is not followed by an object literal", spaDefaultsPath, marker)
+	}
+	depth := 0
+	var quote byte
+	for i := open; i < len(rest); i++ {
+		c := rest[i]
+		if quote != 0 {
+			if c == '\\' {
+				i++
+				continue
+			}
+			if c == quote {
+				quote = 0
+			}
+			continue
+		}
+		switch c {
+		case '\'', '"', '`':
+			quote = c
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return rest[open : i+1]
+			}
+		}
+	}
+	t.Fatalf("%s: the %s object literal is not closed", spaDefaultsPath, marker)
+	return ""
+}
+
+// tsObjectLiteralToJSON normalises one TypeScript object literal into JSON:
+// unquoted keys are quoted, single-quoted strings become double-quoted, and
+// comments and trailing commas are dropped.
+//
+// Only the constructs DEFAULT_SETTINGS uses are handled. Anything else is left
+// as it stands, so json.Unmarshal — not this helper — rejects a literal the
+// normaliser did not understand.
+func tsObjectLiteralToJSON(t *testing.T, literal string) []byte {
+	t.Helper()
+	var out strings.Builder
+	out.Grow(len(literal))
+	for i := 0; i < len(literal); i++ {
+		c := literal[i]
+		switch {
+		case c == '\'' || c == '"' || c == '`':
+			value, next := tsString(t, literal, i)
+			out.WriteString(value)
+			i = next - 1
+		case c == '/' && i+1 < len(literal) && literal[i+1] == '/':
+			for i < len(literal) && literal[i] != '\n' {
+				i++
+			}
+			out.WriteByte(' ')
+		case c == '/' && i+1 < len(literal) && literal[i+1] == '*':
+			end := strings.Index(literal[i+2:], "*/")
+			if end < 0 {
+				t.Fatalf("unterminated block comment in %s", literal)
+			}
+			i += end + 3
+			out.WriteByte(' ')
+		case c == ',':
+			// A trailing comma is legal TypeScript and illegal JSON.
+			j := i + 1
+			for j < len(literal) && isTSSpace(literal[j]) {
+				j++
+			}
+			if j < len(literal) && (literal[j] == '}' || literal[j] == ']') {
+				continue
+			}
+			out.WriteByte(c)
+		case isTSIdentStart(c):
+			j := i
+			for j < len(literal) && isTSIdentPart(literal[j]) {
+				j++
+			}
+			word := literal[i:j]
+			k := j
+			for k < len(literal) && isTSSpace(literal[k]) {
+				k++
+			}
+			if k < len(literal) && literal[k] == ':' {
+				// An unquoted key: JSON wants it quoted.
+				out.WriteByte('"')
+				out.WriteString(word)
+				out.WriteByte('"')
+			} else {
+				// true, false and null: the only bare words a JSON value allows.
+				out.WriteString(word)
+			}
+			i = j - 1
+		default:
+			out.WriteByte(c)
+		}
+	}
+	return []byte(out.String())
+}
+
+// tsString converts the string literal starting at literal[at] to its JSON form
+// and returns it with the index just past the closing quote.
+func tsString(t *testing.T, literal string, at int) (string, int) {
+	t.Helper()
+	quote := literal[at]
+	var out strings.Builder
+	out.WriteByte('"')
+	for i := at + 1; i < len(literal); i++ {
+		c := literal[i]
+		switch {
+		case c == '\\':
+			if i+1 >= len(literal) {
+				t.Fatalf("unterminated escape in %s", literal)
+			}
+			if literal[i+1] == '\'' {
+				// `\'` is not a JSON escape; the apostrophe is plain there.
+				out.WriteByte('\'')
+			} else {
+				out.WriteByte(c)
+				out.WriteByte(literal[i+1])
+			}
+			i++
+		case c == quote:
+			out.WriteByte('"')
+			return out.String(), i + 1
+		case c == '"':
+			out.WriteString(`\"`)
+		default:
+			out.WriteByte(c)
+		}
+	}
+	t.Fatalf("unterminated string in %s", literal)
+	return "", len(literal)
+}
+
+func isTSSpace(c byte) bool {
+	return c == ' ' || c == '	' || c == '\n' || c == '\r'
+}
+
+func isTSIdentStart(c byte) bool {
+	return c == '_' || c == '$' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+func isTSIdentPart(c byte) bool {
+	return isTSIdentStart(c) || (c >= '0' && c <= '9')
 }

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Subject412/dubarr/backend/internal/reflang"
+	"github.com/Subject412/dubarr/backend/internal/sync"
 )
 
 // pipelineConfig is the settled policy with one worker, so a scripted engine's
@@ -66,17 +67,31 @@ func stripAdditive(t *testing.T, raw []byte) map[string]json.RawMessage {
 //
 // The same synthetic pair runs twice: once through the shipped strategy (the
 // engines map, one waveform entry, one always step) and once through the 0.4.0
-// path, reconstructed here by driving the per-checkpoint engine loop directly
-// with a single engine and no routing at all. Every value the old report
-// published must be equal element for element, and the pinned literals below
-// must not move: this is the D4 promise that 0.5.0 changes nothing until the
-// operator adds a technique.
+// path, reconstructed here by driving the engine loop directly with a single
+// engine and no routing at all. Every value the old report published must be
+// equal element for element, and the pinned literals below must not move: this
+// is the D4 promise that 0.5.0 changes nothing until the operator adds a
+// technique.
+//
+// The legacy half is deliberately independent of the production helpers. The
+// plan and the engine jobs are built here from the pinned literals, not by
+// calling runJob (or anything that wraps it): a comparison that asked the code
+// under test what to compare against would pass while runJob shifted a slice
+// start or dropped window_sec.
 func TestPipelineDefaultStrategyIsOutputNeutral(t *testing.T) {
 	// Pinned pre-change values: the scripted answers, and what 0.4.0 made of
 	// them. A change to any of these is a behaviour change, not a refactor.
 	wantOffsets := []float64{1200, 1210, 1195, 1205, 1198, 1202}
 	wantQualities := []float64{0.91, 0.92, 0.90, 0.93, 0.94, 0.95}
 	const wantMaxDriftMS = 15.0
+
+	// The pinned plan: the six windows the settled policy measures on a 600 s
+	// pair — 10%, 25%, 40%, 55%, 70%, 85%, each 190 s wide (max_offset_sec 180
+	// + CheckWindowMarginSec 10), centred and clamped into the duration. All
+	// six land on a whole 8 kHz sample, so the snapped plan prints them
+	// verbatim.
+	wantSlices := []float64{0, 55, 145, 235, 325, 410}
+	const wantSliceLen = 190.0
 
 	req := request(t.TempDir())
 
@@ -123,18 +138,38 @@ func TestPipelineDefaultStrategyIsOutputNeutral(t *testing.T) {
 		}
 	}
 
-	// (b) the 0.4.0 path: one engine, no strategy, no routing. The per-window
-	// loop is the body Analyze ran before #82.
+	// (b) the 0.4.0 path: one engine, no strategy, no routing. The loop below is
+	// the body Analyze ran before #82, with its inputs spelled out here.
 	legacyCfg := pipelineConfig()
 	plan := planForPipeline(t, legacyCfg, req.DurationSec)
+	if len(plan) != len(wantSlices) {
+		t.Fatalf("plan length = %d, want %d", len(plan), len(wantSlices))
+	}
+	for i, w := range plan {
+		if w.FilmStartSec != wantSlices[i] || w.LenSec != wantSliceLen {
+			t.Fatalf("plan[%d] = start %v len %v, want start %v len %v",
+				i, w.FilmStartSec, w.LenSec, wantSlices[i], wantSliceLen)
+		}
+	}
 	eng := &scriptedEngine{offsets: wantOffsets, qualities: wantQualities}
-	slicer := legacyCfg.slicer(req)
 	legacyOffsets := make([]float64, len(plan))
 	legacyQualities := make([]float64, len(plan))
 	legacyMatchZ := make([]float64, len(plan))
 	legacyPoints := make([]Checkpoint, len(plan))
 	for i, w := range plan {
-		res, err := runWindow(context.Background(), eng, legacyCfg, slicer, w)
+		// 0.4.0's job: the request's two staged files, the window's film start,
+		// the planned length, and window_sec set to the analysed slice length so
+		// the engine searches the whole offset bound rather than the checkpoint
+		// window. None of these come from runJob.
+		length := wantSliceLen
+		job := sync.Job{
+			TargetPath:    req.TargetPath,
+			DonorPath:     req.DonorPath,
+			SliceStartSec: wantSlices[i],
+			SliceLenSec:   wantSliceLen,
+			WindowSec:     &length,
+		}
+		res, err := eng.Run(context.Background(), job)
 		if err != nil {
 			t.Fatalf("legacy checkpoint %d: %v", i, err)
 		}
@@ -143,8 +178,8 @@ func TestPipelineDefaultStrategyIsOutputNeutral(t *testing.T) {
 		legacyMatchZ[i] = res.MatchZ
 		legacyPoints[i] = Checkpoint{
 			PositionPct:   w.PositionPct,
-			SliceStartSec: w.FilmStartSec,
-			SliceLenSec:   w.LenSec,
+			SliceStartSec: wantSlices[i],
+			SliceLenSec:   wantSliceLen,
 			OffsetMS:      res.OffsetMS,
 			Quality:       res.CorrelationQuality,
 			OffsetSubMS:   res.OffsetSubMS,
@@ -341,6 +376,84 @@ func TestPipelineAboveDriftRunsOnOutliersOnly(t *testing.T) {
 	}
 	if rep.Verdict != VerdictOK {
 		t.Fatalf("verdict = %q, want ok once the outlier is repaired", rep.Verdict)
+	}
+}
+
+// TestPipelineOnlyOneAttemptIsAccepted is the row's own invariant: a checkpoint
+// states one answer, so its attempt list may carry at most one accepted attempt
+// — and that attempt must be the one whose values the row reports.
+//
+// Phase 2 is where the two can diverge: an `above_drift` technique that clears
+// its own gates but does not beat the incumbent is appended after the accepted
+// phase-1 answer, and marking it accepted would make one row claim two answers.
+func TestPipelineOnlyOneAttemptIsAccepted(t *testing.T) {
+	// Five flat points and a 2 s spike at index 2, so the above_drift step runs
+	// on exactly that checkpoint.
+	cfgFor := func(repairedQuality float64) Config {
+		cfg := pipelineConfig()
+		cfg.Strategy = secondOpinion(TechniqueMFCC, WhenAboveDrift)
+		cfg.Engines = map[TechniqueID]Engine{
+			TechniqueWaveform: &scriptedEngine{
+				offsets:   []float64{1200, 1200, 3200, 1200, 1200, 1200},
+				qualities: []float64{0.9, 0.9, 0.9, 0.9, 0.9, 0.9},
+			},
+			// 0.10 is the second opinion's floor, so both candidates below clear
+			// their own gates; only the first one beats the incumbent's 0.9.
+			TechniqueMFCC: &scriptedEngine{offsets: []float64{1190}, qualities: []float64{repairedQuality}},
+		}
+		return cfg
+	}
+
+	for _, tc := range []struct {
+		name          string
+		repaired      float64
+		wantTechnique string
+		wantOffsetMS  float64
+	}{
+		{name: "the challenger wins", repaired: 0.95,
+			wantTechnique: string(TechniqueMFCC), wantOffsetMS: 1190},
+		{name: "the incumbent keeps the checkpoint", repaired: 0.70,
+			wantTechnique: string(TechniqueWaveform), wantOffsetMS: 3200},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rep, err := Analyze(context.Background(), nil, cfgFor(tc.repaired), request(t.TempDir()))
+			if err != nil {
+				t.Fatalf("Analyze: %v", err)
+			}
+			spike := rep.Checkpoints[2]
+			if spike.Technique != tc.wantTechnique || spike.OffsetMS != tc.wantOffsetMS {
+				t.Fatalf("the outlier = %q/%v, want %q/%v",
+					spike.Technique, spike.OffsetMS, tc.wantTechnique, tc.wantOffsetMS)
+			}
+			if len(spike.Attempts) != 2 {
+				t.Fatalf("the outlier attempts = %+v, want the phase-1 answer and the repair", spike.Attempts)
+			}
+			for i, cp := range rep.Checkpoints {
+				accepted := 0
+				var winner Attempt
+				for _, attempt := range cp.Attempts {
+					if attempt.Accepted {
+						accepted++
+						winner = attempt
+					}
+				}
+				if accepted > 1 {
+					t.Fatalf("checkpoint %d carries %d accepted attempts (%+v), want at most one",
+						i, accepted, cp.Attempts)
+				}
+				if i != 2 {
+					continue
+				}
+				if accepted != 1 {
+					t.Fatalf("the outlier carries %d accepted attempts (%+v), want exactly one",
+						accepted, cp.Attempts)
+				}
+				if winner.Technique != cp.Technique || winner.OffsetMS != cp.OffsetMS {
+					t.Fatalf("the accepted attempt = %+v, want the row's own %q/%v",
+						winner, cp.Technique, cp.OffsetMS)
+				}
+			}
+		})
 	}
 }
 

@@ -285,8 +285,13 @@ func correlate(ctx context.Context, s *Scratch, target, donor []float32, sampleR
 	// the left neighbour is the previously scored lag's ncc if that lag was
 	// exactly i-1; when the scan later reaches i+1, that ncc becomes the right
 	// neighbour. NaN means "never seen", which parabolicPeak turns into 0.
+	// prevIdx starts at -2, not -1: at i == 0 the capture test `prevIdx == i-1`
+	// would hold for a -1 seed and hand parabolicPeak prevNCC's zero value as a
+	// real left neighbour, bending the fit for a peak that is the scan's first
+	// scored lag. -2 keeps the `== i-1` test and fails it at i == 0, where
+	// left stays NaN.
 	left, right := math.NaN(), math.NaN()
-	var prevIdx, bestIdx = -1, -1
+	var prevIdx, bestIdx = -2, -1
 	var prevNCC float64
 
 	for i := 0; i <= 2*maxLag; i++ {

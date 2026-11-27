@@ -115,5 +115,12 @@ describe('theme preference', () => {
 
     expect(await screen.findByRole('heading', { name: 'Sign in' })).toBeInTheDocument()
     expect(htmlTheme()).toBe('dark')
+
+    // The logo beside the wordmark is decorative: it adds no accessible name,
+    // so "Dubarr" is still exposed exactly once.
+    const mark = document.querySelector('img[src="/icon-512.png"]')
+    expect(mark?.getAttribute('aria-hidden')).toBe('true')
+    expect(mark?.getAttribute('alt')).toBe('')
+    expect(screen.getAllByRole('heading', { name: 'Dubarr' })).toHaveLength(1)
   })
 })

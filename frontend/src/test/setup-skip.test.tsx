@@ -92,6 +92,13 @@ describe('first-run wizard escape hatch', () => {
 
     expect(screen.getByRole('heading', { name: 'Administrator account' })).toBeInTheDocument()
     expect(skipButton()).toBeNull()
+
+    // The wizard header carries the same decorative mark, so its single
+    // "Dubarr" heading is still the only one announced.
+    const mark = document.querySelector('img[src="/icon-512.png"]')
+    expect(mark?.getAttribute('aria-hidden')).toBe('true')
+    expect(mark?.getAttribute('alt')).toBe('')
+    expect(screen.getAllByRole('heading', { name: /Dubarr/ })).toHaveLength(1)
   })
 
   it('offers the skip after the administrator is created', async () => {

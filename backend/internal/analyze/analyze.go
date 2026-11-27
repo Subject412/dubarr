@@ -960,31 +960,10 @@ func runCheckpoints(ctx context.Context, cfg Config, slicer Slicer, plan []Windo
 	return runs, nil
 }
 
-// runWindow turns one planned window into one engine result: it asks the
-// slicer for the audio, builds the job from that slice alone, releases the
-// slice whatever happens, and checks the engine's echo.
-//
-// The job's start and length come from the Slice, never from the Window: the
-// Window's FilmStartSec is a position in the movie and the engine addresses
-// the files it was handed, which is the whole point of the seam. WindowSec is
-// the planned length — the same length the whole-file path searches — so
-// max_lag and min_overlap do not change with the analysis source.
-func runWindow(ctx context.Context, engine Engine, cfg Config, slicer Slicer, w Window) (sync.Result, error) {
-	slice, err := slicer.Slice(ctx, w)
-	if err != nil {
-		return sync.Result{}, err
-	}
-	// Every attempt is released, success or not: a window implementation
-	// keeps at most one checkpoint's files per worker.
-	defer slicer.Release(w)
-	return runJob(ctx, engine, cfg, slice, w)
-}
-
 // runJob is one correlation over one already-cut slice: the engine call, its
 // per-job timeout, and the echo check that the engine saw the audio the plan
-// asked for. [runWindow] is its single-technique wrapper and
-// [evaluateCheckpoint] runs it once per technique on the same slice, so the
-// single-technique path and the pipeline cannot drift apart.
+// asked for. [evaluateCheckpoint] runs it once per technique on the same slice,
+// so every technique on a checkpoint reads exactly the audio the plan cut.
 func runJob(ctx context.Context, engine Engine, cfg Config, slice Slice, w Window) (sync.Result, error) {
 	length := slice.LenSec
 	job := sync.Job{

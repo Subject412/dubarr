@@ -980,8 +980,11 @@ func acceptsRetry(windows []analyze.Window, offsets []float64, index int, w anal
 //
 // The 0.5.0 diagnostics are replaced with the retry's own: a z or a sub-sample
 // offset left over from the attempt this one replaces would describe a peak the
-// report no longer carries.
+// report no longer carries. The attempt history follows the row (see
+// [retriedAttempts]), so the disclosure cannot keep describing the answer the
+// retry displaced.
 func replaceCheckpoint(report analyze.Report, index int, result sync.Result) analyze.Report {
+	report.Checkpoints[index].Attempts = retriedAttempts(report.Checkpoints[index].Attempts, result)
 	report.Checkpoints[index].OffsetMS = result.OffsetMS
 	report.Checkpoints[index].Quality = result.CorrelationQuality
 	report.Checkpoints[index].OffsetSubMS = result.OffsetSubMS
@@ -993,6 +996,56 @@ func replaceCheckpoint(report analyze.Report, index int, result sync.Result) ana
 		report.MatchZ[index] = result.MatchZ
 	}
 	return report
+}
+
+// retriedAttempts rewrites one checkpoint's history so that it describes the
+// answer the retry put in the row.
+//
+// The winner is the attempt the row was drawn from: the accepted one, or — when
+// nothing was accepted — the healthiest answer, which is the rule the pipeline
+// itself fills a row with. It takes the retry's numbers and keeps its label: a
+// retry is a re-measurement of the same window, not a new technique. Every other
+// attempt keeps its own numbers and loses the accepted flag, so at most one
+// attempt per checkpoint says it was the answer.
+//
+// No winner at all means the history cannot describe the new answer — a
+// pre-0.5.0 row (no attempts) or one where every technique errored — and it is
+// left empty rather than carrying numbers nobody measured.
+func retriedAttempts(attempts []analyze.Attempt, result sync.Result) []analyze.Attempt {
+	if len(attempts) == 0 {
+		return nil
+	}
+	winner := -1
+	for i, attempt := range attempts {
+		if attempt.Accepted {
+			winner = i
+			break
+		}
+	}
+	if winner < 0 {
+		for i, attempt := range attempts {
+			if attempt.Error != "" {
+				continue
+			}
+			if winner < 0 || attempt.Quality > attempts[winner].Quality {
+				winner = i
+			}
+		}
+	}
+	if winner < 0 {
+		return nil
+	}
+	out := make([]analyze.Attempt, len(attempts))
+	copy(out, attempts)
+	for i := range out {
+		out[i].Accepted = i == winner
+	}
+	out[winner].OffsetMS = result.OffsetMS
+	out[winner].OffsetSubMS = result.OffsetSubMS
+	out[winner].Quality = result.CorrelationQuality
+	out[winner].MatchZ = result.MatchZ
+	out[winner].PrecisionMS = result.PrecisionMS
+	return out
 }
 
 // windowSuspect reports whether a windowed pass failed on a window rather than

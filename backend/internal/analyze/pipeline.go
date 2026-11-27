@@ -242,8 +242,10 @@ func applyAboveDrift(ctx context.Context, cfg Config, slicer Slicer, plan []Wind
 // in list order, keeping the best accepted answer.
 //
 // The window is cut once for all of them, and released when this checkpoint is
-// done. The previous winner's accepted flag is cleared when it is replaced: the
-// report must not claim two accepted answers for one checkpoint.
+// done. The previous winner's accepted flag is cleared when it is replaced, and
+// an answer that clears its own gates but does not beat the incumbent is
+// recorded without the flag: the report must not claim two accepted answers for
+// one checkpoint.
 func applyAboveDriftToCheckpoint(ctx context.Context, cfg Config, entries []Technique, slicer Slicer, w Window, checkpoint *Checkpoint) error {
 	slice, err := slicer.Slice(ctx, w)
 	if err != nil {
@@ -285,8 +287,13 @@ func applyAboveDriftToCheckpoint(ctx context.Context, cfg Config, entries []Tech
 			MatchZ:      result.MatchZ,
 			PrecisionMS: result.PrecisionMS,
 		}
-		attempt.Accepted = accepts(entry, result)
-		if attempt.Accepted && attempt.Quality > best.Quality {
+		// At most one attempt per checkpoint carries Accepted: the row states
+		// one answer, and an attempt that clears its own gates but does not beat
+		// the incumbent is not that answer — marking it accepted too would make
+		// the report claim two answers for one checkpoint (see [winner]).
+		wins := accepts(entry, result) && attempt.Quality > best.Quality
+		attempt.Accepted = wins
+		if wins {
 			for k := range checkpoint.Attempts {
 				checkpoint.Attempts[k].Accepted = false
 			}

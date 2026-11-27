@@ -280,3 +280,68 @@ func TestKnownTechniqueIDs(t *testing.T) {
 		}
 	}
 }
+
+// TestDefaultStrategyShipsPiecewiseOff is D5 stated as a test: the shipped
+// strategy segments nothing, at the documented numbers, so a fresh install
+// produces 0.4.0's report.
+func TestDefaultStrategyShipsPiecewiseOff(t *testing.T) {
+	s := DefaultStrategy()
+	if s.Piecewise.Enabled {
+		t.Fatal("DefaultStrategy() segments by default: D5 makes piecewise opt-in")
+	}
+	if want := DefaultPiecewisePolicy(); s.Piecewise != want {
+		t.Fatalf("DefaultStrategy().Piecewise = %+v, want the documented default %+v", s.Piecewise, want)
+	}
+	if !s.Piecewise.IsZero() {
+		t.Fatal("the shipped piecewise block is not its own zero value: every report would grow a key")
+	}
+}
+
+// TestStrategyValidatesThePiecewiseBlock: the block travels inside the section,
+// so one Validate covers both halves — the analyser's pre-flight check and the
+// settings save.
+func TestStrategyValidatesThePiecewiseBlock(t *testing.T) {
+	cases := []struct {
+		name    string
+		mutate  func(*PiecewisePolicy)
+		wantErr string
+	}{
+		{"the shipped block", func(*PiecewisePolicy) {}, ""},
+		{"enabled at the shipped numbers", func(p *PiecewisePolicy) { p.Enabled = true }, ""},
+		{"a step of 15 s", func(p *PiecewisePolicy) { p.StepSec = 15; p.WindowSec = 30 }, ""},
+		{"a step of 300 s", func(p *PiecewisePolicy) { p.StepSec = 300; p.WindowSec = 120 }, ""},
+		{"a step of 14 s", func(p *PiecewisePolicy) { p.StepSec = 14; p.WindowSec = 20 }, "piecewise.step_sec must be 15..300"},
+		{"a window of 19 s", func(p *PiecewisePolicy) { p.WindowSec = 19 }, "piecewise.window_sec must be 20..190"},
+		{"a window of 191 s", func(p *PiecewisePolicy) { p.StepSec = 120; p.WindowSec = 191 }, "piecewise.window_sec must be 20..190"},
+		{"a window past the search bound while off", func(p *PiecewisePolicy) {
+			p.StepSec = 120
+			p.WindowSec = 190
+		}, ""},
+		{"a window past the search bound while on", func(p *PiecewisePolicy) {
+			p.Enabled = true
+			p.StepSec = 120
+			p.WindowSec = 190
+		}, "when piecewise is enabled"},
+		{"a penalty of 49 ms", func(p *PiecewisePolicy) { p.SplitPenaltyMS = 49 }, "piecewise.split_penalty_ms must be 50..5000"},
+		{"a penalty of 5001 ms", func(p *PiecewisePolicy) { p.SplitPenaltyMS = 5001 }, "piecewise.split_penalty_ms must be 50..5000"},
+		{"a segment of 29 s", func(p *PiecewisePolicy) { p.MinSegmentSec = 29 }, "piecewise.min_segment_sec must be 30..3600"},
+		{"a segment of 3601 s", func(p *PiecewisePolicy) { p.MinSegmentSec = 3601 }, "piecewise.min_segment_sec must be 30..3600"},
+		{"one segment", func(p *PiecewisePolicy) { p.MaxSegments = 1 }, "piecewise.max_segments must be 2..40"},
+		{"41 segments", func(p *PiecewisePolicy) { p.MaxSegments = 41 }, "piecewise.max_segments must be 2..40"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := DefaultStrategy()
+			tc.mutate(&s.Piecewise)
+			err := s.Validate()
+			switch {
+			case tc.wantErr == "" && err != nil:
+				t.Fatalf("Validate() = %v, want nil", err)
+			case tc.wantErr != "" && err == nil:
+				t.Fatalf("Validate() = nil, want %q", tc.wantErr)
+			case tc.wantErr != "" && !strings.Contains(err.Error(), tc.wantErr):
+				t.Fatalf("Validate() = %v, want it to contain %q", err, tc.wantErr)
+			}
+		})
+	}
+}

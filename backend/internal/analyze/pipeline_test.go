@@ -193,7 +193,7 @@ func TestPipelineDefaultStrategyIsOutputNeutral(t *testing.T) {
 		}
 	}
 	fit := FitTimeline(plan, legacyOffsets, legacyQualities, legacyMatchZ, DefaultThresholds)
-	verdict, classification, drift := classify(legacyOffsets, legacyQualities, legacyMatchZ,
+	verdict, classification, drift := classify(legacyOffsets, legacyQualities, legacyMatchZ, nil,
 		float64(legacyCfg.MaxOffsetSec)*1000, DefaultThresholds)
 	targets, vault, policy, original := sameLangRefs()
 	resolved := reflang.Resolve(targets, vault, policy, original)

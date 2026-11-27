@@ -1194,7 +1194,14 @@ func TestSyncDefaultsAnalysisSourceRoundTrips(t *testing.T) {
 // install writes. It is a literal, not a re-marshalled constant: the SPA's
 // DEFAULT_SETTINGS['sync.strategy'] must match it, and a change here is a
 // migration, not a refactor.
-const defaultStrategyJSON = `{"preset":"balanced","techniques":[{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5,"z_gate":true}]}`
+//
+// #84 added the `piecewise` block to the same section, off at the documented
+// numbers: the feature is opt-in (D5), and the numbers are written out because
+// the section is the document the operator edits — the UI has to be served the
+// values it would be editing. That is why the block is always present here and
+// absent from a report while it is off (analyze.Strategy omits it at the shipped
+// values; settings.StrategyOptions always writes it).
+const defaultStrategyJSON = `{"preset":"balanced","techniques":[{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5,"z_gate":true}],"piecewise":{"enabled":false,"step_sec":45,"window_sec":60,"split_penalty_ms":250,"min_segment_sec":120,"max_segments":12}}`
 
 func TestKnownKeysIncludesSyncStrategy(t *testing.T) {
 	if KeySyncStrategy != "sync.strategy" {
@@ -1240,6 +1247,14 @@ func TestSyncStrategyDefaultsAreTheBalancedList(t *testing.T) {
 	}
 	if entry.MinConfidence != 0.10 || entry.MinMatchZ != 5.0 || !entry.ZGate {
 		t.Fatalf("shipped thresholds = %v/%v/%v, want 0.10/5.0/true", entry.MinConfidence, entry.MinMatchZ, entry.ZGate)
+	}
+	// The piecewise block is written at the documented numbers and switched off:
+	// a fresh install measures six points and writes 0.4.0's report (D5).
+	if got, want := strategy.Piecewise, analyze.DefaultPiecewisePolicy(); got != want {
+		t.Fatalf("shipped piecewise = %+v, want the documented default %+v", got, want)
+	}
+	if strategy.Piecewise.Enabled {
+		t.Fatal("the shipped piecewise block is enabled: segmentation is opt-in (D5)")
 	}
 }
 
@@ -1435,46 +1450,72 @@ func TestSyncStrategyPresetBecomesCustomWhenEdited(t *testing.T) {
 	}
 }
 
-// TestPresetTechniques pins the three canonical lists. `fast` is deliberately
+// TestPreset pins the three canonical sections. `fast` is deliberately
 // identical to `balanced` (D4a): the paid-for saving is fewer checkpoints, not
 // a coarser matcher, and MFCC is never a preset.
-func TestPresetTechniques(t *testing.T) {
-	balanced := PresetTechniques(analyze.PresetBalanced)
-	fast := PresetTechniques(analyze.PresetFast)
-	maximum := PresetTechniques(analyze.PresetMaximumAccuracy)
+//
+// The preset covers the whole section — techniques *and* the piecewise block —
+// because a preset is one statement about the job. No preset switches
+// segmentation on: it is the one setting that changes what a job does to the
+// operator's dub copy, so it is only ever on because someone said so, never
+// because a stored preset was redefined under them (D5).
+func TestPreset(t *testing.T) {
+	balanced := Preset(analyze.PresetBalanced)
+	fast := Preset(analyze.PresetFast)
+	maximum := Preset(analyze.PresetMaximumAccuracy)
 
-	if len(balanced) != 1 || balanced[0].ID != analyze.TechniqueWaveform || balanced[0].When != analyze.WhenAlways {
-		t.Fatalf("balanced = %+v, want one waveform/always entry", balanced)
+	if balanced.Preset != analyze.PresetBalanced {
+		t.Fatalf("balanced label = %q, want %q", balanced.Preset, analyze.PresetBalanced)
 	}
-	if !balanced[0].ZGate {
-		t.Fatalf("balanced = %+v, want its waveform entry z-gated", balanced)
+	if len(balanced.Techniques) != 1 || balanced.Techniques[0].ID != analyze.TechniqueWaveform ||
+		balanced.Techniques[0].When != analyze.WhenAlways {
+		t.Fatalf("balanced = %+v, want one waveform/always entry", balanced.Techniques)
 	}
-	if len(fast) != 1 || fast[0] != balanced[0] {
-		t.Fatalf("fast = %+v, want the balanced list (D4a)", fast)
+	if !balanced.Techniques[0].ZGate {
+		t.Fatalf("balanced = %+v, want its waveform entry z-gated", balanced.Techniques[0])
 	}
-	if len(maximum) != 2 {
-		t.Fatalf("maximum_accuracy = %+v, want two entries", maximum)
+	if len(fast.Techniques) != 1 || fast.Techniques[0] != balanced.Techniques[0] || fast.Piecewise != balanced.Piecewise {
+		t.Fatalf("fast = %+v, want the balanced section (D4a)", fast)
 	}
-	if maximum[1].ID != analyze.TechniqueMFCC || maximum[1].When != analyze.WhenBelowConfidence {
-		t.Fatalf("maximum_accuracy second entry = %+v, want mfcc/below_confidence", maximum[1])
+	if len(maximum.Techniques) != 2 {
+		t.Fatalf("maximum_accuracy = %+v, want two entries", maximum.Techniques)
+	}
+	if maximum.Techniques[1].ID != analyze.TechniqueMFCC || maximum.Techniques[1].When != analyze.WhenBelowConfidence {
+		t.Fatalf("maximum_accuracy second entry = %+v, want mfcc/below_confidence", maximum.Techniques[1])
 	}
 	// The σ gate is per technique: the waveform step keeps its 5σ band, the
 	// mel-cepstral step is judged on quality alone (its z is a diagnostic on a
 	// different curve), which is why it carries no band to be gated by.
-	if !maximum[0].ZGate || maximum[1].ZGate {
+	if !maximum.Techniques[0].ZGate || maximum.Techniques[1].ZGate {
 		t.Fatalf("maximum_accuracy gates = %v/%v, want waveform gated and mfcc not",
-			maximum[0].ZGate, maximum[1].ZGate)
+			maximum.Techniques[0].ZGate, maximum.Techniques[1].ZGate)
 	}
-	if maximum[1].MinConfidence != 0.15 || maximum[1].MinMatchZ != 0 {
+	if maximum.Techniques[1].MinConfidence != 0.15 || maximum.Techniques[1].MinMatchZ != 0 {
 		t.Fatalf("maximum_accuracy thresholds = %v/%v, want 0.15/0 (quality-gated)",
-			maximum[1].MinConfidence, maximum[1].MinMatchZ)
+			maximum.Techniques[1].MinConfidence, maximum.Techniques[1].MinMatchZ)
 	}
-	if got := PresetTechniques(analyze.PresetCustom); got != nil {
-		t.Fatalf("custom = %+v, want no canonical list", got)
+	// No preset segments: the block is off at the documented numbers in all
+	// three, so saving a preset can never start re-encoding a dub copy.
+	for _, section := range []analyze.Strategy{balanced, fast, maximum} {
+		if section.Piecewise.Enabled {
+			t.Fatalf("preset %q segments: D5 makes segmentation opt-in", section.Preset)
+		}
+		if section.Piecewise != analyze.DefaultPiecewisePolicy() {
+			t.Fatalf("preset %q piecewise = %+v, want the documented default", section.Preset, section.Piecewise)
+		}
+	}
+	// The one preset that segments still has to validate as a stored section.
+	for _, name := range []string{analyze.PresetFast, analyze.PresetBalanced, analyze.PresetMaximumAccuracy} {
+		if err := Preset(name).Validate(); err != nil {
+			t.Fatalf("preset %q does not validate: %v", name, err)
+		}
+	}
+	if got := Preset(analyze.PresetCustom); !reflect.DeepEqual(got, analyze.Strategy{}) {
+		t.Fatalf("custom = %+v, want the zero section", got)
 	}
 	// No preset may name MFCC first or alone: D4a forbids a coarser default.
 	for _, preset := range []string{analyze.PresetFast, analyze.PresetBalanced} {
-		for _, entry := range PresetTechniques(preset) {
+		for _, entry := range Preset(preset).Techniques {
 			if entry.ID != analyze.TechniqueWaveform {
 				t.Fatalf("preset %q names %q, want waveform only", preset, entry.ID)
 			}
@@ -1512,8 +1553,15 @@ func TestDefaultStrategyMatchesTheSPADefault(t *testing.T) {
 	// the same literal is decoded once more without that safety net: a key the
 	// SPA forgot must fail below instead of being papered over with the value it
 	// was supposed to assert.
-	plain := decodeStrict[analyze.Strategy](t, raw)
-	if !reflect.DeepEqual(analyze.Strategy(got), plain) {
+	//
+	// The comparison is made on normalised sections because the `piecewise`
+	// block (#84) is legitimately absent from either side: a SPA build from
+	// before the block existed posts a section without it, and the server fills
+	// it from the default. Normalising both sides keeps "a key the SPA forgot
+	// must fail" true for the techniques list — which is what this test is for —
+	// without failing on the one block that has a defined absent meaning.
+	plain := normaliseStrategy(decodeStrict[analyze.Strategy](t, raw))
+	if !reflect.DeepEqual(normaliseStrategy(analyze.Strategy(got)), plain) {
 		t.Fatalf("the SPA's literal is not the whole section:\n with Go defaults %+v\n as written %+v",
 			analyze.Strategy(got), plain)
 	}
@@ -1528,6 +1576,14 @@ func TestDefaultStrategyMatchesTheSPADefault(t *testing.T) {
 	if err := analyze.Strategy(got).Validate(); err != nil {
 		t.Fatalf("the SPA's %s fails the Go validation: %v", KeySyncStrategy, err)
 	}
+}
+
+// normaliseStrategy is the canonical form the SPA parity test compares: the
+// piecewise block at its documented numbers, so a section that omits the block
+// and one that writes the defaults are the same statement.
+func normaliseStrategy(s analyze.Strategy) analyze.Strategy {
+	s.Piecewise = s.Piecewise.Normalised()
+	return s
 }
 
 // decodeStrict decodes raw into T with unknown fields rejected, mirroring the
@@ -1706,4 +1762,127 @@ func isTSIdentStart(c byte) bool {
 
 func isTSIdentPart(c byte) bool {
 	return isTSIdentStart(c) || (c >= '0' && c <= '9')
+}
+
+// TestSyncStrategyAlwaysServesThePiecewiseBlock pins the settings-side wire
+// shape, which is deliberately the opposite of the report's: the section is the
+// document the operator edits, so the UI is served the numbers it would be
+// editing even on a fresh install, while a report omits the block for a job that
+// never ran it (analyze.Strategy's omitzero).
+func TestSyncStrategyAlwaysServesThePiecewiseBlock(t *testing.T) {
+	raw, err := json.Marshal(Defaults("")[KeySyncStrategy])
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	block, ok := fields["piecewise"]
+	if !ok {
+		t.Fatalf("the served section has no piecewise block: %s", raw)
+	}
+	var policy analyze.PiecewisePolicy
+	if err := json.Unmarshal(block, &policy); err != nil {
+		t.Fatalf("piecewise block is not a policy: %v (%s)", err, block)
+	}
+	if want := analyze.DefaultPiecewisePolicy(); policy != want {
+		t.Fatalf("served piecewise = %+v, want the documented default %+v", policy, want)
+	}
+}
+
+// TestSyncStrategyPiecewiseRoundTrip: a section the operator switched on comes
+// back switched on, with its numbers, and the preset label follows the section.
+func TestSyncStrategyPiecewiseRoundTrip(t *testing.T) {
+	blob := `{"preset":"maximum_accuracy","techniques":[` +
+		`{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5,"z_gate":true},` +
+		`{"id":"mfcc","enabled":true,"when":"below_confidence","min_confidence":0.15,"min_match_z":0,"z_gate":false}],` +
+		`"piecewise":{"enabled":true,"step_sec":60,"window_sec":60,"split_penalty_ms":400,"min_segment_sec":180,"max_segments":6}}`
+	stored := decode[StrategyOptions](t, []byte(blob))
+	if err := validateStrategy(&stored); err != nil {
+		t.Fatalf("validateStrategy: %v", err)
+	}
+	want := analyze.PiecewisePolicy{
+		Enabled: true, StepSec: 60, WindowSec: 60,
+		SplitPenaltyMS: 400, MinSegmentSec: 180, MaxSegments: 6,
+	}
+	if stored.Piecewise != want {
+		t.Fatalf("stored piecewise = %+v, want %+v", stored.Piecewise, want)
+	}
+	// Turning the block on is an edit like any other, so the label is `custom`:
+	// no preset segments on the operator's behalf (D5).
+	if stored.Preset != analyze.PresetCustom {
+		t.Fatalf("preset = %q, want %q: a section with segmentation on is not any preset",
+			stored.Preset, analyze.PresetCustom)
+	}
+
+	// Switching it back off — the numbers as well, since the block was tuned —
+	// restores the maximum_accuracy section exactly, and with it the label.
+	off := stored
+	off.Piecewise = analyze.DefaultPiecewisePolicy()
+	if err := validateStrategy(&off); err != nil {
+		t.Fatalf("validateStrategy: %v", err)
+	}
+	if off.Preset != analyze.PresetMaximumAccuracy {
+		t.Fatalf("preset = %q, want %q once the block is back at the default",
+			off.Preset, analyze.PresetMaximumAccuracy)
+	}
+}
+
+// TestSyncStrategyAbsentPiecewiseMaterialises: a row written before #84 has no
+// `piecewise` key. Nothing is invented beyond the documented default, and the
+// section is stored with the numbers written out — which is what D1 means by
+// "no migration".
+func TestSyncStrategyAbsentPiecewiseMaterialises(t *testing.T) {
+	blob := `{"preset":"balanced","techniques":[` +
+		`{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5,"z_gate":true}]}`
+	stored := decode[StrategyOptions](t, []byte(blob))
+	if err := validateStrategy(&stored); err != nil {
+		t.Fatalf("validateStrategy: %v", err)
+	}
+	if want := analyze.DefaultPiecewisePolicy(); stored.Piecewise != want {
+		t.Fatalf("piecewise = %+v, want the documented default %+v", stored.Piecewise, want)
+	}
+	if stored.Piecewise.Enabled {
+		t.Fatal("an absent block came back enabled: segmentation must stay opt-in (D5)")
+	}
+	if stored.Preset != analyze.PresetBalanced {
+		t.Fatalf("preset = %q, want %q", stored.Preset, analyze.PresetBalanced)
+	}
+}
+
+// TestSyncStrategyPiecewiseRangesRejected: the ranges are enforced on the way in,
+// with the section key prefix the settings API returns.
+func TestSyncStrategyPiecewiseRangesRejected(t *testing.T) {
+	cases := []struct {
+		name   string
+		block  string
+		wantIn string
+	}{
+		{"step", `{"enabled":true,"step_sec":5}`, "piecewise.step_sec must be 15..300"},
+		{"window", `{"enabled":true,"step_sec":45,"window_sec":19}`, "piecewise.window_sec must be 20..190"},
+		{"overlap", `{"enabled":true,"step_sec":20,"window_sec":60}`, "piecewise.window_sec must be at most twice step_sec"},
+		{"penalty", `{"enabled":true,"split_penalty_ms":10}`, "piecewise.split_penalty_ms must be 50..5000"},
+		{"segment", `{"enabled":true,"min_segment_sec":10}`, "piecewise.min_segment_sec must be 30..3600"},
+		{"count", `{"enabled":true,"max_segments":1}`, "piecewise.max_segments must be 2..40"},
+		{"search bound", `{"enabled":true,"step_sec":90,"window_sec":180}`, "when piecewise is enabled"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			blob := `{"preset":"custom","techniques":[` +
+				`{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5,"z_gate":true}],` +
+				`"piecewise":` + tc.block + `}`
+			stored := decode[StrategyOptions](t, []byte(blob))
+			err := validateStrategy(&stored)
+			if err == nil {
+				t.Fatalf("validateStrategy(%s) = nil, want an error", tc.block)
+			}
+			if !strings.Contains(err.Error(), tc.wantIn) {
+				t.Fatalf("error = %v, want it to contain %q", err, tc.wantIn)
+			}
+			if !strings.Contains(err.Error(), KeySyncStrategy) {
+				t.Fatalf("error = %v, want it prefixed with %q", err, KeySyncStrategy)
+			}
+		})
+	}
 }

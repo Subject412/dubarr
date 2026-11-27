@@ -193,6 +193,112 @@ describe('matching techniques settings (#82)', () => {
     expect(strategy.preset).toBe('balanced')
   })
 
+  /**
+   * D4a makes Fast a `sync.defaults` decision as well as a `sync.strategy` one,
+   * so a preset press that stored only the label would leave the two sections
+   * disagreeing — the reported `preset:"fast"` over six stored points. The
+   * settings endpoint applies one payload in one transaction (settings.Store.Apply
+   * validates everything before writing anything), so both halves travel in the
+   * same PUT: neither can land without the other.
+   */
+  it('writes the strategy and the checkpoint positions in one save when a preset is pressed', async () => {
+    const user = userEvent.setup()
+    const fetchMock = mockFetch()
+    await openPage()
+
+    await user.click(within(strategyCard()).getByRole('button', { name: 'Fast' }))
+    // Until it is saved the card says so: a press is not a stored starting point.
+    expect(within(strategyCard()).getByTestId('strategy-preset-pending')).toHaveTextContent(
+      /not saved/i,
+    )
+
+    await user.click(screen.getByLabelText('Save Matching techniques'))
+    await waitFor(() => expect(putPayloads(fetchMock)).toHaveLength(1))
+
+    const payload = putPayloads(fetchMock)[0]
+    expect(Object.keys(payload).sort()).toEqual(['sync.defaults', 'sync.strategy'])
+    const strategy = payload['sync.strategy'] as { preset: string; techniques: unknown[] }
+    const defaults = payload['sync.defaults'] as {
+      checkpoint_positions_pct: number[]
+      max_offset_sec: number
+    }
+    expect(strategy.preset).toBe('fast')
+    expect(strategy.techniques).toEqual(SHIPPED.techniques)
+    expect(defaults.checkpoint_positions_pct).toEqual(FAST_POSITIONS)
+    // Only the positions move; the rest of the section goes back as stored.
+    expect(defaults.max_offset_sec).toBe(180)
+
+    // Stored now, so the card stops saying otherwise.
+    await waitFor(() => expect(within(strategyCard()).queryByTestId('strategy-preset-pending')).toBeNull())
+    expect(within(strategyCard()).getByTestId('strategy-preset')).toHaveTextContent(/^Fast$/)
+  })
+
+  it('carries both sections when the Sync defaults card saves a staged preset', async () => {
+    const user = userEvent.setup()
+    const fetchMock = mockFetch()
+    await openPage()
+
+    await user.click(within(strategyCard()).getByRole('button', { name: 'Fast' }))
+    await user.click(screen.getByLabelText('Save Sync defaults'))
+    await waitFor(() => expect(putPayloads(fetchMock)).toHaveLength(1))
+
+    // The other card's Save is the same user action, so it writes the pair too:
+    // storing the positions alone would print Balanced over three points.
+    const payload = putPayloads(fetchMock)[0]
+    expect(Object.keys(payload).sort()).toEqual(['sync.defaults', 'sync.strategy'])
+    expect((payload['sync.strategy'] as { preset: string }).preset).toBe('fast')
+    expect(
+      (payload['sync.defaults'] as { checkpoint_positions_pct: number[] })
+        .checkpoint_positions_pct,
+    ).toEqual(FAST_POSITIONS)
+  })
+
+  it('keeps the preset visibly unsaved when the paired save is refused', async () => {
+    const user = userEvent.setup()
+    const refusal = 'sync.defaults: checkpoint positions must be 1..12 entries'
+    const fetchMock = mockFetch({ putStatus: 400, putError: refusal })
+    await openPage()
+
+    await user.click(within(strategyCard()).getByRole('button', { name: 'Fast' }))
+    await user.click(screen.getByLabelText('Save Matching techniques'))
+
+    expect(await within(strategyCard()).findByRole('alert')).toHaveTextContent(refusal)
+    // One refused request, so neither half is stored — and the card cannot claim
+    // to hold a starting point it never stored.
+    await waitFor(() => expect(putPayloads(fetchMock)).toHaveLength(1))
+    expect(Object.keys(putPayloads(fetchMock)[0]).sort()).toEqual([
+      'sync.defaults',
+      'sync.strategy',
+    ])
+    expect(within(strategyCard()).getByTestId('strategy-preset')).toHaveTextContent(
+      /Fast \(not saved yet\)/,
+    )
+    expect(within(strategyCard()).getByTestId('strategy-preset')).not.toHaveTextContent(/^Fast$/)
+  })
+
+  it('abandons the staged positions when the list is edited away from the preset', async () => {
+    const user = userEvent.setup()
+    const fetchMock = mockFetch()
+    await openPage()
+
+    await user.click(within(strategyCard()).getByRole('button', { name: 'Fast' }))
+    await user.selectOptions(within(strategyCard()).getByLabelText('Step 1 method'), 'mfcc')
+
+    // A custom list is not the preset any more, so its checkpoint count is not
+    // rewritten behind the operator's back.
+    expect(within(strategyCard()).getByTestId('strategy-preset')).toHaveTextContent(/^Custom$/)
+    expect(within(strategyCard()).queryByTestId('strategy-preset-pending')).toBeNull()
+    await waitFor(() =>
+      expect(within(syncCard()).getByLabelText('Checkpoint positions (%)')).toHaveValue(
+        '10, 25, 40, 55, 70, 85',
+      ),
+    )
+
+    await user.click(screen.getByLabelText('Save Matching techniques'))
+    await waitFor(() => expect(putPayloads(fetchMock)).toHaveLength(1))
+    expect(Object.keys(putPayloads(fetchMock)[0])).toEqual(['sync.strategy'])
+  })
+
   it('labels an edited list Custom and submits the custom preset', async () => {
     const user = userEvent.setup()
     const fetchMock = mockFetch()

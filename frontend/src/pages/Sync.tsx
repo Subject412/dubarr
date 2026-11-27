@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import type { LibrarySearchItem, SyncJob, SyncJobStatus, SyncReport } from '../lib/api'
+import type { LibrarySearchItem, SyncFit, SyncJob, SyncJobStatus, SyncReport } from '../lib/api'
 import {
   useCreateSyncJob,
   useDebouncedValue,
@@ -8,8 +8,9 @@ import {
   useSyncJobs,
   useVault,
 } from '../lib/hooks'
-import { Alert, Badge, Button, Card, Input, PageHeader, Spinner } from '../components/ui'
+import { Alert, Badge, Button, Card, InfoTip, Input, PageHeader, Spinner } from '../components/ui'
 import { CheckpointChart } from '../components/CheckpointChart'
+import { helpIdFor } from '../lib/help-id'
 
 type Tone = 'neutral' | 'success' | 'warning' | 'danger' | 'accent'
 
@@ -44,11 +45,111 @@ function formatMs(value: number): string {
   return `${Math.round(value)} ms`
 }
 
+/**
+ * The slope reads in milliseconds of offset per second of film, the unit the
+ * backend reports (`slope_ms_per_sec`): 42.7 is the 25.000 -> 23.976 fps
+ * mismatch.
+ */
+function formatSlope(value: number): string {
+  return `${value < 0 ? '−' : '+'}${Math.abs(value).toFixed(1)} ms/s`
+}
+
 function libraryLabel(entry: LibrarySearchItem): string {
   const base = entry.year ? `${entry.title} (${entry.year})` : entry.title
   if (entry.season_number == null || entry.episode_number == null) return base
   const pad = (n: number) => String(n).padStart(2, '0')
   return `${base} S${pad(entry.season_number)}E${pad(entry.episode_number)}`
+}
+
+const shapeView: Record<string, { tone: Tone; label: string }> = {
+  constant: { tone: 'success', label: 'constant' },
+  drift: { tone: 'warning', label: 'drift' },
+  cut: { tone: 'danger', label: 'cut' },
+  mixed: { tone: 'neutral', label: 'mixed' },
+  insufficient: { tone: 'neutral', label: 'insufficient' },
+}
+
+/**
+ * D11: what the trend means, when it matters and what it costs. Behind `shape`
+ * it can only appear on a report that actually carries a fit.
+ */
+const TREND_HELP =
+  "A steady slope across the run means the dub was made at a slightly different " +
+  'frame rate. Dubarr corrects it by stretching the audio to the film’s speed ' +
+  '(pitch is preserved) and re-encodes the dub copy once, losslessly. A step ' +
+  'instead of a slope means the film was re-cut, which this release cannot fix ' +
+  'automatically.'
+
+/**
+ * The line fit through the checkpoint offsets (#86). Every number is optional on
+ * the wire: a 0.4.0 report has no `fit` at all and renders a dash, never a
+ * fabricated zero slope.
+ */
+function TrendBlock({ fit }: { fit?: SyncFit }) {
+  const shape = fit?.shape
+  const shapeBadge = shape ? (shapeView[shape] ?? { tone: 'neutral' as Tone, label: shape }) : null
+  const slope = fit?.slope_ms_per_sec
+  const r2 = fit?.r2
+  const tempo = fit?.tempo_factor
+  const cutAt = fit?.cut_at_sec
+  const cutUncertainty = fit?.cut_uncertainty_sec
+
+  return (
+    <section data-testid="sync-trend" className="space-y-2">
+      <div className="flex items-center gap-1.5">
+        <h3 className="text-[11px] uppercase tracking-wider text-zinc-500">Trend</h3>
+        <InfoTip id={helpIdFor('Trend')} label="Trend" text={TREND_HELP} />
+      </div>
+      {fit ? (
+        <dl className="grid gap-3 sm:grid-cols-4">
+          <div>
+            <dt className="text-[11px] uppercase tracking-wider text-zinc-500">Shape</dt>
+            <dd className="mt-0.5 text-sm text-zinc-200">
+              <span data-testid="sync-trend-shape">
+                <Badge tone={shapeBadge?.tone ?? 'neutral'}>{shapeBadge?.label ?? '—'}</Badge>
+              </span>
+            </dd>
+          </div>
+          <div>
+            <dt className="text-[11px] uppercase tracking-wider text-zinc-500">Slope</dt>
+            <dd data-testid="sync-trend-slope" className="mt-0.5 font-mono text-sm text-zinc-200">
+              {typeof slope === 'number' && Number.isFinite(slope) ? formatSlope(slope) : '—'}
+            </dd>
+          </div>
+          <div>
+            <dt className="text-[11px] uppercase tracking-wider text-zinc-500">R²</dt>
+            <dd data-testid="sync-trend-r2" className="mt-0.5 font-mono text-sm text-zinc-200">
+              {typeof r2 === 'number' && Number.isFinite(r2) ? r2.toFixed(3) : '—'}
+            </dd>
+          </div>
+          <div>
+            <dt className="text-[11px] uppercase tracking-wider text-zinc-500">Tempo</dt>
+            <dd data-testid="sync-trend-tempo" className="mt-0.5 font-mono text-sm text-zinc-200">
+              {typeof tempo === 'number' && Number.isFinite(tempo) && tempo > 0
+                ? `tempo ${tempo.toFixed(4)} · ${fit.tempo_applied ? 'applied' : 'not applied'}`
+                : '—'}
+            </dd>
+          </div>
+          {shape === 'cut' && typeof cutAt === 'number' && Number.isFinite(cutAt) && (
+            <div className="sm:col-span-2">
+              <dt className="text-[11px] uppercase tracking-wider text-zinc-500">Cut</dt>
+              <dd data-testid="sync-trend-cut" className="mt-0.5 font-mono text-sm text-zinc-200">
+                {`cut at ${cutAt.toFixed(1)} s${
+                  typeof cutUncertainty === 'number' && Number.isFinite(cutUncertainty)
+                    ? ` ± ${cutUncertainty.toFixed(1)} s`
+                    : ''
+                }`}
+              </dd>
+            </div>
+          )}
+        </dl>
+      ) : (
+        <p data-testid="sync-trend-empty" className="text-sm text-zinc-300">
+          —
+        </p>
+      )}
+    </section>
+  )
 }
 
 function JobRow({
@@ -62,6 +163,9 @@ function JobRow({
 }) {
   const status = statusBadge(job.status)
   const verdict = job.report ? verdictBadge(job.report.verdict) : null
+  // What was done to the dub copy before the mux (#86): a tempo re-encode is
+  // otherwise only inferable from an applied offset of ~0.
+  const applicationNote = job.report?.application?.note
 
   return (
     <li>
@@ -100,6 +204,15 @@ function JobRow({
               Target: {job.target_video_path}
             </span>
           )}
+          {applicationNote && (
+            <span
+              data-testid={`sync-job-application-${job.id}`}
+              className="truncate text-[11px] text-accent-400"
+              title={applicationNote}
+            >
+              {applicationNote}
+            </span>
+          )}
         </div>
         <div className="flex flex-wrap items-center gap-1.5">
           <Badge tone={status.tone}>{status.label}</Badge>
@@ -123,7 +236,7 @@ function ReportView({ report, calculatedOffsetMs }: { report: SyncReport; calcul
         <Badge tone="neutral">classification: {report.classification}</Badge>
         <Badge tone="accent">method: {report.sync_method}</Badge>
         <Badge tone="neutral">applied offset: {formatMs(calculatedOffsetMs)}</Badge>
-        {report.precision_ms != null && (
+        {report.precision_ms != null && report.precision_ms > 0 && (
           <span data-testid="sync-precision">
             <Badge tone="neutral">±{report.precision_ms} ms</Badge>
           </span>
@@ -153,9 +266,11 @@ function ReportView({ report, calculatedOffsetMs }: { report: SyncReport; calcul
         </div>
       </dl>
 
+      <TrendBlock fit={report.fit} />
+
       {report.reason && <Alert tone="warning">{report.reason}</Alert>}
 
-      <CheckpointChart checkpoints={report.checkpoints} />
+      <CheckpointChart checkpoints={report.checkpoints} fit={report.fit} />
 
       <div className="overflow-x-auto">
         <table className="w-full text-left text-xs">

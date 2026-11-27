@@ -424,6 +424,42 @@ export type SyncThresholds = {
   match_z_good: number
 }
 
+/** What the line through the checkpoint offsets says about the material. */
+export type SyncFitShape = 'constant' | 'drift' | 'cut' | 'mixed' | 'insufficient'
+
+/**
+ * The trend through the checkpoint offsets (`analyze.LineFit`, #86). `slope_ms_per_sec`
+ * is milliseconds of offset per second of film: a 25.000 -> 23.976 fps mismatch
+ * reads +42.7. `tempo_factor` is the atempo factor that removes the slope and is
+ * set only for a drift the encoder can represent; `tempo_applied` says whether
+ * the worker folded it into the job's single encode.
+ *
+ * Every field is optional: the fit itself is absent on a 0.4.0 report, and a
+ * reader must tolerate a partial object rather than invent numbers.
+ */
+export type SyncFit = {
+  slope_ms_per_sec?: number
+  intercept_ms?: number
+  residual_rms_ms?: number
+  max_residual_ms?: number
+  r2?: number
+  points?: number
+  /** Closed set on the server; kept loose so an unknown shape renders as itself. */
+  shape?: string
+  cut_at_sec?: number
+  cut_uncertainty_sec?: number
+  tempo_factor?: number
+  tempo_applied?: boolean
+}
+
+/** What was done to the dub copy before the mux, so a row can say it in words. */
+export type SyncApplication = {
+  /** `copy` | `re-encoded` */
+  mode: string
+  /** e.g. `copied untouched`, `re-encoded (tempo 1.0427)` */
+  note: string
+}
+
 export type SyncReport = {
   verdict: SyncVerdict | string
   offsets_ms: number[]
@@ -437,6 +473,10 @@ export type SyncReport = {
   /** Coarsest precision among the checkpoints; absent on a 0.4.0 report. */
   precision_ms?: number
   thresholds?: SyncThresholds
+  /** The timeline fit; absent on a 0.4.0 report, so the UI must render "unknown". */
+  fit?: SyncFit
+  /** Absent on a plain copy; present when the dub copy was re-encoded. */
+  application?: SyncApplication
   reason?: string
 }
 

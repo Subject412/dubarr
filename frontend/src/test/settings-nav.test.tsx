@@ -236,6 +236,25 @@ describe('settings submenu (issue #13)', () => {
     })
   })
 
+  it('renders the matching-techniques card between Sync defaults and Mux options', async () => {
+    mockFetch()
+    renderShell('/settings')
+    expect(await screen.findByRole('heading', { name: 'Storage paths' })).toBeInTheDocument()
+
+    // #82: the list editor is its own category, right after the bounds it
+    // complements, and the settings anchors follow the registry order.
+    const order = Array.from(document.querySelectorAll('section[id^="settings-"]')).map(
+      (node) => node.id,
+    )
+    const defaults = order.indexOf(settingsSectionId('sync.defaults'))
+    const strategy = order.indexOf(settingsSectionId('sync.strategy'))
+    const mux = order.indexOf(settingsSectionId('mux.options'))
+    expect(defaults).toBeGreaterThanOrEqual(0)
+    expect(strategy).toBe(defaults + 1)
+    expect(mux).toBe(strategy + 1)
+    expect(within(submenu()).getByRole('link', { name: 'Matching techniques' })).toBeInTheDocument()
+  })
+
   it('offers the categories as a second chip row on mobile', async () => {
     const user = userEvent.setup()
     mockFetch()

@@ -840,5 +840,169 @@ describe('sync studio', () => {
     expect(within(table).getByText('Match z')).toBeInTheDocument()
     expect(screen.getByTestId('sync-trend')).toBeInTheDocument()
     expect(screen.getByTestId('checkpoint-chart')).toBeInTheDocument()
+    // Nothing of #84 existed when this row was written: no segmentation block,
+    // no review sentence, and therefore no markers on the chart.
+    expect(screen.queryByTestId('sync-piecewise')).toBeNull()
+    expect(screen.queryByTestId('sync-review-reason')).toBeNull()
+    expect(screen.queryByTestId(/^boundary-marker-/)).toBeNull()
+  })
+})
+
+/** The two runs of the film a re-cut dub needs (`analyze.Segment`). */
+const PIECEWISE_SEGMENTS = [
+  { start_sec: 0, end_sec: 1800, offset_ms: 0, confidence: 0.91, points: 40 },
+  { start_sec: 1800, end_sec: 3600, offset_ms: 2500, confidence: 0.88, points: 41 },
+]
+
+/** Where the two runs meet (`analyze.Boundary`), with its own uncertainty. */
+const PIECEWISE_BOUNDARIES = [{ at_sec: 1800, uncertainty_sec: 22.5, step_ms: 2500 }]
+
+/**
+ * A dense plan's checkpoints: `position_pct` is the slice centre as a percent
+ * of the film, so a 3600 s film reports 5% -> centre 180 s. The chart recovers
+ * the duration from exactly this relation, which is why the fixture is exact.
+ */
+function denseCheckpoints(secondHalfOffsetMs = 2500) {
+  return Array.from({ length: 10 }, (_, index) => {
+    const pct = 5 + index * 10
+    const centre = (pct / 100) * 3600
+    return {
+      position_pct: pct,
+      slice_start_sec: centre - 30,
+      slice_len_sec: 60,
+      offset_ms: index < 5 ? 0 : secondHalfOffsetMs,
+      correlation_quality: 0.9,
+    }
+  })
+}
+
+describe('piecewise report (#84)', () => {
+  it('renders the segment table, the joins and the chart markers for a cut', async () => {
+    const job = makeJob({
+      id: 40,
+      // The audio is already aligned, so the mux offset is 0 — the documented
+      // signature of a piecewise job, with the note saying what happened.
+      calculated_offset_ms: 0,
+      report: makeReport({
+        verdict: 'ok',
+        classification: 'piecewise',
+        offsets_ms: PIECEWISE_SEGMENTS.map((segment) => segment.offset_ms),
+        qualities: PIECEWISE_SEGMENTS.map((segment) => segment.confidence),
+        max_drift_ms: 12,
+        checkpoints: denseCheckpoints(),
+        piecewise: {
+          segments: PIECEWISE_SEGMENTS,
+          boundaries: PIECEWISE_BOUNDARIES,
+          dominant_offset_ms: 0,
+          step_sec: 45,
+        },
+        application: {
+          mode: 'piecewise',
+          note: 're-encoded (piecewise, 2 segments)',
+          segment_count: 2,
+          segments: PIECEWISE_SEGMENTS,
+        },
+      }),
+    })
+    stubJob(job)
+    renderWithProviders(<SyncPage />, { route: '/sync' })
+
+    const section = await screen.findByTestId('sync-piecewise')
+    expect(within(section).getByText('Start')).toBeInTheDocument()
+    expect(within(section).getByText('End')).toBeInTheDocument()
+    expect(within(section).getByText('Offset')).toBeInTheDocument()
+    expect(within(section).getByText('Confidence')).toBeInTheDocument()
+    expect(within(section).getByText('Points')).toBeInTheDocument()
+    expect(screen.getByTestId('piecewise-count')).toHaveTextContent('2 segments')
+
+    const rows = within(section).getAllByTestId(/^piecewise-row-/)
+    expect(rows).toHaveLength(2)
+    expect(within(rows[0]).getByText('0.0 s')).toBeInTheDocument()
+    expect(within(rows[0]).getByText('1800.0 s')).toBeInTheDocument()
+    expect(within(rows[0]).getByText('0 ms')).toBeInTheDocument()
+    expect(within(rows[0]).getByText('0.91')).toBeInTheDocument()
+    expect(within(rows[0]).getByText('40')).toBeInTheDocument()
+    expect(within(rows[1]).getByText('2500 ms')).toBeInTheDocument()
+    expect(within(rows[1]).getByText('41')).toBeInTheDocument()
+
+    const joins = screen.getByTestId('sync-piecewise-boundaries')
+    const join = within(joins).getByTestId('piecewise-boundary-0')
+    expect(join).toHaveTextContent('1800.0 s ± 22.5 s')
+    expect(join).toHaveTextContent('+2500 ms')
+
+    // The job line says what was done to the dub copy.
+    const row = await screen.findByTestId('sync-job-row-40')
+    expect(within(row).getByTestId('sync-job-application-40')).toHaveTextContent(
+      're-encoded (piecewise, 2 segments)',
+    )
+
+    // One dashed marker at the accepted join: 1800 s of a 3600 s film is 50%,
+    // which is the chart's own x scale (LEFT 56 + half of the 564 plot width).
+    const markers = await screen.findAllByTestId(/^boundary-marker-/)
+    expect(markers).toHaveLength(1)
+    expect(markers[0]).toHaveAttribute('data-at-sec', '1800')
+    expect(Number(markers[0].getAttribute('x1'))).toBeCloseTo(56 + 564 / 2, 5)
+    expect(Number(markers[0].getAttribute('x2'))).toBeCloseTo(56 + 564 / 2, 5)
+    expect(markers[0].getAttribute('stroke-dasharray')).not.toBeNull()
+    // No review badge: the plan was accepted.
+    expect(screen.queryByTestId('sync-review-reason')).toBeNull()
+  })
+
+  it('shows the review reason and no segment table when the plan was rejected', async () => {
+    // Two segments and a boundary are present, so only the rejection can be
+    // what withholds the table: the worker applied the dominant offset instead.
+    const job = makeJob({
+      id: 41,
+      report: makeReport({
+        verdict: 'drifting',
+        classification: 'drifting',
+        max_drift_ms: 2500,
+        checkpoints: denseCheckpoints(),
+        piecewise: {
+          segments: PIECEWISE_SEGMENTS,
+          boundaries: PIECEWISE_BOUNDARIES,
+          dominant_offset_ms: 0,
+          step_sec: 45,
+          rejected_reason: 'boundary at 1800.0 s is not confident enough',
+        },
+        review_reason:
+          'cut not confident — applied the dominant offset (boundary at 1800.0 s is not confident enough)',
+      }),
+    })
+    stubJob(job)
+    renderWithProviders(<SyncPage />, { route: '/sync' })
+
+    const review = await screen.findByTestId('sync-review-reason')
+    expect(review).toHaveTextContent(/cut not confident/)
+    expect(review).toHaveTextContent(/dominant offset/)
+
+    expect(screen.queryByTestId('sync-piecewise')).toBeNull()
+    expect(screen.queryByTestId('piecewise-count')).toBeNull()
+    expect(screen.queryByTestId(/^piecewise-row-/)).toBeNull()
+    expect(screen.queryByTestId('sync-piecewise-boundaries')).toBeNull()
+    // A rejected plan's boundaries are not evidence: no marker is drawn.
+    expect(screen.queryByTestId(/^boundary-marker-/)).toBeNull()
+  })
+
+  it('renders a segment table for a clean one-offset plan only when there is a cut', async () => {
+    // Accepted with a single segment is the ordinary constant-offset job: the
+    // dense plan ran and found nothing to re-cut, so there is nothing to list.
+    const job = makeJob({
+      id: 42,
+      report: makeReport({
+        piecewise: {
+          segments: [{ start_sec: 0, end_sec: 3600, offset_ms: 120, confidence: 0.9, points: 80 }],
+          boundaries: [],
+          dominant_offset_ms: 120,
+          step_sec: 45,
+        },
+      }),
+    })
+    stubJob(job)
+    renderWithProviders(<SyncPage />, { route: '/sync' })
+
+    expect(await screen.findByTestId('verdict-badge')).toBeInTheDocument()
+    expect(screen.queryByTestId('sync-piecewise')).toBeNull()
+    expect(screen.queryByTestId(/^boundary-marker-/)).toBeNull()
   })
 })

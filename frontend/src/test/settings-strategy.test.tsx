@@ -7,6 +7,21 @@ import { SettingsPage } from '../pages/Settings'
 import { isMethod, jsonResponse, renderWithProviders } from '../test/helpers'
 
 /**
+ * `analyze.DefaultPiecewisePolicy()` (#84, D5), field for field: segmentation is
+ * off on a fresh install, because a piecewise job re-encodes the dub copy and
+ * nobody should pay for that on a film that needed one offset. Both shipped
+ * strategies below point at this object rather than copying the numbers twice.
+ */
+const PIECEWISE_DEFAULTS = {
+  enabled: false,
+  step_sec: 45,
+  window_sec: 60,
+  split_penalty_ms: 250,
+  min_segment_sec: 120,
+  max_segments: 12,
+}
+
+/**
  * The shipped strategy (#82, D4), spelled out. The server seeds exactly this
  * (`analyze.DefaultStrategy` / `settings.PresetTechniques("balanced")`), so
  * DEFAULTS['sync.strategy'] must stay equal to it — that equality is one of the
@@ -28,6 +43,9 @@ const SHIPPED = {
       z_gate: true,
     },
   ],
+  // `analyze.DefaultPiecewisePolicy()` (#84, D5): segmentation is off on a
+  // fresh install, because a piecewise job re-encodes the operator's dub copy.
+  piecewise: PIECEWISE_DEFAULTS,
 }
 
 /**
@@ -55,6 +73,10 @@ const MAXIMUM_ACCURACY = {
       z_gate: false,
     },
   ],
+  // Off, like every preset (#84): `settings.Preset` keeps the documented
+  // piecewise block in all three starting points, and `sameStrategy` compares
+  // it, so a section that flipped it would be stored as `custom`.
+  piecewise: PIECEWISE_DEFAULTS,
 }
 
 const FAST_POSITIONS = [15, 50, 85]
@@ -477,5 +499,132 @@ describe('matching techniques settings (#82)', () => {
       techniques: Array<{ enabled: boolean }>
     }
     expect(strategy.techniques[0].enabled).toBe(false)
+  })
+})
+
+/**
+ * The segmentation block (#84, D5), in the operator's words (D11): one switch
+ * that says what it is for, and five numbers the operator never has to touch
+ * unless the default is wrong for their film.
+ */
+const PIECEWISE_TOGGLE = 'Handle films with a cut or an inserted scene'
+
+const PIECEWISE_KNOBS = [
+  { label: 'Check every (seconds)', value: 45 },
+  { label: 'Sample length (seconds)', value: 60 },
+  { label: 'Evidence needed for another segment', value: 250 },
+  { label: 'Shortest segment (seconds)', value: 120 },
+  { label: 'At most how many segments', value: 12 },
+]
+
+function piecewiseBlock(): HTMLElement {
+  return within(strategyCard()).getByTestId('strategy-piecewise')
+}
+
+describe('piecewise settings (#84)', () => {
+  it('ships switched off, with every knob hidden but described', async () => {
+    mockFetch()
+    await openPage()
+
+    const block = piecewiseBlock()
+    const toggle = within(block).getByRole('switch', { name: PIECEWISE_TOGGLE })
+    expect(toggle).toHaveAttribute('aria-checked', 'false')
+
+    // Off means the knobs are not in the form at all — but each one is still
+    // described, so the operator can read what the switch would use.
+    for (const knob of PIECEWISE_KNOBS) {
+      expect(within(block).queryByLabelText(knob.label)).toBeNull()
+      expect(
+        within(block).getByRole('button', { name: `About ${knob.label}` }),
+      ).toBeInTheDocument()
+    }
+    // Exactly one help button per authored key: the switch plus five knobs.
+    expect(within(block).getAllByRole('button', { name: /^About / })).toHaveLength(6)
+
+    // The SPA default is the server's documented policy, number for number.
+    expect(DEFAULT_SETTINGS['sync.strategy'].piecewise).toEqual(PIECEWISE_DEFAULTS)
+  })
+
+  it('reveals the five knobs with the documented defaults when switched on', async () => {
+    const user = userEvent.setup()
+    mockFetch()
+    await openPage()
+
+    const block = piecewiseBlock()
+    await user.click(within(block).getByRole('switch', { name: PIECEWISE_TOGGLE }))
+    expect(within(block).getByRole('switch', { name: PIECEWISE_TOGGLE })).toHaveAttribute(
+      'aria-checked',
+      'true',
+    )
+
+    // Still collapsed: the values are read out, with nothing to mis-set.
+    for (const knob of PIECEWISE_KNOBS) {
+      expect(within(block).queryByLabelText(knob.label)).toBeNull()
+    }
+
+    await user.click(within(block).getByRole('button', { name: 'Advanced' }))
+    for (const knob of PIECEWISE_KNOBS) {
+      expect(within(block).getByLabelText(knob.label)).toHaveValue(knob.value)
+    }
+    // Advanced moves the tips onto the inputs: still one per key, never both.
+    expect(within(block).getAllByRole('button', { name: /^About / })).toHaveLength(6)
+  })
+
+  it('round-trips the switch and an edited knob into the saved payload', async () => {
+    const user = userEvent.setup()
+    const fetchMock = mockFetch()
+    await openPage()
+
+    const block = piecewiseBlock()
+    await user.click(within(block).getByRole('switch', { name: PIECEWISE_TOGGLE }))
+    await user.click(within(block).getByRole('button', { name: 'Advanced' }))
+    const cap = within(block).getByLabelText('At most how many segments')
+    await user.clear(cap)
+    await user.type(cap, '8')
+
+    await user.click(screen.getByLabelText('Save Matching techniques'))
+    await waitFor(() => expect(putPayloads(fetchMock)).toHaveLength(1))
+
+    // The block is part of the section, so the server stores it with the list —
+    // and an edited block is no longer any starting point.
+    expect(Object.keys(putPayloads(fetchMock)[0])).toEqual(['sync.strategy'])
+    const strategy = savedSection<{ preset: string; piecewise: unknown }>(
+      fetchMock,
+      'sync.strategy',
+    )
+    expect(strategy.preset).toBe('custom')
+    expect(strategy.piecewise).toEqual({ ...PIECEWISE_DEFAULTS, enabled: true, max_segments: 8 })
+  })
+
+  it('keeps the block off when a starting point is pressed, as the server preset does', async () => {
+    const user = userEvent.setup()
+    const fetchMock = mockFetch({
+      strategy: { ...MAXIMUM_ACCURACY, piecewise: { ...PIECEWISE_DEFAULTS, enabled: true } },
+    })
+    await openPage()
+
+    const block = piecewiseBlock()
+    expect(within(block).getByRole('switch', { name: PIECEWISE_TOGGLE })).toHaveAttribute(
+      'aria-checked',
+      'true',
+    )
+
+    // `settings.Preset` keeps the documented (off) block in every preset and
+    // `resolvePreset` compares it, so a press that left the switch on would be
+    // stored as `custom` while the button claims a starting point.
+    await user.click(within(strategyCard()).getByRole('button', { name: 'Maximum accuracy' }))
+    expect(within(block).getByRole('switch', { name: PIECEWISE_TOGGLE })).toHaveAttribute(
+      'aria-checked',
+      'false',
+    )
+
+    await user.click(screen.getByLabelText('Save Matching techniques'))
+    await waitFor(() => expect(putPayloads(fetchMock)).toHaveLength(1))
+    const strategy = savedSection<{ preset: string; piecewise: unknown }>(
+      fetchMock,
+      'sync.strategy',
+    )
+    expect(strategy.preset).toBe('maximum_accuracy')
+    expect(strategy.piecewise).toEqual(PIECEWISE_DEFAULTS)
   })
 })

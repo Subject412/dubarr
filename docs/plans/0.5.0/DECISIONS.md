@@ -66,7 +66,19 @@ confidence check:
   re-evaluated on every gate pass **and once at boot** — never a timer, never a queue that a restart strands.
 - Operator example accepted: approve an episode whose media is not yet upgraded → held; NAS reboots → still
   held; Sonarr upgrades → next pass releases and muxes, with no second approval. A rejection cancels intent.
-- Force-override semantics unchanged. ADR-0019 records Design B replacing Design A.
+- Force-override semantics unchanged. ADR-0021 records Design B replacing Design A (ADR-0019 and 0020 are
+  taken by the sync-engine decisions: technique pipeline and piecewise re-encode).
+
+### D6a — #48 refinements confirmed after the design pass
+
+- The hold lives on `sync_mux_jobs` (`held`), **not** on `import_queue`: approve stops refusing on gate
+  eligibility but still refuses (409) where no pair can be formed at all — no matched identity, no target file,
+  unreadable folder, no donor. ADR-0005's "donors are never tag-gated" is untouched.
+- Release points: end of each arr sync pass (covers the scheduled loop and manual Trigger), after a successful
+  per-item rescan, and once at boot before the sync worker starts. Plus a claim-time re-check in the worker so a
+  job released a moment before its target loses the tag re-holds instead of muxing.
+- The glossary entry for Match State / Match Blocker must widen from "ready = approval possible" to
+  "ready = no gate verdict blocks approval"; the orchestrator amends `GLOSSARY.md`, never a subagent.
 
 ## D7 — #56 hierarchy: mimic the arrs
 

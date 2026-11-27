@@ -255,6 +255,79 @@ describe('vault organise preview and apply (#47)', () => {
     expect(within(attention).getByText(/could not be undone/i)).toBeInTheDocument()
   })
 
+  it('names the files to inspect when a run needs attention (#127)', async () => {
+    const FAILED_SOURCE = '/vault/Minions.S01E02.pl.mka'
+    const FAILED_DESTINATION = '/vault/Minions/Season 01/Minions - S01E02 [Dubbing AC3 2.0].pl.mka'
+    mockOrganise({
+      runs: () =>
+        jsonResponse({
+          items: [
+            {
+              id: 3,
+              started_at: '2026-11-27T20:10:00Z',
+              finished_at: '2026-11-27T20:10:04Z',
+              status: 'needs_attention',
+              plan_hash: 'sha256:def456',
+              file_count: 40,
+              detail: 'stage=rename: permission denied',
+              files: [
+                {
+                  source_path: SOURCE,
+                  destination_path: DESTINATION,
+                  result: 'reconciled',
+                },
+                {
+                  source_path: FAILED_SOURCE,
+                  destination_path: FAILED_DESTINATION,
+                  result: 'failed',
+                },
+              ],
+            },
+            {
+              // An applied row is the ordinary case: it must stay one row even
+              // if a file list ever came back with it.
+              id: 1,
+              started_at: '2026-11-27T19:00:00Z',
+              finished_at: '2026-11-27T19:00:02Z',
+              status: 'applied',
+              plan_hash: 'sha256:abc123',
+              file_count: 41,
+              files: [
+                {
+                  source_path: '/vault/Other.2001.pl.mka',
+                  destination_path: '/vault/Other (2001)/Other (2001).pl.mka',
+                  result: 'reconciled',
+                },
+              ],
+            },
+          ],
+        }),
+    })
+    renderWithProviders(<VaultPage />, { route: '/vault' })
+
+    const attention = await screen.findByTestId('organise-run-files-3')
+    // The reconciled file is at its destination, so that is the path to check.
+    expect(within(attention).getByText(DESTINATION)).toBeInTheDocument()
+    expect(within(attention).getByText('moved, database pointed at the new path')).toBeInTheDocument()
+    // The failed file never moved, so its source is the path to check — and the
+    // destination is named too, because the row may mean the database update
+    // alone failed after the file had already moved.
+    expect(within(attention).getByText(FAILED_SOURCE)).toBeInTheDocument()
+    expect(within(attention).getByText('never moved')).toBeInTheDocument()
+    expect(within(attention).getByText(FAILED_DESTINATION)).toBeInTheDocument()
+    expect(within(attention).getByText(/or already at/i)).toBeInTheDocument()
+    expect(within(attention).getByText(/if the move happened/i)).toBeInTheDocument()
+    expect(within(attention).getByText(/check these paths/i)).toBeInTheDocument()
+    // The paths replace the Logs pointer rather than sitting next to it.
+    expect(within(attention).queryByText(/Logs page/i)).toBeNull()
+
+    const clean = screen.getByTestId('organise-run-applied-1')
+    expect(within(clean).getByText('Files moved')).toBeInTheDocument()
+    expect(within(clean).queryByText('/vault/Other (2001)/Other (2001).pl.mka')).toBeNull()
+    expect(within(clean).queryByText(/moved, database pointed/i)).toBeNull()
+    expect(within(clean).queryByText(/check these paths/i)).toBeNull()
+  })
+
   it('renders a run that needs attention differently from a clean run', async () => {
     mockOrganise({
       runs: () =>
@@ -290,5 +363,98 @@ describe('vault organise preview and apply (#47)', () => {
     expect(within(clean).getByText('Files moved')).toBeInTheDocument()
     expect(within(clean).queryByText(/Needs your attention/)).toBeNull()
     expect(within(clean).queryByText(/check the file paths/i)).toBeNull()
+  })
+
+  it('shows a failed file at its source with a fallback destination', async () => {
+    const FAILED_SOURCE = '/vault/Angry Birds.2016.pl.mka'
+    const FAILED_DESTINATION = '/vault/Angry Birds (2016)/Angry Birds (2016) [Lektor AC3 5.1].pl.mka'
+    mockOrganise({
+      runs: () =>
+        jsonResponse({
+          items: [
+            {
+              id: 4,
+              started_at: '2026-11-27T20:10:00Z',
+              finished_at: '2026-11-27T20:10:04Z',
+              status: 'needs_attention',
+              plan_hash: 'sha256:ghi789',
+              file_count: 2,
+              detail: 'stage=sql: database is locked',
+              files: [
+                {
+                  source_path: FAILED_SOURCE,
+                  destination_path: FAILED_DESTINATION,
+                  result: 'failed',
+                },
+              ],
+            },
+          ],
+        }),
+    })
+    renderWithProviders(<VaultPage />, { route: '/vault' })
+
+    const files = await screen.findByTestId('organise-run-files-4')
+    // Both paths are named: the source is where the file should be, the
+    // destination is where it is if only the database update failed.
+    expect(within(files).getByText(FAILED_SOURCE)).toBeInTheDocument()
+    expect(within(files).getByText('never moved')).toBeInTheDocument()
+    expect(within(files).getByText(FAILED_DESTINATION)).toBeInTheDocument()
+    expect(within(files).getByText(/or already at/i)).toBeInTheDocument()
+    expect(within(files).getByText(/database update failed/i)).toBeInTheDocument()
+  })
+
+  it('shows only the source for a failed file with no destination', async () => {
+    const FAILED_SOURCE = '/vault/Orphan.2001.pl.mka'
+    mockOrganise({
+      runs: () =>
+        jsonResponse({
+          items: [
+            {
+              id: 5,
+              started_at: '2026-11-27T20:10:00Z',
+              finished_at: '2026-11-27T20:10:04Z',
+              status: 'needs_attention',
+              plan_hash: 'sha256:jkl012',
+              file_count: 1,
+              detail: 'stage=rename: permission denied',
+              files: [{ source_path: FAILED_SOURCE, destination_path: '', result: 'failed' }],
+            },
+          ],
+        }),
+    })
+    renderWithProviders(<VaultPage />, { route: '/vault' })
+
+    const files = await screen.findByTestId('organise-run-files-5')
+    expect(within(files).getByText(FAILED_SOURCE)).toBeInTheDocument()
+    expect(within(files).getByText('never moved')).toBeInTheDocument()
+    // No destination to fall back to: no second line, no repeated path.
+    expect(within(files).queryByText(/or already at/i)).toBeNull()
+  })
+
+  it('leaves a reconciled file at its destination alone', async () => {
+    mockOrganise({
+      runs: () =>
+        jsonResponse({
+          items: [
+            {
+              id: 6,
+              started_at: '2026-11-27T20:10:00Z',
+              finished_at: '2026-11-27T20:10:04Z',
+              status: 'needs_attention',
+              plan_hash: 'sha256:mno345',
+              file_count: 2,
+              detail: 'stage=sql: database is locked',
+              files: [{ source_path: SOURCE, destination_path: DESTINATION, result: 'reconciled' }],
+            },
+          ],
+        }),
+    })
+    renderWithProviders(<VaultPage />, { route: '/vault' })
+
+    const files = await screen.findByTestId('organise-run-files-6')
+    expect(within(files).getByText(DESTINATION)).toBeInTheDocument()
+    expect(within(files).getByText('moved, database pointed at the new path')).toBeInTheDocument()
+    expect(within(files).queryByText(SOURCE)).toBeNull()
+    expect(within(files).queryByText(/or already at/i)).toBeNull()
   })
 })

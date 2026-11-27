@@ -339,6 +339,62 @@ func (s *Store) ListOrganiseRuns(ctx context.Context, limit int) ([]OrganiseRunR
 	return out, nil
 }
 
+// OrganiseFileRow is one audited file of a run as the history read serves it.
+type OrganiseFileRow struct {
+	RunID           int64
+	SourcePath      string
+	DestinationPath string
+	// Result is one of OrganiseResult{Failed,Reconciled}: the two outcomes a
+	// human has to look at. renamed and renamed_back never reach this read.
+	Result string
+}
+
+// ListOrganiseFilesForRuns returns, per run id, the audited files an operator
+// has to inspect: exactly the reconciled and failed rows (#127).
+//
+// renamed and renamed_back are left out on purpose: a file that moved, or one
+// that was put back, needs no inspection, and the run's file_count already says
+// how many files the run touched. The filter is server-side so a caller cannot
+// accidentally ship the whole audit table to the UI.
+//
+// Rows are ordered by run id then source path (then id, so two rows with the
+// same path still come out in a stable order) — the same input renders the same
+// list twice.
+func (s *Store) ListOrganiseFilesForRuns(ctx context.Context, runIDs []int64) (map[int64][]OrganiseFileRow, error) {
+	out := make(map[int64][]OrganiseFileRow, len(runIDs))
+	ids := uniqueIDs(runIDs)
+	if len(ids) == 0 {
+		// No runs, no query: an empty IN () is a syntax error waiting to happen.
+		return out, nil
+	}
+	args := make([]any, 0, len(ids))
+	for _, id := range ids {
+		args = append(args, id)
+	}
+	rows, err := s.DB.QueryContext(ctx, `
+		SELECT run_id, source_path, destination_path, result
+		  FROM vault_organise_files
+		 WHERE run_id IN (`+placeholders(len(ids))+`)
+		   AND result IN ('reconciled', 'failed')
+		 ORDER BY run_id, source_path, id`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("store: list organise files: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var row OrganiseFileRow
+		if err := rows.Scan(&row.RunID, &row.SourcePath, &row.DestinationPath, &row.Result); err != nil {
+			return nil, fmt.Errorf("store: scan organise file: %w", err)
+		}
+		out[row.RunID] = append(out[row.RunID], row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate organise files: %w", err)
+	}
+	return out, nil
+}
+
 // JobsInFlight counts sync_mux_jobs rows that reference any of trackIDs.
 //
 // Referencing counts a job whose target or reference track is planned: those

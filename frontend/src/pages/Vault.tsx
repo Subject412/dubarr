@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { ApiError, type VaultItem, type VaultPlanFile, type VaultPlanResponse } from '../lib/api'
+import { ApiError, type VaultItem, type VaultOrganiseRunFile, type VaultPlanFile, type VaultPlanResponse } from '../lib/api'
 import { useOrganiseApply, useOrganisePreview, useOrganiseRuns, useVault } from '../lib/hooks'
 import { Alert, Badge, Button, Card, PageHeader, Spinner } from '../components/ui'
 
@@ -263,6 +263,80 @@ const RUN_STATUS: Record<string, { label: string; tone: 'success' | 'warning' | 
   applied: { label: 'Files moved', tone: 'success' },
   rolled_back: { label: 'Put back — nothing changed', tone: 'warning' },
   needs_attention: { label: 'Needs your attention', tone: 'danger' },
+}
+
+/**
+ * What one audited file of a needs_attention run means, in the operator's
+ * words. Keyed by the closed `result` vocabulary the server sends (#127); an
+ * unknown result is shown as-is rather than crashing or being guessed at.
+ */
+const RUN_FILE_RESULT: Record<string, string> = {
+  reconciled: 'moved, database pointed at the new path',
+  failed: 'never moved',
+}
+// `failed` also names the destination: the row means the database could not be
+// pointed at the file even though the move had already happened.
+
+/** The path to inspect for one audited file row, plus what happened to it. */
+function runFileOutcome(file: VaultOrganiseRunFile): {
+  path: string
+  outcome: string
+  /**
+   * A second path worth checking when the recorded outcome cannot pin one down
+   * — absent when it would just repeat `path`.
+   */
+  fallback?: string
+} {
+  // A failed move left the file where it started; every other recorded outcome
+  // leaves it at the destination, which is what the database now points at.
+  const path =
+    file.result === 'failed'
+      ? file.source_path
+      : file.destination_path !== ''
+        ? file.destination_path
+        : file.source_path
+  // A `failed` row only says the database update did not land, so the file may
+  // still sit at its destination; skip a missing or identical destination.
+  const fallback =
+    file.result === 'failed' &&
+    file.destination_path !== '' &&
+    file.destination_path !== file.source_path
+      ? file.destination_path
+      : undefined
+  return { path, outcome: RUN_FILE_RESULT[file.result] ?? file.result, fallback }
+}
+
+/**
+ * The paths a needs_attention run needs a human to look at (#127). Each row is
+ * a path with its outcome in plain words — the same shape as the apply-refusal
+ * list above, never a retelling of the run's `detail` prose.
+ */
+function RunFileList({ runID, files }: { runID: number; files: VaultOrganiseRunFile[] }) {
+  return (
+    <div data-testid={`organise-run-files-${runID}`} className="mt-1 max-w-md text-xs text-red-300">
+      <p>
+        The rename stopped part-way and could not be put back. The library now lists whatever is on
+        disk — check these paths:
+      </p>
+      <ul className="mt-2 space-y-1 font-mono text-[11px]">
+        {files.map((file, index) => {
+          const row = runFileOutcome(file)
+          return (
+            <li key={`${file.source_path}-${index}`} className="break-all">
+              <span className="text-red-200">{row.path}</span>
+              <span className="block text-red-400/80">{row.outcome}</span>
+              {row.fallback !== undefined && (
+                <span className="block text-red-400/80">
+                  or already at <span className="text-red-200">{row.fallback}</span> if the move
+                  happened but the database update failed
+                </span>
+              )}
+            </li>
+          )
+        })}
+      </ul>
+    </div>
+  )
 }
 
 export function VaultPage() {
@@ -604,6 +678,7 @@ export function VaultPage() {
                   {runRows.map((run) => {
                     const status = RUN_STATUS[run.status]
                     const needsAttention = run.status === 'needs_attention'
+                    const filesToInspect = run.files ?? []
                     return (
                       <tr
                         key={run.id}
@@ -619,13 +694,16 @@ export function VaultPage() {
                         </td>
                         <td className="px-4 py-3 align-top">
                           <Badge tone={status?.tone ?? 'neutral'}>{status?.label ?? run.status}</Badge>
-                          {needsAttention && (
-                            <p className="mt-1 max-w-md text-xs text-red-300">
-                              The rename stopped part-way and could not be put back. The library now
-                              lists whatever is on disk — check the file paths this run logged on the
-                              Logs page before the next preview.
-                            </p>
-                          )}
+                          {needsAttention &&
+                            (filesToInspect.length > 0 ? (
+                              <RunFileList runID={run.id} files={filesToInspect} />
+                            ) : (
+                              <p className="mt-1 max-w-md text-xs text-red-300">
+                                The rename stopped part-way and could not be put back. The library now
+                                lists whatever is on disk — check the file paths this run logged on the
+                                Logs page before the next preview.
+                              </p>
+                            ))}
                           {run.status === 'rolled_back' && (
                             <p className="mt-1 max-w-md text-xs text-zinc-500">
                               Every file was put back where it was, so nothing changed.

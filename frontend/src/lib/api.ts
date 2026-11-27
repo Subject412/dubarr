@@ -665,6 +665,17 @@ export type VaultApplyResponse = {
   unchanged: number
 }
 
+/**
+ * One audited file of a needs_attention run (#127). `result` is the closed
+ * vocabulary `reconciled` | `failed`; the UI translates it and never parses
+ * the run's `detail` prose.
+ */
+export type VaultOrganiseRunFile = {
+  source_path: string
+  destination_path: string
+  result: string
+}
+
 /** One audit run of GET /api/vault/organise/runs, newest first. */
 export type VaultOrganiseRun = {
   id: number
@@ -676,6 +687,11 @@ export type VaultOrganiseRun = {
   file_count: number
   actor?: string
   detail?: string
+  /**
+   * Present only for a needs_attention run, and only with the files a human has
+   * to inspect (reconciled, failed). An applied run carries no list at all.
+   */
+  files?: VaultOrganiseRunFile[]
 }
 
 export type VaultOrganiseRunsResponse = {

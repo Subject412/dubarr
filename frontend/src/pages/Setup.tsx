@@ -188,9 +188,12 @@ export function SetupPage() {
     <div className="min-h-full bg-ink-950 px-4 py-10 sm:py-16">
       <div className="mx-auto w-full max-w-3xl">
         <header className="mb-8 flex items-center gap-3">
-          <span className="grid h-11 w-11 place-items-center rounded-xl bg-accent-500 text-xl font-bold text-ink-950">
-            D
-          </span>
+          <img
+            src="/icon-512.png"
+            alt=""
+            aria-hidden="true"
+            className="h-12 w-12 object-contain"
+          />
           <div>
             <h1 className="text-xl font-semibold tracking-tight text-zinc-100">Dubarr first-run setup</h1>
             <p className="text-sm text-zinc-500">Configure the appliance before your first library scan.</p>

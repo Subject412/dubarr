@@ -95,9 +95,12 @@ export function AppShell() {
     <div className="flex min-h-full bg-ink-950 text-zinc-200">
       <aside className="hidden w-60 shrink-0 flex-col border-r border-ink-800 bg-ink-900 md:sticky md:top-0 md:h-dvh md:flex md:self-start">
         <div className="flex h-16 items-center gap-2 border-b border-ink-800 px-5">
-          <span className="grid h-8 w-8 place-items-center rounded-lg bg-accent-500 font-bold text-ink-950">
-            D
-          </span>
+          <img
+            src="/icon-512.png"
+            alt=""
+            aria-hidden="true"
+            className="h-8 w-8 object-contain"
+          />
           <div>
             <p className="text-sm font-semibold tracking-wide text-zinc-100">Dubarr</p>
             <p className="text-[11px] uppercase tracking-wider text-zinc-500">dubbing sync</p>
@@ -183,9 +186,12 @@ export function AppShell() {
       <div className="flex min-w-0 flex-1 flex-col">
         <header className="flex h-16 items-center justify-between gap-4 border-b border-ink-800 bg-ink-900/70 px-5 backdrop-blur">
           <div className="flex items-center gap-3">
-            <span className="grid h-7 w-7 place-items-center rounded bg-accent-500 font-bold text-ink-950 md:hidden">
-              D
-            </span>
+            <img
+              src="/icon-512.png"
+              alt=""
+              aria-hidden="true"
+              className="h-7 w-7 object-contain md:hidden"
+            />
             <h1 className="text-sm font-semibold tracking-wide text-zinc-200">Dubarr</h1>
           </div>
           <div className="flex items-center gap-3">

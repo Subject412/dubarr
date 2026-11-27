@@ -24,9 +24,12 @@ export function LoginPage() {
     <div className="grid min-h-full place-items-center bg-ink-950 px-4 py-16">
       <div className="w-full max-w-sm">
         <div className="mb-8 flex items-center gap-3">
-          <span className="grid h-11 w-11 place-items-center rounded-xl bg-accent-500 text-xl font-bold text-ink-950">
-            D
-          </span>
+          <img
+            src="/icon-512.png"
+            alt=""
+            aria-hidden="true"
+            className="h-12 w-12 object-contain"
+          />
           <div>
             <h1 className="text-xl font-semibold tracking-tight text-zinc-100">Dubarr</h1>
             <p className="text-xs uppercase tracking-widest text-zinc-500">dubbing sync appliance</p>

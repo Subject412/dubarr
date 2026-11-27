@@ -291,7 +291,10 @@ func TestSampleRendersForEveryPreset(t *testing.T) {
 		if sample == "" {
 			t.Fatalf("Sample(%q) is empty", raw)
 		}
-		if strings.ContainsAny(sample, "{}[]") {
+		// Braces are template syntax; square brackets are literal characters the
+		// default templates use around the variant group, so only an unsubstituted
+		// token would be residue.
+		if strings.ContainsAny(sample, "{}") {
 			t.Fatalf("Sample(%q) = %q, want no template residue", raw, sample)
 		}
 	}

@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"github.com/Subject412/dubarr/backend/internal/analyze"
+	"github.com/Subject412/dubarr/backend/internal/dsp/mfcc"
 	"github.com/Subject412/dubarr/backend/internal/probe"
 	"github.com/Subject412/dubarr/backend/internal/reflang"
 	"github.com/Subject412/dubarr/backend/internal/settings"
@@ -581,12 +582,7 @@ func (s *Service) runAnalysis(ctx context.Context, rec store.SyncJobRecord) (ana
 	if engine == nil {
 		engine = sync.New(sync.WithTimeout(analyze.JobTimeout(cfg)), sync.WithLogger(s.logger))
 	}
-	// Every technique this build can run, by id. Slice #83 adds
-	// analyze.TechniqueMFCC here; until then a strategy naming it is skipped
-	// with a note in the report instead of failing every job.
-	engines := map[analyze.TechniqueID]analyze.Engine{
-		analyze.TechniqueWaveform: engine,
-	}
+	engines := s.enginesFor(cfg, engine)
 
 	jr := jobRun{
 		jobID:    rec.ID,
@@ -905,8 +901,14 @@ func (s *Service) runWindowed(ctx context.Context, engine analyze.Engine, jr job
 	// retry is accepted only within the stable band of the timeline that verdict
 	// was computed from, so it cannot contradict the offsets it was drawn from,
 	// and re-judging a partially different evidence set is not this layer's job.
+	//
+	// The row also names the technique that answered it. A retry always
+	// re-decodes with the waveform engine (see [retryTechnique]), so an mfcc row
+	// that gets retried must stop claiming the hop: otherwise it carries sample
+	// precision under a label that says ±10 ms, and the report keeps a precision
+	// no row accounts for.
 	return analysisRun{
-		Report:     replaceCheckpoint(report, suspect.Index, retried),
+		Report:     replaceCheckpoint(report, suspect.Index, retryTechnique, retried),
 		Source:     analyze.AnalysisSourceWindows,
 		DecodedSec: slicer.DecodedSeconds(),
 	}, nil
@@ -975,6 +977,14 @@ func acceptsRetry(windows []analyze.Window, offsets []float64, index int, w anal
 	return analyze.Accepts(reference, referenceOffsets, w, offsetMS)
 }
 
+// retryTechnique is the technique a retried window is re-measured with: the
+// waveform runner, which is the engine the map registers under
+// [analyze.TechniqueWaveform] and the one a retry deliberately keeps. A retry
+// re-decodes a suspect window exactly; a hop-quantised second opinion is not
+// what a re-measurement is for, so the engine is unchanged and only its name is
+// recorded.
+const retryTechnique analyze.TechniqueID = analyze.TechniqueWaveform
+
 // replaceCheckpoint writes an accepted retry into the report at its own index,
 // leaving every other checkpoint untouched.
 //
@@ -983,8 +993,15 @@ func acceptsRetry(windows []analyze.Window, offsets []float64, index int, w anal
 // report no longer carries. The attempt history follows the row (see
 // [retriedAttempts]), so the disclosure cannot keep describing the answer the
 // retry displaced.
-func replaceCheckpoint(report analyze.Report, index int, result sync.Result) analyze.Report {
-	report.Checkpoints[index].Attempts = retriedAttempts(report.Checkpoints[index].Attempts, result)
+//
+// technique is the matcher that produced the retry, and the row names it: a row
+// carrying the retry's sample precision must not keep the hop-quantised label
+// of the answer it replaced. The report's precision is recomputed from the rows
+// after the write, because the flat and aggregate views must describe the same
+// answers as the checkpoints do (see [coarsestPrecision]).
+func replaceCheckpoint(report analyze.Report, index int, technique analyze.TechniqueID, result sync.Result) analyze.Report {
+	report.Checkpoints[index].Attempts = retriedAttempts(report.Checkpoints[index].Attempts, technique, result)
+	report.Checkpoints[index].Technique = string(technique)
 	report.Checkpoints[index].OffsetMS = result.OffsetMS
 	report.Checkpoints[index].Quality = result.CorrelationQuality
 	report.Checkpoints[index].OffsetSubMS = result.OffsetSubMS
@@ -995,7 +1012,22 @@ func replaceCheckpoint(report analyze.Report, index int, result sync.Result) ana
 	if index < len(report.MatchZ) {
 		report.MatchZ[index] = result.MatchZ
 	}
+	report.PrecisionMS = coarsestPrecision(report.Checkpoints)
 	return report
+}
+
+// coarsestPrecision is the report's precision: the largest sample period among
+// the checkpoints that recorded one, so a report never claims more resolution
+// than its worst answer. A checkpoint with 0 recorded no precision (a 0.4.0
+// row) and contributes nothing rather than making the whole report claim none.
+func coarsestPrecision(checkpoints []analyze.Checkpoint) float64 {
+	precision := 0.0
+	for _, checkpoint := range checkpoints {
+		if checkpoint.PrecisionMS > precision {
+			precision = checkpoint.PrecisionMS
+		}
+	}
+	return precision
 }
 
 // retriedAttempts rewrites one checkpoint's history so that it describes the
@@ -1003,15 +1035,17 @@ func replaceCheckpoint(report analyze.Report, index int, result sync.Result) ana
 //
 // The winner is the attempt the row was drawn from: the accepted one, or — when
 // nothing was accepted — the healthiest answer, which is the rule the pipeline
-// itself fills a row with. It takes the retry's numbers and keeps its label: a
-// retry is a re-measurement of the same window, not a new technique. Every other
-// attempt keeps its own numbers and loses the accepted flag, so at most one
-// attempt per checkpoint says it was the answer.
+// itself fills a row with. It takes the retry's numbers and the technique that
+// produced them: a retry is a re-measurement of the same window, so the entry
+// describes that measurement, and leaving the displaced technique's label on it
+// would state a matcher that did not answer. Every other attempt keeps its own
+// numbers and loses the accepted flag, so at most one attempt per checkpoint
+// says it was the answer.
 //
 // No winner at all means the history cannot describe the new answer — a
 // pre-0.5.0 row (no attempts) or one where every technique errored — and it is
 // left empty rather than carrying numbers nobody measured.
-func retriedAttempts(attempts []analyze.Attempt, result sync.Result) []analyze.Attempt {
+func retriedAttempts(attempts []analyze.Attempt, technique analyze.TechniqueID, result sync.Result) []analyze.Attempt {
 	if len(attempts) == 0 {
 		return nil
 	}
@@ -1040,6 +1074,7 @@ func retriedAttempts(attempts []analyze.Attempt, result sync.Result) []analyze.A
 	for i := range out {
 		out[i].Accepted = i == winner
 	}
+	out[winner].Technique = string(technique)
 	out[winner].OffsetMS = result.OffsetMS
 	out[winner].OffsetSubMS = result.OffsetSubMS
 	out[winner].Quality = result.CorrelationQuality
@@ -1277,6 +1312,50 @@ func (s *Service) analysisPolicy(ctx context.Context) (reflang.Languages, analyz
 		}
 	}
 	return policy, cfg
+}
+
+// enginesFor registers every technique this build can actually run, by id: the
+// waveform runner passed in (a test's injected engine wins, as it always has)
+// and MFCC's, built only when the strategy names the technique. The map never
+// carries a placeholder, so a configured `mfcc` entry it does not hold stays
+// analyze.Analyze's own verdict — a loud "no enabled technique has an engine"
+// when nothing else can answer, and a report note otherwise. The waveform
+// answer is never substituted for it.
+//
+// It is the composition root's whole decision about which matchers a job owns,
+// in one place, so "did this job build a second engine, and which one?" is
+// answerable without running a job.
+func (s *Service) enginesFor(cfg analyze.Config, waveform analyze.Engine) map[analyze.TechniqueID]analyze.Engine {
+	engines := map[analyze.TechniqueID]analyze.Engine{
+		analyze.TechniqueWaveform: waveform,
+	}
+	if !strategyUses(cfg.Strategy, analyze.TechniqueMFCC) {
+		return engines
+	}
+	engines[analyze.TechniqueMFCC] = sync.New(
+		sync.WithCorrelator(mfcc.Analyze),
+		sync.WithTimeout(analyze.JobTimeout(cfg)),
+		sync.WithLogger(s.logger),
+	)
+	return engines
+}
+
+// strategyUses reports whether the strategy enables one technique. It is what
+// decides which engines the composition root builds: an entry the strategy
+// disables never runs, so its engine would never be called, and building one
+// anyway would put a technique in the map that this job does not use.
+//
+// The list read is [analyze.Strategy.Enabled]'s, the same one the pipeline
+// routes on, so "uses" means exactly "will be asked for". A zero strategy
+// enables nothing and therefore asks for nothing: analyze resolves that to the
+// shipped waveform-only strategy.
+func strategyUses(s analyze.Strategy, id analyze.TechniqueID) bool {
+	for _, entry := range s.Enabled() {
+		if entry.ID == id {
+			return true
+		}
+	}
+	return false
 }
 
 // sanitizeStrategy drops what this build cannot run and keeps the rest.

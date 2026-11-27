@@ -152,7 +152,16 @@ export type SyncTechnique = {
   enabled: boolean
   when: SyncWhen
   min_confidence: number
+  /** This entry's σ floor. Ignored unless `z_gate` is true; 0 when not gated. */
   min_match_z: number
+  /**
+   * Whether `min_match_z` gates acceptance (`analyze.Technique.ZGate`, new in
+   * 0.5.0). The waveform matcher is gated by it; the mel-cepstral matcher is
+   * not, because its z lives on a different curve — for it, quality decides and
+   * the σ is recorded as a diagnostic. Absent in a list written before 0.5.0,
+   * which reads as false: no band is applied to a number that is not there.
+   */
+  z_gate?: boolean
 }
 
 /** `sync.strategy`: the ordered technique list plus the preset it came from. */
@@ -462,7 +471,13 @@ export type SyncCheckpoint = {
    * `0` is the "not recorded" sentinel, so a 0.4.0 row renders as unknown.
    */
   match_z?: number
-  /** One sample of the analysis rate (0.125 at 8 kHz). Absent before 0.5.0. */
+  /**
+   * The grid this checkpoint's offset is reported on, in milliseconds — the
+   * matcher's own, so the UI never prints a precision the answer does not have
+   * (D3). The sample correlator reports one sample of the analysis rate
+   * (0.125 at 8 kHz); the mel-cepstral matcher reports its 10 ms hop. Read it,
+   * do not derive it from the sample rate. Absent before 0.5.0.
+   */
   precision_ms?: number
   /**
    * The technique whose answer was kept here (`analyze.Checkpoint.Technique`).

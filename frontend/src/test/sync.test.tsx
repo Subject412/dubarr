@@ -375,6 +375,69 @@ describe('sync studio', () => {
     expect(dot.querySelector('title')).toHaveTextContent('z 27.5')
   })
 
+  it('states a hop-quantised offset as hop-quantised instead of sample-accurate', async () => {
+    // MFCC answers on a 10 ms hop and reports that as its precision. The badge
+    // must name the grid and the matcher — ±10 ms · MFCC — so the number is
+    // never read as the waveform matcher's 0.125 ms sample (D3).
+    const job = makeJob({
+      id: 18,
+      report: makeReport({
+        precision_ms: 10,
+        checkpoints: [
+          { position_pct: 10, slice_start_sec: 60, slice_len_sec: 190, offset_ms: 250, correlation_quality: 0.8, technique: 'mfcc', precision_ms: 10 },
+          { position_pct: 50, slice_start_sec: 300, slice_len_sec: 190, offset_ms: 250, correlation_quality: 0.75, technique: 'mfcc', precision_ms: 10 },
+          { position_pct: 90, slice_start_sec: 540, slice_len_sec: 190, offset_ms: 260, correlation_quality: 0.7, technique: 'mfcc', precision_ms: 10 },
+        ],
+      }),
+    })
+    stubJob(job)
+    renderWithProviders(<SyncPage />, { route: '/sync' })
+
+    const precision = await screen.findByTestId('sync-precision')
+    expect(precision).toHaveTextContent('±10 ms · MFCC')
+    expect(precision).not.toHaveTextContent('±0.125 ms')
+  })
+
+  it('names MFCC when only one checkpoint of a mixed report sits on the hop', async () => {
+    // precision_ms is the coarsest answer in the report, so one MFCC row makes
+    // the whole report hop-quantised; naming the matcher is what keeps the
+    // waveform rows' sample precision from being claimed for all of them.
+    const job = makeJob({
+      id: 19,
+      report: makeReport({
+        precision_ms: 10,
+        checkpoints: [
+          { position_pct: 10, slice_start_sec: 60, slice_len_sec: 190, offset_ms: 120, correlation_quality: 0.92, technique: 'waveform', precision_ms: 0.125 },
+          { position_pct: 50, slice_start_sec: 300, slice_len_sec: 190, offset_ms: 250, correlation_quality: 0.4, technique: 'mfcc', precision_ms: 10 },
+        ],
+      }),
+    })
+    stubJob(job)
+    renderWithProviders(<SyncPage />, { route: '/sync' })
+
+    const precision = await screen.findByTestId('sync-precision')
+    expect(precision).toHaveTextContent('±10 ms · MFCC')
+  })
+
+  it('keeps the plain sample-precision badge for a waveform report', async () => {
+    const job = makeJob({
+      id: 20,
+      report: makeReport({
+        precision_ms: 0.125,
+        checkpoints: [
+          { position_pct: 10, slice_start_sec: 60, slice_len_sec: 3, offset_ms: 120, correlation_quality: 0.92, technique: 'waveform', precision_ms: 0.125 },
+          { position_pct: 50, slice_start_sec: 300, slice_len_sec: 3, offset_ms: 121, correlation_quality: 0.9, technique: 'waveform', precision_ms: 0.125 },
+        ],
+      }),
+    })
+    stubJob(job)
+    renderWithProviders(<SyncPage />, { route: '/sync' })
+
+    const precision = await screen.findByTestId('sync-precision')
+    // Exactly today's badge: no method suffix and no hop claim.
+    expect(precision.textContent).toBe('±0.125 ms')
+  })
+
   it('renders a 0.4.0 report without match z or precision', async () => {
     // Exactly what a job stored before 0.5.0 returns: no match_z array, no
     // precision_ms, and checkpoints without the new keys. The table must still

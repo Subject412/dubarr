@@ -5,6 +5,7 @@ import {
   PRESET_NAMES,
   PRESET_POSITIONS_PCT,
   PRESET_TECHNIQUES,
+  isZGated,
   presetChoiceLabel,
   type PresetName,
   type PresetPress,
@@ -42,9 +43,39 @@ const METHOD_IDS: readonly SyncTechniqueID[] = ['waveform', 'mfcc']
 /** The server's bound on a strategy: 1..4 entries. */
 const MAX_STEPS = 4
 
-/** A row the operator added: off by default, so it changes nothing until switched on. */
+/** The shipped σ band on the sample correlator's curve: "a human should look". */
+const WAVEFORM_Z_BAND = 5
+
+/**
+ * The gates a method brings with it, applied when the operator picks it. The
+ * waveform matcher is judged on its peak's z as well as on quality, so it keeps
+ * the shipped 5σ band. MFCC is not z-gated (`z_gate: false`, no band): its z
+ * lives on a different curve — a few thousand overlapping hop lags against
+ * ~8·10⁴ near-independent samples — so a shared band would refuse the very
+ * answers it exists for. It is judged on match quality alone and its z is
+ * recorded as a diagnostic.
+ */
+function gatesFor(id: SyncTechniqueID): Pick<SyncTechnique, 'z_gate' | 'min_match_z'> {
+  return id === 'mfcc'
+    ? { z_gate: false, min_match_z: 0 }
+    : { z_gate: true, min_match_z: WAVEFORM_Z_BAND }
+}
+
+/**
+ * A row the operator added: off by default, so it changes nothing until switched
+ * on. `z_gate: true` is the shipped rule — the σ field is there until a method
+ * that is judged on quality alone is picked, and the server refuses a gated
+ * entry without a band.
+ */
 function newStep(id: SyncTechniqueID): SyncTechnique {
-  return { id, enabled: false, when: 'below_confidence', min_confidence: 0.15, min_match_z: 8 }
+  return {
+    id,
+    enabled: false,
+    when: 'below_confidence',
+    min_confidence: 0.15,
+    min_match_z: 8,
+    z_gate: true,
+  }
 }
 
 /**
@@ -208,6 +239,8 @@ export function StrategyEditor({
         {techniques.map((entry, index) => {
           const step = index + 1
           const advanced = Boolean(openAdvanced[index])
+          // Not every method is judged on its peak's z: see `gatesFor`.
+          const gated = isZGated(entry)
           return (
             <div key={index} className="space-y-3 rounded-lg border border-ink-700 bg-ink-950/40 p-3">
               <div className="flex flex-wrap items-center justify-between gap-2">
@@ -258,9 +291,13 @@ export function StrategyEditor({
                   <Select
                     aria-label={`Step ${step} method`}
                     value={entry.id}
-                    onChange={(event) =>
-                      updateStep(index, { id: event.target.value as SyncTechniqueID })
-                    }
+                    onChange={(event) => {
+                      // The method decides which gates apply: MFCC drops the σ
+                      // band (quality alone judges it), waveform brings the
+                      // shipped 5σ back.
+                      const id = event.target.value as SyncTechniqueID
+                      updateStep(index, { id, ...gatesFor(id) })
+                    }}
                   >
                     {METHOD_OPTIONS.map((option) => (
                       <option key={option.value} value={option.value}>
@@ -306,11 +343,13 @@ export function StrategyEditor({
                       {advanced ? 'Hide advanced' : 'Advanced'}
                     </Button>
                     {/*
-                      Both gates keep their help in either state: collapsed, the
-                      row reads out the values the step is judged by and each
-                      value carries its own tip; expanded, the tips move onto the
-                      inputs that edit those same values. One tip per gate, never
-                      both at once.
+                      The confidence gate always applies, so its tip is always
+                      here: collapsed, the row reads out the values the step is
+                      judged by and each value carries its own tip; expanded,
+                      the tips move onto the inputs that edit those same values.
+                      One tip per gate, never both at once. The σ gate is the
+                      exception — it only exists for a method that is judged on
+                      it, so its tip lives where its value does.
                     */}
                     {!advanced && (
                       <div className="flex flex-wrap items-center gap-3 text-xs text-zinc-500">
@@ -327,19 +366,21 @@ export function StrategyEditor({
                             text={settingsHelp('sync.strategy', 'min_confidence') ?? ''}
                           />
                         </span>
-                        <span className="inline-flex items-center gap-1">
-                          <span>
-                            Peak σ ≥{' '}
-                            <span className="font-medium text-zinc-300">
-                              {entry.min_match_z}
+                        {gated && (
+                          <span className="inline-flex items-center gap-1">
+                            <span>
+                              Peak σ ≥{' '}
+                              <span className="font-medium text-zinc-300">
+                                {entry.min_match_z}
+                              </span>
                             </span>
+                            <InfoTip
+                              id={`sync-strategy-min-match-z-${index}`}
+                              label={`Step ${step} peak must stand out by (σ)`}
+                              text={settingsHelp('sync.strategy', 'min_match_z') ?? ''}
+                            />
                           </span>
-                          <InfoTip
-                            id={`sync-strategy-min-match-z-${index}`}
-                            label={`Step ${step} peak must stand out by (σ)`}
-                            text={settingsHelp('sync.strategy', 'min_match_z') ?? ''}
-                          />
-                        </span>
+                        )}
                       </div>
                     )}
                   </div>
@@ -367,26 +408,45 @@ export function StrategyEditor({
                           }
                         />
                       </Field>
-                      <Field
-                        label={`Step ${step} peak must stand out by (σ)`}
-                        hint="5 means a human should check the result."
-                        help={settingsHelp('sync.strategy', 'min_match_z')}
-                      >
-                        <Input
-                          type="number"
-                          step="0.5"
-                          min={0}
-                          max={100}
-                          aria-label={`Step ${step} peak must stand out by (σ)`}
-                          value={entry.min_match_z}
-                          onChange={(event) =>
-                            updateStep(index, {
-                              min_match_z: thresholdFrom(event.target.value, entry.min_match_z),
-                            })
-                          }
-                        />
-                      </Field>
+                      {gated && (
+                        <Field
+                          label={`Step ${step} peak must stand out by (σ)`}
+                          hint="5 means a human should check the result."
+                          help={settingsHelp('sync.strategy', 'min_match_z')}
+                        >
+                          <Input
+                            type="number"
+                            step="0.5"
+                            min={0}
+                            max={100}
+                            aria-label={`Step ${step} peak must stand out by (σ)`}
+                            value={entry.min_match_z}
+                            onChange={(event) =>
+                              updateStep(index, {
+                                min_match_z: thresholdFrom(event.target.value, entry.min_match_z),
+                              })
+                            }
+                          />
+                        </Field>
+                      )}
                     </div>
+                  )}
+                  {/*
+                    A quality-judged method has no σ to show and none to edit,
+                    so the note takes the field's place — in both states, since
+                    the reason is not something Advanced reveals. It is a line of
+                    text, not a tip: the σ help key stays on the entry that
+                    still applies it.
+                  */}
+                  {!gated && (
+                    <p
+                      data-testid={`strategy-z-diagnostic-${step}`}
+                      className="text-xs text-zinc-500"
+                    >
+                      <span className="font-medium text-zinc-300">Judged on match quality.</span>{' '}
+                      σ does not gate this method — its peak’s z is recorded for diagnostics only,
+                      and the confidence floor alone decides.
+                    </p>
                   )}
                 </div>
               )}

@@ -71,7 +71,11 @@ func TestReplaceCheckpointKeepsTheAttemptsConsistent(t *testing.T) {
 	report := reportWithHistory(attempts)
 	untouched := report.Checkpoints[1]
 
-	got := replaceCheckpoint(report, 0, retriedResult)
+	// The technique passed in is the one that answered the retry. These cases
+	// keep mfcc so the winner's own label is the one asserted; the real retry
+	// path answers with the waveform matcher (see
+	// TestRetriedCheckpointNamesTheTechniqueThatAnswered).
+	got := replaceCheckpoint(report, 0, analyze.TechniqueMFCC, retriedResult)
 	row := got.Checkpoints[0]
 
 	if row.OffsetMS != retriedResult.OffsetMS || row.OffsetSubMS != retriedResult.OffsetSubMS ||
@@ -112,7 +116,7 @@ func TestReplaceCheckpointKeepsTheAttemptsConsistent(t *testing.T) {
 			{Technique: "waveform", OffsetMS: 1100, Quality: 0.3, MatchZ: 2},
 			{Technique: "mfcc", OffsetMS: 1150, Quality: 0.6, MatchZ: 4},
 		}
-		got := replaceCheckpoint(reportWithHistory(attempts), 0, retriedResult)
+		got := replaceCheckpoint(reportWithHistory(attempts), 0, analyze.TechniqueMFCC, retriedResult)
 		want := []analyze.Attempt{
 			{Technique: "waveform", OffsetMS: 1100, Quality: 0.3, MatchZ: 2},
 			{Technique: "mfcc", OffsetMS: retriedResult.OffsetMS, OffsetSubMS: retriedResult.OffsetSubMS,
@@ -126,7 +130,7 @@ func TestReplaceCheckpointKeepsTheAttemptsConsistent(t *testing.T) {
 	})
 
 	t.Run("a pre-0.5.0 row keeps an empty history", func(t *testing.T) {
-		got := replaceCheckpoint(reportWithHistory(nil), 0, retriedResult)
+		got := replaceCheckpoint(reportWithHistory(nil), 0, analyze.TechniqueMFCC, retriedResult)
 		if got.Checkpoints[0].Attempts != nil {
 			t.Fatalf("attempts = %+v, want none: a 0.4.0 row has no history to rewrite",
 				got.Checkpoints[0].Attempts)
@@ -135,10 +139,118 @@ func TestReplaceCheckpointKeepsTheAttemptsConsistent(t *testing.T) {
 
 	t.Run("a history of failures is dropped", func(t *testing.T) {
 		attempts := []analyze.Attempt{{Technique: "waveform", Error: "engine exploded"}}
-		got := replaceCheckpoint(reportWithHistory(attempts), 0, retriedResult)
+		got := replaceCheckpoint(reportWithHistory(attempts), 0, analyze.TechniqueMFCC, retriedResult)
 		if got.Checkpoints[0].Attempts != nil {
 			t.Fatalf("attempts = %+v, want none: no attempt describes the retry's answer",
 				got.Checkpoints[0].Attempts)
+		}
+	})
+}
+
+// Precisions the fixture below mixes: an MFCC answer is hop-quantised, the
+// waveform matcher resolves one sample at the 8 kHz analysis rate.
+const (
+	hopPrecisionMS    = 10
+	samplePrecisionMS = 0.125
+)
+
+// TestRetriedCheckpointNamesTheTechniqueThatAnswered: a retry re-decodes one
+// window with the waveform engine, so the row it writes must name that
+// technique and carry its precision — not the hop-quantised label of the answer
+// it displaced.
+//
+// Left alone, an MFCC row kept technique "mfcc" while carrying sample
+// precision, so the report described an accuracy the row did not have; and the
+// report's own precision_ms was never recomputed, so it could claim a hop no
+// remaining row answered at.
+func TestRetriedCheckpointNamesTheTechniqueThatAnswered(t *testing.T) {
+	report := analyze.Report{
+		OffsetsMS:   []float64{1200, 1210, 1190},
+		Qualities:   []float64{0.9, 0.85, 0.8},
+		MatchZ:      []float64{6, 7, 8},
+		PrecisionMS: hopPrecisionMS,
+		Checkpoints: []analyze.Checkpoint{
+			{
+				PositionPct: 10, SliceStartSec: 20, SliceLenSec: 190,
+				OffsetMS: 1200, Quality: 0.9, MatchZ: 6, PrecisionMS: hopPrecisionMS,
+				Technique: "mfcc",
+				Attempts: []analyze.Attempt{
+					{Technique: "waveform", OffsetMS: 1100, Quality: 0.05, MatchZ: 3, PrecisionMS: samplePrecisionMS},
+					{Technique: "mfcc", OffsetMS: 1200, OffsetSubMS: 1200, Quality: 0.9, MatchZ: 6,
+						PrecisionMS: hopPrecisionMS, Accepted: true},
+				},
+			},
+			{
+				PositionPct: 40, SliceStartSec: 90, SliceLenSec: 190,
+				OffsetMS: 1210, Quality: 0.85, MatchZ: 7, PrecisionMS: hopPrecisionMS,
+				Technique: "mfcc",
+			},
+			{
+				PositionPct: 70, SliceStartSec: 160, SliceLenSec: 190,
+				OffsetMS: 1190, Quality: 0.8, MatchZ: 8, PrecisionMS: samplePrecisionMS,
+				Technique: "waveform",
+			},
+		},
+	}
+
+	got := replaceCheckpoint(report, 0, analyze.TechniqueWaveform, retriedResult)
+	row := got.Checkpoints[0]
+
+	if row.Technique != string(analyze.TechniqueWaveform) {
+		t.Fatalf("checkpoint technique = %q, want %q: the row carries the retry's numbers",
+			row.Technique, analyze.TechniqueWaveform)
+	}
+	if row.PrecisionMS != retriedResult.PrecisionMS {
+		t.Fatalf("checkpoint precision = %v, want %v", row.PrecisionMS, retriedResult.PrecisionMS)
+	}
+	// The winning attempt states the same technique: an entry left labelled
+	// mfcc while carrying the retry's sample numbers is the same lie, one level
+	// down.
+	if winner := row.Attempts[1]; winner.Technique != string(analyze.TechniqueWaveform) || !winner.Accepted {
+		t.Fatalf("winning attempt = %+v, want the retry's technique and the acceptance", winner)
+	}
+	if n := acceptedCount(row.Attempts); n != 1 {
+		t.Fatalf("%d accepted attempts, want exactly one: %+v", n, row.Attempts)
+	}
+
+	// Checkpoint 1 still answers at the hop, so the report keeps the coarsest
+	// precision its rows carry: a report never claims more resolution than its
+	// worst checkpoint.
+	if got.PrecisionMS != hopPrecisionMS {
+		t.Fatalf("report precision = %v, want %v: checkpoint 1 still answered at the hop",
+			got.PrecisionMS, hopPrecisionMS)
+	}
+
+	t.Run("the coarsest remaining row decides the report precision", func(t *testing.T) {
+		// The only hop-quantised row is the one retried, so the report follows
+		// its rows down to sample precision instead of keeping a hop nobody
+		// answered at. A row with no recorded precision (a pre-0.5.0 one)
+		// contributes nothing rather than dragging the report to zero.
+		pair := analyze.Report{
+			OffsetsMS:   []float64{1200, 1190},
+			Qualities:   []float64{0.9, 0.8},
+			MatchZ:      []float64{6, 8},
+			PrecisionMS: hopPrecisionMS,
+			Checkpoints: []analyze.Checkpoint{
+				{
+					PositionPct: 10, SliceStartSec: 20, SliceLenSec: 190,
+					OffsetMS: 1200, Quality: 0.9, MatchZ: 6, PrecisionMS: hopPrecisionMS,
+					Technique: "mfcc",
+				},
+				{
+					PositionPct: 70, SliceStartSec: 160, SliceLenSec: 190,
+					OffsetMS: 1190, Quality: 0.8, MatchZ: 8,
+					Technique: "waveform",
+				},
+			},
+		}
+		got := replaceCheckpoint(pair, 0, analyze.TechniqueWaveform, retriedResult)
+		if got.Checkpoints[0].Technique != string(analyze.TechniqueWaveform) {
+			t.Fatalf("checkpoint technique = %q, want %q", got.Checkpoints[0].Technique, analyze.TechniqueWaveform)
+		}
+		if got.PrecisionMS != retriedResult.PrecisionMS {
+			t.Fatalf("report precision = %v, want %v: no checkpoint answers at the hop any more",
+				got.PrecisionMS, retriedResult.PrecisionMS)
 		}
 	})
 }

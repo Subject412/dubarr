@@ -17,18 +17,19 @@ func defaultEntry() Technique {
 		When:          WhenAlways,
 		MinConfidence: 0.10,
 		MinMatchZ:     5.0,
+		ZGate:         true,
 	}
 }
 
 // alwaysEntry is one enabled entry with the shipped thresholds.
 func alwaysEntry(id TechniqueID, when When) Technique {
-	return Technique{ID: id, Enabled: true, When: when, MinConfidence: 0.10, MinMatchZ: 5.0}
+	return Technique{ID: id, Enabled: true, When: when, MinConfidence: 0.10, MinMatchZ: 5.0, ZGate: true}
 }
 
 // disabledEntry is one disabled entry with the shipped thresholds; disabled
 // entries stay in the list but never run.
 func disabledEntry(id TechniqueID, when When) Technique {
-	return Technique{ID: id, Enabled: false, When: when, MinConfidence: 0.10, MinMatchZ: 5.0}
+	return Technique{ID: id, Enabled: false, When: when, MinConfidence: 0.10, MinMatchZ: 5.0, ZGate: true}
 }
 
 func strategyOf(preset string, entries ...Technique) Strategy {
@@ -62,6 +63,9 @@ func TestDefaultStrategyIsOneWaveformEntry(t *testing.T) {
 	}
 	if entry.MinMatchZ != 5.0 {
 		t.Fatalf("min_match_z = %v, want 5.0", entry.MinMatchZ)
+	}
+	if !entry.ZGate {
+		t.Fatal("the shipped entry is not z-gated: a weak peak would no longer be refused")
 	}
 	if err := s.Validate(); err != nil {
 		t.Fatalf("DefaultStrategy().Validate() = %v, want nil", err)
@@ -104,8 +108,11 @@ func TestStrategyValidateTable(t *testing.T) {
 		{"unknown when", strategyOf(PresetCustom, Technique{ID: TechniqueWaveform, Enabled: true, When: "sometimes", MinConfidence: 0.10, MinMatchZ: 5.0}), "when must be always, below_confidence or above_drift"},
 		{"min_confidence above 1", strategyOf(PresetCustom, Technique{ID: TechniqueWaveform, Enabled: true, When: WhenAlways, MinConfidence: 1.5, MinMatchZ: 5.0}), "min_confidence must be 0..1"},
 		{"min_confidence below 0", strategyOf(PresetCustom, Technique{ID: TechniqueWaveform, Enabled: true, When: WhenAlways, MinConfidence: -0.1, MinMatchZ: 5.0}), "min_confidence must be 0..1"},
-		{"min_match_z above 100", strategyOf(PresetCustom, Technique{ID: TechniqueWaveform, Enabled: true, When: WhenAlways, MinConfidence: 0.10, MinMatchZ: 101}), "min_match_z must be 0..100"},
-		{"min_match_z below 0", strategyOf(PresetCustom, Technique{ID: TechniqueWaveform, Enabled: true, When: WhenAlways, MinConfidence: 0.10, MinMatchZ: -1}), "min_match_z must be 0..100"},
+		{"min_match_z above 100", strategyOf(PresetCustom, Technique{ID: TechniqueWaveform, Enabled: true, When: WhenAlways, MinConfidence: 0.10, MinMatchZ: 101, ZGate: true}), "min_match_z must be 0..100"},
+		{"min_match_z below 0", strategyOf(PresetCustom, Technique{ID: TechniqueWaveform, Enabled: true, When: WhenAlways, MinConfidence: 0.10, MinMatchZ: -1, ZGate: true}), "min_match_z must be 0..100"},
+		{"a z-gated entry with no z band", strategyOf(PresetCustom, Technique{ID: TechniqueWaveform, Enabled: true, When: WhenAlways, MinConfidence: 0.10, MinMatchZ: 0, ZGate: true}), "min_match_z must be above 0"},
+		{"a quality-gated entry needs no z band", strategyOf(PresetCustom, Technique{ID: TechniqueMFCC, Enabled: true, When: WhenAlways, MinConfidence: 0.15, MinMatchZ: 0, ZGate: false}), ""},
+		{"a quality-gated entry may carry an ignored z band", strategyOf(PresetCustom, Technique{ID: TechniqueMFCC, Enabled: true, When: WhenAlways, MinConfidence: 0.15, MinMatchZ: 8, ZGate: false}), ""},
 		{"unknown preset", strategyOf("turbo", defaultEntry()), "preset must be fast, balanced, maximum_accuracy or custom"},
 		{"an unlabelled strategy is a custom one", strategyOf("", defaultEntry()), ""},
 	}
@@ -159,10 +166,13 @@ func TestStrategyNormalisedFallsBackToTheDefault(t *testing.T) {
 }
 
 // TestAcceptsNeedsBothGates: an answer is good enough when its quality clears
-// this entry's floor AND its peak either stands out enough or was never scored
-// (a zero z means "this technique does not report one", not "unreliable").
+// this entry's floor AND, for an entry that is z-gated, its peak either stands
+// out enough or was never scored (a zero z means "this technique does not report
+// one", not "unreliable"). The z gate is per technique: an entry with ZGate
+// false is judged on quality alone, whatever z it reports. Only the confidence
+// floor is always consulted.
 func TestAcceptsNeedsBothGates(t *testing.T) {
-	entry := defaultEntry() // min_confidence 0.10, min_match_z 5.0
+	entry := defaultEntry() // min_confidence 0.10, min_match_z 5.0, z-gated
 	cases := []struct {
 		name       string
 		quality, z float64
@@ -184,6 +194,20 @@ func TestAcceptsNeedsBothGates(t *testing.T) {
 				t.Fatalf("accepts(quality %v, z %v) = %v, want %v", tc.quality, tc.z, got, tc.want)
 			}
 		})
+	}
+
+	// The same entry with the z gate off — how MFCC is judged — accepts every
+	// one of those answers on quality alone, and is still refused below its own
+	// confidence floor.
+	ungated := entry
+	ungated.ZGate = false
+	for _, z := range []float64{0, 1.0, 4.9, 5.8, 8.0, 30} {
+		if !accepts(ungated, sync.Result{CorrelationQuality: 0.5, MatchZ: z}) {
+			t.Fatalf("accepts(quality 0.5, z %v) = false for a quality-gated entry, want true", z)
+		}
+	}
+	if accepts(ungated, sync.Result{CorrelationQuality: 0.05, MatchZ: 30}) {
+		t.Fatal("accepts() = true under the confidence floor, want false: quality is always a gate")
 	}
 }
 

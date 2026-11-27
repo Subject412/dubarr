@@ -1,0 +1,3 @@
+# The generator writes these; they are reproducible from
+# `cd backend && go run ./internal/dsp/mfcc/testdata/gen` and never committed.
+*.wav

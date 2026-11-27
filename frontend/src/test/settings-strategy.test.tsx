@@ -11,11 +11,49 @@ import { isMethod, jsonResponse, renderWithProviders } from '../test/helpers'
  * (`analyze.DefaultStrategy` / `settings.PresetTechniques("balanced")`), so
  * DEFAULTS['sync.strategy'] must stay equal to it — that equality is one of the
  * assertions below, because a drift there would rewrite every operator's list.
+ *
+ * `z_gate` is true: the waveform matcher is judged on its peak's z as well as on
+ * quality. The flag is part of the section, not a UI preference, so the literal
+ * carries it.
  */
 const SHIPPED = {
   preset: 'balanced',
   techniques: [
-    { id: 'waveform', enabled: true, when: 'always', min_confidence: 0.1, min_match_z: 5 },
+    {
+      id: 'waveform',
+      enabled: true,
+      when: 'always',
+      min_confidence: 0.1,
+      min_match_z: 5,
+      z_gate: true,
+    },
+  ],
+}
+
+/**
+ * The `maximum_accuracy` list as the server serves it: a waveform step gated on
+ * quality and σ, then the mel-cepstral second opinion judged on quality alone
+ * (`z_gate: false`, no σ band), because its z lives on a different curve.
+ */
+const MAXIMUM_ACCURACY = {
+  preset: 'maximum_accuracy',
+  techniques: [
+    {
+      id: 'waveform',
+      enabled: true,
+      when: 'always',
+      min_confidence: 0.1,
+      min_match_z: 5,
+      z_gate: true,
+    },
+    {
+      id: 'mfcc',
+      enabled: true,
+      when: 'below_confidence',
+      min_confidence: 0.15,
+      min_match_z: 0,
+      z_gate: false,
+    },
   ],
 }
 
@@ -137,6 +175,36 @@ describe('matching techniques settings (#82)', () => {
 
     // The SPA default is the server's stored default, byte for byte.
     expect(DEFAULT_SETTINGS['sync.strategy']).toEqual(SHIPPED)
+  })
+
+  it('hides the σ field for a method that is judged on match quality', async () => {
+    const user = userEvent.setup()
+    mockFetch({ strategy: MAXIMUM_ACCURACY })
+    await openPage()
+
+    const card = strategyCard()
+
+    // Collapsed, the mfcc row reads out no σ at all, and says in one line what
+    // judges it instead.
+    expect(within(card).queryByTestId('strategy-z-diagnostic-1')).toBeNull()
+    expect(within(card).getByTestId('strategy-z-diagnostic-2')).toHaveTextContent(
+      /judged on match quality/i,
+    )
+
+    // Both rows are on, so both disclosures are offered.
+    const disclosures = within(card).getAllByRole('button', { name: 'Advanced' })
+    expect(disclosures).toHaveLength(2)
+    await user.click(disclosures[0])
+    await user.click(disclosures[1])
+
+    // The waveform step keeps its σ band: it is z-gated.
+    expect(within(card).getByLabelText('Step 1 peak must stand out by (σ)')).toHaveValue(5)
+    // The mfcc step has none, and the note stays in its place.
+    expect(within(card).queryByLabelText('Step 2 peak must stand out by (σ)')).toBeNull()
+    expect(within(card).getByLabelText('Step 2 confidence needed')).toHaveValue(0.15)
+    expect(within(card).getByTestId('strategy-z-diagnostic-2')).toHaveTextContent(
+      /judged on match quality/i,
+    )
   })
 
   it('switches to the Fast preset and writes the three checkpoint positions too', async () => {

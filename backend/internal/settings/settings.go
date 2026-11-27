@@ -1255,6 +1255,15 @@ func validateSync(p *SyncDefaults) error {
 // (3 rather than 6, a sync.defaults decision), so its list is `balanced`'s.
 // MFCC is never a preset: its hop error is only acceptable once an operator
 // opts in.
+//
+// The σ gate is per technique. The waveform entry is gated by it — 5σ is the
+// shipped "a human should look" line on the sample correlator's curve. The
+// `maximum_accuracy` mfcc entry is not: its z lives on a different curve (a few
+// thousand overlapping hop lags against ~8·10⁴ near-independent samples), so a
+// correct answer scores 5.3 where the waveform scores 21-28 on the same pair and
+// the 8σ band refused the answers MFCC exists for. That entry carries
+// `min_match_z: 0` and is judged on quality alone; the z is still recorded in
+// the attempt, as a diagnostic.
 func PresetTechniques(name string) []analyze.Technique {
 	switch name {
 	case analyze.PresetFast:
@@ -1271,6 +1280,7 @@ func PresetTechniques(name string) []analyze.Technique {
 				When:          analyze.WhenAlways,
 				MinConfidence: analyze.LowQualityThreshold,
 				MinMatchZ:     analyze.DefaultThresholds.MatchZMaybe,
+				ZGate:         true,
 			},
 			{
 				// A second opinion only where the waveform answer was weak:
@@ -1279,7 +1289,8 @@ func PresetTechniques(name string) []analyze.Technique {
 				Enabled:       true,
 				When:          analyze.WhenBelowConfidence,
 				MinConfidence: 0.15,
-				MinMatchZ:     8.0,
+				MinMatchZ:     0,
+				ZGate:         false,
 			},
 		}
 	default:

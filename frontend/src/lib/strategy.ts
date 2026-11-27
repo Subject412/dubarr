@@ -49,14 +49,51 @@ export function presetChoiceLabel(preset: SyncPreset): string {
   return preset === 'balanced' ? `${PRESET_LABELS[preset]} (default)` : PRESET_LABELS[preset]
 }
 
-/** The one waveform step the shipped strategy is (see below). */
+/**
+ * The one waveform step the shipped strategy is (see below). It is z-gated: 5σ
+ * on the sample correlator's curve is the shipped "a human should look" line.
+ */
 function waveformStep(): SyncTechnique {
-  return { id: 'waveform', enabled: true, when: 'always', min_confidence: 0.1, min_match_z: 5 }
+  return {
+    id: 'waveform',
+    enabled: true,
+    when: 'always',
+    min_confidence: 0.1,
+    min_match_z: 5,
+    z_gate: true,
+  }
 }
 
-/** The second opinion `maximum_accuracy` adds: only where the first was unsure. */
+/**
+ * The second opinion `maximum_accuracy` adds: only where the first was unsure.
+ *
+ * It is NOT z-gated (`z_gate: false`, no σ band). Its z has the waveform
+ * matcher's formula but not its scale — this matcher scores a few thousand
+ * overlapping hop lags against ~8·10⁴ near-independent samples, so a correct
+ * answer scores z 5.3 where the waveform scores 21-28 on the same pair — so a
+ * shared band would refuse the very answers it exists for. Quality decides; the
+ * z is still recorded, as a diagnostic.
+ */
 function secondOpinionStep(): SyncTechnique {
-  return { id: 'mfcc', enabled: true, when: 'below_confidence', min_confidence: 0.15, min_match_z: 8 }
+  return {
+    id: 'mfcc',
+    enabled: true,
+    when: 'below_confidence',
+    min_confidence: 0.15,
+    min_match_z: 0,
+    z_gate: false,
+  }
+}
+
+/**
+ * Whether this entry's `min_match_z` gates acceptance. The flag is the server's
+ * (`analyze.Technique.ZGate`) and only an explicit `false` turns the gate off:
+ * a stored list from before 0.5.0 carries no flag, but the σ it carries was a
+ * band, and the report names it as the reason a peak was refused — so hiding it
+ * there would erase a rule that did apply.
+ */
+export function isZGated(entry: SyncTechnique): boolean {
+  return entry.z_gate !== false
 }
 
 /**

@@ -1194,7 +1194,7 @@ func TestSyncDefaultsAnalysisSourceRoundTrips(t *testing.T) {
 // install writes. It is a literal, not a re-marshalled constant: the SPA's
 // DEFAULT_SETTINGS['sync.strategy'] must match it, and a change here is a
 // migration, not a refactor.
-const defaultStrategyJSON = `{"preset":"balanced","techniques":[{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5}]}`
+const defaultStrategyJSON = `{"preset":"balanced","techniques":[{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5,"z_gate":true}]}`
 
 func TestKnownKeysIncludesSyncStrategy(t *testing.T) {
 	if KeySyncStrategy != "sync.strategy" {
@@ -1238,8 +1238,8 @@ func TestSyncStrategyDefaultsAreTheBalancedList(t *testing.T) {
 	if entry.ID != analyze.TechniqueWaveform || !entry.Enabled || entry.When != analyze.WhenAlways {
 		t.Fatalf("shipped entry = %+v, want waveform/always/enabled", entry)
 	}
-	if entry.MinConfidence != 0.10 || entry.MinMatchZ != 5.0 {
-		t.Fatalf("shipped thresholds = %v/%v, want 0.10/5.0", entry.MinConfidence, entry.MinMatchZ)
+	if entry.MinConfidence != 0.10 || entry.MinMatchZ != 5.0 || !entry.ZGate {
+		t.Fatalf("shipped thresholds = %v/%v/%v, want 0.10/5.0/true", entry.MinConfidence, entry.MinMatchZ, entry.ZGate)
 	}
 }
 
@@ -1325,6 +1325,53 @@ func TestSyncStrategyValidationTable(t *testing.T) {
 	}
 }
 
+// TestWaveformEntryWithZeroZGateFailsValidation pins the rule the per-technique
+// σ gate needs: a z-gated technique must carry a band to be gated by, so
+// `min_match_z: 0` is legal only for an entry that says it is judged on quality
+// alone. The reverse is not an error — a quality-gated entry that still carries
+// a σ is accepted and the number is ignored, because it is a diagnostic there.
+func TestWaveformEntryWithZeroZGateFailsValidation(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct{ name, body, wantErr string }{
+		{
+			name:    "a z-gated waveform entry with no band",
+			body:    `{"preset":"custom","techniques":[{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":0,"z_gate":true}]}`,
+			wantErr: "min_match_z must be above 0",
+		},
+		{
+			name: "an absent z_gate reads as quality-gated, so no band is needed",
+			body: `{"preset":"custom","techniques":[{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":0}]}`,
+		},
+		{
+			name: "a quality-gated mfcc entry may carry a band that is ignored",
+			body: `{"preset":"custom","techniques":[` +
+				`{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5,"z_gate":true},` +
+				`{"id":"mfcc","enabled":true,"when":"below_confidence","min_confidence":0.15,"min_match_z":8,"z_gate":false}]}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := openStore(t)
+			err := s.Set(ctx, KeySyncStrategy, json.RawMessage(tc.body))
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Set(%s) = %v, want it accepted", tc.body, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Set(%s) = nil, want %q", tc.body, tc.wantErr)
+			}
+			if !errors.Is(err, ErrInvalidValue) {
+				t.Fatalf("Set(%s) = %v, want ErrInvalidValue", tc.body, err)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Set(%s) = %q, want it to contain %q", tc.body, err, tc.wantErr)
+			}
+		})
+	}
+}
+
 // TestSyncStrategyPresetBecomesCustomWhenEdited: the server never trusts the
 // label. The list is authoritative, and a list that is not the named preset's
 // canonical one is stored as custom, in one direction only.
@@ -1334,13 +1381,13 @@ func TestSyncStrategyPresetBecomesCustomWhenEdited(t *testing.T) {
 		{
 			name: "an edited balanced list is custom",
 			body: `{"preset":"balanced","techniques":[` +
-				`{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5},` +
-				`{"id":"mfcc","enabled":true,"when":"below_confidence","min_confidence":0.15,"min_match_z":8}]}`,
+				`{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5,"z_gate":true},` +
+				`{"id":"mfcc","enabled":true,"when":"below_confidence","min_confidence":0.15,"min_match_z":0,"z_gate":false}]}`,
 			wantPreset: analyze.PresetCustom,
 		},
 		{
 			name:       "an unedited balanced list keeps its label",
-			body:       `{"preset":"balanced","techniques":[{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5}]}`,
+			body:       `{"preset":"balanced","techniques":[{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5,"z_gate":true}]}`,
 			wantPreset: analyze.PresetBalanced,
 		},
 		{
@@ -1348,26 +1395,26 @@ func TestSyncStrategyPresetBecomesCustomWhenEdited(t *testing.T) {
 			// checkpoints, so its technique list IS the balanced one. Only the
 			// label distinguishes them, and the server keeps that label.
 			name:       "fast keeps its own label with the balanced list",
-			body:       `{"preset":"fast","techniques":[{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5}]}`,
+			body:       `{"preset":"fast","techniques":[{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5,"z_gate":true}]}`,
 			wantPreset: analyze.PresetFast,
 		},
 		{
 			name: "maximum accuracy keeps its canonical list",
 			body: `{"preset":"maximum_accuracy","techniques":[` +
-				`{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5},` +
-				`{"id":"mfcc","enabled":true,"when":"below_confidence","min_confidence":0.15,"min_match_z":8}]}`,
+				`{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5,"z_gate":true},` +
+				`{"id":"mfcc","enabled":true,"when":"below_confidence","min_confidence":0.15,"min_match_z":0,"z_gate":false}]}`,
 			wantPreset: analyze.PresetMaximumAccuracy,
 		},
 		{
 			name: "a raised confidence makes maximum accuracy custom",
 			body: `{"preset":"maximum_accuracy","techniques":[` +
-				`{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5},` +
-				`{"id":"mfcc","enabled":true,"when":"below_confidence","min_confidence":0.2,"min_match_z":8}]}`,
+				`{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5,"z_gate":true},` +
+				`{"id":"mfcc","enabled":true,"when":"below_confidence","min_confidence":0.2,"min_match_z":0,"z_gate":false}]}`,
 			wantPreset: analyze.PresetCustom,
 		},
 		{
 			name:       "an absent label is derived from the list",
-			body:       `{"techniques":[{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5}]}`,
+			body:       `{"techniques":[{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5,"z_gate":true}]}`,
 			wantPreset: analyze.PresetBalanced,
 		},
 	}
@@ -1399,6 +1446,9 @@ func TestPresetTechniques(t *testing.T) {
 	if len(balanced) != 1 || balanced[0].ID != analyze.TechniqueWaveform || balanced[0].When != analyze.WhenAlways {
 		t.Fatalf("balanced = %+v, want one waveform/always entry", balanced)
 	}
+	if !balanced[0].ZGate {
+		t.Fatalf("balanced = %+v, want its waveform entry z-gated", balanced)
+	}
 	if len(fast) != 1 || fast[0] != balanced[0] {
 		t.Fatalf("fast = %+v, want the balanced list (D4a)", fast)
 	}
@@ -1408,8 +1458,16 @@ func TestPresetTechniques(t *testing.T) {
 	if maximum[1].ID != analyze.TechniqueMFCC || maximum[1].When != analyze.WhenBelowConfidence {
 		t.Fatalf("maximum_accuracy second entry = %+v, want mfcc/below_confidence", maximum[1])
 	}
-	if maximum[1].MinConfidence != 0.15 || maximum[1].MinMatchZ != 8.0 {
-		t.Fatalf("maximum_accuracy thresholds = %v/%v, want 0.15/8.0", maximum[1].MinConfidence, maximum[1].MinMatchZ)
+	// The σ gate is per technique: the waveform step keeps its 5σ band, the
+	// mel-cepstral step is judged on quality alone (its z is a diagnostic on a
+	// different curve), which is why it carries no band to be gated by.
+	if !maximum[0].ZGate || maximum[1].ZGate {
+		t.Fatalf("maximum_accuracy gates = %v/%v, want waveform gated and mfcc not",
+			maximum[0].ZGate, maximum[1].ZGate)
+	}
+	if maximum[1].MinConfidence != 0.15 || maximum[1].MinMatchZ != 0 {
+		t.Fatalf("maximum_accuracy thresholds = %v/%v, want 0.15/0 (quality-gated)",
+			maximum[1].MinConfidence, maximum[1].MinMatchZ)
 	}
 	if got := PresetTechniques(analyze.PresetCustom); got != nil {
 		t.Fatalf("custom = %+v, want no canonical list", got)

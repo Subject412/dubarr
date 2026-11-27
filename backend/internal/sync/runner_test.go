@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Subject412/dubarr/backend/internal/dsp/correlate"
+	"github.com/Subject412/dubarr/backend/internal/dsp/wav"
 )
 
 // testRate is the engine's production analysis rate.
@@ -178,6 +179,117 @@ func TestResultCarriesMatchZAndPrecision(t *testing.T) {
 	}
 	if res.PrecisionMS != 0.125 {
 		t.Fatalf("precision_ms = %v, want 0.125", res.PrecisionMS)
+	}
+}
+
+// TestRunnerUsesTheInjectedCorrelator proves the exported seam is the one the
+// runner calls: the injected correlator receives exactly the slice the job asked
+// for — both files, at the job's start and length, at the file's rate and with
+// the job's window bound — and what it reports reaches the Result. That is what
+// lets a second matcher (the mel-cepstral one) run behind the same validation,
+// slice echo and deadline handling as the waveform matcher.
+func TestRunnerUsesTheInjectedCorrelator(t *testing.T) {
+	target := noiseSignal(16000, 11)
+	donor := advanced(target, 2000)
+	dir := t.TempDir()
+	targetPath := filepath.Join(dir, "target.wav")
+	donorPath := filepath.Join(dir, "donor.wav")
+	writeWAV(t, targetPath, testRate, target)
+	writeWAV(t, donorPath, testRate, donor)
+
+	// The slice the job asks for, read back the way the runner reads it: 0.25 s
+	// into each file, one second long (2000..10000 at 8 kHz).
+	wantTarget, err := readWAVSamples(targetPath, 2000, 8000)
+	if err != nil {
+		t.Fatalf("read target slice: %v", err)
+	}
+	wantDonor, err := readWAVSamples(donorPath, 2000, 8000)
+	if err != nil {
+		t.Fatalf("read donor slice: %v", err)
+	}
+
+	window := 2.0
+	var calls int
+	var gotRate uint32
+	var gotWindow float64
+	var gotTarget, gotDonor []float32
+	r := New(
+		WithLogger(discardLogger()),
+		WithCorrelator(func(_ context.Context, targetSlice, donorSlice []float32, rate uint32, windowSec float64) (correlate.Analysis, error) {
+			calls++
+			gotTarget, gotDonor, gotRate, gotWindow = targetSlice, donorSlice, rate, windowSec
+			return correlate.Analysis{
+				OffsetSamples:    2400,
+				OffsetSubSamples: 2400,
+				Quality:          0.6,
+				MatchZ:           31.25,
+				PrecisionMS:      10,
+			}, nil
+		}),
+	)
+
+	res, err := r.Run(context.Background(), Job{
+		TargetPath:    targetPath,
+		DonorPath:     donorPath,
+		SliceStartSec: 0.25,
+		SliceLenSec:   1,
+		WindowSec:     &window,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("correlator calls = %d, want 1", calls)
+	}
+	if gotRate != testRate {
+		t.Fatalf("sample_rate = %d, want %d", gotRate, testRate)
+	}
+	if gotWindow != window {
+		t.Fatalf("window_sec = %v, want %v", gotWindow, window)
+	}
+	// The paths are proved by their content: each recorded slice must equal the
+	// samples that file holds at the job's start and length, so reading the
+	// wrong file or the wrong window fails here.
+	assertSameSamples(t, "target", gotTarget, wantTarget)
+	assertSameSamples(t, "donor", gotDonor, wantDonor)
+
+	// The injected answer is what comes out, untranslated: a hop-quantised
+	// precision and the z the matcher scored, at the rate the job ran.
+	if res.PrecisionMS != 10 {
+		t.Fatalf("precision_ms = %v, want 10", res.PrecisionMS)
+	}
+	if res.MatchZ != 31.25 {
+		t.Fatalf("match_z = %v, want 31.25", res.MatchZ)
+	}
+	if res.OffsetMS != 300 || res.OffsetSubMS != 300 {
+		t.Fatalf("offset = %v/%v ms, want 300/300 (2400 samples at 8 kHz)", res.OffsetMS, res.OffsetSubMS)
+	}
+	if res.Analyzed.Start != 0.25 || res.Analyzed.Len != 1 {
+		t.Fatalf("analyzed = %+v, want start 0.25 len 1", res.Analyzed)
+	}
+}
+
+// readWAVSamples decodes frames from start of a WAV file, the way the runner
+// reads the slices it hands the correlator.
+func readWAVSamples(path string, start, frames int64) ([]float32, error) {
+	reader, err := wav.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer reader.Close()
+	return reader.ReadMono(start, frames)
+}
+
+// assertSameSamples fails on the first sample that differs, naming the slice.
+func assertSameSamples(t *testing.T, which string, got, want []float32) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("%s slice length = %d, want %d", which, len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("%s slice[%d] = %v, want %v", which, i, got[i], want[i])
+		}
 	}
 }
 

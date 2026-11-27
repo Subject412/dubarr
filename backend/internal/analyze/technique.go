@@ -79,11 +79,21 @@ type Technique struct {
 	Enabled bool        `json:"enabled"`
 	When    When        `json:"when"`
 	// MinConfidence and MinMatchZ are this entry's acceptance gates: an answer
-	// is good enough when Quality >= MinConfidence AND (MatchZ == 0 OR
-	// MatchZ >= MinMatchZ). A zero MatchZ means the technique does not report
-	// one, and is not treated as a failure.
+	// is good enough when Quality >= MinConfidence AND, for an entry whose
+	// ZGate is true, (MatchZ == 0 OR MatchZ >= MinMatchZ). A zero MatchZ means
+	// the technique does not report one, and is not treated as a failure.
 	MinConfidence float64 `json:"min_confidence"`
 	MinMatchZ     float64 `json:"min_match_z"`
+	// ZGate says whether MinMatchZ gates acceptance. It is per technique, not a
+	// policy knob, because the z is only comparable within one matcher: the
+	// sample correlator scores ~8·10⁴ near-independent lags while a hop-based
+	// matcher scores a few thousand overlapping ones, so its peak stands out by
+	// ~3x less for the same correct answer (5.3 against 21-28 on committed
+	// audio). An entry with ZGate false is judged on quality alone and records
+	// its MatchZ as a diagnostic; a zero band there means "not used", so the
+	// value is carried and ignored. Always written, never omitted: an operator
+	// reading a stored strategy must see which rule applied.
+	ZGate bool `json:"z_gate"`
 }
 
 // Strategy is the whole pipeline policy: an ordered list of techniques plus the
@@ -107,6 +117,7 @@ func DefaultStrategy() Strategy {
 			When:          WhenAlways,
 			MinConfidence: LowQualityThreshold,
 			MinMatchZ:     DefaultThresholds.MatchZMaybe,
+			ZGate:         true,
 		}},
 	}
 }
@@ -167,6 +178,12 @@ func (s Strategy) Validate() error {
 		if entry.MinMatchZ < 0 || entry.MinMatchZ > 100 {
 			return errors.New("min_match_z must be 0..100")
 		}
+		// A z-gated entry must carry a band to be gated by. Zero is reserved for
+		// the quality-gated spelling, where the number is a diagnostic and no
+		// band is applied.
+		if entry.ZGate && entry.MinMatchZ <= 0 {
+			return fmt.Errorf("technique %q: min_match_z must be above 0 for a z-gated technique (set z_gate false to judge on quality alone)", entry.ID)
+		}
 	}
 
 	enabled := s.Enabled()
@@ -194,8 +211,17 @@ func (s Strategy) Validate() error {
 }
 
 // accepts reports whether one technique's answer is good enough under its own
-// barriers: the confidence gate is a floor on correlation quality, and the z
-// gate is a floor on how far the peak stands above the rest of the lag curve.
+// barriers: the confidence gate is always a floor on correlation quality, and
+// the z gate — only for an entry that is z-gated — is a floor on how far the
+// peak stands above the rest of the lag curve.
+//
+// The z gate is per technique because z is only comparable within one matcher.
+// MFCC scores a few thousand heavily overlapping hop lags where the sample
+// correlator scores ~8·10⁴ near-independent ones, so a correct mel-cepstral
+// answer stands out by ~3x less (5.3 against 21-28 on the same committed pair).
+// Gating it on the waveform band would refuse the answers it exists for, so its
+// entry carries ZGate false: MinConfidence decides, and the z is recorded in the
+// attempt as a diagnostic.
 //
 // A zero MatchZ means the engine did not score one (and is what a 0.4.0-shaped
 // result carries), so it cannot be evidence of a bad match: only a recorded z
@@ -204,7 +230,7 @@ func accepts(entry Technique, r sync.Result) bool {
 	if r.CorrelationQuality < entry.MinConfidence {
 		return false
 	}
-	if r.MatchZ != 0 && r.MatchZ < entry.MinMatchZ {
+	if entry.ZGate && r.MatchZ != 0 && r.MatchZ < entry.MinMatchZ {
 		return false
 	}
 	return true

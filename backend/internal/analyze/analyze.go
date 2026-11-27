@@ -406,11 +406,17 @@ const (
 
 // Classifications explain the verdict. They mirror the verdict names so a
 // consumer can render either field without a lookup table.
+//
+// ClassificationPiecewise is the one 0.5.0 addition: a job whose re-cut was
+// segmented and accepted is `ok`, and the classification says why the offsets
+// were not one number. A consumer that switches on classification (the UI is
+// the only one) must render it.
 const (
 	ClassificationStable     = "stable"
 	ClassificationDrifting   = "drifting"
 	ClassificationUnreliable = "unreliable"
 	ClassificationOutOfRange = "out_of_range"
+	ClassificationPiecewise  = "piecewise"
 )
 
 // Engine is the one-job correlation seam. *sync.Runner satisfies it.
@@ -453,6 +459,13 @@ type Config struct {
 	// registers its engine. [Analyze]'s own engine argument satisfies
 	// — and, when unset here, fills in — the waveform entry.
 	Engines map[TechniqueID]Engine `json:"-"`
+
+	// Piecewise is the segmentation policy for this job (#84). Its zero value
+	// is the shipped one: off. When it is left at the zero value entirely,
+	// [Analyze] takes the policy from [Strategy.Piecewise] instead — the
+	// settings path stores the block inside the section, and a job must not
+	// silently ignore a switch the operator turned on.
+	Piecewise PiecewisePolicy `json:"piecewise"`
 }
 
 // windowed reports whether cfg asks for windows cut at the planned positions
@@ -597,6 +610,16 @@ type Report struct {
 	// self-describing: two reports are comparable only when the same
 	// techniques produced them.
 	Strategy Strategy `json:"strategy"`
+	// Piecewise is the segmentation result (#84) and is absent unless the
+	// feature ran: a job with the shipped strategy has no key at all, which is
+	// how a reader tells "piecewise was off" from "piecewise ran and found
+	// nothing".
+	Piecewise *Piecewise `json:"piecewise,omitempty"`
+	// ReviewReason says, in one operator-facing sentence, why a job needs a
+	// human look even though the verdict alone does not demand it — today only
+	// "the cut was not confident, the dominant offset was applied" (D5). It is
+	// distinct from Reason, which belongs to the reference-language resolver.
+	ReviewReason string `json:"review_reason,omitempty"`
 	// Notes explains a configured technique that did not run — this build has
 	// no engine for it — so a strategy naming `mfcc` says why it was ignored
 	// instead of quietly doing less. Empty (and absent) for the shipped
@@ -621,18 +644,8 @@ type Application struct {
 	Segments     []Segment `json:"segments,omitempty"`
 }
 
-// Segment is one run of the film during which the offset is constant. Its
-// StartSec/EndSec are positions in the target timeline, not in the dub: the
-// encoder shifts them by OffsetMS to find the source material. Slice 05
-// produces these; the type is fixed here so Application never grows a second
-// shape (D2b).
-type Segment struct {
-	StartSec   float64 `json:"start_sec"`
-	EndSec     float64 `json:"end_sec"`
-	OffsetMS   float64 `json:"offset_ms"`
-	Confidence float64 `json:"confidence"` // min confidence of its points
-	Points     int     `json:"points"`
-}
+// Segment, and the rest of the piecewise shape, live in segment.go with the
+// segmenter that produces them (D2b: one shape, populated by slice 05).
 
 // Analyze resolves the reference strategy, runs one correlation per checkpoint,
 // and aggregates the drift report.
@@ -734,6 +747,19 @@ func Analyze(ctx context.Context, engine Engine, cfg Config, req Request) (Repor
 		return Report{}, fmt.Errorf("analyze: %w", err)
 	}
 	cfg.Strategy = strategy
+	// One piecewise policy for the job. Config's own copy wins when it names
+	// one; otherwise the strategy's — the settings path stores the block inside
+	// the section, so a switch the operator turned on must not be ignored here.
+	// The strategy itself is left exactly as the caller passed it: the report's
+	// `strategy` block is a record of the request, and `piecewise` beside it is
+	// the record of what the request did.
+	if cfg.Piecewise == (PiecewisePolicy{}) {
+		cfg.Piecewise = strategy.Piecewise
+	}
+	cfg.Piecewise = cfg.Piecewise.Normalised()
+	if err := cfg.Piecewise.validate(); err != nil {
+		return Report{}, fmt.Errorf("analyze: %w", err)
+	}
 	cfg.Engines = mergeEngines(cfg.Engines, engine)
 	if len(cfg.entries()) == 0 {
 		// Every enabled technique is unavailable: that is a composition-root
@@ -786,11 +812,24 @@ func Analyze(ctx context.Context, engine Engine, cfg Config, req Request) (Repor
 	// analysis sources consume, which is what keeps their reports
 	// comparable; where each source's audio actually starts inside the files
 	// it reads is the slicer's business (see [Slicer]).
+	//
+	// #84 replaces the shipped six percentages with a uniform dense grid when
+	// piecewise is on. Six checkpoints cannot locate a boundary; a grid cannot
+	// miss one by more than a step. The shipped path is untouched, so a job
+	// with piecewise off plans exactly what it planned before.
 	timing := Timing{
 		Target: SourceTiming{DurationSec: targetDur, OriginKnown: true},
 		Donor:  SourceTiming{DurationSec: donorDur, OriginKnown: true},
 	}
-	plan, err := PlanWindows(timing, pcts, window)
+	var (
+		plan []Window
+		err  error
+	)
+	if cfg.Piecewise.Enabled {
+		plan, err = PlanWindowsEvery(timing, cfg.Piecewise.StepSec, cfg.Piecewise.WindowSec)
+	} else {
+		plan, err = PlanWindows(timing, pcts, window)
+	}
 	if err != nil {
 		return Report{}, err
 	}
@@ -798,10 +837,10 @@ func Analyze(ctx context.Context, engine Engine, cfg Config, req Request) (Repor
 	report := Report{
 		SyncMethod:  method,
 		Reason:      resolved.Pairs[0].Reason,
-		Checkpoints: make([]Checkpoint, len(pcts)),
-		OffsetsMS:   make([]float64, len(pcts)),
-		Qualities:   make([]float64, len(pcts)),
-		MatchZ:      make([]float64, len(pcts)),
+		Checkpoints: make([]Checkpoint, len(plan)),
+		OffsetsMS:   make([]float64, len(plan)),
+		Qualities:   make([]float64, len(plan)),
+		MatchZ:      make([]float64, len(plan)),
 		Thresholds:  DefaultThresholds,
 		Strategy:    cfg.Strategy,
 	}
@@ -844,8 +883,24 @@ func Analyze(ctx context.Context, engine Engine, cfg Config, req Request) (Repor
 	fit := FitTimeline(plan, report.OffsetsMS, report.Qualities, report.MatchZ, DefaultThresholds)
 	report.Fit = &fit
 
+	// Segmentation runs after the pipeline (every checkpoint answered) and
+	// after the fit (the report keeps the shape of the raw timeline, so a
+	// reader still sees the cut even once the verdict says `ok`): the two are
+	// different statements about the same evidence.
+	var piecewise *Piecewise
+	if cfg.Piecewise.Enabled {
+		built := BuildSegments(plan, report.OffsetsMS, report.Qualities, cfg.Piecewise, DefaultThresholds)
+		piecewise = &built
+		report.Piecewise = piecewise
+		if built.RejectedReason != "" {
+			// A rejected plan is not a failure of the job (D5): the dominant
+			// offset is applied and the row says why a human should look.
+			report.ReviewReason = fmt.Sprintf("cut not confident — applied the dominant offset (%s)", built.RejectedReason)
+		}
+	}
+
 	verdict, classification, drift := classify(report.OffsetsMS, report.Qualities, report.MatchZ,
-		float64(cfg.MaxOffsetSec)*1000, DefaultThresholds)
+		piecewise, float64(cfg.MaxOffsetSec)*1000, DefaultThresholds)
 	report.Verdict = verdict
 	report.Classification = classification
 	report.MaxDriftMS = drift
@@ -1001,7 +1056,16 @@ func searchWindowSec(cfg Config) float64 {
 // spread across checkpoints, drift has a large one, and any point beyond the
 // acceptance bound fails loudly. A checkpoint too weak to trust outranks drift
 // but not an out-of-range offset, giving the precedence
-// out_of_range > unreliable > drifting > ok — unchanged from 0.4.0.
+//
+//	out_of_range > piecewise-ok > unreliable > drifting > ok
+//
+// The piecewise rule is slice 05's one addition and it sits *below*
+// out_of_range on purpose: an out-of-range checkpoint is out of range whatever
+// the segmentation says about the rest. When the plan was accepted, the verdict
+// is `ok` and the classification says why (`piecewise`), and the drift reported
+// is the residual left by the segmentation — each point against its own
+// segment's median — not the step it removed, so a successful re-cut job reads
+// as a few milliseconds rather than as 2.5 s.
 //
 // Every limit comes from th (see [Thresholds]); no literal survives here, so
 // re-tuning is one edit to [DefaultThresholds].
@@ -1023,7 +1087,7 @@ func searchWindowSec(cfg Config) float64 {
 // "no z recorded" means len(matchZ) <= i or matchZ[i] == 0: a zero z is the
 // documented sentinel for "not measured", so a legacy report behaves exactly as
 // it did in 0.4.0.
-func classify(offsets, qualities, matchZ []float64, maxOffsetMS float64, th Thresholds) (verdict, classification string, maxDrift float64) {
+func classify(offsets, qualities, matchZ []float64, piecewise *Piecewise, maxOffsetMS float64, th Thresholds) (verdict, classification string, maxDrift float64) {
 	if len(offsets) == 0 {
 		return VerdictOutOfRange, ClassificationOutOfRange, 0
 	}
@@ -1041,6 +1105,11 @@ func classify(offsets, qualities, matchZ []float64, maxOffsetMS float64, th Thre
 		if math.Abs(off) > maxOffsetMS {
 			return VerdictOutOfRange, ClassificationOutOfRange, maxDrift
 		}
+	}
+	if piecewise.accepted() {
+		// The step the raw spread measures is what the segmentation explains
+		// away, so the honest number is the residual it leaves behind.
+		return VerdictOK, ClassificationPiecewise, piecewise.maxResidualMS
 	}
 	for i, q := range qualities {
 		if q >= th.LowQuality {

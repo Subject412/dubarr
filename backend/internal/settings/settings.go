@@ -276,10 +276,16 @@ type StrategyOptions analyze.Strategy
 // with a pipeline that has nothing to run. An explicit empty list is a
 // *present* key and stays empty, so [validateStrategy] can reject it with the
 // message the operator needs rather than silently replacing their edit.
+//
+// The `piecewise` block (0.5.0, #84) is decoded the same absent-tolerant way: a
+// row written before the block existed — and a client that has never heard of it
+// — keeps the documented default, which is "off" (D5). That is why no migration
+// is needed and why there is no "exists but does nothing" flag (D1).
 func (o *StrategyOptions) UnmarshalJSON(data []byte) error {
 	var aux struct {
-		Preset     *string              `json:"preset"`
-		Techniques *[]analyze.Technique `json:"techniques"`
+		Preset     *string                  `json:"preset"`
+		Techniques *[]analyze.Technique     `json:"techniques"`
+		Piecewise  *analyze.PiecewisePolicy `json:"piecewise"`
 	}
 	// Unknown fields are rejected here, not only by the caller's decoder: the
 	// section is served back to the UI as it was stored, so a stray key
@@ -296,8 +302,32 @@ func (o *StrategyOptions) UnmarshalJSON(data []byte) error {
 	if aux.Techniques != nil {
 		strategy.Techniques = *aux.Techniques
 	}
+	if aux.Piecewise != nil {
+		strategy.Piecewise = *aux.Piecewise
+	}
 	*o = StrategyOptions(strategy)
 	return nil
+}
+
+// MarshalJSON always writes the piecewise block, at the documented numbers when
+// the section does not carry them.
+//
+// The analyzer's own [analyze.Strategy] omits the block while it is "off at the
+// shipped numbers", because every stored report embeds it and a report must not
+// grow a key for a feature that never ran. The *settings section* is the
+// opposite contract: it is the document the operator edits, so the UI has to be
+// served the numbers it would be editing even on a fresh install.
+func (o StrategyOptions) MarshalJSON() ([]byte, error) {
+	type section struct {
+		Preset     string                  `json:"preset"`
+		Techniques []analyze.Technique     `json:"techniques"`
+		Piecewise  analyze.PiecewisePolicy `json:"piecewise"`
+	}
+	return json.Marshal(section{
+		Preset:     o.Preset,
+		Techniques: o.Techniques,
+		Piecewise:  o.Piecewise.Normalised(),
+	})
 }
 
 // SecurityOptions are appliance-wide safety switches.
@@ -1243,13 +1273,25 @@ func validateSync(p *SyncDefaults) error {
 	}
 }
 
-// PresetTechniques is the one place a preset's technique list exists. The
-// server never expands a preset into a list at run time and the UI must not
-// either: both read it from here, and a settings test asserts the SPA's
+// Preset is the one place a preset's contents exist. The server never expands a
+// preset into a section at run time and the UI must not either: both read it
+// from here, and a settings test asserts the SPA's
 // DEFAULT_SETTINGS['sync.strategy'] is this value, so the two cannot drift.
 //
-// `custom` has no canonical list — it is what every other list is called — and
-// returns nil.
+// It returns the *whole* section — techniques and the piecewise block — because
+// a preset is one statement about the job. Keeping the two halves in separate
+// functions is what would let a preset mean two different things in two places,
+// which is why this replaced PresetTechniques rather than sitting beside it.
+//
+// No preset switches segmentation on (#84). Piecewise is the one setting that
+// changes what a job *does* to the operator's dub copy — a re-cut file encoded
+// once, instead of a mux with an offset — so it is only ever on because someone
+// said so, never because a stored preset was redefined under them. A section
+// that enables it is therefore `custom`, which is the one label that cannot be
+// mistaken for "nothing changed" (D5).
+//
+// `custom` has no canonical section — it is what every other section is called —
+// and returns the zero Strategy.
 //
 // D4a: `fast` keeps the waveform matcher and spends fewer checkpoints instead
 // (3 rather than 6, a sync.defaults decision), so its list is `balanced`'s.
@@ -1264,50 +1306,63 @@ func validateSync(p *SyncDefaults) error {
 // the 8σ band refused the answers MFCC exists for. That entry carries
 // `min_match_z: 0` and is judged on quality alone; the z is still recorded in
 // the attempt, as a diagnostic.
-func PresetTechniques(name string) []analyze.Technique {
+func Preset(name string) analyze.Strategy {
 	switch name {
 	case analyze.PresetFast:
-		return PresetTechniques(analyze.PresetBalanced)
+		return Preset(analyze.PresetBalanced)
 	case analyze.PresetBalanced:
-		// A copy: the caller may edit the list it gets back (the editor
+		// A copy: the caller may edit the section it gets back (the editor
 		// does), and the shipped strategy must not change with it.
-		return append([]analyze.Technique(nil), analyze.DefaultStrategy().Techniques...)
+		shipped := analyze.DefaultStrategy()
+		shipped.Techniques = append([]analyze.Technique(nil), shipped.Techniques...)
+		return shipped
 	case analyze.PresetMaximumAccuracy:
-		return []analyze.Technique{
-			{
-				ID:            analyze.TechniqueWaveform,
-				Enabled:       true,
-				When:          analyze.WhenAlways,
-				MinConfidence: analyze.LowQualityThreshold,
-				MinMatchZ:     analyze.DefaultThresholds.MatchZMaybe,
-				ZGate:         true,
+		return analyze.Strategy{
+			Preset: analyze.PresetMaximumAccuracy,
+			Techniques: []analyze.Technique{
+				{
+					ID:            analyze.TechniqueWaveform,
+					Enabled:       true,
+					When:          analyze.WhenAlways,
+					MinConfidence: analyze.LowQualityThreshold,
+					MinMatchZ:     analyze.DefaultThresholds.MatchZMaybe,
+					ZGate:         true,
+				},
+				{
+					// A second opinion only where the waveform answer was weak:
+					// every checkpoint would pay a decode for no gain.
+					ID:            analyze.TechniqueMFCC,
+					Enabled:       true,
+					When:          analyze.WhenBelowConfidence,
+					MinConfidence: 0.15,
+					MinMatchZ:     0,
+					ZGate:         false,
+				},
 			},
-			{
-				// A second opinion only where the waveform answer was weak:
-				// every checkpoint would pay a decode for no gain.
-				ID:            analyze.TechniqueMFCC,
-				Enabled:       true,
-				When:          analyze.WhenBelowConfidence,
-				MinConfidence: 0.15,
-				MinMatchZ:     0,
-				ZGate:         false,
-			},
+			// Off, like every preset: see above.
+			Piecewise: analyze.DefaultPiecewisePolicy(),
 		}
 	default:
-		return nil
+		return analyze.Strategy{}
 	}
 }
 
-// validateStrategy enforces the #82 table on the way in, and stores the preset
-// name the list actually is.
+// validateStrategy enforces the #82 table and the #84 piecewise ranges on the
+// way in, and stores the preset name the section actually is.
 //
-// The label is only believed where it matches its own canonical list: a client
-// that posts preset "maximum accuracy" with the balanced list gets "custom"
-// stored, never "balanced", and a hand-edited list is "custom" too. Only an
-// unknown label and an unsound list are errors.
+// The label is only believed where it matches its own canonical section: a
+// client that posts preset "maximum accuracy" with the balanced list — or with
+// segmentation switched off — gets "custom" stored, never "balanced", and a
+// hand-edited section is "custom" too. Only an unknown label and an unsound
+// section are errors.
+//
+// The piecewise numbers are materialised before validation, so an absent block
+// is stored as the documented defaults (off, 45/60/250/120/12) rather than as
+// zeros the UI would have to guess at.
 func validateStrategy(p *StrategyOptions) error {
 	s := analyze.Strategy(*p)
-	s.Preset = resolvePreset(s.Preset, s.Techniques)
+	s.Piecewise = s.Piecewise.Normalised()
+	s.Preset = resolvePreset(s)
 	if err := s.Validate(); err != nil {
 		return fmt.Errorf("%s: %w", KeySyncStrategy, err)
 	}
@@ -1315,35 +1370,44 @@ func validateStrategy(p *StrategyOptions) error {
 	return nil
 }
 
-// resolvePreset answers "which name does this list have?".
+// resolvePreset answers "which name is this section?".
 //
-// A known label whose list is that label's own canonical list is kept — `fast`
-// and `balanced` share a list, so the label is the only thing that tells them
-// apart, and it is what the operator picked. A known label whose list differs
-// is `custom`: an edited preset is never silently promoted to a different
-// preset, even when the edit happens to reproduce that preset's list. An empty
-// label is derived from the list (balanced, then maximum_accuracy), and an
-// unknown label is passed through untouched so [analyze.Strategy.Validate]
-// rejects it instead of quietly renaming the operator's choice.
-func resolvePreset(label string, techniques []analyze.Technique) string {
-	switch label {
+// A known label whose section is that label's own canonical section is kept —
+// `fast` and `balanced` share a section, so the label is the only thing that
+// tells them apart, and it is what the operator picked. A known label whose
+// section differs is `custom`: an edited preset is never silently promoted to a
+// different preset, even when the edit happens to reproduce that preset's
+// section. An empty label is derived from the section (balanced, then
+// maximum_accuracy), and an unknown label is passed through untouched so
+// [analyze.Strategy.Validate] rejects it instead of quietly renaming the
+// operator's choice.
+func resolvePreset(s analyze.Strategy) string {
+	switch s.Preset {
 	case analyze.PresetFast, analyze.PresetBalanced, analyze.PresetMaximumAccuracy:
-		if sameTechniques(techniques, PresetTechniques(label)) {
-			return label
+		if sameStrategy(s, Preset(s.Preset)) {
+			return s.Preset
 		}
 		return analyze.PresetCustom
 	case analyze.PresetCustom:
 		return analyze.PresetCustom
 	case "":
 	default:
-		return label
+		return s.Preset
 	}
 	for _, name := range []string{analyze.PresetBalanced, analyze.PresetMaximumAccuracy} {
-		if sameTechniques(techniques, PresetTechniques(name)) {
+		if sameStrategy(s, Preset(name)) {
 			return name
 		}
 	}
 	return analyze.PresetCustom
+}
+
+// sameStrategy compares two sections field by field, ignoring the label itself.
+// Both sides come from the same JSON schema, so exact equality is the right
+// test: a threshold the operator changed by one thousandth is a different
+// strategy, and a segmentation knob that differs is a different preset.
+func sameStrategy(a, b analyze.Strategy) bool {
+	return sameTechniques(a.Techniques, b.Techniques) && a.Piecewise == b.Piecewise
 }
 
 // sameTechniques compares two lists element for element. Both sides come from

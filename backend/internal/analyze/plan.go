@@ -171,7 +171,7 @@ func PlanWindows(dur Timing, pcts []int, window float64) ([]Window, error) {
 	durSamples := base * analysisSampleRate
 	windows := make([]Window, len(pcts))
 	for i, pct := range pcts {
-		start, length := clampWindow(base, pct, window)
+		start, length := clampWindow(base, float64(pct), window)
 		startSample, lenSamples := sampleCount(start), sampleCount(length)
 		if lenSamples < 1 {
 			lenSamples = 1
@@ -193,14 +193,18 @@ func PlanWindows(dur Timing, pcts []int, window float64) ([]Window, error) {
 	return windows, nil
 }
 
-// clampWindow places one window at pct of dur, centred on the checkpoint and
-// clamped into the analysis input, in this exact order: centre it, floor the
-// start at 0, pull the start back so start+window fits, floor it at 0 again,
-// then take the length as the smaller of the window and the audio left. The
-// order matters: flooring before fitting a file shorter than the window is
-// what turns that case into "start 0, length dur" instead of a negative start.
-func clampWindow(dur float64, pct int, window float64) (start, length float64) {
-	start = dur*float64(pct)/100 - window/2
+// clampWindow places one window centred on pct per cent of dur and clamped into
+// the analysis input, in this exact order: centre it, floor the start at 0, pull
+// the start back so start+window fits, floor it at 0 again, then take the length
+// as the smaller of the window and the audio left. The order matters: flooring
+// before fitting a file shorter than the window is what turns that case into
+// "start 0, length dur" instead of a negative start.
+//
+// pct is fractional, not a whole percentage: the dense plan places its windows
+// on a time grid ([PlanWindowsEvery]) and hands the equivalent percentage in, so
+// the two planners share one clamp instead of two copies of these four rules.
+func clampWindow(dur, pct, window float64) (start, length float64) {
+	start = dur*pct/100 - window/2
 	if start < 0 {
 		start = 0
 	}
@@ -212,6 +216,94 @@ func clampWindow(dur float64, pct int, window float64) (start, length float64) {
 	}
 	length = math.Min(window, dur-start)
 	return start, length
+}
+
+// MaxDenseSamples caps the dense checkpoint grid: with the shipped 45 s step a
+// two-hour film is 160 checkpoints, and beyond this many the step is widened
+// rather than the pool flooded. 400 points is also the bound the segmenter's
+// O(n²) tables are sized for (a few megabytes, milliseconds).
+const MaxDenseSamples = 400
+
+// DenseStepSec is the sampling step [PlanWindowsEvery] will actually use:
+// stepSec, widened to dur/MaxDenseSamples when that is coarser.
+//
+// The widening is a resolution trade, not a failure: a ten-hour source cannot be
+// sampled every 45 s within the cap, so it degrades to 90 s and the report says
+// so ([Piecewise.StepSec]) instead of allocating an unbounded plan.
+func DenseStepSec(durationSec, stepSec float64) float64 {
+	if stepSec <= 0 || math.IsNaN(stepSec) || math.IsInf(stepSec, 0) {
+		stepSec = DefaultPiecewisePolicy().StepSec
+	}
+	if durationSec <= 0 || math.IsNaN(durationSec) || math.IsInf(durationSec, 0) {
+		return stepSec
+	}
+	if widened := durationSec / MaxDenseSamples; widened > stepSec {
+		return widened
+	}
+	return stepSec
+}
+
+// PlanWindowsEvery builds a uniform checkpoint grid: one window every stepSec,
+// centred in its slot, for as long as a whole window still fits inside the
+// timeline (the same margin, clamping and sample snapping [PlanWindows] applies).
+//
+// The grid is what turns a re-cut into a measurable discontinuity: six
+// percentage checkpoints cannot locate a boundary, a grid 45 s apart locates it
+// to within about ±step/2. Positions are still reported as percentages so an
+// existing reader of [Checkpoint.PositionPct] has a number to show; on a dense
+// plan that number is an approximation of the true film position, and
+// [Window.FilmStartSec] is the fact.
+//
+// The step is widened past [MaxDenseSamples] (see [DenseStepSec]); a caller that
+// needs to report the effective step asks for it by name rather than reading it
+// back out of the plan.
+func PlanWindowsEvery(dur Timing, stepSec, windowSec float64) ([]Window, error) {
+	base := dur.DurationSec()
+	if math.IsNaN(base) || math.IsInf(base, 0) || base <= 0 {
+		return nil, fmt.Errorf("%w: duration %v is not a positive finite number", ErrWindowPlan, base)
+	}
+	if math.IsNaN(windowSec) || math.IsInf(windowSec, 0) || windowSec <= 0 {
+		return nil, fmt.Errorf("%w: window %v is not a positive finite number", ErrWindowPlan, windowSec)
+	}
+	if math.IsNaN(stepSec) || math.IsInf(stepSec, 0) || stepSec <= 0 {
+		return nil, fmt.Errorf("%w: step %v is not a positive finite number", ErrWindowPlan, stepSec)
+	}
+
+	origin := dur.unknownOrigin()
+	durSamples := base * analysisSampleRate
+	step := DenseStepSec(base, stepSec)
+	windows := make([]Window, 0, int(base/step)+1)
+	for centre := step / 2; centre+windowSec/2 <= base-CheckWindowMarginSec; centre += step {
+		start, length := clampWindow(base, centre*100/base, windowSec)
+		startSample, lenSamples := sampleCount(start), sampleCount(length)
+		if lenSamples < 1 {
+			lenSamples = 1
+		}
+		if windowEscapes(startSample, lenSamples, durSamples) {
+			return nil, fmt.Errorf("%w: dense window at %.3f s: samples %d+%d exceed %.3f",
+				ErrWindowPlan, centre, startSample, lenSamples, durSamples)
+		}
+		film := float64(startSample) / analysisSampleRate
+		pct := int(math.Round(centre / base * 100))
+		if pct < 1 {
+			pct = 1
+		}
+		if pct > 99 {
+			pct = 99
+		}
+		windows = append(windows, Window{
+			PositionPct:   pct,
+			FilmStartSec:  film,
+			LenSec:        float64(lenSamples) / analysisSampleRate,
+			TargetSeekSec: film + dur.Target.seekCorrection(),
+			DonorSeekSec:  film + dur.Donor.seekCorrection(),
+			UnknownOrigin: origin,
+		})
+	}
+	if len(windows) == 0 {
+		return nil, fmt.Errorf("%w: no dense window fits %.3f s of audio", ErrWindowPlan, base)
+	}
+	return windows, nil
 }
 
 // sampleCount converts seconds to a whole number of samples at

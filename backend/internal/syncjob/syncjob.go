@@ -1369,6 +1369,12 @@ func sanitizeStrategy(s analyze.Strategy) analyze.Strategy {
 	out := analyze.Strategy{
 		Preset:     s.Preset,
 		Techniques: make([]analyze.Technique, 0, len(s.Techniques)),
+		// The piecewise block rides along unchanged (#84): it is not a
+		// technique, so there is nothing here to filter, and dropping it would
+		// silently switch a job the operator opted in for back to six
+		// checkpoints. A row that predates the block decodes to the documented
+		// default ("off"), which is what [analyze.DefaultStrategy] ships.
+		Piecewise: s.Piecewise,
 	}
 	for _, entry := range s.Techniques {
 		if !entry.ID.Known() || !entry.When.Known() {

@@ -161,7 +161,10 @@ function mockLibrary(fixtures: Fixtures) {
 }
 
 function fetchedUrls(fetchMock: ReturnType<typeof mockLibrary>): URL[] {
-  const calls = fetchMock.mock.calls as Array<[RequestInfo | URL, RequestInit | undefined]>
+  // fetch's call tuple is typed as a one-element rest in some DOM lib versions,
+  // so the cast goes through unknown rather than asserting a shape the compiler
+  // can prove wrong.
+  const calls = fetchMock.mock.calls as unknown as Array<[RequestInfo | URL, RequestInit | undefined]>
   return calls.map(([input]) => new URL(String(input), 'http://localhost'))
 }
 

@@ -138,14 +138,17 @@ func TestAnalyzeStable(t *testing.T) {
 	if len(rep.OffsetsMS) != 6 || len(rep.Qualities) != 6 || len(rep.Checkpoints) != 6 {
 		t.Fatalf("report lengths = %d/%d/%d, want 6", len(rep.OffsetsMS), len(rep.Qualities), len(rep.Checkpoints))
 	}
-	// slice_start = pct*duration - window/2, clamped into the file. The
-	// analysed slice is widened to max_offset_sec + margin (190 s).
+	// slice_start = pct*duration - window/2, clamped into the file and then
+	// snapped to a whole 8 kHz sample. The analysed slice is widened to
+	// max_offset_sec + margin (190 s). Both values below land on an exact
+	// sample, so the snapped plan still prints 0 and 235: the plan is
+	// sample-exact, not merely rounded twice.
 	const sliceLen = 190.0
 	wantFirst := 0.0
 	if got := rep.Checkpoints[0].SliceStartSec; math.Abs(got-wantFirst) > 1e-9 {
 		t.Fatalf("first slice_start = %v, want %v", got, wantFirst)
 	}
-	want55 := 0.55*600 - sliceLen/2
+	want55 := 235.0 // 0.55*600 - sliceLen/2, exactly 1 880 000 samples
 	if got := rep.Checkpoints[3].SliceStartSec; math.Abs(got-want55) > 1e-9 {
 		t.Fatalf("55%% slice_start = %v, want %v", got, want55)
 	}
@@ -168,37 +171,8 @@ func TestAnalyzeStable(t *testing.T) {
 	}
 }
 
-func TestSliceWindow(t *testing.T) {
-	cases := []struct {
-		name     string
-		duration float64
-		pct      int
-		window   float64
-		start    float64
-		length   float64
-	}{
-		{"head clamp", 600, 10, 190, 0, 190},
-		{"centred", 600, 55, 190, 235, 190},
-		{"tail clamp", 600, 85, 190, 410, 190},
-		{"file shorter than window", 100, 50, 190, 0, 100},
-		{"file shorter at head", 120, 10, 190, 0, 120},
-		{"file equals window", 190, 50, 190, 0, 190},
-		{"file just short of window", 189, 99, 190, 0, 189},
-		{"window below file", 600, 1, 150, 0, 150},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			start, length := sliceWindow(tc.duration, tc.pct, tc.window)
-			if math.Abs(start-tc.start) > 1e-9 || math.Abs(length-tc.length) > 1e-9 {
-				t.Fatalf("sliceWindow(%v, %d, %v) = (%v, %v), want (%v, %v)",
-					tc.duration, tc.pct, tc.window, start, length, tc.start, tc.length)
-			}
-			if start < 0 || length <= 0 || start+length > tc.duration+1e-9 {
-				t.Fatalf("window (%v, %v) escapes [0, %v]", start, length, tc.duration)
-			}
-		})
-	}
-}
+// The former TestSliceWindow lives on as TestPlanWindows in plan_test.go: the
+// window geometry is now [PlanWindows] data, not a helper inside Analyze.
 
 func TestAnalyzeDrifting(t *testing.T) {
 	eng := &scriptedEngine{offsets: []float64{500, 500, 500, 2000, 2000, 2000}}
@@ -695,15 +669,21 @@ func parallelConfig(t *testing.T, n int) Config {
 	return cfg
 }
 
-// checkpointStarts maps a checkpoint's slice start to its index, so a stub
-// engine can answer per checkpoint instead of per call order — which is what
-// makes a completion-order bug visible.
+// checkpointStarts maps a checkpoint's planned film start to its index, so a
+// stub engine can answer per checkpoint instead of per call order — which is
+// what makes a completion-order bug visible.
 func checkpointStarts(cfg Config) map[float64]int {
-	window := searchWindowSec(cfg)
-	starts := make(map[float64]int, len(cfg.CheckpointPositionsPct))
-	for i, pct := range cfg.CheckpointPositionsPct {
-		start, _ := sliceWindow(600, pct, window)
-		starts[start] = i
+	timing := Timing{
+		Target: SourceTiming{DurationSec: 600, OriginKnown: true},
+		Donor:  SourceTiming{DurationSec: 600, OriginKnown: true},
+	}
+	plan, err := PlanWindows(timing, cfg.CheckpointPositionsPct, searchWindowSec(cfg))
+	if err != nil {
+		panic(err)
+	}
+	starts := make(map[float64]int, len(plan))
+	for i, w := range plan {
+		starts[w.FilmStartSec] = i
 	}
 	return starts
 }

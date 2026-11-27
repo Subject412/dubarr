@@ -491,11 +491,15 @@ type Report struct {
 //
 // Each checkpoint window is centred on the settled pct position, but its
 // length is searchWindowSec: the larger of checkpoint_window_sec and
-// max_offset_sec + CheckWindowMarginSec (190 s with the settled defaults).
-// The engine's search is bounded by the slice length, so a slice that stopped
-// at the 150 s checkpoint window could never report an offset near the ±180 s
-// bound and [VerdictOutOfRange] would be unreachable. WindowSec is set to the
-// actual slice length, so the engine searches the whole analysed slice.
+// max_offset_sec + CheckWindowMarginSec (190 s with the settled defaults). The
+// geometry itself is [PlanWindows] and only [PlanWindows]: one start is
+// clamped into the shorter input, both sources receive that same film
+// position, and every boundary is snapped to a whole sample at
+// [analysisSampleRate]. The engine's search is bounded by the slice length, so
+// a slice that stopped at the 150 s checkpoint window could never report an
+// offset near the ±180 s bound and [VerdictOutOfRange] would be unreachable.
+// WindowSec is set to the planned length, so the engine searches the whole
+// analysed slice.
 //
 // Each checkpoint runs with its own deadline, [JobTimeout] (120 s for the
 // settled slice, or [Config.JobTimeout] when set), derived from the shared
@@ -521,12 +525,14 @@ func Analyze(ctx context.Context, engine Engine, cfg Config, req Request) (Repor
 	method := resolved.Pairs[0].Method
 
 	duration := req.DurationSec
+	targetDur, donorDur := duration, duration
 	if duration <= 0 {
-		targetDur, err := wavDuration(req.TargetPath)
+		var err error
+		targetDur, err = wavDuration(req.TargetPath)
 		if err != nil {
 			return Report{}, fmt.Errorf("analyze: target duration: %w", err)
 		}
-		donorDur, err := wavDuration(req.DonorPath)
+		donorDur, err = wavDuration(req.DonorPath)
 		if err != nil {
 			return Report{}, fmt.Errorf("analyze: donor duration: %w", err)
 		}
@@ -540,6 +546,22 @@ func Analyze(ctx context.Context, engine Engine, cfg Config, req Request) (Repor
 	workers := parallelWorkers(cfg)
 	pcts := cfg.CheckpointPositionsPct
 
+	// One plan for the whole job, computed once: the film positions and
+	// lengths every checkpoint reports, and the correction that would be
+	// applied to each source's seek. This unit analyses whole files, whose
+	// frame 0 is film 0, so both corrections are a known zero and the engine's
+	// start is the film start — but the plan is the same object a windowed
+	// decode will consume (U-WIN.4), which is what keeps both modes' reports
+	// comparable.
+	timing := Timing{
+		Target: SourceTiming{DurationSec: targetDur, OriginKnown: true},
+		Donor:  SourceTiming{DurationSec: donorDur, OriginKnown: true},
+	}
+	plan, err := PlanWindows(timing, pcts, window)
+	if err != nil {
+		return Report{}, err
+	}
+
 	report := Report{
 		SyncMethod:  method,
 		Reason:      resolved.Pairs[0].Reason,
@@ -548,7 +570,7 @@ func Analyze(ctx context.Context, engine Engine, cfg Config, req Request) (Repor
 		Qualities:   make([]float64, len(pcts)),
 	}
 
-	runs, err := runCheckpoints(ctx, engine, cfg, req, duration, window, workers)
+	runs, err := runCheckpoints(ctx, engine, cfg, req, plan, workers)
 	if err != nil {
 		return Report{}, err
 	}
@@ -582,21 +604,20 @@ type checkpointRun struct {
 	casualty bool
 }
 
-// runCheckpoints analyses len(cfg.CheckpointPositionsPct) checkpoints with at
+// runCheckpoints analyses one planned window per checkpoint position with at
 // most workers of them in flight, and returns their slots. A non-nil error is
 // the deterministic pick described on [Analyze]: the lowest checkpoint index
 // that genuinely failed, else the lowest one a cancellation stopped.
-func runCheckpoints(ctx context.Context, engine Engine, cfg Config, req Request, duration, window float64, workers int) ([]checkpointRun, error) {
-	pcts := cfg.CheckpointPositionsPct
-	runs := make([]checkpointRun, len(pcts))
+func runCheckpoints(ctx context.Context, engine Engine, cfg Config, req Request, plan []Window, workers int) ([]checkpointRun, error) {
+	runs := make([]checkpointRun, len(plan))
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	// One buffered channel of checkpoint indices: the workers pull, so a
 	// worker never blocks another one and finishing early costs nothing.
-	queue := make(chan int, len(pcts))
-	for i := range pcts {
+	queue := make(chan int, len(plan))
+	for i := range plan {
 		queue <- i
 	}
 	close(queue)
@@ -608,13 +629,17 @@ func runCheckpoints(ctx context.Context, engine Engine, cfg Config, req Request,
 		go func() {
 			defer func() { done <- struct{}{} }()
 			for i := range queue {
-				pct := pcts[i]
-				start, length := sliceWindow(duration, pct, window)
+				// The window is data, planned once for the whole job: the
+				// report takes its film position and the engine takes its
+				// start and length, and neither is derived from the other.
+				window := plan[i]
+				pct := window.PositionPct
+				length := window.LenSec
 				search := length
 				job := sync.Job{
 					TargetPath:    req.TargetPath,
 					DonorPath:     req.DonorPath,
-					SliceStartSec: start,
+					SliceStartSec: window.FilmStartSec,
 					SliceLenSec:   length,
 					WindowSec:     &search,
 				}
@@ -644,7 +669,7 @@ func runCheckpoints(ctx context.Context, engine Engine, cfg Config, req Request,
 				}
 				runs[i] = checkpointRun{checkpoint: Checkpoint{
 					PositionPct:   pct,
-					SliceStartSec: start,
+					SliceStartSec: window.FilmStartSec,
 					SliceLenSec:   length,
 					OffsetMS:      result.OffsetMS,
 					Quality:       result.CorrelationQuality,
@@ -672,7 +697,7 @@ func runCheckpoints(ctx context.Context, engine Engine, cfg Config, req Request,
 	// Nothing failed but the caller's context did: the analysis is not a
 	// result, so report it the way a cancelled checkpoint would have been.
 	if err := ctx.Err(); err != nil {
-		return nil, fmt.Errorf("analyze: checkpoint %d%%: %w", pcts[0], err)
+		return nil, fmt.Errorf("analyze: checkpoint %d%%: %w", plan[0].PositionPct, err)
 	}
 	return runs, nil
 }
@@ -682,24 +707,6 @@ func runCheckpoints(ctx context.Context, engine Engine, cfg Config, req Request,
 // the engine's lag search reaches the full offset bound.
 func searchWindowSec(cfg Config) float64 {
 	return math.Max(float64(cfg.CheckpointWindowSec), float64(cfg.MaxOffsetSec+CheckWindowMarginSec))
-}
-
-// sliceWindow places the checkpoint window at pct of duration, centred on the
-// checkpoint and clamped into the file. For files shorter than the window the
-// whole file is analysed.
-func sliceWindow(duration float64, pct int, window float64) (start, length float64) {
-	start = duration*float64(pct)/100 - window/2
-	if start < 0 {
-		start = 0
-	}
-	if start+window > duration {
-		start = duration - window
-	}
-	if start < 0 {
-		start = 0
-	}
-	length = math.Min(window, duration-start)
-	return start, length
 }
 
 // classify implements the monotonic sanity check: a constant shift has a small

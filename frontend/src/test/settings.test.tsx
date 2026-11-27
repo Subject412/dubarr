@@ -963,6 +963,7 @@ describe('parallel checkpoints (U-DSP.8)', () => {
     preview_positions_pct: [10, 25, 50, 75, 90],
     preview_window_sec: 60,
     parallel_checkpoints: 1,
+    analysis_source: 'full',
   }
 
   function mockSyncFetch(): ReturnType<typeof vi.fn> {
@@ -1066,5 +1067,128 @@ describe('parallel checkpoints (U-DSP.8)', () => {
       'parallel_checkpoints must be 1..8',
     )
     expect(field).toHaveValue(9)
+  })
+})
+
+// analysis_source (U-WIN.6). The backend serves a materialised value, but a
+// section stored before the key existed (or an older server) must still render
+// a *selected* option — a blank select is the finding-4 symptom — and an
+// untouched save must send the mode it displays, not leave the key out.
+describe('analysis source (U-WIN.6)', () => {
+  const storedSync = {
+    max_offset_sec: 180,
+    checkpoint_positions_pct: [10, 25, 40, 55, 70, 85],
+    checkpoint_window_sec: 150,
+    preview_positions_pct: [10, 25, 50, 75, 90],
+    preview_window_sec: 60,
+    parallel_checkpoints: 1,
+    analysis_source: 'full',
+  }
+
+  /** The same section as stored before the key existed: no analysis_source. */
+  const legacySync = {
+    max_offset_sec: 180,
+    checkpoint_positions_pct: [10, 25, 40, 55, 70, 85],
+    checkpoint_window_sec: 150,
+    preview_positions_pct: [10, 25, 50, 75, 90],
+    preview_window_sec: 60,
+    parallel_checkpoints: 1,
+  }
+
+  function mockSyncFetch(
+    section: Record<string, unknown>,
+  ): ReturnType<typeof vi.fn> {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/api/settings') && isMethod(init, 'PUT')) {
+        return jsonResponse({ settings: { 'sync.defaults': section } })
+      }
+      if (url.includes('/api/settings')) {
+        return jsonResponse({ settings: { 'sync.defaults': section } })
+      }
+      return jsonResponse({ error: 'unexpected' }, 404)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    return fetchMock
+  }
+
+  function syncCard(): HTMLElement {
+    const element = document.getElementById(settingsSectionId('sync.defaults'))
+    expect(element).not.toBeNull()
+    return element as HTMLElement
+  }
+
+  function analysisSelect(): HTMLSelectElement {
+    return within(syncCard()).getByLabelText('Analysis source') as HTMLSelectElement
+  }
+
+  function savedSync(fetchMock: ReturnType<typeof vi.fn>): Record<string, unknown> {
+    const put = fetchMock.mock.calls.find(([, init]) => isMethod(init, 'PUT'))
+    expect(put).toBeDefined()
+    const body = JSON.parse(String(put?.[1]?.body)) as {
+      settings: Record<string, Record<string, unknown>>
+    }
+    expect(Object.keys(body.settings)).toEqual(['sync.defaults'])
+    return body.settings['sync.defaults']
+  }
+
+  it('renders Windows and Full with the stored mode selected and its help text', async () => {
+    mockSyncFetch(storedSync)
+    renderWithProviders(<SettingsPage />, { route: '/settings' })
+    expect(await screen.findByRole('heading', { name: 'Sync defaults' })).toBeInTheDocument()
+
+    const field = analysisSelect()
+    expect(field).toHaveValue('full')
+    expect(Array.from(field.options).map((option) => option.value)).toEqual(['windows', 'full'])
+
+    const trigger = screen.getByRole('button', { name: 'About Analysis source' })
+    const helpId = field.getAttribute('aria-describedby') ?? ''
+    expect(helpId).not.toBe('')
+    expect(trigger).toHaveAttribute('aria-describedby', helpId)
+    act(() => trigger.focus())
+    const tooltip = await screen.findByRole('tooltip')
+    expect(tooltip).toHaveTextContent(SETTINGS_HELP['sync.defaults'].analysis_source)
+    expect(tooltip).toHaveTextContent(/several times faster/i)
+    expect(tooltip).toHaveTextContent(/never falls back/i)
+  })
+
+  it('saves full plus 4 parallel workers and leaves every other field untouched', async () => {
+    const user = userEvent.setup()
+    const fetchMock = mockSyncFetch({ ...storedSync, analysis_source: 'windows' })
+    renderWithProviders(<SettingsPage />, { route: '/settings' })
+    expect(await screen.findByRole('heading', { name: 'Sync defaults' })).toBeInTheDocument()
+
+    expect(analysisSelect()).toHaveValue('windows')
+    await user.selectOptions(analysisSelect(), 'full')
+
+    const workers = within(syncCard()).getByLabelText('Parallel checkpoints')
+    await user.clear(workers)
+    await user.type(workers, '4')
+    await user.click(screen.getByLabelText('Save Sync defaults'))
+
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.some(([, init]) => isMethod(init, 'PUT'))).toBe(true),
+    )
+    expect(savedSync(fetchMock)).toEqual({ ...storedSync, parallel_checkpoints: 4 })
+  })
+
+  it('renders the default for a section without the key and saves it untouched', async () => {
+    const user = userEvent.setup()
+    const fetchMock = mockSyncFetch(legacySync)
+    renderWithProviders(<SettingsPage />, { route: '/settings' })
+    expect(await screen.findByRole('heading', { name: 'Sync defaults' })).toBeInTheDocument()
+
+    // Never a blank control: the compiled default is what the operator sees.
+    const field = analysisSelect()
+    expect(field).toHaveValue('full')
+    expect(field.value).not.toBe('')
+
+    // An untouched save PATCHes the mode it displays, so the section is
+    // complete from then on instead of relying on the read-time default.
+    await user.click(screen.getByLabelText('Save Sync defaults'))
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.some(([, init]) => isMethod(init, 'PUT'))).toBe(true),
+    )
+    expect(savedSync(fetchMock)).toEqual({ ...legacySync, analysis_source: 'full' })
   })
 })

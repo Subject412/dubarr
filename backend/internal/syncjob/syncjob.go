@@ -705,6 +705,20 @@ func (s *Service) analysisPolicy(ctx context.Context) (reflang.Languages, analyz
 			if sd.ParallelCheckpoints > 0 {
 				cfg.ParallelCheckpoints = sd.ParallelCheckpoints
 			}
+			// UnmarshalJSON already resolved an absent key to
+			// DefaultAnalysisSource, and the settings API serves a materialised
+			// value. This switch is the defence in depth for a row that never
+			// went through either: a direct Store.Get in a test, an imported
+			// backup. "" (and anything unrecognised, which validation forbids)
+			// must mean the compiled default, never "no mode".
+			switch sd.AnalysisSource {
+			case analyze.AnalysisSourceWindows:
+				cfg.AnalysisSource = analyze.AnalysisSourceWindows
+			case analyze.AnalysisSourceFull:
+				cfg.AnalysisSource = analyze.AnalysisSourceFull
+			default:
+				cfg.AnalysisSource = settings.DefaultAnalysisSource
+			}
 		}
 	}
 	return policy, cfg

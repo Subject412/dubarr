@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Subject412/dubarr/backend/internal/analyze"
 	"github.com/Subject412/dubarr/backend/internal/store"
 )
 
@@ -997,5 +998,188 @@ func validSyncDefaults() SyncDefaults {
 		PreviewPositionsPct:    []int{10, 25, 50, 75, 90},
 		PreviewWindowSec:       60,
 		ParallelCheckpoints:    DefaultParallelCheckpoints,
+		AnalysisSource:         DefaultAnalysisSource,
+	}
+}
+
+// legacySyncDefaults is the section exactly as every row written before
+// analysis_source (and parallel_checkpoints) existed carries it.
+const legacySyncDefaults = `{"max_offset_sec":180,"checkpoint_positions_pct":[10,25,40,55,70,85],` +
+	`"checkpoint_window_sec":150,"preview_positions_pct":[10,25,50,75,90],"preview_window_sec":60}`
+
+// analysis_source follows the parallel_checkpoints contract: absent is the
+// compiled default (so a legacy row keeps analysing whole tracks), a present ""
+// stays empty so the boundary — not the decoder — decides what it means.
+func TestSyncDefaultsAnalysisSourceDecode(t *testing.T) {
+	var absent SyncDefaults
+	if err := json.Unmarshal([]byte(legacySyncDefaults), &absent); err != nil {
+		t.Fatalf("unmarshal legacy row: %v", err)
+	}
+	if absent.AnalysisSource != DefaultAnalysisSource {
+		t.Errorf("absent analysis_source = %q, want %q", absent.AnalysisSource, DefaultAnalysisSource)
+	}
+	if err := validateSync(&absent); err != nil {
+		t.Errorf("legacy row failed validation: %v", err)
+	}
+
+	var empty SyncDefaults
+	if err := json.Unmarshal([]byte(`{"analysis_source":""}`), &empty); err != nil {
+		t.Fatalf("unmarshal empty: %v", err)
+	}
+	if empty.AnalysisSource != "" {
+		t.Fatalf("present \"\" decoded as %q; it must stay empty for validation to judge", empty.AnalysisSource)
+	}
+
+	for _, mode := range []string{analyze.AnalysisSourceWindows, analyze.AnalysisSourceFull} {
+		var got SyncDefaults
+		if err := json.Unmarshal([]byte(`{"analysis_source":"`+mode+`"}`), &got); err != nil {
+			t.Fatalf("unmarshal %q: %v", mode, err)
+		}
+		if got.AnalysisSource != mode {
+			t.Errorf("present %q decoded as %q", mode, got.AnalysisSource)
+		}
+	}
+}
+
+// The compiled default is 'full' in this unit; U-WIN.9 flips the constant and
+// this test with it.
+func TestDefaultsAnalysisSource(t *testing.T) {
+	sd, ok := Defaults("")[KeySyncDefaults].(SyncDefaults)
+	if !ok {
+		t.Fatalf("Defaults()[%s] is not a SyncDefaults", KeySyncDefaults)
+	}
+	if sd.AnalysisSource != analyze.AnalysisSourceFull {
+		t.Errorf("default analysis_source = %q, want %q", sd.AnalysisSource, analyze.AnalysisSourceFull)
+	}
+	if DefaultAnalysisSource != analyze.AnalysisSourceFull {
+		t.Errorf("DefaultAnalysisSource = %q, want the compiled default %q", DefaultAnalysisSource, analyze.AnalysisSourceFull)
+	}
+}
+
+// validateSync accepts "" as "the compiled default" and rejects everything
+// outside {windows, full}. Case is not normalised, so "Windows" is a client bug
+// the operator is told about instead of one silently repaired.
+func TestValidateSyncAnalysisSource(t *testing.T) {
+	for _, mode := range []string{"", analyze.AnalysisSourceWindows, analyze.AnalysisSourceFull} {
+		p := validSyncDefaults()
+		p.AnalysisSource = mode
+		if err := validateSync(&p); err != nil {
+			t.Errorf("validateSync rejected %q: %v", mode, err)
+		}
+	}
+	for _, mode := range []string{"bogus", "Windows", "FULL", "windows ", " full"} {
+		p := validSyncDefaults()
+		p.AnalysisSource = mode
+		err := validateSync(&p)
+		if err == nil {
+			t.Errorf("validateSync accepted %q", mode)
+			continue
+		}
+		if err.Error() != "analysis_source must be windows or full" {
+			t.Errorf("message for %q = %q, want %q", mode, err.Error(), "analysis_source must be windows or full")
+		}
+	}
+}
+
+// The legacy-row contract in both directions: a stored row without the key is
+// served with the compiled default, PATCHing that exact served object neither
+// fails nor changes the mode, and neither the read nor the write turns the row
+// into an "" one.
+func TestSyncDefaultsAnalysisSourceLegacyRow(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`,
+		KeySyncDefaults, legacySyncDefaults); err != nil {
+		t.Fatalf("insert legacy sync.defaults: %v", err)
+	}
+
+	served := mustGet(t, s, ctx, KeySyncDefaults)
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(served, &fields); err != nil {
+		t.Fatalf("decode served section: %v (%s)", err, served)
+	}
+	if got := string(fields["analysis_source"]); got != `"full"` {
+		t.Fatalf("served analysis_source = %s, want \"full\" (%s)", got, served)
+	}
+	sd := decode[SyncDefaults](t, served)
+	if sd.ParallelCheckpoints != DefaultParallelCheckpoints || sd.CheckpointWindowSec != 150 {
+		t.Fatalf("served section lost a legacy value: %+v", sd)
+	}
+
+	// The read must not rewrite the stored bytes.
+	var stored string
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT value FROM settings WHERE key = ?`, KeySyncDefaults).Scan(&stored); err != nil {
+		t.Fatalf("read stored row: %v", err)
+	}
+	if stored != legacySyncDefaults {
+		t.Errorf("Get rewrote the stored row:\n got %s\nwant %s", stored, legacySyncDefaults)
+	}
+
+	// The PATCH the card sends when the operator saves the untouched section.
+	if err := s.Set(ctx, KeySyncDefaults, served); err != nil {
+		t.Fatalf("PATCH of the served legacy section: %v", err)
+	}
+	after := mustGet(t, s, ctx, KeySyncDefaults)
+	if got := decode[SyncDefaults](t, after).AnalysisSource; got != DefaultAnalysisSource {
+		t.Fatalf("analysis_source after PATCH = %q, want %q (%s)", got, DefaultAnalysisSource, after)
+	}
+	if strings.Contains(string(after), `"analysis_source":""`) {
+		t.Errorf("stored row carries an empty analysis_source: %s", after)
+	}
+	var rewritten map[string]json.RawMessage
+	if err := json.Unmarshal(after, &rewritten); err != nil {
+		t.Fatalf("decode rewritten row: %v", err)
+	}
+	if got := string(rewritten["analysis_source"]); got != `"full"` {
+		t.Errorf("stored analysis_source = %s, want \"full\"", got)
+	}
+	round := decode[SyncDefaults](t, after)
+	if round.CheckpointWindowSec != 150 || round.MaxOffsetSec != 180 ||
+		round.ParallelCheckpoints != DefaultParallelCheckpoints {
+		t.Errorf("round trip changed the section: %+v", round)
+	}
+}
+
+// A client that sends "" (or omits the key) must not leave the DB with a row
+// every later reader has to interpret: normalize materialises the default.
+func TestSetMaterialisesEmptyAnalysisSource(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	for _, body := range []string{
+		legacySyncDefaults,
+		`{"max_offset_sec":180,"checkpoint_positions_pct":[10,25,40,55,70,85],` +
+			`"checkpoint_window_sec":150,"preview_positions_pct":[10,25,50,75,90],` +
+			`"preview_window_sec":60,"parallel_checkpoints":1,"analysis_source":""}`,
+	} {
+		if err := s.Set(ctx, KeySyncDefaults, json.RawMessage(body)); err != nil {
+			t.Fatalf("Set(%s): %v", body, err)
+		}
+		raw := mustGet(t, s, ctx, KeySyncDefaults)
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &fields); err != nil {
+			t.Fatalf("decode stored row: %v (%s)", err, raw)
+		}
+		if got := string(fields["analysis_source"]); got != `"full"` {
+			t.Errorf("stored analysis_source = %s, want \"full\" (%s)", got, raw)
+		}
+	}
+}
+
+// A stored "windows" must survive the round trip byte-for-byte in its mode, so
+// U-WIN.9's flip cannot silently rewrite an operator's explicit choice.
+func TestSyncDefaultsAnalysisSourceRoundTrips(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	body := `{"max_offset_sec":180,"checkpoint_positions_pct":[10,25,40,55,70,85],` +
+		`"checkpoint_window_sec":150,"preview_positions_pct":[10,25,50,75,90],` +
+		`"preview_window_sec":60,"parallel_checkpoints":1,"analysis_source":"windows"}`
+	if err := s.Set(ctx, KeySyncDefaults, json.RawMessage(body)); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	raw := mustGet(t, s, ctx, KeySyncDefaults)
+	if got := decode[SyncDefaults](t, raw).AnalysisSource; got != analyze.AnalysisSourceWindows {
+		t.Fatalf("stored analysis_source = %q, want windows (%s)", got, raw)
 	}
 }

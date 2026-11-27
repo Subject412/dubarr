@@ -60,6 +60,8 @@ export const SETTINGS_HELP: Record<SettingsSectionKey, Record<string, string>> =
     preview_positions_pct: 'Timeline positions where Preview Slices start.',
     parallel_checkpoints:
       'How many checkpoints one sync job analyses at the same time. 1 uses one core and is the safest choice on a laptop; 4 suits a server, and a 4 GB container gets 4 workers. Budget about 400 MB per extra worker; the app reduces the number automatically when memory is short. Only one sync job runs at a time.',
+    analysis_source:
+      'How the analysis gets its audio. Windows decodes only the checkpoint windows and falls back to a full decode if a window looks wrong, which is several times faster; Full decodes both tracks completely, which is slower but never falls back.',
   },
   'mux.options': {
     track_title_in_mkv: 'Track title written into the Matroska container for the muxed audio.',

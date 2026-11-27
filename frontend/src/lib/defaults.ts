@@ -67,7 +67,14 @@ export const DEFAULT_SETTINGS: DubarrSettings = {
   'sync.strategy': {
     preset: 'balanced',
     techniques: [
-      { id: 'waveform', enabled: true, when: 'always', min_confidence: 0.1, min_match_z: 5 },
+      {
+        id: 'waveform',
+        enabled: true,
+        when: 'always',
+        min_confidence: 0.1,
+        min_match_z: 5,
+        z_gate: true,
+      },
     ],
   } as SyncStrategy,
   'mux.options': {

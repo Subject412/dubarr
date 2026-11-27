@@ -133,6 +133,10 @@ function whenLabel(when: string): string {
  * Why an attempt did not decide its checkpoint. The gates come from the
  * strategy the report recorded, so the sentence is the one the operator's own
  * thresholds produced; without a matching step the reason stays generic.
+ *
+ * The σ half is only read out for a step the σ gate applies to (`z_gate`): a
+ * method judged on quality alone records its z as a diagnostic, so naming a z
+ * gate for it would claim a refusal rule that never ran.
  */
 function attemptOutcome(attempt: SyncAttempt, step?: SyncTechnique): string {
   if (attempt.accepted) return 'accepted'
@@ -142,7 +146,12 @@ function attemptOutcome(attempt: SyncAttempt, step?: SyncTechnique): string {
   if (attempt.quality < step.min_confidence) {
     gates.push(`below the confidence gate (${step.min_confidence.toFixed(2)})`)
   }
-  if (step.min_match_z > 0 && attempt.match_z > 0 && attempt.match_z < step.min_match_z) {
+  if (
+    step.z_gate !== false &&
+    step.min_match_z > 0 &&
+    attempt.match_z > 0 &&
+    attempt.match_z < step.min_match_z
+  ) {
     gates.push(`peak under the z gate (${step.min_match_z.toFixed(1)}σ)`)
   }
   return gates.length > 0 ? `rejected: ${gates.join(' · ')}` : 'rejected'

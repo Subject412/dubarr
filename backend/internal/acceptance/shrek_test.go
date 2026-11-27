@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -25,6 +26,43 @@ import (
 	"github.com/Subject412/dubarr/backend/internal/syncjob"
 	"github.com/Subject412/dubarr/backend/internal/syncworker"
 )
+
+// shrekGoldenCheckpoints is the reference engine's recorded output for Shrek's
+// six checkpoints, copied from backend/internal/dsp/testdata/GOLDEN.md
+// ("Tier B — real material", the shrek table) so the parity check needs no
+// testdata parse. GOLDEN.md is the authority if the two ever disagree.
+//
+// What this table does and does not prove: the goldens were captured from the
+// committed 10 s excerpts with window_sec=10, while this test analyses the
+// production 190 s slice (analyze.searchWindowSec) at the same positions — the
+// same fixtures, but not the same correlation input, so a few samples and a
+// visibly different prominence score are expected here. The 1-sample
+// (0.125 ms) parity proof on *identical* inputs is internal/dsp/correlate's
+// golden test (U-DSP.4) over those excerpts; keep the two apart, this one
+// covers the whole pipeline on real material and the other covers the
+// correlator alone.
+type goldenCheckpoint struct {
+	positionPct int
+	offsetMS    float64
+	quality     float64
+}
+
+// shrekGoldenExcerptSec is the length of the excerpts those values were
+// captured from (GOLDEN.md, "Excerpt length and the committed-size budget").
+const shrekGoldenExcerptSec = 10
+
+var shrekGoldenCheckpoints = []goldenCheckpoint{
+	{10, -335.500, 0.286},
+	{25, -354.125, 0.395},
+	{40, -347.875, 0.598},
+	{55, -347.500, 0.597},
+	{70, -336.000, 0.553},
+	{85, -338.125, 0.251},
+}
+
+// shrekGoldenVerdict is GOLDEN.md's recorded verdict for every shrek checkpoint
+// (all qualities are above the 0.10 floor, so the report aggregates to ok).
+const shrekGoldenVerdict = analyze.VerdictOK
 
 // TestShrekEndToEnd is the M5-5 same-language proof over copies of the Shrek
 // fixtures: queue → approve → extract → vault → sync job → syncworker
@@ -137,27 +175,89 @@ func TestShrekEndToEnd(t *testing.T) {
 	if report.SyncMethod != reflang.SameLangReference {
 		t.Fatalf("sync_method = %q, want %q", report.SyncMethod, reflang.SameLangReference)
 	}
-	if report.Verdict != analyze.VerdictOK {
-		t.Fatalf("verdict = %q (%s), want ok", report.Verdict, report.Reason)
+	// Parity with the recorded Rust values (U-DSP.9). GOLDEN.md holds the
+	// reference engine's output for these checkpoints; this block prints it
+	// beside the Go report so a human can read every delta and margin without
+	// a debugger, and asserts the parts that must not regress.
+	//
+	// Why the offsets are asserted against this test's documented band rather
+	// than against each golden value within one sample: the goldens were
+	// captured from the committed 10 s excerpts (window_sec=10), while this job
+	// analyses the production 190 s slice (analyze.searchWindowSec =
+	// max(150, 180+10)) at the same positions. That is a different correlation
+	// input, and the measured per-checkpoint deltas (+0.000, +6.250, −1.125,
+	// −1.500, +0.125, +3.125 ms at 10/25/40/55/70/85 %) are a property of the
+	// window length, not of the port: re-running the reference binary
+	// (sync-engine/target/release/dubarr-sync) on those same six 190 s windows
+	// reproduced all six Go offsets to the sample and all six qualities to
+	// three decimals. The one-sample parity on identical inputs is
+	// internal/dsp/correlate's golden test over those excerpts (U-DSP.4); do
+	// not conflate the two — this test covers the whole pipeline on real
+	// material, that one covers the correlator alone.
+	const (
+		// The band the settled constant offset must land in on these fixtures
+		// (the reference engine measures −335.5..−349) and its spread bound.
+		offsetMinMS = -355.0
+		offsetMaxMS = -330.0
+		maxSpreadMS = 25.0
+		// The hard floor (analyze.LowQualityThreshold) plus 0.02 of slack: a
+		// value that only just clears 0.10 is a sign-off matter, not
+		// something to round away.
+		qualityFloor = analyze.LowQualityThreshold + 0.02
+		// One sample at the 8 kHz analysis rate GOLDEN.md records.
+		oneSampleMS = 1000.0 / 8000.0
+	)
+	if report.Verdict != shrekGoldenVerdict {
+		t.Fatalf("verdict = %q (%s), recorded verdict = %q", report.Verdict, report.Reason, shrekGoldenVerdict)
 	}
-	// New peak-prominence metric: the real fixtures must land in the constant
-	// around −335..−352 ms (observed −335.5..−349) with a small spread
-	// (observed 14 ms; the settled constant-offset bound is 40 ms).
-	if len(report.OffsetsMS) != len(analyze.DefaultCheckpointPositionsPct) {
-		t.Fatalf("checkpoint count = %d, want %d", len(report.OffsetsMS), len(analyze.DefaultCheckpointPositionsPct))
+	if len(report.Checkpoints) != len(shrekGoldenCheckpoints) ||
+		len(report.OffsetsMS) != len(shrekGoldenCheckpoints) ||
+		len(report.Qualities) != len(shrekGoldenCheckpoints) {
+		t.Fatalf("report rows = %d checkpoints / %d offsets / %d qualities, golden rows = %d",
+			len(report.Checkpoints), len(report.OffsetsMS), len(report.Qualities), len(shrekGoldenCheckpoints))
 	}
-	for i, off := range report.OffsetsMS {
-		if off > -330 || off < -355 {
-			t.Fatalf("checkpoint %d offset = %v ms, want within −355..−330; all %v", i, off, report.OffsetsMS)
+
+	table := make([]string, 0, len(shrekGoldenCheckpoints)+1)
+	table = append(table, fmt.Sprintf("%-5s %11s %11s %9s %6s %7s %7s %8s %8s",
+		"pos", "go_offset", "golden_off", "d_ms", "d_smp", "go_q", "golden_q", "d_q", "margin"))
+	for i, want := range shrekGoldenCheckpoints {
+		got := report.Checkpoints[i]
+		table = append(table, fmt.Sprintf("%-5d %11.3f %11.3f %+9.3f %+6.0f %7.3f %7.3f %+8.3f %+8.3f",
+			want.positionPct, got.OffsetMS, want.offsetMS,
+			got.OffsetMS-want.offsetMS, (got.OffsetMS-want.offsetMS)/oneSampleMS,
+			got.Quality, want.quality, got.Quality-want.quality,
+			got.Quality-analyze.LowQualityThreshold))
+	}
+	t.Logf("shrek parity vs internal/dsp/testdata/GOLDEN.md (%d s excerpts, recorded verdict %q, quality floor %.2f) over %.0f s analysis slices:\n%s",
+		shrekGoldenExcerptSec, shrekGoldenVerdict, qualityFloor,
+		report.Checkpoints[0].SliceLenSec, strings.Join(table, "\n"))
+
+	for i, want := range shrekGoldenCheckpoints {
+		got := report.Checkpoints[i]
+		if got.PositionPct != want.positionPct {
+			t.Fatalf("checkpoint row %d position = %d%%, golden row is %d%% (report order changed)",
+				i, got.PositionPct, want.positionPct)
+		}
+		// The golden offset and the delta to it are logged above; the
+		// assertion is the band, because the window length differs (see the
+		// comment on the constants).
+		if got.OffsetMS < offsetMinMS || got.OffsetMS > offsetMaxMS {
+			t.Fatalf("checkpoint %d%% offset = %.3f ms, want within %.0f..%.0f (golden %.3f ms on the %d s excerpt, delta %+.3f ms); all %v",
+				want.positionPct, got.OffsetMS, offsetMinMS, offsetMaxMS,
+				want.offsetMS, shrekGoldenExcerptSec, got.OffsetMS-want.offsetMS, report.OffsetsMS)
+		}
+		if got.Quality < qualityFloor {
+			t.Fatalf("checkpoint %d%% quality = %.3f (margin %+.3f over the %.2f floor), want >= %.2f; golden %.3f on the %d s excerpt, delta %+.3f; all %v",
+				want.positionPct, got.Quality, got.Quality-analyze.LowQualityThreshold,
+				analyze.LowQualityThreshold, qualityFloor, want.quality,
+				shrekGoldenExcerptSec, got.Quality-want.quality, report.Qualities)
 		}
 	}
-	if report.MaxDriftMS > 25 {
-		t.Fatalf("checkpoint spread = %v ms, want <= 25 (constant offset); all %v", report.MaxDriftMS, report.OffsetsMS)
-	}
-	for i, q := range report.Qualities {
-		if q < analyze.LowQualityThreshold {
-			t.Fatalf("checkpoint %d quality = %v, want >= %v; all %v", i, q, analyze.LowQualityThreshold, report.Qualities)
-		}
+	// New peak-prominence metric: the real fixtures must land in a constant
+	// offset with a small spread (observed 14 ms; the settled constant-offset
+	// bound is 40 ms).
+	if report.MaxDriftMS > maxSpreadMS {
+		t.Fatalf("checkpoint spread = %v ms, want <= %v (constant offset); all %v", report.MaxDriftMS, maxSpreadMS, report.OffsetsMS)
 	}
 
 	// 5. Muxed output: the Polish track was appended, tagged, video untouched.

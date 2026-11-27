@@ -629,7 +629,7 @@ func TestReportCarriesFit(t *testing.T) {
 		t.Fatalf("fit.points = %d, want %d", rep.Fit.Points, len(rep.OffsetsMS))
 	}
 
-	// A genuine ramp at 42.7 ms/s (25.000 -> 23.976 fps): the fit reports the
+	// A genuine ramp at 40.96 ms/s (25.000 -> 23.976 fps): the fit reports the
 	// drift and the factor that would remove it, and analyze leaves
 	// TempoApplied alone — only the worker knows whether an encode can run.
 	timing := Timing{
@@ -642,7 +642,7 @@ func TestReportCarriesFit(t *testing.T) {
 	}
 	ramp := make([]float64, len(windows))
 	for i, w := range windows {
-		ramp[i] = -340 + 42.7*w.FilmStartSec
+		ramp[i] = -340 + 40.96*w.FilmStartSec
 	}
 	rep, err = Analyze(context.Background(), &scriptedEngine{offsets: ramp}, DefaultConfig(), request(t.TempDir()))
 	if err != nil {
@@ -654,11 +654,15 @@ func TestReportCarriesFit(t *testing.T) {
 	if rep.Fit == nil || rep.Fit.Shape != ShapeDrift {
 		t.Fatalf("fit = %+v, want shape %q", rep.Fit, ShapeDrift)
 	}
-	if math.Abs(rep.Fit.SlopeMSPerSec-42.7) > 0.2 {
-		t.Fatalf("fit.slope_ms_per_sec = %v, want 42.7", rep.Fit.SlopeMSPerSec)
+	if math.Abs(rep.Fit.SlopeMSPerSec-40.96) > 0.2 {
+		t.Fatalf("fit.slope_ms_per_sec = %v, want 40.96", rep.Fit.SlopeMSPerSec)
 	}
-	if math.Abs(rep.Fit.TempoFactor-1.0427) > 2e-4 {
-		t.Fatalf("fit.tempo_factor = %v, want 1.0427", rep.Fit.TempoFactor)
+	if math.Abs(rep.Fit.TempoFactor-0.95904) > 2e-4 {
+		t.Fatalf("fit.tempo_factor = %v, want 0.95904", rep.Fit.TempoFactor)
+	}
+	if rep.Fit.TempoFactor >= 1 {
+		t.Fatalf("fit.tempo_factor = %v for a positive slope, want < 1: the dub runs fast and is slowed",
+			rep.Fit.TempoFactor)
 	}
 	if rep.Fit.TempoApplied {
 		t.Fatal("fit.tempo_applied = true, want false: analyze never claims the encode happened")
@@ -673,8 +677,8 @@ func TestReportJSONShapeCarriesFit(t *testing.T) {
 		Classification: ClassificationStable,
 		SyncMethod:     reflang.SameLangReference,
 		Fit: &LineFit{
-			SlopeMSPerSec: 42.7, InterceptMS: -340, ResidualRMSMS: 1.2, MaxResidualMS: 3.4,
-			R2: 0.999, Points: 3, Shape: ShapeDrift, TempoFactor: 1.0427,
+			SlopeMSPerSec: 40.96, InterceptMS: -340, ResidualRMSMS: 1.2, MaxResidualMS: 3.4,
+			R2: 0.999, Points: 3, Shape: ShapeDrift, TempoFactor: 0.95904,
 		},
 	}
 	raw, err := json.Marshal(rep)
@@ -881,7 +885,25 @@ func TestIntegrationConstantOffset(t *testing.T) {
 	}
 }
 
+// TestIntegrationPiecewiseDrift is the re-cut fixture run against the real
+// engine: one 2.5 s step at 712 s. Piecewise is disabled here, which is the
+// shipped default (05-piecewise-sync.md), so the verdict stays `drifting`.
 func TestIntegrationPiecewiseDrift(t *testing.T) {
+	assertPiecewiseDrift(t)
+}
+
+// TestIntegrationPiecewiseDriftKeepsDriftingVerdict is the named assertion the
+// #86 plan states (docs/plans/0.5.0/02-line-fit-drift.md): a step is a
+// `drifting` verdict whose trend is a `cut`, never a `drift` — otherwise the
+// worker would try to tempo-correct a re-cut and make it muxable.
+func TestIntegrationPiecewiseDriftKeepsDriftingVerdict(t *testing.T) {
+	assertPiecewiseDrift(t)
+}
+
+// assertPiecewiseDrift runs the step fixture once per named test: a `drifting`
+// verdict paired with a `cut` shape is the whole point of both.
+func assertPiecewiseDrift(t *testing.T) {
+	t.Helper()
 	eng := requireEngine(t)
 	dir := t.TempDir()
 	const dur = 1500

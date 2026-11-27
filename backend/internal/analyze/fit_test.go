@@ -67,21 +67,27 @@ func TestFitTimelineConstant(t *testing.T) {
 
 // TestFitTimelineDriftRecoversTempoFactor is the 25.000 -> 23.976 fps case: the
 // fit must return the slope the fixture was built from and the atempo factor
-// that removes it. TempoApplied stays false — analyze never sets it, because it
-// does not know whether an encode path exists.
+// that removes it. The factor is BELOW 1 on purpose: a positive offset slope
+// means the donor runs fast, so the correction is a slow-down — 1 + slope/1000
+// would stretch it further and double the drift. TempoApplied stays false —
+// analyze never sets it, because it does not know whether an encode path exists.
 func TestFitTimelineDriftRecoversTempoFactor(t *testing.T) {
 	windows := fitWindows(t, 5400)
-	offsets := rampOffsets(windows, 42.7, -340)
+	offsets := rampOffsets(windows, 40.96, -340)
 
 	fit := FitTimeline(windows, offsets, fillQualities(len(offsets), 0.9), nil, DefaultThresholds)
 	if fit.Shape != ShapeDrift {
 		t.Fatalf("shape = %q (slope %v, R2 %v), want %q", fit.Shape, fit.SlopeMSPerSec, fit.R2, ShapeDrift)
 	}
-	if math.Abs(fit.SlopeMSPerSec-42.7) >= 0.2 {
-		t.Fatalf("slope = %v ms/s, want 42.7", fit.SlopeMSPerSec)
+	if math.Abs(fit.SlopeMSPerSec-40.96) >= 0.2 {
+		t.Fatalf("slope = %v ms/s, want 40.96", fit.SlopeMSPerSec)
 	}
-	if math.Abs(fit.TempoFactor-1.0427) >= 2e-4 {
-		t.Fatalf("tempo factor = %v, want 1.0427", fit.TempoFactor)
+	if math.Abs(fit.TempoFactor-0.95904) >= 2e-4 {
+		t.Fatalf("tempo factor = %v, want 0.95904", fit.TempoFactor)
+	}
+	if fit.TempoFactor >= 1 {
+		t.Fatalf("tempo factor = %v for a positive slope, want < 1: a fast dub is slowed, never stretched",
+			fit.TempoFactor)
 	}
 	if fit.TempoApplied {
 		t.Fatal("TempoApplied = true, want false: analyze must never claim the encode happened")
@@ -159,7 +165,7 @@ func TestFitTimelineInsufficientBelowThreePoints(t *testing.T) {
 // report the five that are left.
 func TestFitTimelineIgnoresAnUnconfidentPoint(t *testing.T) {
 	windows := fitWindows(t, 5400)
-	offsets := rampOffsets(windows, 42.7, -340)
+	offsets := rampOffsets(windows, 40.96, -340)
 	offsets[4] += 3000
 	qualities := fillQualities(len(offsets), 0.9)
 	qualities[4] = 0.04 // below LowQualityThreshold, and no z to outvote it
@@ -168,8 +174,8 @@ func TestFitTimelineIgnoresAnUnconfidentPoint(t *testing.T) {
 	if fit.Points != len(offsets)-1 {
 		t.Fatalf("points = %d, want %d: the unconfident checkpoint must not be fitted", fit.Points, len(offsets)-1)
 	}
-	if math.Abs(fit.SlopeMSPerSec-42.7) >= 0.2 {
-		t.Fatalf("slope = %v ms/s, want the drift's 42.7, not the outlier's", fit.SlopeMSPerSec)
+	if math.Abs(fit.SlopeMSPerSec-40.96) >= 0.2 {
+		t.Fatalf("slope = %v ms/s, want the drift's 40.96, not the outlier's", fit.SlopeMSPerSec)
 	}
 	if fit.Shape != ShapeDrift {
 		t.Fatalf("shape = %q (slope %v, R2 %v), want %q", fit.Shape, fit.SlopeMSPerSec, fit.R2, ShapeDrift)
@@ -192,31 +198,66 @@ func TestFitTimelineOutlierDoesNotMoveTheSlope(t *testing.T) {
 	}
 }
 
-// TestTempoFactorForRejectsOutOfRange pins the encoder's own range: atempo
-// honours 0.5..2.0 (transcode.ValidateTempo), i.e. slopes of -500..+1000 ms/s.
-// One step past either end must be refused rather than clamped.
+// TestTempoFactorForRejectsOutOfRange pins the encoder's own range and the
+// direction of the correction: atempo honours 0.5..2.0 (transcode.ValidateTempo),
+// which with factor = 1 - slope/1000 is slopes of -1000..+500 ms/s. One step
+// past either end must be refused rather than clamped, and a positive slope —
+// a dub that runs fast — must land BELOW 1, because it has to be slowed.
 func TestTempoFactorForRejectsOutOfRange(t *testing.T) {
-	// The encoder honours 0.5..2.0 (transcode.ValidateTempo), i.e. slopes of
-	// -500..+1000 ms/s. One step past either end must be refused, not clamped.
-	for _, slope := range []float64{1200, -600, 0} {
-		if factor, ok := tempoFactorFor(slope); ok || factor != 0 {
-			t.Fatalf("tempoFactorFor(%v) = %v/%v, want 0/false (outside atempo's 0.5..2.0)",
-				slope, factor, ok)
-		}
-	}
 	for _, tc := range []struct {
-		slope, factor float64
+		slope  float64
+		factor float64
+		ok     bool
 	}{
-		{42.7, 1.0427},  // 25.000 -> 23.976 fps
-		{-42.7, 0.9573}, // the same mismatch the other way
+		// Terms of factor = 1 - slope/1000 that fall outside atempo's
+		// 0.5..2.0, plus the zero slope, which corrects nothing.
+		{slope: 600, ok: false},
+		{slope: -1200, ok: false},
+		{slope: 0, ok: false},
+		// The 25.000 -> 23.976 fps pair, in both directions: a positive
+		// slope is a fast dub and a factor below 1.
+		{slope: 40.96, factor: 0.95904, ok: true},
+		{slope: -40.96, factor: 1.04096, ok: true},
 	} {
 		got, ok := tempoFactorFor(tc.slope)
-		if !ok {
-			t.Fatalf("tempoFactorFor(%v) = %v/false, want %v/true", tc.slope, got, tc.factor)
+		if ok != tc.ok {
+			t.Fatalf("tempoFactorFor(%v) = %v/%v, want %v/%v", tc.slope, got, ok, tc.factor, tc.ok)
+		}
+		if !tc.ok {
+			if got != 0 {
+				t.Fatalf("tempoFactorFor(%v) = %v/false, want 0/false outside atempo's 0.5..2.0", tc.slope, got)
+			}
+			continue
 		}
 		if math.Abs(got-tc.factor) > 1e-9 {
 			t.Fatalf("tempoFactorFor(%v) = %v, want %v", tc.slope, got, tc.factor)
 		}
+	}
+}
+
+// TestTempoFactorForMatchesTheFramesPerSecondRatio ties the formula to the
+// physical case it exists for. A 25.000 fps dub against a 23.976 fps target
+// advances 23.976/25 of a second per target second, so the offset grows by
+// (1 - 23.976/25) * 1000 ms/s and the correction that removes it is exactly
+// that duration ratio — below 1, a slow-down. This is the one number a wrong
+// sign cannot be caught on elsewhere: transcode.Verify expects duration/f,
+// which a wrongly-signed factor satisfies just as well.
+func TestTempoFactorForMatchesTheFramesPerSecondRatio(t *testing.T) {
+	const (
+		dubFPS    = 25.0
+		targetFPS = 23.976
+	)
+	slope := (1 - targetFPS/dubFPS) * 1000
+	factor, ok := tempoFactorFor(slope)
+	if !ok {
+		t.Fatalf("tempoFactorFor(%v) = %v/false, want the factor for the 25.000 -> 23.976 drift", slope, factor)
+	}
+	want := targetFPS / dubFPS
+	if math.Abs(factor-want) >= 1e-6 {
+		t.Fatalf("tempo factor = %v, want 23.976/25 = %v", factor, want)
+	}
+	if factor >= 1 {
+		t.Fatalf("tempo factor = %v, want < 1: the 25 fps dub runs fast and must be slowed", factor)
 	}
 }
 

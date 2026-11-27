@@ -418,7 +418,7 @@ describe('sync studio', () => {
   it('renders the trend block with the slope, R² and the applied tempo', async () => {
     const job = makeJob({
       id: 21,
-      calculated_offset_ms: -340,
+      calculated_offset_ms: -355,
       report: makeReport({
         verdict: 'drifting',
         classification: 'drifting',
@@ -430,10 +430,10 @@ describe('sync studio', () => {
           max_residual_ms: 7.9,
           r2: 0.999,
           points: 6,
-          tempo_factor: 1.0427,
+          tempo_factor: 0.95904,
           tempo_applied: true,
         },
-        application: { mode: 're-encoded', note: 're-encoded (tempo 1.0427)' },
+        application: { mode: 're-encoded', note: 're-encoded (tempo 0.95904)' },
       }),
     })
     stubJob(job)
@@ -444,13 +444,14 @@ describe('sync studio', () => {
     expect(within(screen.getByTestId('sync-trend-shape')).getByText('drift')).toBeInTheDocument()
     expect(screen.getByTestId('sync-trend-slope')).toHaveTextContent('+42.7 ms/s')
     expect(screen.getByTestId('sync-trend-r2')).toHaveTextContent('0.999')
-    expect(screen.getByTestId('sync-trend-tempo')).toHaveTextContent('tempo 1.0427 · applied')
-    // The applied offset is the intercept once the tempo removes the slope.
-    expect(screen.getByText('applied offset: -340 ms')).toBeInTheDocument()
+    expect(screen.getByTestId('sync-trend-tempo')).toHaveTextContent('tempo 0.9590 · applied')
+    // The applied offset is the scaled residual: the intercept divided by the
+    // tempo factor, because the encode already stretched the timeline.
+    expect(screen.getByText('applied offset: -355 ms')).toBeInTheDocument()
 
     const row = await screen.findByTestId('sync-job-row-21')
     expect(within(row).getByTestId('sync-job-application-21')).toHaveTextContent(
-      're-encoded (tempo 1.0427)',
+      're-encoded (tempo 0.95904)',
     )
   })
 

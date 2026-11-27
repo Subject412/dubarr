@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -1077,13 +1078,15 @@ func TestDrainSkipsRequeuedJobAndRunsTheJobsBehindIt(t *testing.T) {
 }
 
 // driftReport is the analysis of a clean frame-rate drift: the offsets ramp at
-// 42.7 ms/s (25.000 -> 23.976 fps) from an intercept of -340 ms. The median of
-// the ramp is nowhere near the intercept, which is what makes the
+// 40.96 ms/s (a 25.000 fps dub against a 23.976 fps target) from an intercept of
+// -340 ms, and the tempo factor that removes it is 1 - 40.96/1000 = 0.95904 —
+// below 1, because the dub runs fast and has to be slowed. The median of the
+// ramp is nowhere near the intercept, which is what makes the
 // intercept-as-offset assertion bite.
 func driftReport() analyze.Report {
 	const (
 		intercept = -340.0
-		slope     = 42.7
+		slope     = 40.96
 	)
 	positions := []float64{60, 150, 240, 330, 420, 510}
 	offsets := make([]float64, len(positions))
@@ -1101,7 +1104,7 @@ func driftReport() analyze.Report {
 			R2:            1,
 			Points:        len(positions),
 			Shape:         analyze.ShapeDrift,
-			TempoFactor:   1.0427,
+			TempoFactor:   0.95904,
 		},
 	}
 }
@@ -1124,11 +1127,11 @@ func TestMuxableReport(t *testing.T) {
 		}, false},
 		{"drifting with a compensated drift", analyze.Report{
 			Verdict: analyze.VerdictDrifting,
-			Fit:     &analyze.LineFit{Shape: analyze.ShapeDrift, TempoFactor: 1.0427, TempoApplied: true},
+			Fit:     &analyze.LineFit{Shape: analyze.ShapeDrift, TempoFactor: 0.95904, TempoApplied: true},
 		}, true},
 		{"drifting with an uncompensated drift", analyze.Report{
 			Verdict: analyze.VerdictDrifting,
-			Fit:     &analyze.LineFit{Shape: analyze.ShapeDrift, TempoFactor: 1.0427},
+			Fit:     &analyze.LineFit{Shape: analyze.ShapeDrift, TempoFactor: 0.95904},
 		}, false},
 		{"unreliable with a compensated drift", analyze.Report{
 			Verdict: analyze.VerdictUnreliable,
@@ -1169,8 +1172,20 @@ func TestProcessOnceAppliesDriftTempoInOneEncode(t *testing.T) {
 	if req.Input != staged {
 		t.Fatalf("transcode input = %q, want the staged copy %q", req.Input, staged)
 	}
-	if req.Plan.TempoFactor != 1.0427 {
-		t.Fatalf("plan tempo factor = %v, want 1.0427", req.Plan.TempoFactor)
+	if req.Plan.TempoFactor != 0.95904 {
+		t.Fatalf("plan tempo factor = %v, want 0.95904", req.Plan.TempoFactor)
+	}
+	// Direction: the fixture's offsets ramp UP (+40.96 ms/s), so the dub runs
+	// fast and the correction must slow it. A factor of 1 + slope/1000 (the
+	// sign this slice shipped inverted) would stretch the fast dub further and
+	// double the drift instead of removing it.
+	fixture := driftReport()
+	if fixture.Fit.SlopeMSPerSec <= 0 {
+		t.Fatalf("fixture slope = %v, want a positive ramp", fixture.Fit.SlopeMSPerSec)
+	}
+	if req.Plan.TempoFactor >= 1 || req.Plan.TempoFactor <= 0 {
+		t.Fatalf("plan tempo factor = %v for a positive offset slope, want 0 < factor < 1 (slow the fast dub)",
+			req.Plan.TempoFactor)
 	}
 	// No rule is configured, so the tempo-only plan is materialised as FLAC:
 	// lossless, so a feature the operator never asked for cannot degrade the
@@ -1185,8 +1200,17 @@ func TestProcessOnceAppliesDriftTempoInOneEncode(t *testing.T) {
 	if len(mx.jobs) != 1 {
 		t.Fatalf("Mux calls = %d, want 1", len(mx.jobs))
 	}
-	if got := mx.jobs[0].SyncOffsetMS; got != -340 {
-		t.Fatalf("mux offset = %d ms, want the intercept -340 (median would leave half the drift in place)", got)
+	// The intercept is measured on the uncorrected timeline, and the tempo
+	// encode has already stretched that timeline by the factor — so the
+	// constant mkvmerge shifts by is intercept/factor, not the raw intercept.
+	// A 30 s intercept at 5 ms/s would otherwise leave ~150 ms of shift, well
+	// outside the 40 ms stable band.
+	if want := int64(math.Round(-340 / 0.95904)); want != -355 {
+		t.Fatalf("round(-340/0.95904) = %d, want the fixture's -355", want)
+	}
+	if got := mx.jobs[0].SyncOffsetMS; got != -355 {
+		t.Fatalf("mux offset = %d ms, want round(intercept/tempo_factor) = -355, not the raw intercept -340",
+			got)
 	}
 	if got := mx.jobs[0].AudioPath; got != req.Output {
 		t.Fatalf("mux audio = %q, want the encoded track %q", got, req.Output)
@@ -1202,8 +1226,11 @@ func TestProcessOnceAppliesDriftTempoInOneEncode(t *testing.T) {
 	if rec.Status != statusCompleted {
 		t.Fatalf("status = %q (%s), want completed", rec.Status, rec.ErrorMessage)
 	}
-	if rec.CalculatedOffsetMS != -340 {
-		t.Fatalf("calculated_offset_ms = %d, want the intercept -340", rec.CalculatedOffsetMS)
+	// The persisted offset is the one the job actually muxed with, so it is the
+	// scaled residual too — the Sync page's "applied offset" badge reads it,
+	// and reporting the raw intercept there would disagree with the mux.
+	if rec.CalculatedOffsetMS != -355 {
+		t.Fatalf("calculated_offset_ms = %d, want round(intercept/tempo_factor) = -355", rec.CalculatedOffsetMS)
 	}
 	var stored analyze.Report
 	if err := json.Unmarshal([]byte(rec.CheckpointsJSON), &stored); err != nil {
@@ -1212,8 +1239,10 @@ func TestProcessOnceAppliesDriftTempoInOneEncode(t *testing.T) {
 	if stored.Application == nil {
 		t.Fatalf("stored report has no application block: %s", rec.CheckpointsJSON)
 	}
-	if stored.Application.Mode != "re-encoded" || stored.Application.Note != "re-encoded (tempo 1.0427)" {
-		t.Fatalf("application = %+v, want re-encoded with the tempo note", stored.Application)
+	// %.5f, not %.4f: the factor is 0.95904 and four decimals would print
+	// 0.9590 — a different number from the one the encode was given.
+	if stored.Application.Mode != "re-encoded" || !strings.Contains(stored.Application.Note, "0.95904") {
+		t.Fatalf("application = %+v, want a re-encoded note naming tempo 0.95904", stored.Application)
 	}
 	if stored.Fit == nil || !stored.Fit.TempoApplied {
 		t.Fatalf("stored fit = %+v, want tempo_applied true", stored.Fit)

@@ -126,7 +126,7 @@ func TestPipelineDefaultStrategyIsOutputNeutral(t *testing.T) {
 	// (b) the 0.4.0 path: one engine, no strategy, no routing. The per-window
 	// loop is the body Analyze ran before #82.
 	legacyCfg := pipelineConfig()
-	plan := planFor(t, legacyCfg, req.DurationSec)
+	plan := planForPipeline(t, legacyCfg, req.DurationSec)
 	eng := &scriptedEngine{offsets: wantOffsets, qualities: wantQualities}
 	slicer := legacyCfg.slicer(req)
 	legacyOffsets := make([]float64, len(plan))
@@ -185,8 +185,8 @@ func TestPipelineDefaultStrategyIsOutputNeutral(t *testing.T) {
 	}
 }
 
-// planFor rebuilds the window plan the analysis will use.
-func planFor(t *testing.T, cfg Config, durationSec float64) []Window {
+// planForPipeline rebuilds the window plan the analysis will use.
+func planForPipeline(t *testing.T, cfg Config, durationSec float64) []Window {
 	t.Helper()
 	timing := Timing{
 		Target: SourceTiming{DurationSec: durationSec, OriginKnown: true},
@@ -301,7 +301,7 @@ func TestPipelineAboveDriftRunsOnOutliersOnly(t *testing.T) {
 	cfg.Strategy = secondOpinion(TechniqueMFCC, WhenAboveDrift)
 	cfg.Engines = map[TechniqueID]Engine{TechniqueWaveform: wf, TechniqueMFCC: repair}
 
-	before := FitTimeline(planFor(t, cfg, 600), []float64{1200, 1200, 3200, 1200, 1200, 1200},
+	before := FitTimeline(planForPipeline(t, cfg, 600), []float64{1200, 1200, 3200, 1200, 1200, 1200},
 		[]float64{0.9, 0.9, 0.9, 0.9, 0.9, 0.9}, nil, DefaultThresholds)
 
 	rep, err := Analyze(context.Background(), nil, cfg, request(t.TempDir()))

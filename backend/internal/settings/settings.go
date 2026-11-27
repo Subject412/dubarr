@@ -1290,10 +1290,10 @@ func PresetTechniques(name string) []analyze.Technique {
 // validateStrategy enforces the #82 table on the way in, and stores the preset
 // name the list actually is.
 //
-// The label is derived, never trusted: a client that posts preset "maximum
-// accuracy" with the balanced list gets "balanced" stored, and one that posts a
-// hand-edited list gets "custom". Only an unknown label and an unsound list are
-// errors.
+// The label is only believed where it matches its own canonical list: a client
+// that posts preset "maximum accuracy" with the balanced list gets "custom"
+// stored, never "balanced", and a hand-edited list is "custom" too. Only an
+// unknown label and an unsound list are errors.
 func validateStrategy(p *StrategyOptions) error {
 	s := analyze.Strategy(*p)
 	s.Preset = resolvePreset(s.Preset, s.Techniques)
@@ -1306,19 +1306,25 @@ func validateStrategy(p *StrategyOptions) error {
 
 // resolvePreset answers "which name does this list have?".
 //
-// A label that matches its own preset's canonical list is kept — `fast` and
-// `balanced` share a list, so the label is the only thing that tells them
-// apart, and it is what the operator picked. Anything else is re-derived from
-// the list, and a list that is nobody's canonical list is `custom`. An unknown
-// label is passed through untouched so [analyze.Strategy.Validate] rejects it
-// instead of quietly renaming the operator's choice.
+// A known label whose list is that label's own canonical list is kept — `fast`
+// and `balanced` share a list, so the label is the only thing that tells them
+// apart, and it is what the operator picked. A known label whose list differs
+// is `custom`: an edited preset is never silently promoted to a different
+// preset, even when the edit happens to reproduce that preset's list. An empty
+// label is derived from the list (balanced, then maximum_accuracy), and an
+// unknown label is passed through untouched so [analyze.Strategy.Validate]
+// rejects it instead of quietly renaming the operator's choice.
 func resolvePreset(label string, techniques []analyze.Technique) string {
 	switch label {
-	case "", analyze.PresetFast, analyze.PresetBalanced, analyze.PresetMaximumAccuracy, analyze.PresetCustom:
+	case analyze.PresetFast, analyze.PresetBalanced, analyze.PresetMaximumAccuracy:
+		if sameTechniques(techniques, PresetTechniques(label)) {
+			return label
+		}
+		return analyze.PresetCustom
+	case analyze.PresetCustom:
+		return analyze.PresetCustom
+	case "":
 	default:
-		return label
-	}
-	if label != "" && label != analyze.PresetCustom && sameTechniques(techniques, PresetTechniques(label)) {
 		return label
 	}
 	for _, name := range []string{analyze.PresetBalanced, analyze.PresetMaximumAccuracy} {

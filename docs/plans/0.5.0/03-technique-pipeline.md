@@ -238,15 +238,27 @@ expands a preset; the **UI** rewrites `techniques` when a preset button is
 pressed, and the server forces `preset = "custom"` when the incoming list differs
 from the named preset's canonical list. One rule, one direction:
 
-| Preset | `techniques` |
-|---|---|
-| `balanced` (default) | `[{waveform, always, 0.10, 5.0}]` |
-| `fast` | `[{mfcc, always, 0.10, 5.0}]` |
-| `maximum_accuracy` | `[{waveform, always, 0.10, 5.0}, {mfcc, below_confidence, 0.15, 8.0}]` |
+| Preset | `techniques` | checkpoint budget |
+|---|---|---|
+| `balanced` (default) | `[{waveform, always, 0.10, 5.0}]` | 6 (unchanged) |
+| `fast` | `[{waveform, always, 0.10, 5.0}]` | **3** |
+| `maximum_accuracy` | `[{waveform, always, 0.10, 5.0}, {mfcc, below_confidence, 0.15, 8.0}]` | 6 (unchanged) |
 
-`fast` is genuinely cheaper (MFCC works on 10 ms hop sequences, not a 2^21-point
-FFT per checkpoint) and genuinely coarser (±10 ms), which is what "Fast" means
-and what its tooltip says. `balanced` is 0.4.0's behaviour by construction.
+**Fast measures less, not worse** (ruling D4a): it keeps the waveform matcher, so
+offsets stay sample-exact, and spends fewer checkpoints. An operator who picks
+"Fast" must never silently accept a ±10 ms error on clean material, so MFCC is
+never a preset — it is only reachable by editing the list by hand.
+
+Because the checkpoint count lives in `sync.defaults` (it is a bounds/window
+setting, not a technique), pressing a preset button writes **both** sections:
+`sync.strategy` (the list + label) and, for `fast`/`balanced`, the checkpoint
+count. The tooltip says so in one sentence. The server never expands a preset —
+if the incoming list differs from the named preset's canonical list it forces
+`preset = "custom"`, exactly as below.
+
+`maximum_accuracy` references `mfcc` before slice 04 registers an MFCC engine:
+validation must accept the id, and a technique with no registered engine is
+skipped at run time with a note in the report rather than failing the job.
 
 ### Validation (`settings.validateStrategy`, called from `normalize`)
 

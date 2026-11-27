@@ -21,9 +21,12 @@
 //
 // Rendering order is fixed so every caller agrees: substitute (empty string for
 // an unknown value, never "0"/"nil"), drop the separators an empty token
-// orphaned, remove empty optional groups ((), [], {}) until stable, collapse
-// spaces and dangling dashes, clean, then reject an empty/reserved/over-long
-// stem or one that already ends in .mka.
+// orphaned, remove empty optional groups ((), [], {}) until stable, tidy the
+// space an empty token left just inside a surviving group ("[ 5.1]" ->
+// "[5.1]"), collapse spaces and dangling dashes, clean, then reject an
+// empty/reserved/over-long stem or one that already ends in .mka. [Parse] also
+// refuses at save time a pattern that is statically over the byte cap or that
+// ends in ".mka" itself.
 //
 // The cleaning rules are adapted from Sonarr's
 // NzbDrone.Core/Organizer/{FileNameBuilder,FileNameValidationService} and
@@ -144,9 +147,11 @@ type Template struct {
 // Raw returns the pattern as written, for audit detail and error messages.
 func (t Template) Raw() string { return t.raw }
 
-// Parse turns a pattern into a Template, enforcing the token whitelist and the
-// modifier rules. It performs no rendering, so a template that parses may still
-// be refused by [Validate] or [Template.Render] for what it produces.
+// Parse turns a pattern into a Template, enforcing the token whitelist, the
+// modifier rules and the static rules a pattern can never satisfy (a trailing
+// ".mka", a minimum rendered length over [MaxStemBytes]). It performs no
+// rendering, so a template that parses may still be refused by [Validate] or
+// [Template.Render] for what its values produce.
 func Parse(raw string) (Template, error) {
 	tmpl := Template{raw: raw}
 	var lit strings.Builder
@@ -179,7 +184,40 @@ func Parse(raw string) (Template, error) {
 		}
 	}
 	flush()
+	if err := tmpl.checkStatic(); err != nil {
+		return Template{}, err
+	}
 	return tmpl, nil
+}
+
+// checkStatic refuses a pattern that cannot render a legal stem for *any*
+// track, so a hopeless pattern fails at save time instead of on the first
+// file: the literal bytes plus one byte per token (the shortest a value can
+// render) must fit [MaxStemBytes], and the pattern must not already end in
+// ".mka" because [VaultPath] appends ".<iso2>.mka" ("….mka.pl.mka").
+//
+// A pattern that only grows past the cap once real values are substituted is a
+// per-file error in [cleanStem], not a pattern error.
+func (t Template) checkStatic() error {
+	if len(t.parts) == 0 {
+		return nil // a blank pattern renders nothing; Validate refuses it.
+	}
+	minBytes := 0
+	for _, p := range t.parts {
+		if p.tok == tokenLiteral {
+			minBytes += len(p.lit)
+			continue
+		}
+		minBytes++
+	}
+	if minBytes > MaxStemBytes {
+		return fmt.Errorf("the pattern renders at least %d bytes; the limit is %d", minBytes, MaxStemBytes)
+	}
+	last := t.parts[len(t.parts)-1]
+	if last.tok == tokenLiteral && strings.EqualFold(filepath.Ext(strings.TrimSpace(last.lit)), VaultSuffix) {
+		return fmt.Errorf("the pattern must not end in %s: the vault appends .<language>%s", VaultSuffix, VaultSuffix)
+	}
+	return nil
 }
 
 func parseToken(body string) (part, error) {
@@ -367,18 +405,26 @@ var (
 	reEmptyParen   = regexp.MustCompile(`\([[:space:]]*\)`)
 	reEmptyBracket = regexp.MustCompile(`\[[[:space:]]*\]`)
 	reEmptyBrace   = regexp.MustCompile(`\{[[:space:]]*\}`)
+	reOpenGap      = regexp.MustCompile(`([(\[{])[[:space:]]+`)
+	reCloseGap     = regexp.MustCompile(`[[:space:]]+([)\]\}])`)
 	reDashRun      = regexp.MustCompile(`(?:[[:space:]]*-[[:space:]]*){2,}`)
 )
 
 // collapse applies the documented cleanup until it stops changing the string:
-// empty groups, repeated spaces, repeated dashes, dangling separators. Looping
-// matters because removing one group can expose another ("[ () ]").
+// empty groups, spaces just inside a surviving group, repeated spaces, repeated
+// dashes, dangling separators. Looping matters because removing one group can
+// expose another ("[ () ]").
 func collapse(s string) string {
 	for {
 		before := s
 		s = reEmptyParen.ReplaceAllString(s, "")
 		s = reEmptyBracket.ReplaceAllString(s, "")
 		s = reEmptyBrace.ReplaceAllString(s, "")
+		// An empty token inside a group leaves its neighbouring separator
+		// space behind ("[ 5.1]" when only {Channels} has a value), so the
+		// space next to the delimiter goes too.
+		s = reOpenGap.ReplaceAllString(s, "$1")
+		s = reCloseGap.ReplaceAllString(s, "$1")
 		s = reSpaces.ReplaceAllString(s, " ")
 		s = reDashRun.ReplaceAllString(s, " - ")
 		s = strings.Trim(s, " ")

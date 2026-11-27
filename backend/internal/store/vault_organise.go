@@ -48,18 +48,18 @@ const organiseTimeLayout = "2006-01-02 15:04:05"
 // from the release name (ADR-0014), so the token renders empty and the cleanup
 // removes the separator it leaves behind.
 type VaultTrackPlanRow struct {
-	TrackID     int64
-	MediaID     int64
-	MediaType   string
-	Title       string
-	Year        int
-	Season      *int
-	Episode     *int
-	Variant     string
-	Codec       string
-	Channels    string
-	LangISO2    string
-	FilePath    string
+	TrackID   int64
+	MediaID   int64
+	MediaType string
+	Title     string
+	Year      int
+	Season    *int
+	Episode   *int
+	Variant   string
+	Codec     string
+	Channels  string
+	LangISO2  string
+	FilePath  string
 	// MediaFolderPath is vault_media.vault_folder_path: the folder Dubarr
 	// already owns, never re-derived from a template.
 	MediaFolderPath string
@@ -160,9 +160,9 @@ func (s *Store) VaultTrackPlanRows(ctx context.Context, mediaType string, ids []
 // TrackPathUpdate is one guarded file_path rewrite: To applies only while the
 // row still holds From.
 type TrackPathUpdate struct {
-	TrackID   int64
-	From      string
-	To        string
+	TrackID int64
+	From    string
+	To      string
 }
 
 // UpdateTrackPathsTx rewrites file_path for every update inside the caller's

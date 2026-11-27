@@ -257,9 +257,9 @@ func TestJobsInFlight(t *testing.T) {
 			t.Fatalf("insert job: %v", err)
 		}
 	}
-	insertJob(f.episode1.ID, nil, SyncJobHeld)          // referencing, not blocking
+	insertJob(f.episode1.ID, nil, SyncJobHeld)             // referencing, not blocking
 	insertJob(f.episode2.ID, f.episode1.ID, SyncJobMuxing) // referencing and blocking
-	insertJob(f.movieTrack.ID, nil, SyncJobQueued)      // referencing, not blocking
+	insertJob(f.movieTrack.ID, nil, SyncJobQueued)         // referencing, not blocking
 
 	counts, err := f.store.JobsInFlight(ctx, []int64{f.episode1.ID, f.episode2.ID})
 	if err != nil {

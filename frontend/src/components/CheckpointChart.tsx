@@ -1,4 +1,4 @@
-import type { SyncCheckpoint, SyncFit } from '../lib/api'
+import type { SyncBoundary, SyncCheckpoint, SyncFit } from '../lib/api'
 
 const WIDTH = 640
 const HEIGHT = 220
@@ -12,6 +12,31 @@ const QUALITY_HEIGHT = 26
 function clampPosition(pct: number): number {
   if (!Number.isFinite(pct)) return 0
   return Math.min(100, Math.max(0, pct))
+}
+
+/**
+ * The film's length, recovered from the checkpoints themselves: each one reports
+ * the centre of its slice in both units (`position_pct` is that centre as a
+ * percentage of the film, `slice_start_sec`/`slice_len_sec` are that same centre
+ * in seconds), so `(start + len/2)·100/pct` is the duration. A boundary arrives
+ * in film seconds while this chart's x-axis is percent, and the report carries
+ * no duration of its own — hence the median estimate rather than a new field.
+ */
+function filmDurationSec(checkpoints: SyncCheckpoint[]): number | null {
+  const estimates = checkpoints
+    .filter(
+      (cp) =>
+        cp.position_pct > 0 &&
+        Number.isFinite(cp.slice_start_sec) &&
+        Number.isFinite(cp.slice_len_sec),
+    )
+    .map((cp) => ((cp.slice_start_sec + cp.slice_len_sec / 2) * 100) / cp.position_pct)
+    .filter((value) => Number.isFinite(value) && value > 0)
+    .sort((a, b) => a - b)
+  if (estimates.length === 0) return null
+  // Clamped windows at either end make a single estimate sloppy; the median is
+  // the middle of the film's own evidence and is exact for a dense plan.
+  return estimates[Math.floor(estimates.length / 2)]
 }
 
 /**
@@ -29,7 +54,20 @@ function clampPosition(pct: number): number {
  * waveform would have nothing to play. This pure-SVG chart carries the same
  * per-checkpoint information (offset + quality) with zero new dependencies.
  */
-export function CheckpointChart({ checkpoints, fit }: { checkpoints: SyncCheckpoint[]; fit?: SyncFit }) {
+export function CheckpointChart({
+  checkpoints,
+  fit,
+  boundaries,
+}: {
+  checkpoints: SyncCheckpoint[]
+  fit?: SyncFit
+  /**
+   * Accepted joins from a piecewise plan (#84). Each is drawn as a dashed
+   * vertical marker in film time; a rejected plan's boundaries are not evidence
+   * and the caller passes none, so nothing is drawn for a plan nobody trusts.
+   */
+  boundaries?: SyncBoundary[]
+}) {
   if (checkpoints.length === 0) {
     return <p className="text-sm text-zinc-500">No checkpoints in this report.</p>
   }
@@ -64,6 +102,20 @@ export function CheckpointChart({ checkpoints, fit }: { checkpoints: SyncCheckpo
         )
     : []
   const fitLine = fitPoints.length >= 2 ? fitPoints.join(' ') : null
+
+  // Accepted joins, on the same x scale as the dots. Nothing else about the
+  // plot moves: these are markers, not a second geometry.
+  const duration = filmDurationSec(checkpoints)
+  const boundaryMarkers =
+    duration == null
+      ? []
+      : (boundaries ?? [])
+          .filter((boundary) => Number.isFinite(boundary.at_sec))
+          .map((boundary) => ({
+            at: boundary.at_sec,
+            pct: (boundary.at_sec / duration) * 100,
+            uncertainty: Number.isFinite(boundary.uncertainty_sec) ? boundary.uncertainty_sec : 0,
+          }))
 
   return (
     <figure className="w-full">
@@ -131,6 +183,28 @@ export function CheckpointChart({ checkpoints, fit }: { checkpoints: SyncCheckpo
             strokeDasharray="6 4"
           />
         )}
+
+        {/*
+          A join is drawn under the dots so it cannot hide one: where the dub
+          was re-cut, the offset steps by thousands of milliseconds and the
+          dots either side are the evidence for it.
+        */}
+        {boundaryMarkers.map((marker, index) => (
+          <line
+            key={`boundary-${index}`}
+            data-testid={`boundary-marker-${index}`}
+            data-at-sec={marker.at}
+            x1={x(marker.pct)}
+            x2={x(marker.pct)}
+            y1={TOP}
+            y2={TOP + plotHeight}
+            stroke="#f59e0b"
+            strokeWidth={1.5}
+            strokeDasharray="5 4"
+          >
+            <title>{`join at ${marker.at.toFixed(1)} s ± ${marker.uncertainty.toFixed(1)} s`}</title>
+          </line>
+        ))}
 
         {checkpoints.map((cp, index) => {
           const quality = Math.min(1, Math.max(0, cp.correlation_quality))

@@ -1,4 +1,4 @@
-import type { SyncPreset, SyncStrategy, SyncTechnique } from './api'
+import type { SyncPiecewisePolicy, SyncPreset, SyncStrategy, SyncTechnique } from './api'
 
 /**
  * The SPA's one copy of the preset tables (#82).
@@ -119,6 +119,41 @@ export const PRESET_TECHNIQUES: Record<PresetName, () => SyncTechnique[]> = {
 export const PRESET_POSITIONS_PCT: Partial<Record<PresetName, number[]>> = {
   fast: [15, 50, 85],
   balanced: [10, 25, 40, 55, 70, 85],
+}
+
+/**
+ * The segmentation block at its documented defaults (#84, D5): off, sampling
+ * every 45 s with a 60 s window, a 250 ms split penalty, no segment shorter
+ * than two minutes and at most a dozen of them — `analyze.DefaultPiecewisePolicy`,
+ * field for field.
+ *
+ * `DEFAULT_SETTINGS['sync.strategy']` keeps its own literal because a Go test
+ * brace-scans that file; this copy is what the editors seed a section written
+ * before 0.5.0 with, and the settings test pins the two together.
+ */
+export const DEFAULT_PIECEWISE: SyncPiecewisePolicy = {
+  enabled: false,
+  step_sec: 45,
+  window_sec: 60,
+  split_penalty_ms: 250,
+  min_segment_sec: 120,
+  max_segments: 12,
+}
+
+/**
+ * The segmentation block each starting point stands for — `settings.Preset`,
+ * which keeps the documented (off) block in all three. The block is part of the
+ * section that `resolvePreset` compares, so a press that left segmentation on
+ * would be stored as `custom` while the button still claimed a starting point;
+ * a press therefore stores the preset's own block.
+ *
+ * Functions and a fresh object per call, for the same reason as the lists: the
+ * editor edits the object it is handed.
+ */
+export const PRESET_PIECEWISE: Record<PresetName, () => SyncPiecewisePolicy> = {
+  fast: () => ({ ...DEFAULT_PIECEWISE }),
+  balanced: () => ({ ...DEFAULT_PIECEWISE }),
+  maximum_accuracy: () => ({ ...DEFAULT_PIECEWISE }),
 }
 
 /**

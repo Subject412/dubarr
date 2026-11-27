@@ -78,6 +78,18 @@ export const SETTINGS_HELP: Record<SettingsSectionKey, Record<string, string>> =
       'How good a match must be before this step is believed. 0.10 is the shipped floor: lower accepts more answers, including wrong ones, and higher sends more checkpoints to the next step, or to review when this is the last one.',
     min_match_z:
       'How far the match has to stand out from the rest of the curve, in standard deviations: 5 is the point where a human should look at the result and 10 is almost certainly right. Raising it rejects doubtful matches at the cost of more checkpoints falling through to the next step; lower it only when a difficult release keeps coming back as unreliable.',
+    piecewise_enabled:
+      'Some dubbed releases are cut differently from your copy: the film was extended with extra scenes, or a scene was replaced. The dub then needs a different offset before and after that point, and one offset cannot fit the whole track. With this on, Dubarr listens across the whole film and shifts each part of the dub on its own. Use it when the sync looks right at the start and wrong later — the offset grows through the film and jumps at a scene change. Cost: the analysis visits the whole film instead of six points, which is several minutes more for a feature, and the dub copy is re-encoded once, losslessly, because it has to be cut and rejoined. Your video is never touched. If a join cannot be placed confidently, nothing is guessed: the job keeps the single best offset and asks you to look at it.',
+    piecewise_step_sec:
+      'How often Dubarr samples the film while looking for a cut. A shorter interval places the join more precisely and costs proportionally more analysis time; 45 s locates it to within about ±22 s. Allowed 15..300 s, and the sample length may be at most twice this.',
+    piecewise_window_sec:
+      'How much audio is compared at each sample. Longer survives more noise but blurs a join that sits close to a hard cut. Allowed 20..190 s, and at most twice the sampling interval.',
+    piecewise_split_penalty_ms:
+      'How much better a two-part explanation must fit before another segment is believed. Higher means fewer, more certain segments; lower finds subtle re-cuts but invents segments in noisy material. Allowed 50..5000 ms; 250 ms is the shipped value.',
+    piecewise_min_segment_sec:
+      'Segments shorter than this are merged into their neighbour, because a very short segment is far more likely to be a measurement accident than a real edit. Allowed 30..3600 s.',
+    piecewise_max_segments:
+      'A cap on the result. A real re-cut has a handful of joins; a hit count in the dozens means the boundaries are noise. Allowed 2..40.',
   },
   'mux.options': {
     track_title_in_mkv: 'Track title written into the Matroska container for the muxed audio.',

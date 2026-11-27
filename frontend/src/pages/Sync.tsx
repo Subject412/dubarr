@@ -10,6 +10,7 @@ import type {
   SyncStrategy,
   SyncTechnique,
 } from '../lib/api'
+import { piecewiseCut } from '../lib/api'
 import {
   useCreateSyncJob,
   useDebouncedValue,
@@ -54,6 +55,11 @@ function createdAtLabel(created?: string): string {
 
 function formatMs(value: number): string {
   return `${Math.round(value)} ms`
+}
+
+/** Film seconds, for a segment edge or a join: one decimal, like the trend block. */
+function formatSec(value: number): string {
+  return `${value.toFixed(1)} s`
 }
 
 /**
@@ -375,6 +381,97 @@ function TrendBlock({ fit }: { fit?: SyncFit }) {
   )
 }
 
+/**
+ * D11: what a piecewise job did, why it was done and what it cost. The block
+ * only appears on a report whose plan was accepted AND found a join, so it can
+ * never describe a cut the worker did not apply.
+ */
+const PIECEWISE_HELP =
+  'The dub needed a different offset before and after a scene the two releases do ' +
+  'not share. Dubarr cut the dub copy at the join, shifted each part on its own ' +
+  'and rejoined it in one lossless pass, so the mux needed no further offset. ' +
+  'Your video file was not touched, and a join is only listed when the analysis ' +
+  'was confident enough to place it.'
+
+/**
+ * The segmentation a piecewise job applied (#84): one row per run of the film,
+ * and the joins between them with the uncertainty the sampling step implies.
+ *
+ * A rejected plan renders nothing here — `piecewiseCut` is false for it — so the
+ * table can only ever show a plan that was used, and the review badge is what
+ * explains a fallback.
+ */
+function PiecewiseBlock({ report }: { report: SyncReport }) {
+  if (!piecewiseCut(report.piecewise)) return null
+
+  const segments = report.piecewise?.segments ?? []
+  const boundaries = report.piecewise?.boundaries ?? []
+  // The application block is the worker's own count; the list is the evidence.
+  const count = report.application?.segment_count ?? segments.length
+
+  return (
+    <section data-testid="sync-piecewise" className="space-y-2">
+      <div className="flex items-center gap-1.5">
+        <h3 className="text-[11px] uppercase tracking-wider text-zinc-500">Segments</h3>
+        <InfoTip id={helpIdFor('Segments')} label="Segments" text={PIECEWISE_HELP} />
+      </div>
+      <p data-testid="piecewise-count" className="text-xs text-zinc-400">
+        The dub was cut into {count} segments and rejoined in one pass; each segment carries its own
+        offset.
+      </p>
+      <div className="overflow-x-auto">
+        <table className="w-full text-left text-xs">
+          <thead>
+            <tr className="border-b border-ink-800 text-[11px] uppercase tracking-wider text-zinc-500">
+              <th className="py-1.5 pr-3 font-medium">Start</th>
+              <th className="py-1.5 pr-3 font-medium">End</th>
+              <th className="py-1.5 pr-3 font-medium">Offset</th>
+              <th className="py-1.5 pr-3 font-medium">Confidence</th>
+              <th className="py-1.5 font-medium">Points</th>
+            </tr>
+          </thead>
+          <tbody>
+            {segments.map((segment, index) => (
+              <tr
+                key={`${segment.start_sec}-${index}`}
+                data-testid={`piecewise-row-${index}`}
+                className="border-b border-ink-800/60 text-zinc-300 last:border-0"
+              >
+                <td className="py-1.5 pr-3 font-mono">{formatSec(segment.start_sec)}</td>
+                <td className="py-1.5 pr-3 font-mono">{formatSec(segment.end_sec)}</td>
+                <td className="py-1.5 pr-3 font-mono">{formatMs(segment.offset_ms)}</td>
+                <td className="py-1.5 pr-3 font-mono">{segment.confidence.toFixed(2)}</td>
+                <td className="py-1.5 font-mono">{segment.points}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {boundaries.length > 0 && (
+        <div className="space-y-1">
+          <h4 className="text-[11px] uppercase tracking-wider text-zinc-500">Joins</h4>
+          <ul
+            data-testid="sync-piecewise-boundaries"
+            className="space-y-0.5 text-xs text-zinc-400"
+          >
+            {boundaries.map((boundary, index) => (
+              <li
+                key={`${boundary.at_sec}-${index}`}
+                data-testid={`piecewise-boundary-${index}`}
+                className="font-mono"
+              >
+                {formatSec(boundary.at_sec)} ± {boundary.uncertainty_sec.toFixed(1)} s ·{' '}
+                {boundary.step_ms < 0 ? '−' : '+'}
+                {Math.abs(Math.round(boundary.step_ms))} ms
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </section>
+  )
+}
+
 function JobRow({
   job,
   selected,
@@ -472,6 +569,16 @@ function ReportView({ report, calculatedOffsetMs }: { report: SyncReport; calcul
             <Badge tone="neutral">{precisionLabel(precision)}</Badge>
           </span>
         )}
+        {/*
+          D5: a job the verdict alone would not have flagged still needs a human
+          when the segmentation was refused. The reason is the server's own
+          sentence, printed as given — never re-worded into a claim of ours.
+        */}
+        {report.review_reason && (
+          <span data-testid="sync-review-reason">
+            <Badge tone="warning">review: {report.review_reason}</Badge>
+          </span>
+        )}
       </div>
 
       <dl className="grid gap-3 sm:grid-cols-4">
@@ -501,7 +608,15 @@ function ReportView({ report, calculatedOffsetMs }: { report: SyncReport; calcul
 
       {report.reason && <Alert tone="warning">{report.reason}</Alert>}
 
-      <CheckpointChart checkpoints={report.checkpoints} fit={report.fit} />
+      <PiecewiseBlock report={report} />
+
+      <CheckpointChart
+        checkpoints={report.checkpoints}
+        fit={report.fit}
+        // Only an accepted plan's joins are evidence: a rejected one keeps the
+        // dominant offset, so its boundaries are not drawn at all.
+        boundaries={piecewiseCut(report.piecewise) ? report.piecewise?.boundaries : undefined}
+      />
 
       <StrategySummary strategy={report.strategy} notes={report.notes} />
 

@@ -168,6 +168,11 @@ export type SyncTechnique = {
 export type SyncStrategy = {
   preset: SyncPreset
   techniques: SyncTechnique[]
+  /**
+   * The segmentation block (#84). Absent in a section written before 0.5.0,
+   * which means the same as the documented default at `enabled: false`.
+   */
+  piecewise?: SyncPiecewisePolicy
 }
 
 export type SecurityOptions = {
@@ -529,12 +534,100 @@ export type SyncFit = {
   tempo_applied?: boolean
 }
 
+/** One run of the film during which the offset is constant (`analyze.Segment`). */
+export type SyncSegment = {
+  /** Start of the run in the TARGET timeline, in film seconds. */
+  start_sec: number
+  /** End of the run in the TARGET timeline, in film seconds. */
+  end_sec: number
+  /** The offset applied for this run alone. */
+  offset_ms: number
+  /** The weakest checkpoint in the run, 0..1: the run is only as good as it. */
+  confidence: number
+  /** How many checkpoints the run rests on. */
+  points: number
+}
+
+/** Where one segment ends and the next begins, in film time (`analyze.Boundary`). */
+export type SyncBoundary = {
+  at_sec: number
+  /** Half the sampling step: how precisely the join is known, not more. */
+  uncertainty_sec: number
+  /** The offset change across the join, in milliseconds. */
+  step_ms: number
+}
+
+/**
+ * The segmentation result of a `piecewise` job (`analyze.Piecewise`, #84).
+ *
+ * Every field is optional so both directions stay tolerant: a 0.4.0 report has
+ * no block at all, and a 0.5.0 report whose piecewise settings were off has no
+ * block either — that absence is how a reader tells "never ran" from "ran and
+ * found nothing" (which is a single segment and no rejection).
+ *
+ * `accepted` and `cut` are methods in Go, not wire fields, so they are derived
+ * here by [piecewiseAccepted] and [piecewiseCut].
+ */
+export type SyncPiecewise = {
+  segments?: SyncSegment[]
+  boundaries?: SyncBoundary[]
+  /** The offset a rejected plan falls back to: the median over every point. */
+  dominant_offset_ms?: number
+  /** The sampling step the plan actually used; widened past `MaxDenseSamples`. */
+  step_sec?: number
+  /** Why the plan was refused; empty (absent) on success. */
+  rejected_reason?: string
+}
+
+/**
+ * Whether the segmentation is a plan the job could use: nothing was rejected.
+ * A single-segment plan is accepted as what it is — the ordinary constant-offset
+ * job — so it must not read as a failure.
+ */
+export function piecewiseAccepted(piecewise?: SyncPiecewise): boolean {
+  return Boolean(piecewise) && !(piecewise?.rejected_reason ?? '').trim()
+}
+
+/** Whether the accepted plan actually found a join: only that is a re-cut. */
+export function piecewiseCut(piecewise?: SyncPiecewise): boolean {
+  return piecewiseAccepted(piecewise) && (piecewise?.segments?.length ?? 0) > 1
+}
+
+/**
+ * The `sync.strategy.piecewise` settings block (`analyze.PiecewisePolicy`, #84):
+ * the policy a job is analysed under, as opposed to [SyncPiecewise], the result
+ * a report carries. Off by default (D5) — a piecewise job re-encodes the
+ * operator's dub copy, which nobody should pay for a film that needed one
+ * offset.
+ *
+ * Every field is optional because a section written before 0.5.0 has no block
+ * at all, which reads as the documented default at `enabled: false`. The
+ * ranges the server validates are on each field.
+ */
+export type SyncPiecewisePolicy = {
+  enabled?: boolean
+  /** How often the timeline is sampled: 15..300 s. */
+  step_sec?: number
+  /** How much audio each dense checkpoint compares: 20..190 s, at most 2× step. */
+  window_sec?: number
+  /** How much better a split must fit before it is believed: 50..5000 ms. */
+  split_penalty_ms?: number
+  /** Runs shorter than this are merged into their neighbour: 30..3600 s. */
+  min_segment_sec?: number
+  /** A cap on the result: 2..40. */
+  max_segments?: number
+}
+
 /** What was done to the dub copy before the mux, so a row can say it in words. */
 export type SyncApplication = {
-  /** `copy` | `re-encoded` */
+  /** `copy` | `re-encoded` | `piecewise` */
   mode: string
   /** e.g. `copied untouched`, `re-encoded (tempo 0.95904)` */
   note: string
+  /** How many runs of the film a piecewise render cut and placed separately. */
+  segment_count?: number
+  /** The same runs the report segmented (`analyze.Application.Segments`). */
+  segments?: SyncSegment[]
 }
 
 export type SyncReport = {
@@ -556,6 +649,18 @@ export type SyncReport = {
   application?: SyncApplication
   /** What this job ran, so a report is self-describing; absent before 0.5.0. */
   strategy?: SyncStrategy
+  /**
+   * The segmentation result (#84); absent when the feature was off, so a plain
+   * 0.4.0-shaped report stays byte-identical. See [piecewiseCut].
+   */
+  piecewise?: SyncPiecewise
+  /**
+   * One operator-facing sentence saying why a job needs a human look even
+   * though the verdict alone does not demand it — today "the cut was not
+   * confident, the dominant offset was applied" (D5). Distinct from `reason`,
+   * which belongs to the reference-language resolver.
+   */
+  review_reason?: string
   /**
    * A configured technique that did not run in this build (no engine for it),
    * so the report says why instead of quietly doing less. Absent for the

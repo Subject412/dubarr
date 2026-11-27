@@ -152,6 +152,15 @@ type RunResponse struct {
 	Unchanged int    `json:"unchanged"`
 }
 
+// RunFileRow is one audited file of a needs_attention run: the paths involved
+// and the machine name of what happened to it. Result is the closed vocabulary
+// (reconciled, failed), so the UI translates it and never parses prose.
+type RunFileRow struct {
+	SourcePath      string `json:"source_path"`
+	DestinationPath string `json:"destination_path"`
+	Result          string `json:"result"`
+}
+
 // RunRow is one audit run as the history table renders it.
 type RunRow struct {
 	ID         int64  `json:"id"`
@@ -162,6 +171,11 @@ type RunRow struct {
 	FileCount  int    `json:"file_count"`
 	Actor      string `json:"actor,omitempty"`
 	Detail     string `json:"detail,omitempty"`
+	// Files is populated ONLY for a needs_attention run, and only with the
+	// audited files a human has to look at (reconciled, failed). The payload is
+	// only interesting when a run did not finish cleanly, so an applied run
+	// stays one row with no list. file_count is present for every run (#127).
+	Files []RunFileRow `json:"files,omitempty"`
 }
 
 type runsResponse struct {
@@ -462,6 +476,8 @@ func (s *Service) handleOrganiseRuns(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	items := make([]RunRow, 0, len(rows))
+	attentionIDs := make([]int64, 0, len(rows))
+	attentionAt := make(map[int64]int, len(rows))
 	for _, row := range rows {
 		items = append(items, RunRow{
 			ID:         row.ID,
@@ -473,6 +489,34 @@ func (s *Service) handleOrganiseRuns(w http.ResponseWriter, r *http.Request) {
 			Actor:      row.Actor,
 			Detail:     row.Detail,
 		})
+		// Only a run that did not finish cleanly carries a file list (#127):
+		// the ordinary applied row stays exactly one row, with file_count.
+		if row.Status == store.OrganiseStatusNeedsAttention {
+			attentionAt[row.ID] = len(items) - 1
+			attentionIDs = append(attentionIDs, row.ID)
+		}
+	}
+	if len(attentionIDs) > 0 {
+		filesByRun, err := s.store.ListOrganiseFilesForRuns(r.Context(), attentionIDs)
+		if err != nil {
+			internalFailure(err).write(w)
+			return
+		}
+		for runID, files := range filesByRun {
+			at, ok := attentionAt[runID]
+			if !ok || len(files) == 0 {
+				continue
+			}
+			runFiles := make([]RunFileRow, 0, len(files))
+			for _, f := range files {
+				runFiles = append(runFiles, RunFileRow{
+					SourcePath:      f.SourcePath,
+					DestinationPath: f.DestinationPath,
+					Result:          f.Result,
+				})
+			}
+			items[at].Files = runFiles
+		}
 	}
 	writeJSON(w, http.StatusOK, runsResponse{Items: items})
 }

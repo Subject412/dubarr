@@ -245,6 +245,74 @@ func TestInsertOrganiseRunAndList(t *testing.T) {
 	}
 }
 
+func TestListOrganiseFilesForRunsFiltersAndOrders(t *testing.T) {
+	f := seedOrganiseFixture(t)
+	ctx := context.Background()
+
+	attentionID, err := f.store.InsertOrganiseRun(ctx, OrganiseRunRecord{
+		PlanHash:  "sha256:attention",
+		FileCount: 4,
+		Status:    OrganiseStatusNeedsAttention,
+		Detail:    "stage=rename: injected",
+		Files: []OrganiseFileRecord{
+			// Deliberately not in path order: the read orders by source_path.
+			{SourcePath: "/vault/zeta.pl.mka", DestinationPath: "/vault/zeta-new.pl.mka", Result: OrganiseResultFailed},
+			{SourcePath: "/vault/beta.pl.mka", DestinationPath: "/vault/beta-new.pl.mka", Result: OrganiseResultRenamed},
+			{SourcePath: "/vault/alpha.pl.mka", DestinationPath: "/vault/alpha-new.pl.mka", Result: OrganiseResultReconciled},
+			{SourcePath: "/vault/gamma.pl.mka", DestinationPath: "/vault/gamma.pl.mka", Result: OrganiseResultRenamedBack},
+		},
+	})
+	if err != nil {
+		t.Fatalf("InsertOrganiseRun(needs_attention): %v", err)
+	}
+	appliedID, err := f.store.InsertOrganiseRun(ctx, OrganiseRunRecord{
+		PlanHash: "sha256:applied", FileCount: 1, Status: OrganiseStatusApplied,
+		Files: []OrganiseFileRecord{
+			{SourcePath: "/vault/one.pl.mka", DestinationPath: "/vault/one-new.pl.mka", Result: OrganiseResultRenamed},
+		},
+	})
+	if err != nil {
+		t.Fatalf("InsertOrganiseRun(applied): %v", err)
+	}
+
+	files, err := f.store.ListOrganiseFilesForRuns(ctx, []int64{attentionID, appliedID})
+	if err != nil {
+		t.Fatalf("ListOrganiseFilesForRuns: %v", err)
+	}
+	if _, ok := files[appliedID]; ok {
+		t.Fatalf("an applied run with only renamed rows came back: %+v", files[appliedID])
+	}
+	rows := files[attentionID]
+	if len(rows) != 2 {
+		t.Fatalf("rows = %+v, want exactly reconciled and failed", rows)
+	}
+	if rows[0].SourcePath != "/vault/alpha.pl.mka" || rows[0].Result != OrganiseResultReconciled {
+		t.Fatalf("row 0 = %+v, want the reconciled alpha row ordered by source path", rows[0])
+	}
+	if rows[1].SourcePath != "/vault/zeta.pl.mka" || rows[1].Result != OrganiseResultFailed {
+		t.Fatalf("row 1 = %+v, want the failed zeta row", rows[1])
+	}
+	if rows[1].DestinationPath != "/vault/zeta-new.pl.mka" || rows[1].RunID != attentionID {
+		t.Fatalf("row 1 = %+v, want destination and run id kept", rows[1])
+	}
+
+	// An empty list is answered without a query (no IN () syntax error).
+	empty, err := f.store.ListOrganiseFilesForRuns(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListOrganiseFilesForRuns(nil): %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("nil run ids = %+v, want an empty map", empty)
+	}
+	unknown, err := f.store.ListOrganiseFilesForRuns(ctx, []int64{4242})
+	if err != nil {
+		t.Fatalf("ListOrganiseFilesForRuns(unknown): %v", err)
+	}
+	if len(unknown) != 0 {
+		t.Fatalf("unknown run id = %+v, want an empty map", unknown)
+	}
+}
+
 func TestJobsInFlight(t *testing.T) {
 	f := seedOrganiseFixture(t)
 	ctx := context.Background()

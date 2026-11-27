@@ -10,7 +10,7 @@ import (
 	"github.com/Subject412/dubarr/backend/internal/arr/arrmock"
 )
 
-// tagFixtures carries the /api/v3/tag payload both products expose.
+// tagFixtures carries the {base}/tag payload both products expose.
 func tagFixtures() arrmock.Fixtures {
 	return arrmock.Fixtures{
 		Tags: []arrmock.Tag{
@@ -51,11 +51,16 @@ func TestTagsReadsFromMock(t *testing.T) {
 				t.Errorf("tags = %+v", tags)
 			}
 
-			// Mock parity: the fake saw GET /api/v3/tag with the key.
+			// Mock parity: the fake saw GET {apiBase}/tag with the key. Each
+			// product is asked at its own base — Sonarr v5, Radarr v3.
+			wantPath := "/api/v3/tag"
+			if kind == arrmock.Sonarr {
+				wantPath = "/api/v5/tag"
+			}
 			reqs := srv.Requests()
 			last := reqs[len(reqs)-1]
-			if last.Method != "GET" || last.Path != "/api/v3/tag" {
-				t.Errorf("last request = %s %s, want GET /api/v3/tag", last.Method, last.Path)
+			if last.Method != "GET" || last.Path != wantPath {
+				t.Errorf("last request = %s %s, want GET %s", last.Method, last.Path, wantPath)
 			}
 			if last.APIKey != srv.APIKey() {
 				t.Errorf("X-Api-Key = %q, want the configured key", last.APIKey)

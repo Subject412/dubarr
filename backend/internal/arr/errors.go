@@ -58,3 +58,46 @@ func (e *StatusError) Error() string {
 
 // Is reports whether target is ErrUnexpectedStatus.
 func (e *StatusError) Is(target error) bool { return target == ErrUnexpectedStatus }
+
+// APIVersionError reports an instance that does not serve the API version
+// dubarr requires. Dubarr speaks only the newest API each product ships
+// (Sonarr 5, Radarr 3) and never probes for an older one, so this failure is
+// deliberately loud and specific: it names the product, the version expected
+// and the path tried. It carries no response body and no credential.
+type APIVersionError struct {
+	// Kind is the product dubarr was talking to.
+	Kind Kind
+	// APIBase is the base path requested, e.g. "/api/v5".
+	APIBase string
+	// Code is the HTTP status the instance answered with (404).
+	Code int
+	// Err is the status error this was derived from, so the failure still
+	// classifies as ErrUnexpectedStatus for callers that only know the
+	// generic class.
+	Err *StatusError
+}
+
+// Error implements error.
+func (e *APIVersionError) Error() string {
+	product, version := requiredAPI(e.Kind)
+	return fmt.Sprintf("%s: this instance does not serve %s (%d) — dubarr %s requires %s %s",
+		e.Kind, e.APIBase, e.Code, pinnedRelease, product, version)
+}
+
+// Unwrap exposes the underlying *StatusError.
+func (e *APIVersionError) Unwrap() error {
+	if e.Err == nil {
+		return nil
+	}
+	return e.Err
+}
+
+// requiredAPI names the product and the API release line dubarr requires from
+// it. The constructors pick the base path; this maps the same choice onto the
+// words an operator reads in the connection test.
+func requiredAPI(kind Kind) (product, version string) {
+	if kind == KindSonarr {
+		return "Sonarr", "5.x"
+	}
+	return "Radarr", "3.x"
+}

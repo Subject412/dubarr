@@ -1,10 +1,10 @@
-// arr /api/v3/parse: the instance's own release-name parser.
+// arr {apiBase}/parse: the instance's own release-name parser.
 //
 // The approval queue identifies an unmatched release with the arr instance that
 // will hold its target (ADR-0007: mock-first, no live instance in tests). Radarr
-// and Sonarr answer the same route with different payloads, so the client
-// normalises both into one kind-agnostic ParseResult and keeps the original body
-// as Raw for diagnostics.
+// and Sonarr answer the same route under their own API base with different
+// payloads, so the client normalises both into one kind-agnostic ParseResult
+// and keeps the original body as Raw for diagnostics.
 package arr
 
 import (
@@ -14,8 +14,9 @@ import (
 	"strings"
 )
 
-// parsePath is the shared parse route. Both products expose it under /api/v3.
-const parsePath = "/api/v3/parse"
+// parsePath is the parse route relative to the client's API base ("/api/v5"
+// for Sonarr, "/api/v3" for Radarr).
+const parsePath = "/parse"
 
 // ParseResult is an instance's parse verdict, normalised across Radarr and
 // Sonarr. Title is the media title the parser recognised (the movie title for
@@ -71,7 +72,7 @@ type parseWire struct {
 	} `json:"series"`
 }
 
-// Parse asks the instance to parse one release name (POST /api/v3/parse with
+// Parse asks the instance to parse one release name (POST {apiBase}/parse with
 // {"title": ...}). Errors go through the shared error model, so an operator
 // diagnostic can classify them: ErrAuth, ErrNetwork or a *StatusError. The API
 // key is sent as X-Api-Key and never appears in an error.
@@ -83,16 +84,17 @@ func (c *core) Parse(ctx context.Context, title string) (ParseResult, error) {
 	body := struct {
 		Title string `json:"title"`
 	}{Title: trimmed}
+	path := c.apiBase + parsePath
 
 	// Decoding into a RawMessage keeps the payload verbatim: the normalised
 	// view is derived from these bytes, so Raw and the result cannot disagree.
 	var raw json.RawMessage
-	if err := c.postJSON(ctx, parsePath, body, &raw); err != nil {
+	if err := c.postJSON(ctx, path, body, &raw); err != nil {
 		return ParseResult{}, err
 	}
 	var wire parseWire
 	if err := json.Unmarshal(raw, &wire); err != nil {
-		return ParseResult{}, fmt.Errorf("arr: decode POST %s response: %w", parsePath, err)
+		return ParseResult{}, fmt.Errorf("arr: decode POST %s response: %w", path, err)
 	}
 	return normaliseParse(c.kind, wire, raw), nil
 }

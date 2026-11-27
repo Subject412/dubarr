@@ -13,6 +13,7 @@ import (
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -713,7 +714,7 @@ func TestArrConnectionTestEmptyBodyTestsSavedConnection(t *testing.T) {
 				t.Fatalf("test body = %s", body)
 			}
 			reqs := fake.Requests()
-			if len(reqs) != 1 || reqs[0].Path != "/api/v3/system/status" || reqs[0].APIKey != savedKey {
+			if len(reqs) != 1 || reqs[0].Path != "/api/v5/system/status" || reqs[0].APIKey != savedKey {
 				t.Fatalf("pings = %+v", reqs)
 			}
 			if after := arrSectionSnapshot(t, h); after != before {
@@ -1036,6 +1037,58 @@ func TestArrConnectionTestFailureCarriesDiagnostics(t *testing.T) {
 		}
 		if got.Host != u.Hostname() || got.Port != u.Port() {
 			t.Errorf("target = %s:%s, want %s:%s", got.Host, got.Port, u.Hostname(), u.Port())
+		}
+	})
+
+	// A 404 on the v5 base is not a generic 404: the handler must say which
+	// product and version it required, keep the machine-readable class the UI
+	// reads (status/404, inherited from the wrapped StatusError), and still leak
+	// neither the key nor the host.
+	t.Run("sonarr missing v5 is an api-version failure", func(t *testing.T) {
+		h, _ := newArrHarness(t)
+		h.setupAdmin()
+		const key = "sonarr-key-do-not-leak"
+		fake := arrmock.New(arrmock.Sonarr, key, arrmock.Fixtures{})
+		t.Cleanup(fake.Close)
+		// Every route 404s: that is how an instance serving no v5 answers, and
+		// it keeps the failure off the auth and network paths.
+		fake.FailAll(http.StatusNotFound)
+		if code, body := h.do(http.MethodPut, "/api/settings/arr/sonarr", map[string]any{
+			"base_url": fake.URL, "api_key": key,
+		}); code != http.StatusOK {
+			t.Fatalf("create = %d: %s", code, body)
+		}
+
+		code, body := h.do(http.MethodPost, "/api/settings/arr/sonarr/test", nil)
+		if code != http.StatusBadGateway {
+			t.Fatalf("test = %d, want 502: %s", code, body)
+		}
+		if bytes.Contains(body, []byte(key)) {
+			t.Fatalf("502 body leaked the API key: %s", body)
+		}
+		var got arrTestFailureBody
+		if err := json.Unmarshal(body, &got); err != nil {
+			t.Fatalf("decode 502 body: %v (%s)", err, body)
+		}
+		for _, want := range []string{"sonarr", "/api/v5", "Sonarr 5.x"} {
+			if !strings.Contains(got.Error, want) {
+				t.Errorf("error = %q, want it to name %q", got.Error, want)
+			}
+		}
+		// The pinned release is prose in package arr and deliberately named in
+		// one place only, so assert its shape here instead of copying it.
+		if !regexp.MustCompile(`dubarr \d+\.\d+\.\d+ requires Sonarr 5\.x`).MatchString(got.Error) {
+			t.Errorf("error = %q, want it to name the pinned dubarr release that requires Sonarr 5.x", got.Error)
+		}
+		if got.Class != "status" || got.StatusCode != http.StatusNotFound {
+			t.Errorf("diagnostics = %q/%d, want status/404", got.Class, got.StatusCode)
+		}
+		u, err := url.Parse(fake.URL)
+		if err != nil {
+			t.Fatalf("parse mock URL: %v", err)
+		}
+		if strings.Contains(got.Error, u.Hostname()) {
+			t.Errorf("error %q repeats the base URL host %q", got.Error, u.Hostname())
 		}
 	})
 }

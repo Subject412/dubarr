@@ -3,11 +3,11 @@
 //
 // One pass walks every enabled connection in settings arr.connections, lists
 // its library with the M2 clients (Radarr GET /api/v3/movie, Sonarr
-// GET /api/v3/series plus GET /api/v3/episode?seriesId=N), resolves each item's
-// target video and caches the Processing Gate verdict, then applies the snapshot as
-// a diff: new rows are inserted, changed rows are updated in place (ids
-// survive), unchanged rows are left alone and vanished rows are deleted (see
-// store.SyncLibraryCache).
+// GET /api/v5/series plus GET /api/v5/episode?seriesId=N asking for the
+// episodeFile sub-resource), resolves each item's target video and caches the
+// Processing Gate verdict, then applies the snapshot as a diff: new rows are
+// inserted, changed rows are updated in place (ids survive), unchanged rows are
+// left alone and vanished rows are deleted (see store.SyncLibraryCache).
 //
 // Credentials are read from internal/secrets under arr.<kind>.api_key and
 // re-encrypted into arr_instances.api_key_enc, so the cache's foreign key has a

@@ -1,6 +1,15 @@
 // Package arrmock provides in-process fake Radarr and Sonarr HTTP servers for
-// tests. It reproduces the subset of the *arr REST v3 contract Dubarr reads
+// tests. It reproduces the subset of the *arr REST contract Dubarr reads
 // (ADR-0007): system status, library, quality profiles and root folders.
+//
+// Each fake serves one pinned API prefix per product — /api/v5 for Sonarr,
+// /api/v3 for Radarr — and answers 404 on the other one. That strictness is
+// deliberate and is not a claim about the real servers (a real Sonarr 5 still
+// serves /api/v3): dubarr pins one base path per product, and a fake that
+// answered both versions would hide exactly the wrong-prefix bug the pin
+// exists to catch. The Sonarr episode route embeds `episodeFile` only when the
+// caller asks for it with includeSubresources=EpisodeFile, which is what the
+// real instance does.
 //
 // The fakes enforce the X-Api-Key header so tests exercise the real client's
 // auth-failure path, and can be told to fail every request with a chosen HTTP
@@ -25,6 +34,22 @@ const (
 	Sonarr Kind = "sonarr"
 )
 
+// API bases. Each product serves exactly one: Sonarr its newest v5, Radarr its
+// only v3.
+const (
+	apiV5 = "/api/v5"
+	apiV3 = "/api/v3"
+)
+
+// APIBase is the single API prefix dubarr pins for the product — the newest
+// one — and therefore the only one its fake answers.
+func APIBase(kind Kind) string {
+	if kind == Sonarr {
+		return apiV5
+	}
+	return apiV3
+}
+
 // DefaultAPIKey is used when New is called with an empty key.
 const DefaultAPIKey = "mock-api-key"
 
@@ -34,7 +59,7 @@ type Language struct {
 	Name string `json:"name"`
 }
 
-// Movie is a Radarr /api/v3/movie element.
+// Movie is a Radarr /api/v3/movie element (v3 is Radarr's only API).
 type Movie struct {
 	ID               int        `json:"id"`
 	Title            string     `json:"title"`
@@ -51,7 +76,7 @@ type Movie struct {
 	MovieFile        *MovieFile `json:"movieFile,omitempty"`
 }
 
-// Series is a Sonarr /api/v3/series element.
+// Series is a Sonarr /api/v5/series element.
 type Series struct {
 	ID               int      `json:"id"`
 	Title            string   `json:"title"`
@@ -66,13 +91,13 @@ type Series struct {
 	Tags             []int    `json:"tags"`
 }
 
-// QualityProfile is an /api/v3/qualityprofile element.
+// QualityProfile is a {base}/qualityprofile element.
 type QualityProfile struct {
 	ID   int    `json:"id"`
 	Name string `json:"name"`
 }
 
-// RootFolder is an /api/v3/rootfolder element.
+// RootFolder is a {base}/rootfolder element.
 type RootFolder struct {
 	ID         int    `json:"id"`
 	Path       string `json:"path"`
@@ -80,7 +105,7 @@ type RootFolder struct {
 	FreeSpace  int64  `json:"freeSpace"`
 }
 
-// Tag is an /api/v3/tag element. Both products serve the same shape.
+// Tag is a {base}/tag element. Both products serve the same shape.
 type Tag struct {
 	ID    int64  `json:"id"`
 	Label string `json:"label"`
@@ -95,7 +120,7 @@ type Fixtures struct {
 	QualityProfiles []QualityProfile
 	RootFolders     []RootFolder
 	Tags            []Tag
-	// Parse is the verdict POST /api/v3/parse answers with. A zero value is
+	// Parse is the verdict POST {base}/parse answers with. A zero value is
 	// an instance that parsed nothing.
 	Parse ParseResponse
 }
@@ -104,10 +129,23 @@ type Fixtures struct {
 type RecordedRequest struct {
 	Method string
 	Path   string
+	// Query is the raw query string without its leading "?", so a test can
+	// assert the exact parameters a client sent (for example
+	// includeSubresources=episodeFile).
+	Query  string
 	APIKey string
 }
 
-// CommandRequest is one decoded POST /api/v3/command body. Only the fields
+// URL is the recorded path with its query, i.e. what the client requested
+// below the instance root.
+func (r RecordedRequest) URL() string {
+	if r.Query == "" {
+		return r.Path
+	}
+	return r.Path + "?" + r.Query
+}
+
+// CommandRequest is one decoded POST {base}/command body. Only the fields
 // Dubarr sends are modelled; a real instance accepts more.
 type CommandRequest struct {
 	Name     string `json:"name"`
@@ -142,29 +180,30 @@ func New(kind Kind, apiKey string, fx Fixtures) *Server {
 	if kind == Sonarr {
 		appName = "Sonarr"
 	}
+	base := APIBase(kind)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/v3/system/status", s.handle(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(base+"/system/status", s.handle(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"appName": appName,
 			"version": "5.0.0",
 		})
 	}))
-	mux.HandleFunc("/api/v3/qualityprofile", s.handle(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(base+"/qualityprofile", s.handle(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, nonNil(fx.QualityProfiles))
 	}))
-	mux.HandleFunc("/api/v3/rootfolder", s.handle(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(base+"/rootfolder", s.handle(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, nonNil(fx.RootFolders))
 	}))
-	// /api/v3/tag exists on both products with an identical payload.
-	mux.HandleFunc("/api/v3/tag", s.handle(func(w http.ResponseWriter, r *http.Request) {
+	// {base}/tag exists on both products with an identical payload.
+	mux.HandleFunc(base+"/tag", s.handle(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, nonNil(fx.Tags))
 	}))
-	// /api/v3/parse exists on both products but answers a product-shaped body.
-	mux.HandleFunc("/api/v3/parse", s.serveParse(kind, fx.Parse))
+	// {base}/parse exists on both products but answers a product-shaped body.
+	mux.HandleFunc(base+"/parse", s.serveParse(kind, fx.Parse))
 	// Commands are shared by both products; the fake records the decoded body
 	// so tests can assert the exact command name and id.
-	mux.HandleFunc("/api/v3/command", s.handle(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(base+"/command", s.handle(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"message": "method not allowed"})
 			return
@@ -183,20 +222,46 @@ func New(kind Kind, apiKey string, fx Fixtures) *Server {
 	}))
 	switch kind {
 	case Radarr:
-		mux.HandleFunc("/api/v3/movie", s.handle(func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc(base+"/movie", s.handle(func(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusOK, nonNil(fx.Movies))
 		}))
-		mux.HandleFunc("/api/v3/movie/{id}", s.handle(serveByID("movie", fx.Movies, func(m Movie) int { return m.ID })))
+		mux.HandleFunc(base+"/movie/{id}", s.handle(serveByID("movie", fx.Movies, func(m Movie) int { return m.ID })))
 	case Sonarr:
-		mux.HandleFunc("/api/v3/series", s.handle(func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc(base+"/series", s.handle(func(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusOK, nonNil(fx.Series))
 		}))
-		mux.HandleFunc("/api/v3/series/{id}", s.handle(serveByID("series", fx.Series, func(sv Series) int { return sv.ID })))
-		mux.HandleFunc("/api/v3/episode", s.serveEpisodes(fx.Episodes))
+		mux.HandleFunc(base+"/series/{id}", s.handle(serveByID("series", fx.Series, func(sv Series) int { return sv.ID })))
+		mux.HandleFunc(base+"/episode", s.serveEpisodes(fx.Episodes))
 	}
+
+	// The prefix this product does not serve is rejected on purpose. A real
+	// Sonarr 5 answers /api/v3 as well, so this 404 is the fake being stricter
+	// than the server: dubarr pins one base path per product, and a fake that
+	// answered both versions would hide exactly the wrong-prefix bug that pin
+	// exists to catch. These routes record the request, which lets a test prove
+	// a client never asked the wrong prefix.
+	for _, other := range []string{apiV3, apiV5} {
+		if other == base {
+			continue
+		}
+		mux.HandleFunc(other+"/", s.rejectAPIVersion(other, base))
+	}
+	mux.HandleFunc("/", s.handle(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"message": "not found"})
+	}))
 
 	s.Server = httptest.NewServer(mux)
 	return s
+}
+
+// rejectAPIVersion answers every request under the API prefix this product does
+// not serve.
+func (s *Server) rejectAPIVersion(other, served string) http.HandlerFunc {
+	return s.handle(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusNotFound, map[string]string{
+			"message": "this instance serves " + served + ", not " + other,
+		})
+	})
 }
 
 // APIKey is the key clients must send in X-Api-Key.
@@ -239,6 +304,7 @@ func (s *Server) handle(next http.HandlerFunc) http.HandlerFunc {
 		s.requests = append(s.requests, RecordedRequest{
 			Method: r.Method,
 			Path:   r.URL.Path,
+			Query:  r.URL.RawQuery,
 			APIKey: r.Header.Get("X-Api-Key"),
 		})
 		status, delay := s.failStatus, s.delay
@@ -263,7 +329,7 @@ func (s *Server) handle(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// serveByID answers GET /api/v3/movie/{id} or /api/v3/series/{id} from the
+// serveByID answers GET {base}/movie/{id} or {base}/series/{id} from the
 // fixture slice: the matching element, or a 404 like a real instance.
 func serveByID[T any](kind string, items []T, id func(T) int) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {

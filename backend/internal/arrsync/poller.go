@@ -63,12 +63,12 @@ func (t realTicker) Stop()                  { t.ticker.Stop() }
 // unbounded context.
 const syncFailureWriteTimeout = 5 * time.Second
 
-// tagSource is the /api/v3/tag read both products provide.
+// tagSource is the {apiBase}/tag read both products provide.
 type tagSource interface {
 	Tags(ctx context.Context) ([]arr.Tag, error)
 }
 
-// rootFolderSource is the /api/v3/rootfolder read both products provide.
+// rootFolderSource is the {apiBase}/rootfolder read both products provide.
 type rootFolderSource interface {
 	RootFolders(ctx context.Context) ([]arr.RootFolder, error)
 }

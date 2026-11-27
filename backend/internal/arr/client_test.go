@@ -326,14 +326,42 @@ func TestClientErrorModel(t *testing.T) {
 
 // TestPingRejectsCrossPointedInstance proves a client aimed at the wrong *arr
 // application fails the connection test instead of reporting a healthy ping.
+// The failure differs by direction and that is the point: neither product
+// serves the other's base, so a Sonarr client pointed at a Radarr gets a 404
+// and the loud API-version error, while an endpoint that does answer the Radarr
+// base with Sonarr's appName is caught by the kind check.
 func TestPingRejectsCrossPointedInstance(t *testing.T) {
 	ctx := context.Background()
 
-	t.Run("radarr client against sonarr", func(t *testing.T) {
-		srv := arrmock.New(arrmock.Sonarr, "", sonarrFixtures())
+	t.Run("sonarr client against radarr", func(t *testing.T) {
+		srv := arrmock.New(arrmock.Radarr, "", radarrFixtures())
 		defer srv.Close()
 
-		c, err := arr.NewRadarrClient(srv.URL, srv.APIKey(), time.Second)
+		c, err := arr.NewSonarrClient(srv.URL, srv.APIKey(), time.Second)
+		if err != nil {
+			t.Fatalf("NewSonarrClient: %v", err)
+		}
+		err = c.Ping(ctx)
+		var versionErr *arr.APIVersionError
+		if !errors.As(err, &versionErr) {
+			t.Fatalf("Ping error = %v, want an *arr.APIVersionError naming /api/v5", err)
+		}
+		if versionErr.APIBase != "/api/v5" || versionErr.Kind != arr.KindSonarr {
+			t.Fatalf("APIVersionError = %+v, want the sonarr /api/v5 base", versionErr)
+		}
+	})
+
+	t.Run("radarr client against sonarr", func(t *testing.T) {
+		// The version cannot catch this direction: the fake answers the base
+		// it is asked for, with Sonarr's appName and a healthy 200. Only the
+		// kind check stands between that and a false "connected".
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"appName":"Sonarr","version":"4.0.0"}`))
+		}))
+		defer srv.Close()
+
+		c, err := arr.NewRadarrClient(srv.URL, "k", time.Second)
 		if err != nil {
 			t.Fatalf("NewRadarrClient: %v", err)
 		}
@@ -350,16 +378,19 @@ func TestPingRejectsCrossPointedInstance(t *testing.T) {
 		}
 	})
 
-	t.Run("sonarr client against radarr", func(t *testing.T) {
-		srv := arrmock.New(arrmock.Radarr, "", radarrFixtures())
+	t.Run("radarr client against a sonarr v5 fake", func(t *testing.T) {
+		srv := arrmock.New(arrmock.Sonarr, "", sonarrFixtures())
 		defer srv.Close()
 
-		c, err := arr.NewSonarrClient(srv.URL, srv.APIKey(), time.Second)
+		c, err := arr.NewRadarrClient(srv.URL, srv.APIKey(), time.Second)
 		if err != nil {
-			t.Fatalf("NewSonarrClient: %v", err)
+			t.Fatalf("NewRadarrClient: %v", err)
 		}
-		if err := c.Ping(ctx); !errors.Is(err, arr.ErrKindMismatch) {
-			t.Fatalf("Ping error = %v, want ErrKindMismatch", err)
+		// The fake serves v5 only, so the Radarr client's /api/v3 ping is a
+		// 404 here — a loud version failure, never a silent pass.
+		var versionErr *arr.APIVersionError
+		if err := c.Ping(ctx); !errors.As(err, &versionErr) {
+			t.Fatalf("Ping error = %v, want an *arr.APIVersionError", err)
 		}
 	})
 }
@@ -464,7 +495,7 @@ func TestMovieByIDReadsOneMovie(t *testing.T) {
 }
 
 // TestSeriesByIDReadsOneSeries is the Sonarr half of the per-item read: GET
-// /api/v3/series/{id}, the 404 mapping and the key handling.
+// /api/v5/series/{id}, the 404 mapping and the key handling.
 func TestSeriesByIDReadsOneSeries(t *testing.T) {
 	ctx := context.Background()
 	srv := arrmock.New(arrmock.Sonarr, "per-item-sonarr-key", arrmock.Fixtures{
@@ -623,8 +654,8 @@ func TestSonarrRescanSeriesPostsCommand(t *testing.T) {
 	}
 	reqs := srv.Requests()
 	last := reqs[len(reqs)-1]
-	if last.Method != http.MethodPost || last.Path != "/api/v3/command" {
-		t.Errorf("last request = %s %s, want POST /api/v3/command", last.Method, last.Path)
+	if last.Method != http.MethodPost || last.Path != "/api/v5/command" {
+		t.Errorf("last request = %s %s, want POST /api/v5/command", last.Method, last.Path)
 	}
 }
 

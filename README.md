@@ -142,12 +142,11 @@ secrets and media must stay out of Git.
 | --- | --- | --- |
 | Go | 1.26 or newer | `backend/go.mod` declares `go 1.26.0`; the Docker image uses `golang:1.27-alpine` |
 | Node.js + npm | Node 24 or newer | Vite 8 / TypeScript 7 (image: `node:24-alpine`) |
-| Rust + Cargo | stable | `dubarr-sync`, edition 2021 |
 | `ffmpeg`, `ffprobe` | any current build | extraction, probing, previews |
 | `mkvmerge` | Mkvtoolnix | final muxing — `mkvtoolnix` package on Debian/Ubuntu |
 
-`ffmpeg`, `ffprobe`, `mkvmerge` and `dubarr-sync` must be on `PATH`;
-`/api/health` reports which ones are found.
+`ffmpeg`, `ffprobe` and `mkvmerge` must be on `PATH`; `/api/health` reports
+which ones are found.
 
 ### Build order
 
@@ -163,18 +162,11 @@ npm run build
 # 2. Go server (embeds the assets produced above)
 cd ../backend
 go build ./cmd/dubarr
-
-# 3. Rust DSP CLI (sync and mux need it on PATH)
-cd ../sync-engine
-cargo build --release
-mkdir -p "$HOME/.local/bin"
-cp target/release/dubarr-sync "$HOME/.local/bin/"
 ```
 
-Ensure `$HOME/.local/bin` is on your `PATH`, or copy `dubarr-sync` into any
-directory that is. The DSP CLI is a separate program: without it the web UI and
-library browsing work, but sync jobs and muxing do not. The Docker image bundles
-`dubarr-sync` in `/app` and puts `/app` on `PATH`.
+The result is a single static binary: the DSP engine that finds the audio
+offset is compiled into it, so there is nothing else to install. `ffmpeg`,
+`ffprobe` and `mkvmerge` remain external and must be on `PATH`.
 
 ### Run
 
@@ -199,15 +191,11 @@ cd backend && go test ./... -timeout 1400s
 # Frontend: dev server, production build (-> backend/web), lint, tests
 cd frontend && npm install && npm run dev
 cd frontend && npm run build && npm run lint && npm test
-
-# DSP: build, tests, fmt, lint
-cd sync-engine && cargo build && cargo test && cargo fmt --check && cargo clippy
 ```
 
-`internal/analyze` and `internal/acceptance` rebuild the Rust engine in their
-`TestMain`, which exceeds Go's default ten-minute per-package timeout; pass
-`-timeout 1400s` when running the whole backend suite locally. CI does not need
-it, because those packages skip the rebuild when Rust is absent.
+The acceptance suites decode real media, so they run past Go's default
+ten-minute per-package timeout; pass `-timeout 1400s` when running the whole
+backend suite locally. Without `testfiles/` they skip with a message naming it.
 
 Docker image build: `docker build -f docker/Dockerfile -t dubarr:latest .`
 

@@ -4,10 +4,10 @@
 #
 #   docker build -f docker/Dockerfile -t dubarr:latest .
 #
-# Four stages: Vite/TS frontend -> static Go server (CGO off, SPA embedded)
-# -> Rust `dubarr-sync` -> slim runtime with ffmpeg + mkvtoolnix and a
-# PUID/PGID entrypoint. The Go/Rust stages build natively for the target
-# platform, so a multi-arch buildx build needs no cross toolchains.
+# Three stages: Vite/TS frontend -> static Go server (CGO off, SPA embedded)
+# -> slim runtime with ffmpeg + mkvtoolnix and a PUID/PGID entrypoint. The Go
+# stage builds natively for the target platform, so a multi-arch buildx build
+# needs no cross toolchains.
 #
 # The appliance takes no application environment variables: the runtime
 # process is started with explicit flags only (--data-dir / --listen). PUID and
@@ -55,22 +55,7 @@ RUN cd backend && go build -trimpath \
         -o /dubarr ./cmd/dubarr
 
 # --------------------------------------------------------------------------
-# Stage 3: dubarr-sync. rust:1-bookworm matches the runtime's Debian release,
-# so the binary links against the same glibc generation.
-# --------------------------------------------------------------------------
-FROM rust:1-bookworm AS sync
-
-WORKDIR /src
-
-COPY sync-engine/Cargo.toml sync-engine/Cargo.lock ./
-RUN mkdir -p src && printf 'fn main() {}\n' > src/main.rs \
- && cargo fetch --locked
-
-COPY sync-engine/ ./
-RUN cargo build --release --locked
-
-# --------------------------------------------------------------------------
-# Stage 4: runtime. Debian slim because mkvtoolnix/ffmpeg are first-class
+# Stage 3: runtime. Debian slim because mkvtoolnix/ffmpeg are first-class
 # packages there; gosu drops privileges after the entrypoint fixes ownership.
 # --------------------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
@@ -89,15 +74,14 @@ RUN groupadd -g 1000 dubarr \
  && useradd -u 1000 -g 1000 -M -d /app -s /usr/sbin/nologin dubarr
 
 COPY --from=backend /dubarr /app/dubarr
-COPY --from=sync /src/target/release/dubarr-sync /app/dubarr-sync
 COPY docker/entrypoint.sh /app/entrypoint.sh
-RUN chmod 0755 /app/entrypoint.sh /app/dubarr /app/dubarr-sync \
+RUN chmod 0755 /app/entrypoint.sh /app/dubarr \
  && mkdir -p /config \
  && chown dubarr:dubarr /config \
  && chmod 0700 /config
 
-# Both binaries live in /app; put it on PATH so exec.LookPath("dubarr-sync")
-# resolves inside the container.
+# The binary lives in /app; put it on PATH so `dubarr` resolves in a shell
+# inside the container.
 ENV PATH="/app:${PATH}"
 
 WORKDIR /app

@@ -151,10 +151,22 @@ variables: `entrypoint.sh` forwards extra arguments after its own
 `--data-dir`/`--listen`. Changing the level needs no app setting and no env var
 (ADR-0003). Do **not** mount `/var/run/docker.sock` for logging.
 
-## DSP CLI
+## Memory
 
-`dubarr-sync` (Rust) is required for sync and mux jobs. It is bundled at
-`/app/dubarr-sync` and `/app` is on the container `PATH`, so `/api/health`
-reports it available out of the box. Native installs still keep both binaries
-side by side on `PATH`; release archives ship them together (see
-[docs/RELEASING.md](../docs/RELEASING.md)).
+Dubarr is one binary: the DSP engine is inside it, so there is nothing to install
+beside `dubarr`, and `/api/health` reports only `ffmpeg`, `ffprobe` and
+`mkvmerge`.
+
+Sync is the memory-heavy part, and only while a job runs. Measured on a real
+pair of 90-minute films:
+
+- **idle:** tens of megabytes — the app is not a resident consumer.
+- **during a job:** about **200 MB** of baseline plus roughly **400 MB per
+  parallel checkpoint worker**.
+
+`sync.defaults.parallel_checkpoints` (1..8, default 1) sets the worker count, and
+the app lowers it automatically when memory is short — it reads the container's
+own cgroup limit rather than the host's, so a small container is respected.
+
+A **4 GB** container is comfortable and yields four workers. 2 GB still runs,
+with fewer. Do not size it from idle usage alone.

@@ -3,6 +3,7 @@ package correlate
 import (
 	"context"
 	"math"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -14,25 +15,32 @@ import (
 // as a ratio against a measurement this host makes for itself. An absolute
 // millisecond budget cannot work here — it fails on a busy CI box, gets marked
 // flaky and then gets deleted — so the gate compares the correlation with the
-// three transforms it is built from, timed on the same machine, in the same
-// process, in the same run.
+// same two dominant operations it is built from, timed on the same machine, in
+// the same process, in the same run.
 //
-// What this guards: the correlation's cost relative to its own transform floor.
-// The three transforms are the irreducible part; everything above 1.0x is
-// prepare, the X*conj(Y) product, the prefix sums, the lag scan and the median
-// in peakProminence. Those are the parts a coder can accidentally make
-// quadratic, allocate per element, or sort twice; the ratio moves the moment one
-// of them doubles.
+// What this guards: the correlation's cost relative to its own reference
+// checkpoint — three unfused transforms of nfft points plus one median
+// extraction over a lag-score-sized slice. Those are the irreducible parts;
+// everything above 1.0x is prepare, the X*conj(Y) product, the prefix sums and
+// the lag scan. Those are the parts a coder can accidentally make quadratic or
+// allocate per element; the ratio moves the moment one of them doubles.
 //
-// The ratio is not the 1.5-2.0 the port plan guessed. Measured here it is
-// 3.3-3.4, and a CPU profile says why: the three transforms cost ~295 ms per
-// checkpoint while `peakProminence` spends ~800 ms sorting the ~2.9 M lag
-// scores to take their median (one `slices.Clone`, 23 MB, then pdqsort). That
-// sort is what correlation.rs:192-194 does too, so it is parity, not a
-// regression — the plan's estimate simply did not price an O(n log n) median
-// over three million lags. ../PERF.md records the breakdown; the number to
-// watch is that the sort is the single largest term, so it is also the term a
-// regression will come from.
+// Why the reference carries the median and is not just "three transforms": the
+// transforms are vectorised and scale with CPU width (289 ms on the Ryzen dev
+// laptop, 83 ms on the GitHub runner, ~3.5x), while the median is a
+// memory-bound sort over ~2.9 M scores that barely scales (the whole
+// correlation only went from 981 ms to 401 ms, ~2.4x, and the sort is more than
+// half of it). A transform-only reference therefore shrinks faster than the
+// numerator on a better host, and the ratio *rose* for identical code: 3.40
+// here against 4.84 on CI. With both dominant terms on both sides the ratio is
+// a property of the code, not of the machine. ../PERF.md records that evidence
+// and the current calibration.
+//
+// The transforms are not the whole story: `peakProminence` clones and sorts the
+// ~2.9 M lag scores (one `slices.Clone`, 23 MB, then pdqsort), which is what
+// correlation.rs:192-194 does too — parity, not a regression, and the single
+// largest term of a checkpoint, so it is also the term a regression will come
+// from.
 //
 // What this does NOT guard is correctness, and it cannot: removing the overlap
 // guard (`count < minOverlap`) makes the scan *cheaper* and still passes here;
@@ -50,6 +58,14 @@ const (
 	perfSamples   = perfRate * perfWindowSec
 	perfNFFT      = 1 << 22
 
+	// perfScores is how many lag scores one production checkpoint's median
+	// sorts. The scan offers 2*maxLag+1 = 3 039 999 candidates, and drops the
+	// lags whose overlap is below minOverlap = max(16, shorter/20) = 76 000,
+	// i.e. |lag| > shorter-minOverlap = 1 444 000, leaving
+	// 2*1 444 000+1 = 2 888 001 scores. The reference sorts a slice of exactly
+	// that length, so its median is the same piece of work, not a stand-in.
+	perfScores = 2*1_444_000 + 1
+
 	// perfRuns is how many timed runs each side gets. Best-of-N, never the
 	// mean: everything a shared machine adds — another tenant's container, a
 	// scheduling hiccup, a GC cycle — makes a run slower, so the fastest run
@@ -58,28 +74,34 @@ const (
 	perfRuns = 5
 
 	// costRatioK is the gate: one correlation of a production checkpoint may
-	// cost at most costRatioK times three transforms of the same nfft.
+	// cost at most costRatioK times the reference checkpoint of the same nfft
+	// and the same score count.
 	//
 	// Calibrated once on the host recorded in ../PERF.md (AMD Ryzen 5 2500U,
-	// 2026-11-27): three runs of this test measured 3.33, 3.37 and 3.42, so the
-	// observation taken is the worst of them, 3.42, and
-	// K = ceil(3.42 * 1.25 * 10) / 10 = 4.3. The 25 % headroom is for the
-	// difference a runner can show that is *not* a regression: the median sort
-	// and the transform kernel respond differently to a smaller L3 and to a
-	// shared memory bus, and the ratio is only as portable as that difference is
-	// small.
+	// 2026-11-27): five runs of this test measured 1.23, 1.02, 1.14, 1.08 and
+	// 1.07, so the observation taken is the worst of them, 1.23, and
+	// K = ceil(1.23 * 1.25 * 10) / 10 = 1.6.
 	//
-	// What that headroom buys and what it does not: at 4.3 a correlation that
-	// got ~25 % more expensive fails, and so does a second clone-and-sort of the
-	// scores (that alone is ~1.7x here). A regression confined to the lag scan
-	// alone would have to be ~3x to trip it, because the scan is a small part of
-	// the total — the sort is the largest term. Raising K is a decision that
-	// needs a fresh measurement in PERF.md, not a tweak to silence a red run.
+	// The 25 % headroom is for the difference a runner can legitimately show.
+	// It is narrower than the 25 % that used to sit on a transform-only
+	// reference: both sides now carry both dominant terms, so what is left is
+	// the ratio between the memory-bound median and the vectorised transforms,
+	// not the ratio between all the memory-bound work and none of it. That old
+	// mismatch is what made the gate travel downwards — 3.40 here against 4.84
+	// on CI for the same code.
+	//
+	// What that headroom buys and what it does not: at 1.6 a correlation that
+	// got ~30 % more expensive fails, and so does a second clone-and-sort of
+	// the scores (that alone is ~0.7x of the reference here). A regression
+	// confined to the lag scan alone would have to be ~3x to trip it, because
+	// the scan is a small part of the total — the median is the largest term
+	// and the reference now carries it too. Raising K is a decision that needs
+	// a fresh measurement in PERF.md, not a tweak to silence a red run.
 	//
 	// The number is per checkpoint, not per job. U-DSP.7 runs several
 	// checkpoints at once and they share the memory bus, so the ratio at N > 1
 	// will be a little worse; that unit makes this gate N-aware.
-	costRatioK = 4.3
+	costRatioK = 1.6
 )
 
 var (
@@ -87,10 +109,14 @@ var (
 	perfTarget     []float32
 	perfDonor      []float32
 
+	perfScoresOnce sync.Once
+	perfScoreSlice []float32
+
 	// Sinks: the values the timed runs produce, kept reachable so the compiler
 	// cannot delete the work.
 	perfCorrelationSink Analysis
 	perfTransformSink   []complex64
+	perfMedianSink      float32
 )
 
 // productionSlices returns one checkpoint's pair, built once per test binary.
@@ -152,11 +178,11 @@ func newTransformBuffers() *transformBuffers {
 	return bufs
 }
 
-// runThreeTransforms is this host's floor for the work a correlation cannot
-// avoid: two forward transforms of nfft points and one inverse, all unfused, as
-// the shipping configuration runs them (fft.Options{NoFMA: true}, §3.2 of the
-// port plan). The X*conj(Y) product is not in the reference; it is part of what
-// the ratio measures.
+// runThreeTransforms is the first of the reference checkpoint's two dominant
+// terms, and the work a correlation cannot avoid: two forward transforms of
+// nfft points and one inverse, all unfused, as the shipping configuration runs
+// them (fft.Options{NoFMA: true}, §3.2 of the port plan). The X*conj(Y) product
+// is not in the reference; it is part of what the ratio measures.
 func runThreeTransforms(bufs *transformBuffers) []complex64 {
 	opts := fft.Options{NoFMA: true}
 	x := fft.FFT32With(bufs.target, opts)
@@ -165,6 +191,59 @@ func runThreeTransforms(bufs *transformBuffers) []complex64 {
 	// product replaces one of them.
 	perfTransformSink = y
 	return fft.IFFT32With(x, opts)
+}
+
+// lagScores returns the reference median's input, built once per test binary:
+// exactly as many values as a checkpoint's lag-score slice, all unsorted, all
+// finite, spread over the `-1..1` band the normalised correlations live in.
+//
+// The values must not be zero and must not be sorted. Sorting already-sorted
+// input is a different workload — pdqsort detects the run and does far less
+// branchy swapping — and a zeroed slice is a different one again (every
+// comparison is a tie in a run of identical values). This has to cost what
+// sorting ~2.9 M arbitrary scores costs, or the reference stops being a floor.
+func lagScores() []float32 {
+	perfScoresOnce.Do(func() {
+		perfScoreSlice = make([]float32, perfScores)
+		seed := uint64(0x5C0BE5)
+		for i := range perfScoreSlice {
+			seed = seed*6364136223846793005 + 1442695040888963407
+			perfScoreSlice[i] = float32(2*float64(int64(seed>>11))/float64(uint64(1)<<52) - 1)
+		}
+	})
+	return perfScoreSlice
+}
+
+// runMedian is the second dominant term: one median extraction over the
+// lag-score slice, in the same shape peakProminence gives the production scores
+// — clone, sort, pick the middle. The clone is deliberate: peakProminence
+// clones too, so a reference that sorted one buffer in place would price less
+// than the work it stands for.
+func runMedian(scores []float32) float32 {
+	sorted := slices.Clone(scores)
+	slices.Sort(sorted)
+	perfMedianSink = sorted[len(sorted)/2]
+	return perfMedianSink
+}
+
+// referenceCheckpoint is the reference workload: one checkpoint's irreducible
+// work in a single call, so the two terms are timed together exactly as the
+// correlation runs them.
+type referenceCheckpoint struct {
+	bufs   *transformBuffers
+	scores []float32
+}
+
+func newReferenceCheckpoint() *referenceCheckpoint {
+	return &referenceCheckpoint{bufs: newTransformBuffers(), scores: lagScores()}
+}
+
+// run is this host's floor for a checkpoint: the three transforms, then the
+// median over a lag-score slice of the checkpoint's size.
+func (r *referenceCheckpoint) run() []complex64 {
+	out := runThreeTransforms(r.bufs)
+	runMedian(r.scores)
+	return out
 }
 
 // runCorrelation is one production checkpoint through the shipping path: a
@@ -190,8 +269,9 @@ func bestOf(t *testing.T, n int, f func()) time.Duration {
 }
 
 // TestCorrelationCostRatio is the numeric gate: one production checkpoint may
-// not cost more than costRatioK times three unfused transforms of the same
-// nfft, measured best-of-perfRuns on this host.
+// not cost more than costRatioK times this host's reference checkpoint — the
+// same three unfused transforms plus one median over a lag-score slice of the
+// same length — measured best-of-perfRuns.
 //
 // It never skips. It is a few seconds of work, it needs no media and no
 // toolchain, and it is the only performance number in the normal `go test` run
@@ -201,6 +281,9 @@ func TestCorrelationCostRatio(t *testing.T) {
 	if len(target) != perfSamples || len(donor) != perfSamples {
 		t.Fatalf("production slices are %d and %d samples, want %d each",
 			len(target), len(donor), perfSamples)
+	}
+	if scores := lagScores(); len(scores) != perfScores {
+		t.Fatalf("reference scores are %d values, want %d", len(scores), perfScores)
 	}
 
 	// One pool for both the warm-up and the timed runs, as a job reuses it.
@@ -223,32 +306,34 @@ func TestCorrelationCostRatio(t *testing.T) {
 		perfCorrelationSink = got
 	})
 
-	bufs := newTransformBuffers()
-	// Warm-up for the transform side too: go-fft caches its plan32 twiddle
-	// table per (n, fused) pair on first use, and a job pays that once.
-	perfTransformSink = runThreeTransforms(bufs)
+	reference := newReferenceCheckpoint()
+	// Warm-up for the reference side too: go-fft caches its plan32 twiddle
+	// table per (n, fused) pair on first use, and the median's clone walks a
+	// fresh 11.5 MB allocation. A job pays both once per worker.
+	perfTransformSink = reference.run()
 
-	reference := bestOf(t, perfRuns, func() {
-		perfTransformSink = runThreeTransforms(bufs)
+	referenceCost := bestOf(t, perfRuns, func() {
+		perfTransformSink = reference.run()
 	})
 
-	if reference <= 0 {
-		t.Fatalf("reference measurement is %v; nothing was timed", reference)
+	if referenceCost <= 0 {
+		t.Fatalf("reference measurement is %v; nothing was timed", referenceCost)
 	}
-	ratio := float64(correlation) / float64(reference)
+	ratio := float64(correlation) / float64(referenceCost)
 
 	t.Logf("190 s @ %d Hz, nfft = 2^%d, NoFMA: correlation %v (%.0f ms), "+
-		"three transforms %v (%.0f ms), ratio %.2f, gate K = %.1f",
+		"reference checkpoint %v (%.0f ms), ratio %.2f, gate K = %.1f",
 		perfRate, int(math.Log2(perfNFFT)), correlation, millis(correlation),
-		reference, millis(reference), ratio, costRatioK)
+		referenceCost, millis(referenceCost), ratio, costRatioK)
 
 	if ratio > costRatioK {
-		t.Fatalf("correlation costs %.2fx the host's three-transform floor, gate is %.1fx "+
-			"(correlation %v, transforms %v): the per-checkpoint work grew, not the machine. "+
-			"Check prepare, the X*conj(Y) product, the prefix sums and the lag scan for a "+
-			"reintroduced per-lag allocation or a lost early exit. Re-measure and record the "+
-			"number in internal/dsp/PERF.md before changing costRatioK.",
-			ratio, costRatioK, correlation, reference)
+		t.Fatalf("correlation costs %.2fx the host's reference checkpoint, gate is %.1fx "+
+			"(correlation %v, reference %v): the per-checkpoint work grew, not the machine. "+
+			"Check prepare, the X*conj(Y) product, the prefix sums, the lag scan and "+
+			"peakProminence's clone-and-sort for a reintroduced per-lag allocation or a lost "+
+			"early exit. Re-measure and record the number in internal/dsp/PERF.md before "+
+			"changing costRatioK.",
+			ratio, costRatioK, correlation, referenceCost)
 	}
 }
 

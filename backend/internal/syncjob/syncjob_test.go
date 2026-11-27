@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/Subject412/dubarr/backend/internal/analyze"
+	"github.com/Subject412/dubarr/backend/internal/dsp/mfcc"
 	"github.com/Subject412/dubarr/backend/internal/probe"
 	"github.com/Subject412/dubarr/backend/internal/reflang"
 	"github.com/Subject412/dubarr/backend/internal/settings"
@@ -600,5 +601,112 @@ func TestAnalysisPolicySeededStrategyIsTheDefault(t *testing.T) {
 	_, cfg := f.svc.analysisPolicy(context.Background())
 	if !reflect.DeepEqual(cfg.Strategy, analyze.DefaultStrategy()) {
 		t.Fatalf("seeded cfg.Strategy = %+v, want %+v", cfg.Strategy, analyze.DefaultStrategy())
+	}
+}
+
+// --- the engines map runAnalysis hands analyze -----------------------------
+
+// strategyConfig is the config shape runAnalysis builds the engines from: the
+// shipped checkpoint policy carrying the given technique list.
+func strategyConfig(strategy analyze.Strategy) analyze.Config {
+	cfg := analyze.DefaultConfig()
+	cfg.Strategy = strategy
+	return cfg
+}
+
+// engineIDs lists a map's keys for a failure message. Map order is the map's,
+// so the message is diagnostic only.
+func engineIDs(engines map[analyze.TechniqueID]analyze.Engine) []analyze.TechniqueID {
+	ids := make([]analyze.TechniqueID, 0, len(engines))
+	for id := range engines {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// TestStrategyWithoutMFCCBuildsNoMFCEEngine: the shipped strategy is one
+// waveform entry, so the map runAnalysis hands analyze holds exactly that and
+// no mfcc entry.
+//
+// The map is what the pipeline routes on, so an mfcc engine built "just in
+// case" would be a matcher the job was never configured to run — and with
+// analyzer/settings both agreeing the technique is off, nothing else would
+// reveal it.
+func TestStrategyWithoutMFCCBuildsNoMFCEEngine(t *testing.T) {
+	cfg := strategyConfig(analyze.DefaultStrategy())
+	if !reflect.DeepEqual(cfg.Strategy, analyze.DefaultStrategy()) {
+		t.Fatalf("the premise changed: cfg.Strategy = %+v, want the shipped waveform-only list", cfg.Strategy)
+	}
+
+	engines := (&Service{}).enginesFor(cfg, sync.New())
+	if len(engines) != 1 {
+		t.Fatalf("engines = %v, want exactly one entry (waveform)", engineIDs(engines))
+	}
+	if _, ok := engines[analyze.TechniqueMFCC]; ok {
+		t.Fatal("the shipped strategy registered an mfcc engine: a job would consult a matcher its strategy never names")
+	}
+	if engines[analyze.TechniqueWaveform] == nil {
+		t.Fatalf("engines = %v, want the waveform entry: nothing could answer", engineIDs(engines))
+	}
+}
+
+// TestStrategyWithMFCCTechniqueRunsIt: naming mfcc in the enabled list adds its
+// engine, and that engine really is the mel-cepstral matcher.
+//
+// Both matchers run behind the same runner, so the only thing that tells them
+// apart downstream is the precision they report: the waveform matcher resolves
+// to one sample (0.125 ms at 8 kHz) and mfcc to its [mfcc.HopMS] hop. Running
+// both entries over the same synthetic pair is therefore the assertion that
+// fails if strategyUses stopped registering the engine, and equally if the
+// entry were built on the waveform correlator.
+func TestStrategyWithMFCCTechniqueRunsIt(t *testing.T) {
+	strategy := analyze.Strategy{
+		Preset: analyze.PresetCustom,
+		Techniques: []analyze.Technique{
+			{ID: analyze.TechniqueWaveform, Enabled: true, When: analyze.WhenAlways, MinConfidence: 0.1, MinMatchZ: 5},
+			{ID: analyze.TechniqueMFCC, Enabled: true, When: analyze.WhenBelowConfidence, MinConfidence: 0.1, MinMatchZ: 5},
+		},
+	}
+	engines := (&Service{}).enginesFor(strategyConfig(strategy), sync.New())
+	if len(engines) != 2 {
+		t.Fatalf("engines = %v, want waveform and mfcc for a strategy that enables both", engineIDs(engines))
+	}
+	mfccEngine, ok := engines[analyze.TechniqueMFCC]
+	if !ok || mfccEngine == nil {
+		t.Fatalf("engines = %v, want an mfcc entry: the strategy enables the technique", engineIDs(engines))
+	}
+
+	const sampleRate = 8000
+	dir := t.TempDir()
+	targetPath := filepath.Join(dir, "target.wav")
+	donorPath := filepath.Join(dir, "donor.wav")
+	base := noise16(20*sampleRate, 83)
+	writePCM16WAV(t, targetPath, base, sampleRate)
+	writePCM16WAV(t, donorPath, shifted(base, 1200), sampleRate)
+
+	window := 2.0
+	job := sync.Job{
+		TargetPath:  targetPath,
+		DonorPath:   donorPath,
+		SliceLenSec: 20,
+		WindowSec:   &window,
+	}
+	got, err := mfccEngine.Run(context.Background(), job)
+	if err != nil {
+		t.Fatalf("mfcc entry: %v", err)
+	}
+	if got.PrecisionMS != mfcc.HopMS {
+		t.Fatalf("mfcc entry precision = %v ms, want %d (the hop): the entry is not running the mel-cepstral matcher",
+			got.PrecisionMS, mfcc.HopMS)
+	}
+
+	// The same pair through the waveform entry, which must stay sample
+	// accurate: two entries, two matchers.
+	waveform, err := engines[analyze.TechniqueWaveform].Run(context.Background(), job)
+	if err != nil {
+		t.Fatalf("waveform entry: %v", err)
+	}
+	if want := 1000 / float64(sampleRate); waveform.PrecisionMS != want {
+		t.Fatalf("waveform entry precision = %v ms, want %v (one sample)", waveform.PrecisionMS, want)
 	}
 }

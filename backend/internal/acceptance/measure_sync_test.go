@@ -19,7 +19,7 @@
 //	DISK|… / MUX|…         existing staging-footprint and mux argv lines
 //	SYNCOFFSET|…           the --sync value handed to mkvmerge
 //	PUBLISH|…              published-file validation
-//	REPORT|…               analyze.Report (verdict/offsets/quality/checkpoints)
+//	REPORT|…               analyze.Report + analysis_source (which mode ran)
 //	TOTAL|…                movie_wall_ms (monotonic, no double count), job_wall_ms
 //	SUMMARY|…              legacy summed fields + parent peaks/CPU + child CPU
 //
@@ -879,8 +879,16 @@ func TestMeasureSyncResources(t *testing.T) {
 	rec.record("analyze_total", time.Since(analyzeStart), 0, 0, 0, true,
 		fmt.Sprintf("offsets_ms=%v", report.OffsetsMS))
 
-	t.Logf("REPORT|verdict=%s|classification=%s|max_drift_ms=%s|offsets_ms=%v|qualities=%v|checkpoints=%s",
-		sanitiseValue(report.Verdict), sanitiseValue(report.Classification),
+	// The mode token (U-WIN.8): this harness decodes both tracks whole itself,
+	// so the run it measures is the full path — an empty Config.AnalysisSource
+	// means full (analyze.Config.windowed). A windowed measurement would have
+	// to drive syncjob instead, and must say so here rather than be inferred.
+	source := cfg.AnalysisSource
+	if source == "" {
+		source = analyze.AnalysisSourceFull
+	}
+	t.Logf("REPORT|analysis_source=%s|verdict=%s|classification=%s|max_drift_ms=%s|offsets_ms=%v|qualities=%v|checkpoints=%s",
+		source, sanitiseValue(report.Verdict), sanitiseValue(report.Classification),
 		f3(report.MaxDriftMS), report.OffsetsMS, report.Qualities,
 		checkpointTriples(report.Checkpoints))
 

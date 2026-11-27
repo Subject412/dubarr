@@ -350,3 +350,36 @@ decode), not now. It is in the tree now because the report is
 order-independent by construction and because #87's requirement was about one
 job using several cores, which is exactly what this does: N concurrent
 checkpoint reads and correlations, never N jobs and never N ffmpeg decodes.
+
+## Windowed decode (#89): what six checkpoints cost when they do not read the whole film
+
+Measured by `internal/acceptance`'s `TestWindowedParity`, which runs one real
+job per mode on each film through the same `Execute` the worker calls: six
+checkpoints, 190 s windows, 2.0 s pre-roll, `lowpass_fallback` band, one host,
+serially so the wall clocks are not competing with each other.
+
+| fixture | mode | wall clock | audio decoded | seeks |
+|---|---|---|---|---|
+| Shrek | full | 106.033 s | 10 863 s | 0 |
+| Shrek | windows | 30.056 s | 2 304 s | 12 |
+| Minions | full | 99.470 s | 10 787 s | 0 |
+| Minions | windows | 27.228 s | 2 304 s | 12 |
+
+That is 3.5x on Shrek and 3.6x on Minions, and 4.7x less audio read. The
+decoded-seconds column is the mechanism: six 190 s windows plus 2 s of pre-roll
+on each side is 2 304 s of audio whether the film is 90 minutes or three hours,
+while the whole-track path reads every second of both tracks twice.
+
+The saving is bounded by what the job does besides decode. Earlier measurement
+put decode at ~97 % of a full job and correlation at ~3 %, which is why the
+parallel-checkpoint setting above was worth little on its own; removing the
+decode is what that 97 % was waiting for.
+
+The wall clocks include the engine's correlation of six 190 s windows, so they
+are job-shaped rather than decode-only. The two modes produce the same verdict,
+the same checkpoint plan, |Δquality| 0.000 and |Δmax_drift| 0.000 on both
+films. Offsets agree to 0.000 ms on Shrek and differ by a constant 1.000 ms on
+Minions — one Matroska timestamp tick, explained at
+`windowedCrossPathOffsetMS` in `internal/acceptance/windowed_test.go`, and
+constant across all six checkpoints, so it cannot move drift or a 40 ms
+threshold.

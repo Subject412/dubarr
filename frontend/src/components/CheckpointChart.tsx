@@ -1,4 +1,4 @@
-import type { SyncCheckpoint } from '../lib/api'
+import type { SyncCheckpoint, SyncFit } from '../lib/api'
 
 const WIDTH = 640
 const HEIGHT = 220
@@ -18,12 +18,18 @@ function clampPosition(pct: number): number {
  * Checkpoint timeline for the Sync Studio. Correlation offsets are drawn as a
  * line of dots against position%; quality is a bar under each dot.
  *
+ * When the report carries a line fit (#86), the fitted trend is drawn as a
+ * dashed grey polyline over the dots: y = intercept_ms + slope_ms_per_sec ·
+ * slice_start_sec, at each checkpoint's own x. A fit the analysis could not
+ * classify (`insufficient`, fewer than three points) has no line to draw, and
+ * neither does a 0.4.0 report — the dots are unchanged either way.
+ *
  * Deliberate deviation from PLAN.md M5-2: there is no API endpoint that
  * streams a vault .mka, and wavesurfer.js is not a dependency, so an audio
  * waveform would have nothing to play. This pure-SVG chart carries the same
  * per-checkpoint information (offset + quality) with zero new dependencies.
  */
-export function CheckpointChart({ checkpoints }: { checkpoints: SyncCheckpoint[] }) {
+export function CheckpointChart({ checkpoints, fit }: { checkpoints: SyncCheckpoint[]; fit?: SyncFit }) {
   if (checkpoints.length === 0) {
     return <p className="text-sm text-zinc-500">No checkpoints in this report.</p>
   }
@@ -34,6 +40,30 @@ export function CheckpointChart({ checkpoints }: { checkpoints: SyncCheckpoint[]
   const x = (pct: number) => LEFT + (clampPosition(pct) / 100) * plotWidth
   const y = (offset: number) => TOP + plotHeight / 2 - (offset / maxOffset) * (plotHeight / 2)
   const zeroY = y(0)
+
+  // The fitted trend, if the report has one the analysis could classify. The
+  // scale stays the dots' scale, so nothing about their geometry moves.
+  const slope = fit?.slope_ms_per_sec
+  const intercept = fit?.intercept_ms
+  const trend =
+    fit &&
+    fit.shape !== 'insufficient' &&
+    typeof slope === 'number' &&
+    Number.isFinite(slope) &&
+    typeof intercept === 'number' &&
+    Number.isFinite(intercept)
+      ? { slope, intercept }
+      : null
+  const fitPoints = trend
+    ? [...checkpoints]
+        .filter((cp) => Number.isFinite(cp.slice_start_sec))
+        .sort((a, b) => a.slice_start_sec - b.slice_start_sec)
+        .map(
+          (cp) =>
+            `${x(cp.position_pct)},${y(trend.intercept + trend.slope * cp.slice_start_sec)}`,
+        )
+    : []
+  const fitLine = fitPoints.length >= 2 ? fitPoints.join(' ') : null
 
   return (
     <figure className="w-full">
@@ -90,6 +120,17 @@ export function CheckpointChart({ checkpoints }: { checkpoints: SyncCheckpoint[]
           stroke="#2dd4bf"
           strokeWidth={2}
         />
+
+        {fitLine && (
+          <polyline
+            data-testid="fit-line"
+            points={fitLine}
+            fill="none"
+            stroke="#a1a1aa"
+            strokeWidth={1.5}
+            strokeDasharray="6 4"
+          />
+        )}
 
         {checkpoints.map((cp, index) => {
           const quality = Math.min(1, Math.max(0, cp.correlation_quality))

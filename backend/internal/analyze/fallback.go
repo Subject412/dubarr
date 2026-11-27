@@ -1,10 +1,5 @@
 package analyze
 
-import (
-	"math"
-	"slices"
-)
-
 // Why this file exists: a windowed analysis decodes one window per source
 // instead of two whole tracks, so a window that decoded the wrong audio
 // invents an offset the aggregation must not trust. The obvious rule —
@@ -23,8 +18,8 @@ import (
 // spike, a peak pinned to the engine's search edge, or a collapse in
 // correlation quality — makes a window untrustworthy.
 //
-// Drift is deliberately *not* reported here. Fitting a slope and writing it
-// into the report is issue #86; this file only decides which points to
+// Drift is deliberately *not* classified here. Fitting a slope and publishing
+// the shape is [FitTimeline] in fit.go; this file only decides which points to
 // re-decode.
 //
 // The thresholds are the package's existing ones — [StableSpreadThresholdMS]
@@ -196,10 +191,6 @@ func Accepts(reference []Window, referenceOffsets []float64, w Window, offsetMS 
 	return abs(offsetMS-expected) < StableSpreadThresholdMS
 }
 
-// timelinePoint is one (film position, measured offset) pair: x in seconds of
-// the movie, y in milliseconds of offset.
-type timelinePoint struct{ x, y float64 }
-
 // residualsAgainstLine returns each window's offset minus the timeline's line
 // at that window's film position, in milliseconds.
 func residualsAgainstLine(windows []Window, offsetsMS []float64) []float64 {
@@ -207,51 +198,14 @@ func residualsAgainstLine(windows []Window, offsetsMS []float64) []float64 {
 	for i := range windows {
 		points[i] = timelinePoint{x: windows[i].FilmStartSec, y: offsetsMS[i]}
 	}
+	// The line (and its reason for being a median of slopes) lives in fit.go,
+	// where the drift report reads it too.
 	slope, intercept := fitLine(points)
 	residuals := make([]float64, len(points))
 	for i, p := range points {
 		residuals[i] = p.y - (slope*p.x + intercept)
 	}
 	return residuals
-}
-
-// fitLine returns the straight line the timeline is measured against: the
-// median of the slopes between every pair of windows, and the median of the
-// intercepts that slope implies.
-//
-// It is not a least-squares line, and it must not become one. A least-squares
-// fit is dragged by the very point the rule is looking for: on six windows
-// holding one spike (-340, -340, +800, -340, -340, -340) it lands at slope
-// -32.6 and leaves residuals of 239..934 ms on the *clean* windows, so the
-// spike's neighbours are as far off as the spike and the "both neighbours on
-// the line" test can never pass — the rule would be dead for the shape it
-// exists to catch. The median of pairwise slopes (Theil–Sen) is the same line
-// for a constant shift and for a true drift — residuals 0 on both — and is
-// moved by at most a minority of windows, so the spike shows up as a spike.
-//
-// Fewer than two points, or every window at the same film position, leaves no
-// slope to take: the line is then horizontal at the median offset, which is
-// the honest answer when position carries no information.
-func fitLine(points []timelinePoint) (slope, intercept float64) {
-	if len(points) == 0 {
-		return 0, 0
-	}
-	slopes := make([]float64, 0, len(points)*(len(points)-1)/2)
-	for i := 0; i < len(points); i++ {
-		for j := i + 1; j < len(points); j++ {
-			if dx := points[j].x - points[i].x; dx != 0 {
-				slopes = append(slopes, (points[j].y-points[i].y)/dx)
-			}
-		}
-	}
-	if len(slopes) > 0 {
-		slope = medianOf(slopes)
-	}
-	intercepts := make([]float64, len(points))
-	for i, p := range points {
-		intercepts[i] = p.y - slope*p.x
-	}
-	return slope, medianOf(intercepts)
 }
 
 // withinBand reports whether every residual is inside
@@ -318,22 +272,3 @@ func loneSpike(residuals []float64, i int) bool {
 	}
 	return abs(residuals[i-1]) < StableSpreadThresholdMS && abs(residuals[i+1]) < StableSpreadThresholdMS
 }
-
-// medianOf returns the median of values, averaging the two middle values for
-// an even count. It sorts a copy: callers reuse their slices.
-func medianOf(values []float64) float64 {
-	sorted := slices.Clone(values)
-	slices.Sort(sorted)
-	if len(sorted) == 0 {
-		return 0
-	}
-	mid := len(sorted) / 2
-	if len(sorted)%2 == 1 {
-		return sorted[mid]
-	}
-	return (sorted[mid-1] + sorted[mid]) / 2
-}
-
-// abs is math.Abs, kept local so the millisecond arithmetic below reads as
-// the rules it implements.
-func abs(v float64) float64 { return math.Abs(v) }

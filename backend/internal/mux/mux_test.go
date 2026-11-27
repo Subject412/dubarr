@@ -638,6 +638,82 @@ func TestUnmuxableVerdictsAbort(t *testing.T) {
 	}
 }
 
+// TestCheckVerdictAcceptsACorrectedDrift pins the one widening (#86): a
+// drifting timeline the fitter classified as a clean drift, and whose tempo
+// factor the worker folded into the job's single encode, is aligned audio, so
+// the guard behind ErrVerdict must let it through.
+func TestCheckVerdictAcceptsACorrectedDrift(t *testing.T) {
+	r := analyze.Report{
+		Verdict:        analyze.VerdictDrifting,
+		Classification: analyze.ClassificationDrifting,
+		Fit: &analyze.LineFit{
+			Shape:         analyze.ShapeDrift,
+			SlopeMSPerSec: 42.7,
+			TempoFactor:   1.0427,
+			TempoApplied:  true,
+		},
+		Application: &analyze.Application{Mode: "re-encoded", Note: "re-encoded (tempo 1.0427)"},
+	}
+	if err := checkVerdict(r); err != nil {
+		t.Fatalf("checkVerdict(corrected drift) = %v, want nil", err)
+	}
+}
+
+// TestCheckVerdictStillRefusesADriftingCut keeps the other side pinned: a
+// re-cut is drifting too, and no tempo factor can align it, so the same
+// verdict with a cut shape must still be refused.
+func TestCheckVerdictStillRefusesADriftingCut(t *testing.T) {
+	r := analyze.Report{
+		Verdict:        analyze.VerdictDrifting,
+		Classification: analyze.ClassificationDrifting,
+		Fit: &analyze.LineFit{
+			Shape:        analyze.ShapeCut,
+			CutAtSec:     1800,
+			TempoFactor:  1.0427,
+			TempoApplied: true,
+		},
+		Application: &analyze.Application{Mode: "re-encoded", Note: "re-encoded (tempo 1.0427)"},
+	}
+	err := checkVerdict(r)
+	if !errors.Is(err, ErrVerdict) {
+		t.Fatalf("checkVerdict(drifting cut) = %v, want ErrVerdict", err)
+	}
+}
+
+// TestCheckVerdictStillRefusesAnUncorrectedDrift covers the trap: a report that
+// merely looks like a drift is not a corrected track. Neither an encode that
+// never happened nor a missing application record may satisfy the widening.
+func TestCheckVerdictStillRefusesAnUncorrectedDrift(t *testing.T) {
+	cases := map[string]analyze.Report{
+		"tempo not applied": {
+			Verdict:        analyze.VerdictDrifting,
+			Classification: analyze.ClassificationDrifting,
+			Fit: &analyze.LineFit{
+				Shape:        analyze.ShapeDrift,
+				TempoFactor:  1.0427,
+				TempoApplied: false,
+			},
+			Application: &analyze.Application{Mode: "copy", Note: "copied untouched"},
+		},
+		"application missing": {
+			Verdict:        analyze.VerdictDrifting,
+			Classification: analyze.ClassificationDrifting,
+			Fit: &analyze.LineFit{
+				Shape:        analyze.ShapeDrift,
+				TempoFactor:  1.0427,
+				TempoApplied: true,
+			},
+		},
+	}
+	for name, r := range cases {
+		t.Run(name, func(t *testing.T) {
+			if err := checkVerdict(r); !errors.Is(err, ErrVerdict) {
+				t.Fatalf("checkVerdict(%s) = %v, want ErrVerdict", name, err)
+			}
+		})
+	}
+}
+
 func TestMkvmergeFailureLeavesOriginalUntouched(t *testing.T) {
 	h := newHarness(t)
 	hash := sha256File(t, h.target)

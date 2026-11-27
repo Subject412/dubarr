@@ -603,6 +603,127 @@ func TestReportJSONShapeCarriesMatchZ(t *testing.T) {
 	}
 }
 
+// TestReportCarriesFit: the report publishes the trend next to the spread.
+//
+// The fixture is the drifting one above, and it is a *step*: the offsets jump
+// once and stay put, so the fit must call it a cut — a step is not a drift and
+// must never be made muxable by the tempo path. The second half of the test is
+// a real linear ramp, which is what a drift looks like.
+func TestReportCarriesFit(t *testing.T) {
+	eng := &scriptedEngine{offsets: []float64{500, 500, 500, 2000, 2000, 2000}}
+	rep, err := Analyze(context.Background(), eng, DefaultConfig(), request(t.TempDir()))
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+	if rep.Fit == nil {
+		t.Fatal("report.fit = nil, want the trend")
+	}
+	if rep.Fit.Shape != ShapeCut {
+		t.Fatalf("fit.shape = %q (slope %v, R2 %v), want %q for a one-step timeline",
+			rep.Fit.Shape, rep.Fit.SlopeMSPerSec, rep.Fit.R2, ShapeCut)
+	}
+	if rep.Fit.SlopeMSPerSec == 0 {
+		t.Fatal("fit.slope_ms_per_sec = 0, want the non-zero slope a step produces")
+	}
+	if rep.Fit.Points != len(rep.OffsetsMS) {
+		t.Fatalf("fit.points = %d, want %d", rep.Fit.Points, len(rep.OffsetsMS))
+	}
+
+	// A genuine ramp at 40.96 ms/s (25.000 -> 23.976 fps): the fit reports the
+	// drift and the factor that would remove it, and analyze leaves
+	// TempoApplied alone — only the worker knows whether an encode can run.
+	timing := Timing{
+		Target: SourceTiming{DurationSec: 600, OriginKnown: true},
+		Donor:  SourceTiming{DurationSec: 600, OriginKnown: true},
+	}
+	windows, err := PlanWindows(timing, DefaultCheckpointPositionsPct, searchWindowSec(DefaultConfig()))
+	if err != nil {
+		t.Fatalf("PlanWindows: %v", err)
+	}
+	ramp := make([]float64, len(windows))
+	for i, w := range windows {
+		ramp[i] = -340 + 40.96*w.FilmStartSec
+	}
+	rep, err = Analyze(context.Background(), &scriptedEngine{offsets: ramp}, DefaultConfig(), request(t.TempDir()))
+	if err != nil {
+		t.Fatalf("Analyze(ramp): %v", err)
+	}
+	if rep.Verdict != VerdictDrifting {
+		t.Fatalf("verdict = %q, want %q", rep.Verdict, VerdictDrifting)
+	}
+	if rep.Fit == nil || rep.Fit.Shape != ShapeDrift {
+		t.Fatalf("fit = %+v, want shape %q", rep.Fit, ShapeDrift)
+	}
+	if math.Abs(rep.Fit.SlopeMSPerSec-40.96) > 0.2 {
+		t.Fatalf("fit.slope_ms_per_sec = %v, want 40.96", rep.Fit.SlopeMSPerSec)
+	}
+	if math.Abs(rep.Fit.TempoFactor-0.95904) > 2e-4 {
+		t.Fatalf("fit.tempo_factor = %v, want 0.95904", rep.Fit.TempoFactor)
+	}
+	if rep.Fit.TempoFactor >= 1 {
+		t.Fatalf("fit.tempo_factor = %v for a positive slope, want < 1: the dub runs fast and is slowed",
+			rep.Fit.TempoFactor)
+	}
+	if rep.Fit.TempoApplied {
+		t.Fatal("fit.tempo_applied = true, want false: analyze never claims the encode happened")
+	}
+}
+
+func TestReportJSONShapeCarriesFit(t *testing.T) {
+	rep := Report{
+		Verdict:        VerdictOK,
+		OffsetsMS:      []float64{1, 2, 3},
+		Qualities:      []float64{0.5, 0.6, 0.7},
+		Classification: ClassificationStable,
+		SyncMethod:     reflang.SameLangReference,
+		Fit: &LineFit{
+			SlopeMSPerSec: 40.96, InterceptMS: -340, ResidualRMSMS: 1.2, MaxResidualMS: 3.4,
+			R2: 0.999, Points: 3, Shape: ShapeDrift, TempoFactor: 0.95904,
+		},
+	}
+	raw, err := json.Marshal(rep)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, ok := fields["fit"]; !ok {
+		t.Fatalf("report JSON missing fit: %s", raw)
+	}
+	var fit map[string]json.RawMessage
+	if err := json.Unmarshal(fields["fit"], &fit); err != nil {
+		t.Fatalf("unmarshal fit: %v", err)
+	}
+	for _, key := range []string{
+		"slope_ms_per_sec", "intercept_ms", "residual_rms_ms", "max_residual_ms",
+		"r2", "points", "shape", "tempo_factor", "tempo_applied",
+	} {
+		if _, ok := fit[key]; !ok {
+			t.Fatalf("fit JSON missing %q: %s", key, fields["fit"])
+		}
+	}
+
+	// A 0.4.0 row has no trend at all: the key must be absent, not zeroed, so
+	// the UI can tell "never measured" from "measured as flat".
+	legacy := Report{Verdict: VerdictOK, OffsetsMS: []float64{1}, Qualities: []float64{0.5}}
+	legacyRaw, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatalf("marshal legacy: %v", err)
+	}
+	var legacyFields map[string]json.RawMessage
+	if err := json.Unmarshal(legacyRaw, &legacyFields); err != nil {
+		t.Fatalf("unmarshal legacy: %v", err)
+	}
+	if _, ok := legacyFields["fit"]; ok {
+		t.Fatalf("legacy report JSON carries fit: %s", legacyRaw)
+	}
+	if _, ok := legacyFields["application"]; ok {
+		t.Fatalf("legacy report JSON carries application: %s", legacyRaw)
+	}
+}
+
 // TestIntegrationConstantOffsetPrecision runs the existing constant-offset pair
 // through the real engine and adds the precision the report now states: the
 // staged WAVs are written at 1 kHz, the runner analyses them at the file's rate,
@@ -764,7 +885,25 @@ func TestIntegrationConstantOffset(t *testing.T) {
 	}
 }
 
+// TestIntegrationPiecewiseDrift is the re-cut fixture run against the real
+// engine: one 2.5 s step at 712 s. Piecewise is disabled here, which is the
+// shipped default (05-piecewise-sync.md), so the verdict stays `drifting`.
 func TestIntegrationPiecewiseDrift(t *testing.T) {
+	assertPiecewiseDrift(t)
+}
+
+// TestIntegrationPiecewiseDriftKeepsDriftingVerdict is the named assertion the
+// #86 plan states (docs/plans/0.5.0/02-line-fit-drift.md): a step is a
+// `drifting` verdict whose trend is a `cut`, never a `drift` — otherwise the
+// worker would try to tempo-correct a re-cut and make it muxable.
+func TestIntegrationPiecewiseDriftKeepsDriftingVerdict(t *testing.T) {
+	assertPiecewiseDrift(t)
+}
+
+// assertPiecewiseDrift runs the step fixture once per named test: a `drifting`
+// verdict paired with a `cut` shape is the whole point of both.
+func assertPiecewiseDrift(t *testing.T) {
+	t.Helper()
 	eng := requireEngine(t)
 	dir := t.TempDir()
 	const dur = 1500
@@ -790,6 +929,20 @@ func TestIntegrationPiecewiseDrift(t *testing.T) {
 	}
 	if rep.MaxDriftMS < 1000 {
 		t.Fatalf("max drift = %v, want >= 1000", rep.MaxDriftMS)
+	}
+	// #86: a re-cut is a step, not a drift. The trend must say so — a job like
+	// this stays unmuxable and waits for piecewise segmentation (slice 05).
+	// The test keeps its name and its `drifting` verdict because piecewise is
+	// off here, which is the shipped default (05-piecewise-sync.md).
+	if rep.Fit == nil {
+		t.Fatal("report.fit = nil, want the trend")
+	}
+	if rep.Fit.Shape != ShapeCut {
+		t.Fatalf("fit.shape = %q (slope %v, R2 %v), want %q: a step is not a drift",
+			rep.Fit.Shape, rep.Fit.SlopeMSPerSec, rep.Fit.R2, ShapeCut)
+	}
+	if rep.Fit.TempoFactor != 0 {
+		t.Fatalf("fit.tempo_factor = %v, want 0: a cut cannot be tempo-corrected", rep.Fit.TempoFactor)
 	}
 }
 

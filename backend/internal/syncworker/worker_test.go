@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -1073,5 +1074,252 @@ func TestDrainSkipsRequeuedJobAndRunsTheJobsBehindIt(t *testing.T) {
 	}
 	if got := mx.count(requeuedID); got != 2 {
 		t.Fatalf("requeued job muxed %d times over two passes, want 2", got)
+	}
+}
+
+// driftReport is the analysis of a clean frame-rate drift: the offsets ramp at
+// 40.96 ms/s (a 25.000 fps dub against a 23.976 fps target) from an intercept of
+// -340 ms, and the tempo factor that removes it is 1 - 40.96/1000 = 0.95904 —
+// below 1, because the dub runs fast and has to be slowed. The median of the
+// ramp is nowhere near the intercept, which is what makes the
+// intercept-as-offset assertion bite.
+func driftReport() analyze.Report {
+	const (
+		intercept = -340.0
+		slope     = 40.96
+	)
+	positions := []float64{60, 150, 240, 330, 420, 510}
+	offsets := make([]float64, len(positions))
+	for i, p := range positions {
+		offsets[i] = intercept + slope*p
+	}
+	return analyze.Report{
+		Verdict:        analyze.VerdictDrifting,
+		Classification: analyze.ClassificationDrifting,
+		SyncMethod:     "same_lang_reference",
+		OffsetsMS:      offsets,
+		Fit: &analyze.LineFit{
+			SlopeMSPerSec: slope,
+			InterceptMS:   intercept,
+			R2:            1,
+			Points:        len(positions),
+			Shape:         analyze.ShapeDrift,
+			TempoFactor:   0.95904,
+		},
+	}
+}
+
+// TestMuxableReport pins what the worker may publish: ok/stable as before, and
+// a drifting report only when the trend is a clean drift the worker has
+// actually compensated. A cut, or a drift this worker did not fix, is review.
+func TestMuxableReport(t *testing.T) {
+	cases := []struct {
+		name   string
+		report analyze.Report
+		want   bool
+	}{
+		{"ok", analyze.Report{Verdict: analyze.VerdictOK}, true},
+		{"stable classification", analyze.Report{Verdict: analyze.ClassificationStable}, true},
+		{"drifting without a fit", analyze.Report{Verdict: analyze.VerdictDrifting}, false},
+		{"drifting with a cut", analyze.Report{
+			Verdict: analyze.VerdictDrifting,
+			Fit:     &analyze.LineFit{Shape: analyze.ShapeCut},
+		}, false},
+		{"drifting with a compensated drift", analyze.Report{
+			Verdict: analyze.VerdictDrifting,
+			Fit:     &analyze.LineFit{Shape: analyze.ShapeDrift, TempoFactor: 0.95904, TempoApplied: true},
+		}, true},
+		{"drifting with an uncompensated drift", analyze.Report{
+			Verdict: analyze.VerdictDrifting,
+			Fit:     &analyze.LineFit{Shape: analyze.ShapeDrift, TempoFactor: 0.95904},
+		}, false},
+		{"unreliable with a compensated drift", analyze.Report{
+			Verdict: analyze.VerdictUnreliable,
+			Fit:     &analyze.LineFit{Shape: analyze.ShapeDrift, TempoApplied: true},
+		}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := muxableReport(tc.report); got != tc.want {
+				t.Fatalf("muxableReport(%q, fit %+v) = %v, want %v",
+					tc.report.Verdict, tc.report.Fit, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestProcessOnceAppliesDriftTempoInOneEncode is #86 end to end at the worker:
+// a drifting report with a clean fit is compensated in ONE ffmpeg pass, muxed
+// at the intercept scaled by the factor it was stretched with (not the median),
+// and the persisted report says so.
+func TestProcessOnceAppliesDriftTempoInOneEncode(t *testing.T) {
+	r := newRig(t)
+	jobID := r.newJob(t)
+	staged := r.stage(t, jobID)
+
+	mx := &fakeMuxer{}
+	tr := &fakeTranscoder{}
+	w := newWorker(t, r, &fakeExecutor{report: driftReport()}, mx, &fakeRescanner{})
+	w.transcoder = tr
+
+	processed, err := w.ProcessOnce(context.Background())
+	if err != nil || !processed {
+		t.Fatalf("ProcessOnce = %v/%v, want true/nil", processed, err)
+	}
+	if len(tr.requests) != 1 {
+		t.Fatalf("Transcode calls = %d, want exactly 1 (tempo and codec in one pass)", len(tr.requests))
+	}
+	req := tr.requests[0]
+	if req.Input != staged {
+		t.Fatalf("transcode input = %q, want the staged copy %q", req.Input, staged)
+	}
+	if req.Plan.TempoFactor != 0.95904 {
+		t.Fatalf("plan tempo factor = %v, want 0.95904", req.Plan.TempoFactor)
+	}
+	// Direction: the fixture's offsets ramp UP (+40.96 ms/s), so the dub runs
+	// fast and the correction must slow it. A factor of 1 + slope/1000 (the
+	// sign this slice shipped inverted) would stretch the fast dub further and
+	// double the drift instead of removing it.
+	fixture := driftReport()
+	if fixture.Fit.SlopeMSPerSec <= 0 {
+		t.Fatalf("fixture slope = %v, want a positive ramp", fixture.Fit.SlopeMSPerSec)
+	}
+	if req.Plan.TempoFactor >= 1 || req.Plan.TempoFactor <= 0 {
+		t.Fatalf("plan tempo factor = %v for a positive offset slope, want 0 < factor < 1 (slow the fast dub)",
+			req.Plan.TempoFactor)
+	}
+	// No rule is configured, so the tempo-only plan is materialised as FLAC:
+	// lossless, so a feature the operator never asked for cannot degrade the
+	// dub's audio.
+	if req.Plan.Codec != transcode.CodecFLAC {
+		t.Fatalf("plan codec = %q, want %q for a tempo-only encode", req.Plan.Codec, transcode.CodecFLAC)
+	}
+	if req.Plan.RuleIndex != transcode.NoRule {
+		t.Fatalf("plan rule index = %d, want %d (no rule produced this encode)", req.Plan.RuleIndex, transcode.NoRule)
+	}
+
+	if len(mx.jobs) != 1 {
+		t.Fatalf("Mux calls = %d, want 1", len(mx.jobs))
+	}
+	// The intercept is measured on the uncorrected timeline, and the tempo
+	// encode has already stretched that timeline by the factor — so the
+	// constant mkvmerge shifts by is intercept/factor, not the raw intercept.
+	// A 30 s intercept at 5 ms/s would otherwise leave ~150 ms of shift, well
+	// outside the 40 ms stable band.
+	if want := int64(math.Round(-340 / 0.95904)); want != -355 {
+		t.Fatalf("round(-340/0.95904) = %d, want the fixture's -355", want)
+	}
+	if got := mx.jobs[0].SyncOffsetMS; got != -355 {
+		t.Fatalf("mux offset = %d ms, want round(intercept/tempo_factor) = -355, not the raw intercept -340",
+			got)
+	}
+	if got := mx.jobs[0].AudioPath; got != req.Output {
+		t.Fatalf("mux audio = %q, want the encoded track %q", got, req.Output)
+	}
+	if mx.jobs[0].Report.Fit == nil || !mx.jobs[0].Report.Fit.TempoApplied {
+		t.Fatalf("mux report fit = %+v, want tempo_applied true", mx.jobs[0].Report.Fit)
+	}
+
+	rec, ok, err := r.store.SyncJobByID(context.Background(), jobID)
+	if err != nil || !ok {
+		t.Fatalf("SyncJobByID = %v/%v", ok, err)
+	}
+	if rec.Status != statusCompleted {
+		t.Fatalf("status = %q (%s), want completed", rec.Status, rec.ErrorMessage)
+	}
+	// The persisted offset is the one the job actually muxed with, so it is the
+	// scaled residual too — the Sync page's "applied offset" badge reads it,
+	// and reporting the raw intercept there would disagree with the mux.
+	if rec.CalculatedOffsetMS != -355 {
+		t.Fatalf("calculated_offset_ms = %d, want round(intercept/tempo_factor) = -355", rec.CalculatedOffsetMS)
+	}
+	var stored analyze.Report
+	if err := json.Unmarshal([]byte(rec.CheckpointsJSON), &stored); err != nil {
+		t.Fatalf("unmarshal stored report: %v", err)
+	}
+	if stored.Application == nil {
+		t.Fatalf("stored report has no application block: %s", rec.CheckpointsJSON)
+	}
+	// %.5f, not %.4f: the factor is 0.95904 and four decimals would print
+	// 0.9590 — a different number from the one the encode was given.
+	if stored.Application.Mode != "re-encoded" || !strings.Contains(stored.Application.Note, "0.95904") {
+		t.Fatalf("application = %+v, want a re-encoded note naming tempo 0.95904", stored.Application)
+	}
+	if stored.Fit == nil || !stored.Fit.TempoApplied {
+		t.Fatalf("stored fit = %+v, want tempo_applied true", stored.Fit)
+	}
+}
+
+// TestProcessOnceDriftingWithoutTempoStaysUnmuxable is the other half: a cut is
+// a drifting verdict this worker cannot fix, so today's behaviour stands —
+// failed, nothing encoded, nothing muxed.
+func TestProcessOnceDriftingWithoutTempoStaysUnmuxable(t *testing.T) {
+	r := newRig(t)
+	jobID := r.newJob(t)
+	r.stage(t, jobID)
+
+	report := driftReport()
+	report.Fit.Shape = analyze.ShapeCut
+	report.Fit.TempoFactor = 0
+	report.Fit.CutAtSec = 712
+	report.Fit.CutUncertaintySec = 100
+
+	mx := &fakeMuxer{}
+	tr := &fakeTranscoder{}
+	w := newWorker(t, r, &fakeExecutor{report: report}, mx, &fakeRescanner{})
+	w.transcoder = tr
+
+	processed, err := w.ProcessOnce(context.Background())
+	if err != nil || !processed {
+		t.Fatalf("ProcessOnce = %v/%v, want true/nil", processed, err)
+	}
+	if len(tr.requests) != 0 || len(tr.probes) != 0 {
+		t.Fatalf("transcoder used for a cut: probes=%v requests=%d", tr.probes, len(tr.requests))
+	}
+	if len(mx.jobs) != 0 {
+		t.Fatalf("Mux called %d times for a cut, want 0", len(mx.jobs))
+	}
+	rec, _, _ := r.store.SyncJobByID(context.Background(), jobID)
+	if rec.Status != statusFailed {
+		t.Fatalf("status = %q, want failed", rec.Status)
+	}
+	if !strings.Contains(rec.ErrorMessage, "not muxable") || !strings.Contains(rec.ErrorMessage, "drifting") {
+		t.Fatalf("error message = %q, want it to name the unmuxable drifting verdict", rec.ErrorMessage)
+	}
+}
+
+// TestProcessOnceTempoNeedsItsEncoder: the factor does not exist until the
+// report does, so this encoder check is the deferred one — after Execute, and
+// before any encode or mux.
+func TestProcessOnceTempoNeedsItsEncoder(t *testing.T) {
+	r := newRig(t)
+	jobID := r.newJob(t)
+	r.stage(t, jobID)
+
+	ex := &fakeExecutor{report: driftReport()}
+	mx := &fakeMuxer{}
+	tr := &fakeTranscoder{available: map[string]bool{"flac": false}}
+	w := newWorker(t, r, ex, mx, &fakeRescanner{})
+	w.transcoder = tr
+
+	processed, err := w.ProcessOnce(context.Background())
+	if err != nil || !processed {
+		t.Fatalf("ProcessOnce = %v/%v, want true/nil", processed, err)
+	}
+	if len(ex.calls) != 1 {
+		t.Fatalf("executor calls = %d, want 1: the check can only run after the report exists", len(ex.calls))
+	}
+	if len(tr.probes) != 1 || tr.probes[0] != "flac" {
+		t.Fatalf("encoder probes = %v, want [flac]", tr.probes)
+	}
+	if len(tr.requests) != 0 || len(mx.jobs) != 0 {
+		t.Fatalf("work happened without the encoder: transcode=%d mux=%d", len(tr.requests), len(mx.jobs))
+	}
+	rec, _, _ := r.store.SyncJobByID(context.Background(), jobID)
+	if rec.Status != statusFailed {
+		t.Fatalf("status = %q, want failed", rec.Status)
+	}
+	if !strings.Contains(rec.ErrorMessage, "flac") {
+		t.Fatalf("error message %q does not name the missing encoder", rec.ErrorMessage)
 	}
 }

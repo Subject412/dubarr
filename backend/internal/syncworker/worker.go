@@ -9,10 +9,10 @@
 //
 // Failure policy:
 //
-//   - Execute failure, a non-muxable verdict (drifting, unreliable,
-//     out_of_range), a mux failure: the job is marked failed with the first
-//     line of the reason, staging under {WORK_DIR}/jobs/{id}/ is removed and
-//     no mux is attempted.
+//   - Execute failure, a non-muxable verdict (an unreliable or out-of-range
+//     report, or a drift this worker cannot correct — see muxableReport), a mux
+//     failure: the job is marked failed with the first line of the reason,
+//     staging under {WORK_DIR}/jobs/{id}/ is removed and no mux is attempted.
 //   - A mux refusal is terminal, never retried: [mux.ErrUnsupportedContainer]
 //     (a target or destination that is not Matroska) and the other mux
 //     sentinels surface unchanged from Mux, so the job is marked failed once
@@ -104,7 +104,9 @@ type Rescanner interface {
 // satisfies it; tests inject a fake to assert the plan and the failure paths.
 type Transcoder interface {
 	// EncoderAvailable is the pre-job check: a missing libopus must surface
-	// as ErrEncoderUnavailable before any work happens.
+	// as ErrEncoderUnavailable before any work happens. A drift correction's
+	// encoder is checked after Execute instead, because its factor does not
+	// exist before the report does; that check still precedes the encode.
 	EncoderAvailable(ctx context.Context, encoder string) (bool, string)
 	// Transcode performs one ffmpeg pass on the copy in the temp folder and
 	// verifies the result.
@@ -410,7 +412,38 @@ func (w *Worker) processJob(ctx context.Context, id int64) error {
 	if err != nil {
 		return atStage("analyze", err)
 	}
-	if !muxableVerdict(report.Verdict) {
+	// #86: a clean frame-rate drift is corrected by this worker, folded into the
+	// one encode the plan already describes (a matched rule's, or a tempo-only
+	// FLAC one). The decision is taken before the muxability gate because the
+	// gate must see whether the drift was actually compensated — and only the
+	// worker knows whether an encode path exists; analyze never sets
+	// TempoApplied itself.
+	if tempoEligible(report) {
+		report.Fit.TempoApplied = true
+		plan = plan.WithTempo(report.Fit.TempoFactor)
+		if !plan.Encode() {
+			// No rule matched, so there is no codec to fold the factor into:
+			// materialise a lossless one. FLAC is the only lossless encoder
+			// this build always carries, so a correction nobody configured
+			// cannot cost the dub any quality.
+			plan = transcode.Plan{RuleIndex: transcode.NoRule, Codec: transcode.CodecFLAC}.WithTempo(report.Fit.TempoFactor)
+		}
+		// The rule path's encoder check ran before Execute (ADR-0010). This one
+		// cannot: the factor does not exist until the report does.
+		if available, detail := w.transcoder.EncoderAvailable(ctx, plan.Encoder()); !available {
+			return atStage("encoder", fmt.Errorf("%w: tempo %.4f needs %s for audio track %d: %s",
+				ErrEncoderUnavailable, report.Fit.TempoFactor, plan.Encoder(), rec.TargetTrackID, detail))
+		}
+		// The note names the factor to five decimals: the factors this slice
+		// produces are 5-decimal numbers (0.95904 for the 25.000 -> 23.976
+		// drift), and %.4f would print 0.9590 — a different number from the
+		// one the encode was given.
+		report.Application = &analyze.Application{
+			Mode: "re-encoded",
+			Note: fmt.Sprintf("re-encoded (tempo %.5f)", report.Fit.TempoFactor),
+		}
+	}
+	if !muxableReport(report) {
 		return atStage("verdict", fmt.Errorf("%w: verdict %q (%s)", ErrUnmuxableVerdict, report.Verdict, strings.TrimSpace(report.Reason)))
 	}
 
@@ -442,7 +475,20 @@ func (w *Worker) processJob(ctx context.Context, id int64) error {
 			return atStage("transcode", err)
 		}
 	}
+	// #86: mkvmerge --sync shifts the whole track by one constant, so the
+	// number to give it is the offset the tempo-corrected track still has at
+	// t = 0 — the intercept, scaled by the factor the encode applied. The fit
+	// measures the intercept on the UNCORRECTED timeline; the encode has
+	// already stretched it by TempoFactor, so the residual constant is
+	// intercept/TempoFactor, not the raw intercept (a 30 s intercept at
+	// 5 ms/s would otherwise leave ~150 ms, well outside the 40 ms stable
+	// band). The median is only the right constant for a timeline with no
+	// trend: on a linear ramp it leaves half the drift in place. A report
+	// without a fit (a 0.4.0 row) keeps the median.
 	offset := medianOffsetMS(report.OffsetsMS)
+	if report.Fit != nil && report.Fit.TempoApplied && report.Fit.TempoFactor > 0 {
+		offset = int64(math.Round(report.Fit.InterceptMS / report.Fit.TempoFactor))
+	}
 	rule, err := w.gateRule(ctx)
 	if err != nil {
 		return atStage("gate", err)
@@ -531,9 +577,11 @@ func (w *Worker) processJob(ctx context.Context, id int64) error {
 		string(report.SyncMethod), offset, report, "", rec.AnalysisSource, rec.AnalysisFallback))
 }
 
-// muxableVerdict accepts exactly the two verdicts M5-1 may publish. The
-// classification word "stable" is tolerated because analyze emits it alongside
-// verdict ok in older reports.
+// muxableVerdict accepts exactly the verdicts this worker may publish without a
+// correction of its own. The classification word "stable" is tolerated because
+// analyze emits it alongside verdict ok in older reports. A drifting verdict is
+// not accepted here: [muxableReport] decides that case, because it depends on
+// whether the drift was actually compensated.
 func muxableVerdict(verdict string) bool {
 	switch strings.ToLower(strings.TrimSpace(verdict)) {
 	case analyze.VerdictOK, analyze.ClassificationStable:
@@ -541,6 +589,50 @@ func muxableVerdict(verdict string) bool {
 	default:
 		return false
 	}
+}
+
+// muxableReport is the gate the job must clear before anything is encoded or
+// muxed: the pre-#86 rules, plus one new case.
+//
+// A drifting verdict is publishable when the trend is a clean drift the encoder
+// can represent and this worker has folded the correction into the job's single
+// encode (Fit.TempoApplied). The mux then runs at intercept/TempoFactor and the
+// row says so in report.application. Everything else keeps today's behaviour:
+// a cut needs per-segment work (slice 05), an unreliable or out-of-range report
+// needs a human, and a drift whose factor the worker refused to apply must not
+// be published with half the correction missing.
+func muxableReport(report analyze.Report) bool {
+	if muxableVerdict(report.Verdict) {
+		return true
+	}
+	if !strings.EqualFold(strings.TrimSpace(report.Verdict), analyze.VerdictDrifting) {
+		return false
+	}
+	return report.Fit != nil && report.Fit.Shape == analyze.ShapeDrift && report.Fit.TempoApplied
+}
+
+// tempoEligible reports whether the report describes a drift this worker can
+// correct in one encode: a drifting verdict, a clean drift shape, a factor the
+// encoder's range accepts.
+//
+// The verdict is part of the test, not just the shape. A cut must never be
+// stretched, and an out_of_range or unreliable report also carries a fit:
+// stretching a timeline whose offsets are already outside the checkpoint window,
+// or whose matches the engine did not trust, would be guessing. An ok report is
+// copied untouched exactly as before — it needs no correction.
+func tempoEligible(report analyze.Report) bool {
+	if report.Fit == nil || report.Fit.Shape != analyze.ShapeDrift {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(report.Verdict), analyze.VerdictDrifting) {
+		return false
+	}
+	if report.Fit.TempoFactor == 0 {
+		return false
+	}
+	// A report is data, and a factor outside the single encode's range is one
+	// this release cannot honour — refuse rather than clamp.
+	return transcode.ValidateTempo(report.Fit.TempoFactor) == nil
 }
 
 // nextQueued returns the lowest-id queued job that this pass has not visited
@@ -787,10 +879,26 @@ func (w *Worker) transcodeStaged(ctx context.Context, jobID int64, audio string,
 		LangISO2:         track.LangISO2,
 	})
 	if err != nil {
-		return "", fmt.Errorf("syncworker: job %d transcode (rule %d): %w", jobID, plan.RuleIndex+1, err)
+		return "", fmt.Errorf("syncworker: job %d transcode (%s): %w", jobID, encodeLabel(plan), err)
 	}
-	w.logf("syncworker: job %d transcoded rule %d to %s (%d ch, %d bps)", jobID, plan.RuleIndex+1, res.Codec, res.Channels, res.BitrateBPS)
+	w.logf("syncworker: job %d transcoded %s to %s (%d ch, %d bps)", jobID, encodeLabel(plan), res.Codec, res.Channels, res.BitrateBPS)
 	return res.Path, nil
+}
+
+// encodeLabel names the encode a plan asks for, in job logs and errors: "rule N"
+// when a rule produced it, "tempo-only" when the plan exists solely to correct a
+// drift (RuleIndex == transcode.NoRule), plus the factor when a drift
+// correction rides along with a rule. Without it, a tempo-only plan would log
+// as "rule 0" — a rule the operator never wrote.
+func encodeLabel(plan transcode.Plan) string {
+	label := "tempo-only"
+	if plan.RuleIndex != transcode.NoRule {
+		label = fmt.Sprintf("rule %d", plan.RuleIndex+1)
+	}
+	if plan.TempoFactor != 0 && plan.TempoFactor != 1 {
+		label += fmt.Sprintf(" + tempo %.4f", plan.TempoFactor)
+	}
+	return label
 }
 
 // outputDestination resolves mux.options.output_mode and re-validates

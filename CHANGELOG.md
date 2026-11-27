@@ -11,6 +11,122 @@ change.
 
 _Nothing yet._
 
+## [0.5.0] - 2026-11-27
+
+Pre-1.0. The sync engine learned to say how sure it is, to tell a speed drift
+from a cut, to run a chosen set of matchers, and to fix a dub that was cut
+differently from your copy. Approving a job stopped being a promise the app
+could not keep, and the library stopped being a flat list.
+
+Settings, jobs, the library and the Audio Vault all migrate forward on start. One behaviour
+change is worth reading twice: **no preset turns the new piecewise sync on**,
+not even Maximum accuracy, because a saved preset must never start re-encoding
+dub copies behind your back.
+
+### Sync engine
+
+- **Confidence is a z-score** over the whole lag curve, not a fit through three
+  numbers, and the peak is interpolated between samples — so a checkpoint now
+  reports both how sure it is and how precisely it could place the offset
+  (±0.125 ms at 8 kHz). The thresholds live in one table; nothing that was `ok`
+  in a 0.4.0 library reclassifies.
+- **Drift is separated from a cut** by fitting a line through the checkpoint
+  offsets. A high-R² line means the two releases run at different speeds; a
+  step means the film was re-cut. A clean drift is corrected in one ffmpeg pass
+  with `atempo = 1 − slope/1000` — for 25.000 → 23.976 fps that is exactly
+  0.95904 — and the residual offset is scaled by the same factor.
+- **You choose which techniques run, and in what order.** Each technique is a
+  rule: waveform, or MFCC, fired always or only when an earlier answer was
+  below a confidence. Presets are `balanced`, `fast` and `maximum_accuracy`;
+  Fast measures fewer checkpoints rather than measuring them worse. A preset
+  press writes the technique list and the checkpoint positions in one save, and
+  a refused save stores neither.
+- **MFCC correlation** as a second matcher behind the same contract. On a
+  codec-degraded pair it scores **0.188 quality against the waveform's 0.017**,
+  because a spectrally-smeared encode hurts a sample-domain correlator far more
+  than a mel-cepstral one. Its z-scores are not on the waveform's scale, so the
+  sigma gate became per-technique.
+- **Piecewise sync** for a dub that was cut differently: with *Handle films
+  with a cut or an inserted scene* enabled, the analysis samples the whole film,
+  a split-penalty dynamic program finds the joins, and each part of the dub is
+  shifted on its own. The dub copy is re-encoded **once** (lossless when no rule
+  asks for anything else) and muxed at zero offset because the track is already
+  aligned. A join is only accepted where both neighbouring windows are confident
+  and the step clears the floor — otherwise the plan is rejected, nothing is
+  transcoded, and the job surfaces for review with the reason. A film with no
+  cut stays an ordinary single-offset job.
+
+Two defects were found in review and are worth naming, because both would have
+lost audio silently: the segment plan stopped at the last analysed window (the
+published track ended ~37.5 s early, and the render check could not see it
+because the expected total was built from the truncated plan), and segments were
+positioned by concatenation order alone, so a quiet opening — checkpoints below
+the quality floor — shifted the whole track earlier while the job recorded a
+zero offset. An accepted plan now **tiles the film** (first segment at 0, last at
+the film's own duration, interiors contiguous) and a render refuses anything
+else with `ErrInvalidPlan`. `TestPiecewiseEndToEndKeepsTailAndHead` proves it on
+generated media with real ffmpeg: published 200.005 s against a 200.000 s target,
+head marker Δ0 ms, post-join marker Δ1 ms, video stream hash unchanged.
+
+### Workflow
+
+- **Approve records intent.** It no longer asks the tag gate anything — it keeps
+  only the four honest refusals (no identity match, no target file, unreadable
+  target folder, no donor) and lets extraction run. The sync job is created where
+  the track finally exists, as `queued` when the pair is eligible or `held` with
+  a reason (`waiting_for_tags`, `missing_target`, `target_changed`,
+  `cancelled_by_rejection`). Release is a projection at every epoch — each arr
+  sync pass, after a rescan, once at boot, and again when a worker claims the
+  job — so a held job promotes itself the moment its tags arrive. Migration 0008
+  rebuilds `sync_mux_jobs` for the new states and is tested against a populated
+  pre-0008 database.
+- A practical consequence: an ineligible film no longer blocks **extraction**,
+  so the expensive half of the work happens while the pair waits for tags.
+
+### Library
+
+- **Series, seasons and episodes.** The library was a flat list of files, which
+  is fine for films and useless for television. Five read endpoints now serve the
+  hierarchy with one aggregate query per level and no N+1: films, series (with
+  season and episode counts and the **worst** eligibility in the tree, so one
+  unprocessable episode surfaces at the series level), a series, its seasons with
+  `percent_of_episodes`, and a season's episodes with paging. A season too long
+  to show at once is paged and says so rather than silently ending. Migration
+  0009 adds the three indexes the drill-down and search need.
+- The flat `/api/library/items` view is unchanged.
+
+### Vault
+
+- **Organise the Audio Vault with arr-style templates.** Film, episode and
+  season-folder patterns you can read, a preview that writes nothing, and an
+  apply that is the only thing that ever moves a file. When a plan has a
+  conflict there is no plan to submit; when a file changed since the preview the
+  apply refuses (`stale_plan`) instead of moving the wrong thing. Preflight
+  refuses a swap, a destination outside the vault, a cross-device move or an
+  occupied destination *before* touching anything. The apply itself is three
+  phases — create parents, rename (undone in reverse on the first error), then a
+  single transaction of guarded `UPDATE … WHERE file_path = <source>` with audit
+  rows; if a rename-back also fails it reconciles the database to whichever path
+  exists and records a run that needs attention, listing the paths to inspect.
+  No file is ever deleted or rewritten: the only removals target directories the
+  request itself created, deepest first, and only while empty. Migration 0010
+  adds the two audit tables.
+- A template that would produce `….mka.pl.mka`, a reserved name, or a stem over
+  200 bytes is refused when you type it, against the field that caused it.
+
+### Upgrade notes
+
+- **Nothing to migrate by hand.** Settings rows load unchanged; missing keys are
+  served with their defaults. Migrations 0008, 0009 and 0010 run on start.
+- **Piecewise sync is off** until you turn it on, in every preset.
+- **Vault organising is opt-in per action**: setting a template never moves a
+  file. Nothing inside the vault changes until you preview a plan and apply it.
+- **A held job is not a failure.** If the queue shows a job waiting for tags, it
+  was approved and is waiting for its target to become eligible; it releases
+  itself, no second press needed.
+- Reports from 0.4.0 render unchanged in Sync Studio; jobs created before 0.5.0
+  keep their stored offsets.
+
 ## [0.4.0] - 2026-11-27
 
 Pre-1.0. This is a minor release and the largest internal change since 0.2.0:

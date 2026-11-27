@@ -1,19 +1,25 @@
 # Dubarr — Implementation Plan
 
-Spec: `VISION.md`. Domain: `GLOSSARY.md`. Decisions: `docs/adr/0001–0018`. Contract: `AGENTS.md`.
+Spec: `VISION.md`. Domain: `GLOSSARY.md`. Decisions: `docs/adr/0001–0022`. Contract: `AGENTS.md`.
 Execution: subagent-driven-development (fresh implementer per task → spec review → quality review). Gate protocol: **stop for user OK at each milestone gate (M1→M5)**. For issues #1–#13 (M7–M10 below) the user settled on continuous execution with **no stop-for-OK gates**; milestones remain work batches only.
 
-## Status (2026-11-26)
+## Status (2026-11-27)
 
-`v0.3.0` is released. M1–M10 are delivered, and M11 (issues #26–#30) shipped in
-0.3.0: the setup-wizard race and opt-in skip, the arr draft test and connection
-diagnostics, library health/routes/page/refresh/rescan, queue match state,
-Identify, the queue triage UI, the 0.3.0 release docs, and the
-`arr_library_cache` identity migration (0006).
+`v0.5.0` is released. M1–M11 are delivered: 0.3.0 shipped the M11 issues (#26–#30),
+0.4.0 replaced the Rust engine with the in-process Go DSP and made windowed
+analysis the shipped mode, and 0.5.0 delivered seven of the eight slices in
+`docs/plans/0.5.0/` — z-scored confidence with an interpolated peak (#85), the
+line fit that separates a drift from a cut with a single-pass tempo render (#86),
+the per-checkpoint technique pipeline and its `sync.strategy` section (#82), the
+MFCC matcher (#83), piecewise sync for a re-cut dub (#84), approve-records-intent
+with held jobs (#48) and the series/season/episode library hierarchy (#56).
+Decisions recorded in ADR-0019, ADR-0020 and ADR-0021.
 
-Next, not yet broken into tasks: the vault lifecycle defined by ADR-0015 (remove
-to Vault Trash, replace with better audio, mark orphaned tracks) and vault naming
-plus reorganisation (issue #47). Windows support is dropped (ADR-0016).
+Not delivered: vault naming plus reorganisation (issue #47); the plan is
+`docs/plans/0.5.0/08-vault-organising.md` and ADR-0022 is still a draft, so
+nothing of it is in 0.5.0. The vault lifecycle defined by ADR-0015 (remove to
+Vault Trash, replace with better audio, mark orphaned tracks) is also still
+outstanding. Windows support is dropped (ADR-0016).
 
 
 ## Settled defaults (grilling Q1–Q15)

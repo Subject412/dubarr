@@ -14,10 +14,10 @@ Dubarr is pre-1.0, so the usual SemVer rules are read as:
 - `1.0.0` is reserved for the point at which the HTTP API, settings schema and
   on-disk data layout are considered stable.
 
-`0.4.0` is released. The next version is chosen when the vault model settles;
-there is no 1.0 target, because being prepared for release is not the same as
-leaving beta. The version number describes how stable the API is, not how ready
-the software is to run.
+`0.5.0` is released. The next version is chosen from what the vault model still
+needs rather than from a schedule; there is no 1.0 target, because being
+prepared for release is not the same as leaving beta. The version number
+describes how stable the API is, not how ready the software is to run.
 
 Pre-release identifiers (`v0.3.0-rc.1`) are permitted and publish a GitHub
 pre-release via the normal tag flow. Build metadata (`+...`) is not used in
@@ -28,9 +28,10 @@ tags.
 The version number says how much the API may move. It says nothing about how
 carefully data is treated — these hold in every release, 0.x included:
 
-- No silent destruction: a target must be matched, tag-eligible and paired with
-  a donor before it can be approved; a mux is validated with `ffprobe` before it
-  replaces anything; the Audio Vault is write-once after first archive.
+- No silent destruction: a target must be matched and paired with a donor before
+  it can be approved, and the mux itself is tag-gated (unless the operator's
+  force override is enabled) and validated with `ffprobe` before it replaces
+  anything; the Audio Vault is write-once after first archive.
 - The database schema is migrated forward automatically on start, and a
   migration that cannot complete rolls back rather than leaving a half-applied
   database.
@@ -42,11 +43,15 @@ What 0.x does **not** promise:
   layout may change between minor releases.
 - **Windows.** Not supported and not built: no Windows archive is published and
   nothing is tested there (ADR-0016).
-- **Automatic vault reorganisation** — moving or renaming files inside the
-  Audio Vault. Planned, not implemented (issue #47). When it lands it must gate
-  the way the arr applications gate media moves: a previewed plan, applied only
-  on approval. Operator-initiated removal and replacement are already defined
-  (ADR-0015) and always go through the Vault Trash.
+- **Automatic vault reorganisation.** 0.5.0 ships vault organising (ADR-0022),
+  but never automatically: a template change moves nothing, and a move happens
+  only when an operator previews a plan and applies it. That gating is a
+  guarantee, not a convenience — the plan is previewed, preflighted (no swaps,
+  nothing outside the vault, nothing cross-device, nothing occupied), applied in
+  three phases with the renames undone in reverse on the first error, and
+  reconciled with an audit run if even that fails. Operator-initiated removal and
+  replacement are already defined (ADR-0015) and always go through the Vault
+  Trash.
 - **Stable internal Go packages.** Only the HTTP API is a contract; `internal/`
   packages may be restructured between minor releases.
 

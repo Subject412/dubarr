@@ -32,8 +32,10 @@ const (
 )
 
 // LineFit is the trend through the checkpoint offsets, reported alongside the
-// spread. Slope is in milliseconds of offset per second of film: a 25.000 ->
-// 23.976 fps mismatch gives +42.7 ms/s (factor 1.0427).
+// spread. Slope is in milliseconds of offset per second of film, measured on
+// the TARGET timeline ([Window.FilmStartSec]): a 25.000 fps dub against a
+// 23.976 fps target gives +40.96 ms/s, and the factor that removes it is
+// 0.95904 — below 1, because the dub runs fast and has to be slowed.
 //
 // TempoFactor is the atempo factor that removes the slope, set only for a
 // [ShapeDrift] the encoder can represent. TempoApplied is deliberately not
@@ -245,11 +247,21 @@ const (
 )
 
 // tempoFactorFor turns a slope in ms/s into the atempo factor that removes it:
-// factor = 1 + slope/1000. Returns (0,false) outside the range the single-pass
-// encoder can honour (transcode.ValidateTempo: 0.5..2.0) and for a zero slope,
-// which is no correction at all.
+// factor = 1 - slope/1000.
+//
+// The sign follows the offset definition: OffsetMS = target - donor, taken on
+// the target timeline, so a POSITIVE slope means the donor falls further behind
+// every second — it runs fast (a 25.000 fps dub against a 23.976 fps target) and
+// must be SLOWED, i.e. a factor below 1. 1 + slope/1000 would stretch it and
+// double the drift; transcode.Verify cannot tell the two apart, because its
+// expected duration is duration/f either way.
+//
+// The 0.5..2.0 window is the range the single-pass encoder honours
+// (transcode.ValidateTempo), which here means slopes of -1000..+500 ms/s.
+// Returns (0,false) outside it and for a zero slope, which is no correction at
+// all.
 func tempoFactorFor(slopeMSPerSec float64) (float64, bool) {
-	factor := 1 + slopeMSPerSec/1000
+	factor := 1 - slopeMSPerSec/1000
 	if factor == 1 || factor < tempoFactorFloor || factor > tempoFactorCeiling {
 		return 0, false
 	}

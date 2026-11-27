@@ -434,9 +434,13 @@ func (w *Worker) processJob(ctx context.Context, id int64) error {
 			return atStage("encoder", fmt.Errorf("%w: tempo %.4f needs %s for audio track %d: %s",
 				ErrEncoderUnavailable, report.Fit.TempoFactor, plan.Encoder(), rec.TargetTrackID, detail))
 		}
+		// The note names the factor to five decimals: the factors this slice
+		// produces are 5-decimal numbers (0.95904 for the 25.000 -> 23.976
+		// drift), and %.4f would print 0.9590 — a different number from the
+		// one the encode was given.
 		report.Application = &analyze.Application{
 			Mode: "re-encoded",
-			Note: fmt.Sprintf("re-encoded (tempo %.4f)", report.Fit.TempoFactor),
+			Note: fmt.Sprintf("re-encoded (tempo %.5f)", report.Fit.TempoFactor),
 		}
 	}
 	if !muxableReport(report) {
@@ -472,13 +476,18 @@ func (w *Worker) processJob(ctx context.Context, id int64) error {
 		}
 	}
 	// #86: mkvmerge --sync shifts the whole track by one constant, so the
-	// number to give it is the offset at t = 0 — the intercept — once the tempo
-	// encode has removed the slope. The median is only the right constant for a
-	// timeline with no trend: on a linear ramp it leaves half the drift in
-	// place. A report without a fit (a 0.4.0 row) keeps the median.
+	// number to give it is the offset the tempo-corrected track still has at
+	// t = 0 — the intercept, scaled by the factor the encode applied. The fit
+	// measures the intercept on the UNCORRECTED timeline; the encode has
+	// already stretched it by TempoFactor, so the residual constant is
+	// intercept/TempoFactor, not the raw intercept (a 30 s intercept at
+	// 5 ms/s would otherwise leave ~150 ms, well outside the 40 ms stable
+	// band). The median is only the right constant for a timeline with no
+	// trend: on a linear ramp it leaves half the drift in place. A report
+	// without a fit (a 0.4.0 row) keeps the median.
 	offset := medianOffsetMS(report.OffsetsMS)
-	if report.Fit != nil && report.Fit.TempoApplied {
-		offset = int64(math.Round(report.Fit.InterceptMS))
+	if report.Fit != nil && report.Fit.TempoApplied && report.Fit.TempoFactor > 0 {
+		offset = int64(math.Round(report.Fit.InterceptMS / report.Fit.TempoFactor))
 	}
 	rule, err := w.gateRule(ctx)
 	if err != nil {
@@ -587,11 +596,11 @@ func muxableVerdict(verdict string) bool {
 //
 // A drifting verdict is publishable when the trend is a clean drift the encoder
 // can represent and this worker has folded the correction into the job's single
-// encode (Fit.TempoApplied). The mux then runs at the intercept and the row
-// says so in report.application. Everything else keeps today's behaviour: a cut
-// needs per-segment work (slice 05), an unreliable or out-of-range report needs
-// a human, and a drift whose factor the worker refused to apply must not be
-// published with half the correction missing.
+// encode (Fit.TempoApplied). The mux then runs at intercept/TempoFactor and the
+// row says so in report.application. Everything else keeps today's behaviour:
+// a cut needs per-segment work (slice 05), an unreliable or out-of-range report
+// needs a human, and a drift whose factor the worker refused to apply must not
+// be published with half the correction missing.
 func muxableReport(report analyze.Report) bool {
 	if muxableVerdict(report.Verdict) {
 		return true

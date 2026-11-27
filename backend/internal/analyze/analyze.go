@@ -541,7 +541,7 @@ type Checkpoint struct {
 // row was never fitted, so the key is absent and a reader can tell "never
 // measured" from "measured as flat". Application records what was done to the
 // dub copy before the mux and is likewise absent on a plain copy, so the row
-// can say "re-encoded (tempo 1.0427)" instead of leaving the operator to infer
+// can say "re-encoded (tempo 0.95904)" instead of leaving the operator to infer
 // it from an offset of 0.
 type Report struct {
 	Verdict        string         `json:"verdict"`
@@ -569,7 +569,7 @@ type Report struct {
 // only Mode and Note for a tempo re-encode.
 type Application struct {
 	Mode string `json:"mode"` // "copy" | "re-encoded"
-	Note string `json:"note"` // "copied untouched", "re-encoded (tempo 1.0427)"
+	Note string `json:"note"` // "copied untouched", "re-encoded (tempo 0.95904)"
 	// SegmentCount and Segments describe a piecewise render: how many runs of
 	// the film were cut and placed separately.
 	SegmentCount int       `json:"segment_count,omitempty"`

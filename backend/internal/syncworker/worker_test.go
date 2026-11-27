@@ -1150,7 +1150,8 @@ func TestMuxableReport(t *testing.T) {
 
 // TestProcessOnceAppliesDriftTempoInOneEncode is #86 end to end at the worker:
 // a drifting report with a clean fit is compensated in ONE ffmpeg pass, muxed
-// at the intercept (not the median), and the persisted report says so.
+// at the intercept scaled by the factor it was stretched with (not the median),
+// and the persisted report says so.
 func TestProcessOnceAppliesDriftTempoInOneEncode(t *testing.T) {
 	r := newRig(t)
 	jobID := r.newJob(t)

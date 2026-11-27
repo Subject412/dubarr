@@ -688,7 +688,10 @@ type fakeTranscoder struct {
 	available map[string]bool
 	probes    []string
 	requests  []transcode.Request
-	err       error
+	// segments is the Segments slice of each call, recorded separately so a
+	// test reads "was this a segmented render?" without unpacking the request.
+	segments [][]transcode.Segment
+	err      error
 }
 
 func (f *fakeTranscoder) EncoderAvailable(_ context.Context, encoder string) (bool, string) {
@@ -705,6 +708,7 @@ func (f *fakeTranscoder) EncoderAvailable(_ context.Context, encoder string) (bo
 
 func (f *fakeTranscoder) Transcode(_ context.Context, req transcode.Request) (transcode.Result, error) {
 	f.requests = append(f.requests, req)
+	f.segments = append(f.segments, req.Segments)
 	if f.err != nil {
 		return transcode.Result{}, f.err
 	}
@@ -1137,6 +1141,44 @@ func TestMuxableReport(t *testing.T) {
 			Verdict: analyze.VerdictUnreliable,
 			Fit:     &analyze.LineFit{Shape: analyze.ShapeDrift, TempoApplied: true},
 		}, false},
+		// #84: an accepted cut is muxable because the worker renders it with
+		// per-segment offsets — the ok verdict alone would already let it
+		// through, and this case pins that the piecewise shape does not turn
+		// it into a review.
+		{"ok with an accepted two-segment cut", analyze.Report{
+			Verdict:        analyze.VerdictOK,
+			Classification: analyze.ClassificationPiecewise,
+			Piecewise:      &analyze.Piecewise{Segments: twoSegments()},
+		}, true},
+		// An accepted plan with a single segment is the ordinary constant-offset
+		// job (no render), so it is judged exactly as before.
+		{"ok with an accepted one-segment plan", analyze.Report{
+			Verdict:   analyze.VerdictOK,
+			Piecewise: &analyze.Piecewise{Segments: []analyze.Segment{{StartSec: 0, EndSec: 2400, OffsetMS: 1205}}},
+		}, true},
+		// A rejection is never published, whatever the verdict says: the whole
+		// point of the rejection is that a human looks at the cut instead of
+		// trusting a boundary the analysis could not locate (D5).
+		{"ok with a rejected piecewise plan", analyze.Report{
+			Verdict: analyze.VerdictOK,
+			Piecewise: &analyze.Piecewise{
+				Segments:       []analyze.Segment{{StartSec: 0, EndSec: 2400, OffsetMS: 1205}},
+				RejectedReason: "boundary at 1500 s is not confident enough",
+			},
+		}, false},
+		{"drifting with a rejected piecewise plan", analyze.Report{
+			Verdict: analyze.VerdictDrifting,
+			Piecewise: &analyze.Piecewise{
+				Segments:       []analyze.Segment{{StartSec: 0, EndSec: 2400, OffsetMS: 1205}},
+				RejectedReason: "the timeline is a single offset",
+			},
+		}, false},
+		// An accepted cut the worker did not render (the verdict is not ok, so
+		// the switch never cut it) must not slip through on the piecewise shape.
+		{"drifting with an accepted cut that was not rendered", analyze.Report{
+			Verdict:   analyze.VerdictDrifting,
+			Piecewise: &analyze.Piecewise{Segments: twoSegments()},
+		}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1322,4 +1364,301 @@ func TestProcessOnceTempoNeedsItsEncoder(t *testing.T) {
 	if !strings.Contains(rec.ErrorMessage, "flac") {
 		t.Fatalf("error message %q does not name the missing encoder", rec.ErrorMessage)
 	}
+}
+
+// twoSegments is the accepted cut the piecewise tests share: one boundary at
+// 1500 s where the dub jumps by 2 s, on a 2400 s timeline.
+func twoSegments() []analyze.Segment {
+	return []analyze.Segment{
+		{StartSec: 300, EndSec: 1500, OffsetMS: 800, Confidence: 0.91, Points: 60},
+		{StartSec: 1500, EndSec: 2400, OffsetMS: 2800, Confidence: 0.86, Points: 40},
+	}
+}
+
+// piecewiseCutReport is what analyze returns for a confident re-cut: verdict ok,
+// classification piecewise, two accepted segments.
+func piecewiseCutReport() analyze.Report {
+	r := stableReport()
+	r.Classification = analyze.ClassificationPiecewise
+	r.OffsetsMS = []float64{800, 810, 2790, 2800}
+	r.Piecewise = &analyze.Piecewise{
+		Segments:         twoSegments(),
+		Boundaries:       []analyze.Boundary{{AtSec: 1500, UncertaintySec: 22.5, StepMS: 2000}},
+		DominantOffsetMS: 800,
+		StepSec:          45,
+	}
+	return r
+}
+
+// TestProcessOncePiecewiseReencodesOnceWithZeroSync is #84 at the worker: an
+// accepted cut is rendered ONCE with the segments, as FLAC when no rule
+// matched, and muxed at offset 0 because the cut track is already aligned.
+func TestProcessOncePiecewiseReencodesOnceWithZeroSync(t *testing.T) {
+	r := newRig(t)
+	jobID := r.newJob(t)
+	staged := r.stage(t, jobID)
+
+	mx := &fakeMuxer{}
+	tr := &fakeTranscoder{}
+	w := newWorker(t, r, &fakeExecutor{report: piecewiseCutReport()}, mx, &fakeRescanner{})
+	w.transcoder = tr
+
+	if processed, err := w.ProcessOnce(context.Background()); err != nil || !processed {
+		t.Fatalf("ProcessOnce = %v/%v, want true/nil", processed, err)
+	}
+	if len(tr.requests) != 1 {
+		t.Fatalf("Transcode calls = %d, want exactly 1 for a 2-segment cut", len(tr.requests))
+	}
+	req := tr.requests[0]
+	if req.Input != staged {
+		t.Fatalf("transcode input = %q, want the staged copy %q", req.Input, staged)
+	}
+	if len(tr.segments) != 1 || len(tr.segments[0]) != 2 {
+		t.Fatalf("recorded segments = %v, want the 2 segments of the plan", tr.segments)
+	}
+	for i, want := range twoSegments() {
+		got := tr.segments[0][i]
+		if got.StartSec != want.StartSec || got.EndSec != want.EndSec || got.OffsetMS != want.OffsetMS {
+			t.Fatalf("segment %d = %+v, want %+v", i, got, want)
+		}
+	}
+	// No rule matched, so the render is lossless: the operator switched this on
+	// for timing, not to lose audio.
+	if req.Plan.Codec != transcode.CodecFLAC || req.Plan.RuleIndex != transcode.NoRule {
+		t.Fatalf("plan = %+v, want the FLAC no-rule plan", req.Plan)
+	}
+	if len(mx.jobs) != 1 {
+		t.Fatalf("Mux calls = %d, want 1", len(mx.jobs))
+	}
+	if mx.jobs[0].SyncOffsetMS != 0 {
+		t.Fatalf("mux offset = %d ms, want 0: every segment was placed absolutely", mx.jobs[0].SyncOffsetMS)
+	}
+	if mx.jobs[0].AudioPath != req.Output {
+		t.Fatalf("mux audio = %q, want the rendered track %q", mx.jobs[0].AudioPath, req.Output)
+	}
+
+	rec, ok, err := r.store.SyncJobByID(context.Background(), jobID)
+	if err != nil || !ok {
+		t.Fatalf("SyncJobByID = %v/%v", ok, err)
+	}
+	if rec.Status != statusCompleted {
+		t.Fatalf("status = %q (%s), want completed", rec.Status, rec.ErrorMessage)
+	}
+	if rec.CalculatedOffsetMS != 0 {
+		t.Fatalf("stored offset = %d, want 0 for a piecewise job", rec.CalculatedOffsetMS)
+	}
+	var stored analyze.Report
+	if err := json.Unmarshal([]byte(rec.CheckpointsJSON), &stored); err != nil {
+		t.Fatalf("unmarshal stored report: %v", err)
+	}
+	if stored.Application == nil {
+		t.Fatalf("stored report has no application block: %s", rec.CheckpointsJSON)
+	}
+	if got, want := stored.Application.Note, "re-encoded (piecewise, 2 segments)"; got != want {
+		t.Fatalf("application note = %q, want %q", got, want)
+	}
+	if stored.Application.Mode != "piecewise" {
+		t.Fatalf("application mode = %q, want piecewise", stored.Application.Mode)
+	}
+	if stored.Application.SegmentCount != 2 || len(stored.Application.Segments) != 2 {
+		t.Fatalf("application segments = %d/%v, want 2 of them",
+			stored.Application.SegmentCount, stored.Application.Segments)
+	}
+	if stored.Application.Segments[1].OffsetMS != 2800 {
+		t.Fatalf("stored second segment = %+v, want the plan's 2800 ms offset", stored.Application.Segments[1])
+	}
+}
+
+// TestProcessOncePiecewiseUsesTheRuleCodec: a segment render is still an encode
+// the operator configured, so a matching rule's codec wins over FLAC.
+func TestProcessOncePiecewiseUsesTheRuleCodec(t *testing.T) {
+	r := newRig(t)
+	setAudioRules(t, r, `{"rules":[{"enabled":true,"when":{"source_codecs":["pcm_s16le"],"lang_iso2":"pl"},
+		"then":{"codec":"opus","bitrate_bps":96000,"channels":2}}]}`)
+	jobID := r.newJob(t)
+	r.stage(t, jobID)
+
+	mx := &fakeMuxer{}
+	tr := &fakeTranscoder{}
+	w := newWorker(t, r, &fakeExecutor{report: piecewiseCutReport()}, mx, &fakeRescanner{})
+	w.transcoder = tr
+
+	if processed, err := w.ProcessOnce(context.Background()); err != nil || !processed {
+		t.Fatalf("ProcessOnce = %v/%v, want true/nil", processed, err)
+	}
+	if len(tr.requests) != 1 {
+		t.Fatalf("Transcode calls = %d, want 1", len(tr.requests))
+	}
+	req := tr.requests[0]
+	if req.Plan.Codec != "opus" || req.Plan.BitrateBPS != 96000 || req.Plan.RuleIndex != 0 {
+		t.Fatalf("plan = %+v, want the matching rule's opus 96k", req.Plan)
+	}
+	if len(tr.segments[0]) != 2 {
+		t.Fatalf("segments = %v, want the 2 segments", tr.segments[0])
+	}
+	if len(mx.jobs) != 1 || mx.jobs[0].SyncOffsetMS != 0 {
+		t.Fatalf("mux jobs = %+v, want one at offset 0", mx.jobs)
+	}
+}
+
+// TestProcessOncePiecewiseRejectionFallsBackToMedian is D5's safe half: an
+// unconfident boundary is never guessed at, the job keeps the dominant single
+// offset, and the reason a human must look travels with the failure.
+func TestProcessOncePiecewiseRejectionFallsBackToMedian(t *testing.T) {
+	r := newRig(t)
+	jobID := r.newJob(t)
+	r.stage(t, jobID)
+
+	report := piecewiseCutReport()
+	report.Verdict = analyze.VerdictDrifting
+	report.Classification = analyze.ClassificationDrifting
+	report.Piecewise = &analyze.Piecewise{
+		Segments:         []analyze.Segment{{StartSec: 300, EndSec: 2400, OffsetMS: 800, Points: 100}},
+		DominantOffsetMS: 800,
+		RejectedReason:   "boundary at 1500 s is not confident enough",
+	}
+	report.ReviewReason = "cut not confident — applied the dominant offset (boundary at 1500 s is not confident enough)"
+
+	mx := &fakeMuxer{}
+	tr := &fakeTranscoder{}
+	w := newWorker(t, r, &fakeExecutor{report: report}, mx, &fakeRescanner{})
+	w.transcoder = tr
+
+	processed, err := w.ProcessOnce(context.Background())
+	if err != nil || !processed {
+		t.Fatalf("ProcessOnce = %v/%v, want true/nil", processed, err)
+	}
+	if len(tr.requests) != 0 || len(tr.probes) != 0 {
+		t.Fatalf("transcoder used for a rejected cut: probes=%v requests=%d", tr.probes, len(tr.requests))
+	}
+	if len(mx.jobs) != 0 {
+		t.Fatalf("Mux called %d times for a rejected cut, want 0", len(mx.jobs))
+	}
+	rec, _, _ := r.store.SyncJobByID(context.Background(), jobID)
+	if rec.Status != statusFailed {
+		t.Fatalf("status = %q, want failed", rec.Status)
+	}
+	if !strings.Contains(rec.ErrorMessage, "not muxable") || !strings.Contains(rec.ErrorMessage, "drifting") {
+		t.Fatalf("error message = %q, want the unmuxable drifting verdict", rec.ErrorMessage)
+	}
+	// The review reason must reach the row: "not muxable" alone does not tell
+	// the operator that a cut was found and refused.
+	if !strings.Contains(rec.ErrorMessage, "cut not confident") {
+		t.Fatalf("error message = %q, want it to carry report.review_reason", rec.ErrorMessage)
+	}
+}
+
+// TestProcessOncePiecewiseNeedsAnEncoder: when no rule matched the render is
+// materialised as FLAC, so that encoder has to exist before anything is cut.
+func TestProcessOncePiecewiseNeedsAnEncoder(t *testing.T) {
+	r := newRig(t)
+	jobID := r.newJob(t)
+	r.stage(t, jobID)
+
+	mx := &fakeMuxer{}
+	tr := &fakeTranscoder{available: map[string]bool{"flac": false}}
+	w := newWorker(t, r, &fakeExecutor{report: piecewiseCutReport()}, mx, &fakeRescanner{})
+	w.transcoder = tr
+
+	if processed, err := w.ProcessOnce(context.Background()); err != nil || !processed {
+		t.Fatalf("ProcessOnce = %v/%v, want true/nil", processed, err)
+	}
+	if len(tr.probes) != 1 || tr.probes[0] != "flac" {
+		t.Fatalf("encoder probes = %v, want [flac]", tr.probes)
+	}
+	if len(tr.requests) != 0 || len(mx.jobs) != 0 {
+		t.Fatalf("work happened without the encoder: transcode=%d mux=%d", len(tr.requests), len(mx.jobs))
+	}
+	rec, _, _ := r.store.SyncJobByID(context.Background(), jobID)
+	if rec.Status != statusFailed {
+		t.Fatalf("status = %q, want failed", rec.Status)
+	}
+	if !strings.Contains(rec.ErrorMessage, "flac") {
+		t.Fatalf("error message %q does not name the missing encoder", rec.ErrorMessage)
+	}
+}
+
+// TestProcessOncePiecewiseSingleSegmentTakesTheOrdinaryPath: a dense plan that
+// found no boundary is not a cut. The job copies the track and applies the one
+// offset it has — no segmented render — unless a rule already demands an encode.
+func TestProcessOncePiecewiseSingleSegmentTakesTheOrdinaryPath(t *testing.T) {
+	single := func() analyze.Report {
+		r := stableReport()
+		r.Piecewise = &analyze.Piecewise{
+			Segments:         []analyze.Segment{{StartSec: 0, EndSec: 2400, OffsetMS: 1205, Confidence: 0.93, Points: 120}},
+			DominantOffsetMS: 1205,
+			StepSec:          45,
+		}
+		// analyze records the copy it means to make for a one-segment plan.
+		r.Application = &analyze.Application{Mode: "copy", Note: "copied untouched"}
+		return r
+	}
+
+	t.Run("no rule", func(t *testing.T) {
+		r := newRig(t)
+		jobID := r.newJob(t)
+		staged := r.stage(t, jobID)
+
+		mx := &fakeMuxer{}
+		tr := &fakeTranscoder{}
+		w := newWorker(t, r, &fakeExecutor{report: single()}, mx, &fakeRescanner{})
+		w.transcoder = tr
+
+		if processed, err := w.ProcessOnce(context.Background()); err != nil || !processed {
+			t.Fatalf("ProcessOnce = %v/%v, want true/nil", processed, err)
+		}
+		if len(tr.requests) != 0 || len(tr.probes) != 0 {
+			t.Fatalf("one segment was rendered: probes=%v requests=%d", tr.probes, len(tr.requests))
+		}
+		if len(mx.jobs) != 1 {
+			t.Fatalf("Mux calls = %d, want 1", len(mx.jobs))
+		}
+		if got := mx.jobs[0].SyncOffsetMS; got != 1205 {
+			t.Fatalf("mux offset = %d ms, want the median 1205", got)
+		}
+		if mx.jobs[0].AudioPath != staged {
+			t.Fatalf("mux audio = %q, want the untouched staged copy", mx.jobs[0].AudioPath)
+		}
+
+		rec, _, _ := r.store.SyncJobByID(context.Background(), jobID)
+		var stored analyze.Report
+		if err := json.Unmarshal([]byte(rec.CheckpointsJSON), &stored); err != nil {
+			t.Fatalf("unmarshal stored report: %v", err)
+		}
+		if stored.Application == nil || stored.Application.Mode != "copy" {
+			t.Fatalf("application = %+v, want the copy analyze recorded", stored.Application)
+		}
+		if stored.Application.SegmentCount != 0 {
+			t.Fatalf("application segment count = %d, want 0: nothing was cut", stored.Application.SegmentCount)
+		}
+	})
+
+	t.Run("rule matched", func(t *testing.T) {
+		r := newRig(t)
+		setAudioRules(t, r, `{"rules":[{"enabled":true,"when":{"source_codecs":["pcm_s16le"]},
+			"then":{"codec":"opus","bitrate_bps":96000}}]}`)
+		jobID := r.newJob(t)
+		r.stage(t, jobID)
+
+		mx := &fakeMuxer{}
+		tr := &fakeTranscoder{}
+		w := newWorker(t, r, &fakeExecutor{report: single()}, mx, &fakeRescanner{})
+		w.transcoder = tr
+
+		if processed, err := w.ProcessOnce(context.Background()); err != nil || !processed {
+			t.Fatalf("ProcessOnce = %v/%v, want true/nil", processed, err)
+		}
+		if len(tr.requests) != 1 {
+			t.Fatalf("Transcode calls = %d, want the rule's single pass", len(tr.requests))
+		}
+		if len(tr.segments[0]) != 0 {
+			t.Fatalf("segments = %v, want none on the ordinary rule path", tr.segments[0])
+		}
+		if tr.requests[0].Plan.Codec != "opus" {
+			t.Fatalf("plan = %+v, want the rule's opus", tr.requests[0].Plan)
+		}
+		if len(mx.jobs) != 1 || mx.jobs[0].SyncOffsetMS != 1205 {
+			t.Fatalf("mux jobs = %+v, want one at the median offset 1205", mx.jobs)
+		}
+	})
 }

@@ -130,6 +130,17 @@ type Service struct {
 	// input, returning the container's MediaInfo. Nil resolves the service's
 	// prober, so tests supply ffprobe output instead of shelling out.
 	probeTimings func(ctx context.Context, path string) (probe.MediaInfo, error)
+	// probeTarget is the media-info probe used for reference resolution (which
+	// audio tracks the target has). It is separate from probeTimings so a test
+	// can drive one without standing in for the other; nil resolves the
+	// service's prober.
+	probeTarget func(ctx context.Context, path string) (probe.MediaInfo, error)
+	// windowDecode is the window decode and frame gate. Nil means decodeWindow;
+	// tests replace it so the windowed path runs without ffmpeg.
+	windowDecode windowDecodeFunc
+	// wholeDecode is the whole-track decode. Nil means decodeAudio; tests
+	// replace it to count the fallback's two full decodes without ffmpeg.
+	wholeDecode func(ctx context.Context, ffmpeg, input string, stream int, filter, out string) error
 }
 
 // RegisterRoutes mounts:
@@ -183,9 +194,15 @@ type JobInfo struct {
 	SyncMethod         string          `json:"sync_method,omitempty"`
 	CalculatedOffsetMS int64           `json:"calculated_offset_ms"`
 	Report             *analyze.Report `json:"report,omitempty"`
-	ErrorMessage       string          `json:"error_message,omitempty"`
-	CreatedAt          string          `json:"created_at,omitempty"`
-	UpdatedAt          string          `json:"updated_at,omitempty"`
+	// AnalysisSource is the analysis mode the job actually used (windows, or
+	// full after a fallback) and AnalysisFallback why a windowed request did
+	// not run as windows ("2-suspect-windows", ...). Both are omitted for a job
+	// analysed before the columns existed, which the UI renders as "—".
+	AnalysisSource   string `json:"analysis_source,omitempty"`
+	AnalysisFallback string `json:"analysis_fallback,omitempty"`
+	ErrorMessage     string `json:"error_message,omitempty"`
+	CreatedAt        string `json:"created_at,omitempty"`
+	UpdatedAt        string `json:"updated_at,omitempty"`
 }
 
 func (s *Service) handleCreate(w http.ResponseWriter, r *http.Request) {
@@ -343,6 +360,8 @@ func jobInfo(rec store.SyncJobRecord) JobInfo {
 		OutputPath:           rec.OutputPath,
 		SyncMethod:           rec.SyncMethod,
 		CalculatedOffsetMS:   rec.CalculatedOffsetMS,
+		AnalysisSource:       rec.AnalysisSource,
+		AnalysisFallback:     rec.AnalysisFallback,
 		ErrorMessage:         rec.ErrorMessage,
 		CreatedAt:            rec.CreatedAt,
 		UpdatedAt:            rec.UpdatedAt,
@@ -391,39 +410,63 @@ func (s *Service) Execute(ctx context.Context, jobID int64) (analyze.Report, err
 	if err := s.store.SetSyncJobStatus(ctx, jobID, statusAnalyzing, ""); err != nil {
 		return analyze.Report{}, err
 	}
-	report, execErr := s.runAnalysis(ctx, rec)
+	run, execErr := s.runAnalysis(ctx, rec)
 	if execErr != nil {
 		_ = s.store.SetSyncJobStatus(context.WithoutCancel(ctx), jobID, statusFailed, execErr.Error())
 		return analyze.Report{}, execErr
 	}
-	offset, err := medianOffset(report.OffsetsMS)
+	offset, err := medianOffset(run.Report.OffsetsMS)
 	if err != nil {
 		_ = s.store.SetSyncJobStatus(context.WithoutCancel(ctx), jobID, statusFailed, err.Error())
 		return analyze.Report{}, err
 	}
-	if err := s.store.FinishSyncJobAnalysis(ctx, jobID, statusCompleted, string(report.SyncMethod), offset, report, ""); err != nil {
+	// The row records what the job did, not what the setting asked for: a
+	// windowed request that fell back is stored as full plus its reason, which
+	// is the only version an operator can check afterwards.
+	if err := s.store.FinishSyncJobAnalysis(ctx, jobID, statusCompleted, string(run.Report.SyncMethod), offset,
+		run.Report, "", run.Source, run.Fallback); err != nil {
 		return analyze.Report{}, err
 	}
-	return report, nil
+	return run.Report, nil
 }
 
-func (s *Service) runAnalysis(ctx context.Context, rec store.SyncJobRecord) (analyze.Report, error) {
+// analysisRun is what one job's analysis produced: the report and the record of
+// how it was obtained. Execute persists Source and Fallback on the job row;
+// DecodedSec is the structural speed gate (how much audio the job read) and is
+// not persisted.
+type analysisRun struct {
+	Report analyze.Report
+	// Source is the mode actually used: windows, or full after a fallback.
+	Source string
+	// Fallback is why a windowed request did not run as windows; empty when the
+	// requested mode ran as requested.
+	Fallback string
+	// DecodedSec is every second of audio this job decoded, both sides: the
+	// windows it cut (plus their pre-roll) and, after a fallback, both whole
+	// tracks.
+	DecodedSec float64
+}
+
+// runAnalysis runs one job's analysis: it stages the group, probes the two
+// analysis inputs, decides the mode once, and then takes exactly one of the two
+// paths — the windows with their retry/fallback policy, or the whole tracks.
+func (s *Service) runAnalysis(ctx context.Context, rec store.SyncJobRecord) (analysisRun, error) {
 	track, ok, err := s.store.VaultTrackByID(ctx, rec.TargetTrackID)
 	if err != nil {
-		return analyze.Report{}, err
+		return analysisRun{}, err
 	}
 	if !ok {
-		return analyze.Report{}, fmt.Errorf("syncjob: vault track %d not found", rec.TargetTrackID)
+		return analysisRun{}, fmt.Errorf("syncjob: vault track %d not found", rec.TargetTrackID)
 	}
 	lib, ok, err := s.store.LibraryCacheJobTargetByID(ctx, rec.TargetLibraryCacheID)
 	if err != nil {
-		return analyze.Report{}, err
+		return analysisRun{}, err
 	}
 	if !ok || lib.TargetFilePath == "" {
-		return analyze.Report{}, fmt.Errorf("syncjob: library target %d has no file", rec.TargetLibraryCacheID)
+		return analysisRun{}, fmt.Errorf("syncjob: library target %d has no file", rec.TargetLibraryCacheID)
 	}
 	if _, err := os.Stat(lib.TargetFilePath); err != nil {
-		return analyze.Report{}, fmt.Errorf("syncjob: target file: %w", err)
+		return analysisRun{}, fmt.Errorf("syncjob: target file: %w", err)
 	}
 
 	workDir := s.workDir
@@ -431,12 +474,12 @@ func (s *Service) runAnalysis(ctx context.Context, rec store.SyncJobRecord) (ana
 		workDir = s.configuredWorkDir(ctx)
 	}
 	if workDir == "" {
-		return analyze.Report{}, errors.New("syncjob: storage.paths.work_dir is not configured")
+		return analysisRun{}, errors.New("syncjob: storage.paths.work_dir is not configured")
 	}
 
 	siblings, err := s.store.SiblingVaultTracks(ctx, track.VaultMediaID, track.GroupUUID, rec.TargetTrackID)
 	if err != nil {
-		return analyze.Report{}, err
+		return analysisRun{}, err
 	}
 	ids := make([]int64, 0, len(siblings))
 	for _, sib := range siblings {
@@ -445,7 +488,7 @@ func (s *Service) runAnalysis(ctx context.Context, rec store.SyncJobRecord) (ana
 
 	stager, err := workdir.New(workDir, s.store)
 	if err != nil {
-		return analyze.Report{}, err
+		return analysisRun{}, err
 	}
 	staging, err := stager.Stage(ctx, workdir.Job{
 		ID:                rec.ID,
@@ -453,7 +496,7 @@ func (s *Service) runAnalysis(ctx context.Context, rec store.SyncJobRecord) (ana
 		ReferenceTrackIDs: ids,
 	})
 	if err != nil {
-		return analyze.Report{}, err
+		return analysisRun{}, err
 	}
 	succeeded := false
 	defer func() {
@@ -475,9 +518,9 @@ func (s *Service) runAnalysis(ctx context.Context, rec store.SyncJobRecord) (ana
 	if prober == nil {
 		prober = probe.New(probe.Dependencies{})
 	}
-	info, err := prober.Probe(ctx, lib.TargetFilePath)
+	info, err := s.probeMediaInfo(ctx, prober, lib.TargetFilePath)
 	if err != nil {
-		return analyze.Report{}, fmt.Errorf("syncjob: probe target: %w", err)
+		return analysisRun{}, fmt.Errorf("syncjob: probe target: %w", err)
 	}
 	targetTracks := info.Tracks
 	vaultTracks := make([]probe.AudioTrack, 0, 1+len(siblings))
@@ -489,7 +532,7 @@ func (s *Service) runAnalysis(ctx context.Context, rec store.SyncJobRecord) (ana
 	policy, cfg := s.analysisPolicy(ctx)
 	resolved := reflang.Resolve(targetTracks, vaultTracks, policy, lib.OriginalLanguageISO2)
 	if len(resolved.Pairs) == 0 {
-		return analyze.Report{}, fmt.Errorf("syncjob: no reference strategy: %s", resolved.Reason)
+		return analysisRun{}, fmt.Errorf("syncjob: no reference strategy: %s", resolved.Reason)
 	}
 	pair := resolved.Pairs[0]
 	// Vault tracks are indexed by their position in the staged group: 0 is the
@@ -500,7 +543,7 @@ func (s *Service) runAnalysis(ctx context.Context, rec store.SyncJobRecord) (ana
 	}
 	donorPath, ok := staged[donorID]
 	if !ok {
-		return analyze.Report{}, fmt.Errorf("syncjob: staged copy of track %d is missing", donorID)
+		return analysisRun{}, fmt.Errorf("syncjob: staged copy of track %d is missing", donorID)
 	}
 
 	// The two analysis inputs' real timings, probed once, here, before
@@ -525,40 +568,466 @@ func (s *Service) runAnalysis(ctx context.Context, rec store.SyncJobRecord) (ana
 
 	ffmpeg, err := s.resolveFFmpeg()
 	if err != nil {
-		return analyze.Report{}, err
+		return analysisRun{}, err
 	}
-	targetWAV := filepath.Join(staging.Dir, "target.wav")
-	donorWAV := filepath.Join(staging.Dir, "donor.wav")
-	filter := analysisFilter(pair.Method)
-	if err := decodeAudio(ctx, ffmpeg, lib.TargetFilePath, pair.Target.Index, filter, targetWAV); err != nil {
-		return analyze.Report{}, fmt.Errorf("syncjob: decode target: %w", err)
-	}
-	if err := decodeAudio(ctx, ffmpeg, donorPath, 0, filter, donorWAV); err != nil {
-		return analyze.Report{}, fmt.Errorf("syncjob: decode donor: %w", err)
-	}
+
+	// ONE decision, here, before any decode: the setting asked for windows, the
+	// container stated both durations and both origins, and the plan fits.
+	// Anything else runs the whole tracks and says why.
+	mode := decideAnalysisSource(cfg, timings)
+	s.logAnalysisSource(rec.ID, mode)
 
 	engine := s.engine
 	if engine == nil {
 		engine = sync.New(sync.WithTimeout(analyze.JobTimeout(cfg)), sync.WithLogger(s.logger))
 	}
-	req := analyze.Request{
-		TargetPath: targetWAV,
-		DonorPath:  donorWAV,
-		// The whole-file path: analyze derives the duration base from the
-		// headers of these two WAVs. The container-side numbers probed above
-		// are not consumed by this path.
-		DurationSec:      0,
-		TargetTracks:     targetTracks,
-		VaultTracks:      vaultTracks,
-		Policy:           policy,
-		OriginalLanguage: lib.OriginalLanguageISO2,
+
+	jr := jobRun{
+		jobID:    rec.ID,
+		mode:     mode,
+		cfg:      cfg,
+		timings:  timings,
+		wholeSec: wholeDecodeSeconds(timings),
+		req: analyze.Request{
+			TargetPath:       filepath.Join(staging.Dir, "target.wav"),
+			DonorPath:        filepath.Join(staging.Dir, "donor.wav"),
+			DurationSec:      mode.DurationSec,
+			TargetTracks:     targetTracks,
+			VaultTracks:      vaultTracks,
+			Policy:           policy,
+			OriginalLanguage: lib.OriginalLanguageISO2,
+		},
+		decode: analysisDecode{
+			ffmpeg:       ffmpeg,
+			targetPath:   lib.TargetFilePath,
+			targetStream: pair.Target.Index,
+			donorPath:    donorPath,
+			filter:       analysisFilter(pair.Method),
+			targetWAV:    filepath.Join(staging.Dir, "target.wav"),
+			donorWAV:     filepath.Join(staging.Dir, "donor.wav"),
+		},
 	}
-	report, err := analyze.Analyze(ctx, engine, cfg, req)
+
+	var run analysisRun
+	if mode.Source == analyze.AnalysisSourceWindows {
+		slicer := newWindowSlicer(windowSlicerSpec{
+			ffmpeg:           ffmpeg,
+			jobDir:           staging.Dir,
+			targetPath:       lib.TargetFilePath,
+			targetStream:     pair.Target.Index,
+			donorPath:        donorPath,
+			filter:           jr.decode.filter,
+			targetCorrection: seekCorrection(timings.Target),
+			donorCorrection:  seekCorrection(timings.Donor),
+			decode:           s.windowDecode,
+		})
+		run, err = s.runWindowed(ctx, engine, jr, slicer)
+	} else {
+		run, err = s.runWhole(ctx, engine, jr)
+	}
 	if err != nil {
-		return analyze.Report{}, err
+		return analysisRun{}, err
 	}
 	succeeded = true
-	return report, nil
+	return run, nil
+}
+
+// analysisDecode is one job's decode inputs: the two analysis inputs, their
+// streams and band filter, and the two WAV paths the whole-track path writes.
+type analysisDecode struct {
+	ffmpeg       string
+	targetPath   string
+	targetStream int
+	donorPath    string
+	filter       string
+	targetWAV    string
+	donorWAV     string
+}
+
+// jobRun is everything the analysis phase needs for one job, resolved once so
+// neither path re-probes, re-plans or re-resolves anything.
+type jobRun struct {
+	jobID   int64
+	mode    analysisMode
+	cfg     analyze.Config
+	timings SourceTimings
+	// wholeSec is how much audio the two whole-track decodes produce, in
+	// seconds (0 when the containers stated no durations).
+	wholeSec float64
+	req      analyze.Request
+	decode   analysisDecode
+}
+
+// Why a job did not request the windowed path. The first three are the mode
+// decision's own reasons; the last is the plan refusing to place the windows.
+const (
+	reasonSettingFull   = "setting-full"
+	reasonNoDuration    = "no-duration"
+	reasonUnknownOrigin = "unknown-origin"
+	reasonPlanInvalid   = "plan-invalid"
+)
+
+// Causes a fallback reason is built from, after its count:
+// "2-suspect-windows", "1-short-window", "1-decode-error".
+const (
+	causeSuspectWindows = "suspect-windows"
+	causeShortWindow    = "short-window"
+	causeDecodeError    = "decode-error"
+)
+
+// analysisMode is the one decision a job makes before it decodes anything.
+type analysisMode struct {
+	// Source is what will be attempted: analyze.AnalysisSourceWindows or
+	// analyze.AnalysisSourceFull.
+	Source string
+	// Reason is why the job did not request windows: one of
+	// reasonSettingFull, reasonNoDuration, reasonUnknownOrigin,
+	// reasonPlanInvalid. Empty when Source is windows.
+	Reason string
+	// DurationSec is the window plan's duration base: the shorter of the two
+	// analysis inputs. It is 0 for a full mode chosen before any duration was
+	// known, where Analyze derives its own base from the staged WAV headers.
+	DurationSec float64
+	// Checkpoints is how many windows the plan holds; it is what the mode log
+	// line reports as `windows=N`.
+	Checkpoints int
+}
+
+// decideAnalysisSource is the whole mode decision, in one place, so "why did
+// this job run full?" has exactly one answer.
+//
+// Windows is chosen only when all three hold: the setting says windows, both
+// inputs stated a duration and both of their timeline origins (a percentage of
+// an unknown duration, or a seek with an unknown correction, is silent
+// corruption), and the plan the job would run validates. Everything else runs
+// the whole tracks with a reason, which the job row and the log both carry.
+func decideAnalysisSource(cfg analyze.Config, timings SourceTimings) analysisMode {
+	if cfg.AnalysisSource != analyze.AnalysisSourceWindows {
+		return analysisMode{Source: analyze.AnalysisSourceFull, Reason: reasonSettingFull}
+	}
+	if timings.Target.Duration <= 0 || timings.Donor.Duration <= 0 {
+		return analysisMode{Source: analyze.AnalysisSourceFull, Reason: reasonNoDuration}
+	}
+	if !timings.Target.Known || !timings.Donor.Known {
+		return analysisMode{Source: analyze.AnalysisSourceFull, Reason: reasonUnknownOrigin}
+	}
+	planning := planTiming(timings)
+	// The plan the job validates here is not kept: analyze.Analyze plans the
+	// same windows again from the same duration, percentages and slice length
+	// and returns them in the report, and the policy is judged on that one (see
+	// windowsFromReport). This call is the gate, not a second plan.
+	if _, err := analyze.PlanWindows(planning, cfg.CheckpointPositionsPct, sliceLenSec(cfg)); err != nil {
+		return analysisMode{Source: analyze.AnalysisSourceFull, Reason: reasonPlanInvalid}
+	}
+	return analysisMode{
+		Source:      analyze.AnalysisSourceWindows,
+		DurationSec: planning.DurationSec(),
+		Checkpoints: len(cfg.CheckpointPositionsPct),
+	}
+}
+
+// planTiming projects the probed timings onto the planner's input.
+func planTiming(t SourceTimings) analyze.Timing {
+	return analyze.Timing{
+		Target: analyze.SourceTiming{
+			DurationSec:       t.Target.Duration.Seconds(),
+			ContainerStartSec: t.Target.ContainerStart.Seconds(),
+			TrackStartSec:     t.Target.TrackStart.Seconds(),
+			OriginKnown:       t.Target.Known,
+		},
+		Donor: analyze.SourceTiming{
+			DurationSec:       t.Donor.Duration.Seconds(),
+			ContainerStartSec: t.Donor.ContainerStart.Seconds(),
+			TrackStartSec:     t.Donor.TrackStart.Seconds(),
+			OriginKnown:       t.Donor.Known,
+		},
+	}
+}
+
+// seekCorrection is how far one input's container seek must be shifted to land
+// on the analysed track's timeline: TrackStart − ContainerStart. It is 0 for an
+// unknown origin, and the job only seeks when both origins are known.
+func seekCorrection(t SourceTiming) float64 {
+	return t.TrackStart.Seconds() - t.ContainerStart.Seconds()
+}
+
+// sliceLenSec is the analysed slice length: the settled checkpoint window,
+// widened to max_offset_sec + CheckWindowMarginSec so the engine's lag search
+// reaches the full offset bound. It is analyze's own formula (searchWindowSec);
+// the job needs it to validate a plan before committing to windows, and the two
+// must agree or the plan checked here would not be the plan that runs.
+func sliceLenSec(cfg analyze.Config) float64 {
+	return math.Max(float64(cfg.CheckpointWindowSec), float64(cfg.MaxOffsetSec+analyze.CheckWindowMarginSec))
+}
+
+// wholeDecodeSeconds is how much audio the two whole-track decodes produce.
+func wholeDecodeSeconds(t SourceTimings) float64 {
+	return math.Max(0, t.Target.Duration.Seconds()) + math.Max(0, t.Donor.Duration.Seconds())
+}
+
+// windowsFromReport is the plan the analysis actually ran, as far as the
+// policy needs it: position and length per checkpoint. Taking it from the
+// report rather than planning again means the retry and the suspect test judge
+// the windows that were decoded, never a second copy that could drift from
+// them. Only those three fields are set; the slicer derives each side's seek
+// from FilmStartSec and its own correction.
+func windowsFromReport(report analyze.Report) []analyze.Window {
+	windows := make([]analyze.Window, len(report.Checkpoints))
+	for i, checkpoint := range report.Checkpoints {
+		windows[i] = analyze.Window{
+			PositionPct:  checkpoint.PositionPct,
+			FilmStartSec: checkpoint.SliceStartSec,
+			LenSec:       checkpoint.SliceLenSec,
+		}
+	}
+	return windows
+}
+
+// maxLagMS is the engine's search bound in milliseconds: the longest planned
+// window, which is the window_sec every checkpoint job was given.
+func maxLagMS(windows []analyze.Window) float64 {
+	longest := 0.0
+	for _, w := range windows {
+		if w.LenSec > longest {
+			longest = w.LenSec
+		}
+	}
+	return longest * 1000
+}
+
+// runWhole decodes both whole tracks exactly as the job always has — same argv,
+// no slicer — and analyses them. The duration base is the mode's when the
+// decision had one (the fallback, so its slice fields stay comparable with the
+// windowed attempt) and Analyze's own WAV-derived base when it did not (the
+// setting said full).
+func (s *Service) runWhole(ctx context.Context, engine analyze.Engine, jr jobRun) (analysisRun, error) {
+	decode := s.wholeDecode
+	if decode == nil {
+		decode = decodeAudio
+	}
+	if err := decode(ctx, jr.decode.ffmpeg, jr.decode.targetPath, jr.decode.targetStream,
+		jr.decode.filter, jr.decode.targetWAV); err != nil {
+		return analysisRun{}, fmt.Errorf("syncjob: decode target: %w", err)
+	}
+	if err := decode(ctx, jr.decode.ffmpeg, jr.decode.donorPath, 0,
+		jr.decode.filter, jr.decode.donorWAV); err != nil {
+		return analysisRun{}, fmt.Errorf("syncjob: decode donor: %w", err)
+	}
+	cfg := jr.cfg
+	cfg.Slicer = nil
+	cfg.AnalysisSource = analyze.AnalysisSourceFull
+	report, err := analyze.Analyze(ctx, engine, cfg, jr.req)
+	if err != nil {
+		return analysisRun{}, err
+	}
+	return analysisRun{
+		Report:     report,
+		Source:     analyze.AnalysisSourceFull,
+		DecodedSec: jr.wholeSec,
+	}, nil
+}
+
+// runWindowed runs the plan through the slicer and then applies the fallback
+// policy: no suspect keeps the report, one suspect is re-decoded once at the
+// longer pre-roll and judged against the windows that were never suspect, and
+// anything the policy cannot repair goes full.
+//
+// Everything after the join is single-threaded: the workers have written their
+// slots, the report exists, and the retry is one window's decode — so the
+// decision cannot depend on which goroutine finished first.
+func (s *Service) runWindowed(ctx context.Context, engine analyze.Engine, jr jobRun, slicer *windowSlicer) (analysisRun, error) {
+	cfg := jr.cfg
+	cfg.Slicer = slicer
+	cfg.AnalysisSource = analyze.AnalysisSourceWindows
+	report, err := analyze.Analyze(ctx, engine, cfg, jr.req)
+	if err != nil {
+		// A window that could not be decoded or was cut short is not an
+		// analysis failure: the policy answers it with one re-decode at the
+		// longer pre-roll and then with a whole-track decode. Only a failure
+		// the engine owns ends the job.
+		if !windowSuspect(slicer, err) {
+			return analysisRun{}, err
+		}
+		failures := 1
+		if w, _, ok := slicer.Failure(); ok {
+			// There is no report to repair (the pass aborted), so the re-decode
+			// cannot rescue this job — but it is the policy's answer to one
+			// untrustworthy window, and its outcome is what makes the reason a
+			// count: "2-short-window" when the longer pre-roll fails too.
+			if _, retryErr := s.retryWindow(ctx, engine, cfg, slicer, w); retryErr != nil {
+				failures++
+			}
+		}
+		return s.fallback(ctx, engine, jr, slicer.DecodedSeconds(),
+			fmt.Sprintf("%d-%s", failures, windowCause(err)))
+	}
+
+	windows := windowsFromReport(report)
+	suspects := analyze.Suspects(windows, report.OffsetsMS, report.Qualities, maxLagMS(windows))
+	switch {
+	case len(suspects) == 0:
+		return analysisRun{
+			Report:     report,
+			Source:     analyze.AnalysisSourceWindows,
+			DecodedSec: slicer.DecodedSeconds(),
+		}, nil
+	case analyze.RequiresFullDecode(suspects):
+		return s.fallback(ctx, engine, jr, slicer.DecodedSeconds(),
+			fmt.Sprintf("%d-%s", len(suspects), causeSuspectWindows))
+	}
+
+	suspect := suspects[0]
+	w := windows[suspect.Index]
+	retried, retryErr := s.retryWindow(ctx, engine, cfg, slicer, w)
+	if retryErr != nil {
+		return s.fallback(ctx, engine, jr, slicer.DecodedSeconds(),
+			fmt.Sprintf("1-%s", windowCause(retryErr)))
+	}
+	if !acceptsRetry(windows, report.OffsetsMS, suspect.Index, w, retried.OffsetMS) {
+		return s.fallback(ctx, engine, jr, slicer.DecodedSeconds(),
+			fmt.Sprintf("1-%s", causeSuspectWindows))
+	}
+	// What was measured replaces what was guessed at: the report states the
+	// retried offset and quality. The verdict stays the analysis's own — the
+	// retry is accepted only within the stable band of the timeline that verdict
+	// was computed from, so it cannot contradict the offsets it was drawn from,
+	// and re-judging a partially different evidence set is not this layer's job.
+	return analysisRun{
+		Report:     replaceCheckpoint(report, suspect.Index, retried),
+		Source:     analyze.AnalysisSourceWindows,
+		DecodedSec: slicer.DecodedSeconds(),
+	}, nil
+}
+
+// fallback escalates one job to the whole-track path and records why. The
+// whole decode is the only part of the job that reads the tracks: everything is
+// cut in the same plan, so the report stays comparable with the windowed
+// attempt it replaces.
+func (s *Service) fallback(ctx context.Context, engine analyze.Engine, jr jobRun, windowsDecoded float64, reason string) (analysisRun, error) {
+	s.logAnalysisFallback(jr.jobID, reason, jr.timings)
+	run, err := s.runWhole(ctx, engine, jr)
+	if err != nil {
+		return analysisRun{}, err
+	}
+	run.Fallback = reason
+	run.DecodedSec += windowsDecoded
+	return run, nil
+}
+
+// retryWindow decodes one flagged window again at the retry pre-roll and runs
+// the engine for that window only. It is analyze.Analyze's per-checkpoint body
+// for a single window: the same slice, the same job shape, the same echo check.
+// (Analyze runs a whole plan and offers no single-window entry point, so this
+// is the one place the job reproduces it.)
+func (s *Service) retryWindow(ctx context.Context, engine analyze.Engine, cfg analyze.Config, slicer *windowSlicer, w analyze.Window) (sync.Result, error) {
+	slice, err := slicer.Retry(ctx, w)
+	if err != nil {
+		return sync.Result{}, err
+	}
+	defer slicer.Release(w)
+
+	length := slice.LenSec
+	job := sync.Job{
+		TargetPath:    slice.TargetPath,
+		DonorPath:     slice.DonorPath,
+		SliceStartSec: slice.EngineStartSec,
+		SliceLenSec:   slice.LenSec,
+		WindowSec:     &length,
+	}
+	jobCtx, cancel := context.WithTimeout(ctx, analyze.JobTimeout(cfg))
+	defer cancel()
+	result, err := engine.Run(jobCtx, job)
+	if err != nil {
+		return sync.Result{}, err
+	}
+	if result.Analyzed.Len < w.LenSec-1.0/windowSampleRate {
+		return sync.Result{}, fmt.Errorf("%w: analyzed.len %.6f s, planned %.6f s",
+			analyze.ErrShortWindow, result.Analyzed.Len, w.LenSec)
+	}
+	return result, nil
+}
+
+// acceptsRetry judges one re-decoded window against the reference built from
+// the windows that were never suspect.
+func acceptsRetry(windows []analyze.Window, offsets []float64, index int, w analyze.Window, offsetMS float64) bool {
+	reference := make([]analyze.Window, 0, len(windows)-1)
+	referenceOffsets := make([]float64, 0, len(windows)-1)
+	for i := range windows {
+		if i == index {
+			continue
+		}
+		reference = append(reference, windows[i])
+		referenceOffsets = append(referenceOffsets, offsets[i])
+	}
+	return analyze.Accepts(reference, referenceOffsets, w, offsetMS)
+}
+
+// replaceCheckpoint writes an accepted retry into the report at its own index,
+// leaving every other checkpoint untouched.
+func replaceCheckpoint(report analyze.Report, index int, result sync.Result) analyze.Report {
+	report.Checkpoints[index].OffsetMS = result.OffsetMS
+	report.Checkpoints[index].Quality = result.CorrelationQuality
+	report.OffsetsMS[index] = result.OffsetMS
+	report.Qualities[index] = result.CorrelationQuality
+	return report
+}
+
+// windowSuspect reports whether a windowed pass failed on a window rather than
+// on the analysis: the slicer recorded a decode or frame-gate failure, or the
+// engine's echo says it analysed less audio than the plan asked for.
+func windowSuspect(slicer *windowSlicer, err error) bool {
+	if _, _, ok := slicer.Failure(); ok {
+		return true
+	}
+	return errors.Is(err, analyze.ErrShortWindow)
+}
+
+// windowCause names a window failure for the fallback reason: a short window is
+// the frame gate or the engine's echo, anything else is a decode failure.
+func windowCause(err error) string {
+	var short *ErrShortWindow
+	if errors.As(err, &short) || errors.Is(err, analyze.ErrShortWindow) {
+		return causeShortWindow
+	}
+	return causeDecodeError
+}
+
+// logAnalysisSource records the mode decision once, with the job id, so
+// `grep 'job 12'` answers "which mode did this job use, and why?".
+func (s *Service) logAnalysisSource(jobID int64, mode analysisMode) {
+	if s.logger == nil {
+		return
+	}
+	if mode.Source == analyze.AnalysisSourceWindows {
+		s.logger.Info(fmt.Sprintf("syncjob: job %d analysis_source=windows windows=%d preroll=%gs",
+			jobID, mode.Checkpoints, WindowPrerollSec))
+		return
+	}
+	s.logger.Info(fmt.Sprintf("syncjob: job %d analysis_source=full reason=%s", jobID, mode.Reason))
+}
+
+// logAnalysisFallback records the escalation, the reason and what it cost to
+// decode: the two whole tracks, per side.
+func (s *Service) logAnalysisFallback(jobID int64, reason string, timings SourceTimings) {
+	if s.logger == nil {
+		return
+	}
+	s.logger.Info(fmt.Sprintf("syncjob: job %d analysis fallback=full reason=%s decoded=%ds+%ds",
+		jobID, reason,
+		int64(timings.Target.Duration.Seconds()), int64(timings.Donor.Duration.Seconds())))
+}
+
+// probeMediaInfo is the media-info probe reference resolution runs: the test
+// seam when set, else the real prober.
+func (s *Service) probeMediaInfo(ctx context.Context, prober *probe.Prober, path string) (probe.MediaInfo, error) {
+	if s.probeTarget != nil {
+		return s.probeTarget(ctx, path)
+	}
+	info, err := prober.Probe(ctx, path)
+	if err != nil {
+		return probe.MediaInfo{}, err
+	}
+	return *info, nil
 }
 
 // sourceTimings probes the two files the job will decode and projects what the
@@ -619,9 +1088,9 @@ func sourceTiming(info probe.MediaInfo, index int) SourceTiming {
 	return timing
 }
 
-// logSourceTimings records the probed timings once per job. Nothing acts on
-// them yet; the line is what makes a later mode decision auditable ("why did
-// this job run full?").
+// logSourceTimings records the probed timings once per job. The line is what
+// makes the mode decision auditable ("why did this job run full?"), and it is
+// written before that decision is taken.
 func (s *Service) logSourceTimings(jobID int64, timings SourceTimings) {
 	if s.logger == nil {
 		return

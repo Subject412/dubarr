@@ -247,6 +247,13 @@ function JobDetail({
             <dt className="text-[11px] uppercase tracking-wider text-zinc-500">Target language</dt>
             <dd className="mt-0.5 text-sm text-zinc-200">{data.target_lang_iso2 || '—'}</dd>
           </div>
+          <div>
+            <dt className="text-[11px] uppercase tracking-wider text-zinc-500">Analysis</dt>
+            <dd data-testid="sync-detail-analysis" className="mt-0.5 text-sm text-zinc-200">
+              {data.analysis_source || '—'}
+              {data.analysis_fallback ? ` (fallback: ${data.analysis_fallback})` : ''}
+            </dd>
+          </div>
           {showTargetFile && (
             <div className="sm:col-span-3">
               <dt className="text-[11px] uppercase tracking-wider text-zinc-500">Target file</dt>

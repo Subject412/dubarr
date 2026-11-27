@@ -273,4 +273,45 @@ describe('sync studio', () => {
     expect(detailTarget).toHaveTextContent('/media/Shrek (2001) [Remux].mkv')
     expect(screen.queryByTestId('sync-detail-output')).toBeNull()
   })
+
+  it('shows the analysis mode and why it fell back', async () => {
+    const job = makeJob({
+      id: 14,
+      analysis_source: 'full',
+      analysis_fallback: '2-suspect-windows',
+    })
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input)
+        if (url.endsWith('/api/sync/jobs')) return jsonResponse({ items: [job] })
+        if (url.endsWith('/api/sync/jobs/14')) return jsonResponse(job)
+        return jsonResponse({ error: 'unexpected' }, 404)
+      }),
+    )
+    renderWithProviders(<SyncPage />, { route: '/sync' })
+
+    const analysis = await screen.findByTestId('sync-detail-analysis')
+    expect(analysis).toHaveTextContent('full (fallback: 2-suspect-windows)')
+  })
+
+  it('shows an unknown analysis mode as a dash rather than claiming full', async () => {
+    // Jobs analysed before windowing existed have no recorded mode. Rendering
+    // "full" for them would be a claim the database never made.
+    const job = makeJob({ id: 15 })
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input)
+        if (url.endsWith('/api/sync/jobs')) return jsonResponse({ items: [job] })
+        if (url.endsWith('/api/sync/jobs/15')) return jsonResponse(job)
+        return jsonResponse({ error: 'unexpected' }, 404)
+      }),
+    )
+    renderWithProviders(<SyncPage />, { route: '/sync' })
+
+    const analysis = await screen.findByTestId('sync-detail-analysis')
+    expect(analysis).toHaveTextContent('—')
+    expect(analysis).not.toHaveTextContent('full')
+  })
 })

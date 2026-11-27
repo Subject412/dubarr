@@ -1184,3 +1184,239 @@ func TestSyncDefaultsAnalysisSourceRoundTrips(t *testing.T) {
 		t.Fatalf("stored analysis_source = %q, want windows (%s)", got, raw)
 	}
 }
+
+// The sync.strategy section: the technique pipeline #82 adds.
+
+// defaultStrategyJSON is the shipped section, byte for byte what a fresh
+// install writes. It is a literal, not a re-marshalled constant: the SPA's
+// DEFAULT_SETTINGS['sync.strategy'] must match it, and a change here is a
+// migration, not a refactor.
+const defaultStrategyJSON = `{"preset":"balanced","techniques":[{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5}]}`
+
+func TestKnownKeysIncludesSyncStrategy(t *testing.T) {
+	if KeySyncStrategy != "sync.strategy" {
+		t.Fatalf("KeySyncStrategy = %q, want %q", KeySyncStrategy, "sync.strategy")
+	}
+	found := false
+	for _, key := range KnownKeys() {
+		if key == KeySyncStrategy {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("KnownKeys() = %v, want it to include %q", KnownKeys(), KeySyncStrategy)
+	}
+}
+
+// TestSyncStrategyDefaultsAreTheBalancedList pins the shipped section and the
+// D4 guarantee behind it: one waveform entry, on every checkpoint.
+func TestSyncStrategyDefaultsAreTheBalancedList(t *testing.T) {
+	defaults := Defaults(t.TempDir())
+	raw, ok := defaults[KeySyncStrategy]
+	if !ok {
+		t.Fatalf("Defaults() has no %q section", KeySyncStrategy)
+	}
+	blob, err := json.Marshal(raw)
+	if err != nil {
+		t.Fatalf("marshal default: %v", err)
+	}
+	if string(blob) != defaultStrategyJSON {
+		t.Fatalf("shipped %s =\n %s\nwant\n %s", KeySyncStrategy, blob, defaultStrategyJSON)
+	}
+
+	strategy := decode[StrategyOptions](t, blob)
+	if strategy.Preset != analyze.PresetBalanced {
+		t.Fatalf("preset = %q, want %q", strategy.Preset, analyze.PresetBalanced)
+	}
+	if len(strategy.Techniques) != 1 {
+		t.Fatalf("techniques = %+v, want exactly one", strategy.Techniques)
+	}
+	entry := strategy.Techniques[0]
+	if entry.ID != analyze.TechniqueWaveform || !entry.Enabled || entry.When != analyze.WhenAlways {
+		t.Fatalf("shipped entry = %+v, want waveform/always/enabled", entry)
+	}
+	if entry.MinConfidence != 0.10 || entry.MinMatchZ != 5.0 {
+		t.Fatalf("shipped thresholds = %v/%v, want 0.10/5.0", entry.MinConfidence, entry.MinMatchZ)
+	}
+}
+
+// TestSyncStrategyAbsentSectionMaterialises: a row written before 0.5.0 carries
+// neither key. Reading it must serve the whole default list, never
+// `"techniques": null` — a pipeline with nothing to run is not a setting.
+func TestSyncStrategyAbsentSectionMaterialises(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`,
+		KeySyncStrategy, `{}`); err != nil {
+		t.Fatalf("insert legacy %s: %v", KeySyncStrategy, err)
+	}
+
+	served := mustGet(t, s, ctx, KeySyncStrategy)
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(served, &fields); err != nil {
+		t.Fatalf("decode served section: %v (%s)", err, served)
+	}
+	if string(fields["techniques"]) == "null" || len(fields["techniques"]) == 0 {
+		t.Fatalf("served techniques = %s, want the default list (%s)", fields["techniques"], served)
+	}
+	if got := string(fields["preset"]); got != `"balanced"` {
+		t.Fatalf("served preset = %s, want \"balanced\" (%s)", got, served)
+	}
+
+	// The read must not rewrite the stored bytes.
+	var stored string
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT value FROM settings WHERE key = ?`, KeySyncStrategy).Scan(&stored); err != nil {
+		t.Fatalf("read stored row: %v", err)
+	}
+	if stored != `{}` {
+		t.Errorf("Get rewrote the stored row: %s", stored)
+	}
+	if got := len(decode[StrategyOptions](t, served).Techniques); got != 1 {
+		t.Fatalf("served techniques = %d entries, want 1", got)
+	}
+}
+
+// TestSyncStrategyValidationTable is one row per rule in the #82 validation
+// table, each through the write path the API uses, so a 400 comes back with the
+// message the operator reads.
+func TestSyncStrategyValidationTable(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct{ name, body, wantErr string }{
+		{"no techniques", `{"preset":"balanced","techniques":[]}`, "techniques must have 1..4 entries"},
+		{"five techniques", `{"preset":"custom","techniques":[` +
+			`{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5},` +
+			`{"id":"mfcc","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5},` +
+			`{"id":"waveform","enabled":true,"when":"below_confidence","min_confidence":0.1,"min_match_z":5},` +
+			`{"id":"mfcc","enabled":true,"when":"above_drift","min_confidence":0.1,"min_match_z":5},` +
+			`{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5}]}`, "techniques must have 1..4 entries"},
+		{"unknown technique", `{"preset":"custom","techniques":[{"id":"chroma","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5}]}`, `unknown technique "chroma"`},
+		{"duplicate technique", `{"preset":"custom","techniques":[` +
+			`{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5},` +
+			`{"id":"waveform","enabled":true,"when":"below_confidence","min_confidence":0.1,"min_match_z":5}]}`, `duplicate technique "waveform"`},
+		{"nothing enabled", `{"preset":"custom","techniques":[{"id":"waveform","enabled":false,"when":"always","min_confidence":0.1,"min_match_z":5}]}`, "at least one technique must be enabled"},
+		{"the first enabled step is not always", `{"preset":"custom","techniques":[` +
+			`{"id":"mfcc","enabled":true,"when":"above_drift","min_confidence":0.1,"min_match_z":5},` +
+			`{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5}]}`, "the first enabled technique must run always"},
+		{"below_confidence needs an earlier step", `{"preset":"custom","techniques":[{"id":"mfcc","enabled":true,"when":"below_confidence","min_confidence":0.1,"min_match_z":5}]}`, `technique "mfcc" needs an earlier step to react to`},
+		{"min_confidence above 1", `{"preset":"custom","techniques":[{"id":"waveform","enabled":true,"when":"always","min_confidence":1.5,"min_match_z":5}]}`, "min_confidence must be 0..1"},
+		{"min_match_z above 100", `{"preset":"custom","techniques":[{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":101}]}`, "min_match_z must be 0..100"},
+		{"unknown preset", `{"preset":"turbo","techniques":[{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5}]}`, "preset must be fast, balanced, maximum_accuracy or custom"},
+		{"unknown field", `{"preset":"balanced","technique":[]}`, "unknown field"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := openStore(t)
+			err := s.Set(ctx, KeySyncStrategy, json.RawMessage(tc.body))
+			if err == nil {
+				t.Fatalf("Set(%s) = nil, want %q", tc.body, tc.wantErr)
+			}
+			if !errors.Is(err, ErrInvalidValue) {
+				t.Fatalf("Set(%s) = %v, want ErrInvalidValue", tc.body, err)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Set(%s) = %q, want it to contain %q", tc.body, err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestSyncStrategyPresetBecomesCustomWhenEdited: the server never trusts the
+// label. The list is authoritative, and a list that is not the named preset's
+// canonical one is stored as custom, in one direction only.
+func TestSyncStrategyPresetBecomesCustomWhenEdited(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct{ name, body, wantPreset string }{
+		{
+			name: "an edited balanced list is custom",
+			body: `{"preset":"balanced","techniques":[` +
+				`{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5},` +
+				`{"id":"mfcc","enabled":true,"when":"below_confidence","min_confidence":0.15,"min_match_z":8}]}`,
+			wantPreset: analyze.PresetCustom,
+		},
+		{
+			name:       "an unedited balanced list keeps its label",
+			body:       `{"preset":"balanced","techniques":[{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5}]}`,
+			wantPreset: analyze.PresetBalanced,
+		},
+		{
+			// D4a: Fast keeps the waveform matcher and spends fewer
+			// checkpoints, so its technique list IS the balanced one. Only the
+			// label distinguishes them, and the server keeps that label.
+			name:       "fast keeps its own label with the balanced list",
+			body:       `{"preset":"fast","techniques":[{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5}]}`,
+			wantPreset: analyze.PresetFast,
+		},
+		{
+			name: "maximum accuracy keeps its canonical list",
+			body: `{"preset":"maximum_accuracy","techniques":[` +
+				`{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5},` +
+				`{"id":"mfcc","enabled":true,"when":"below_confidence","min_confidence":0.15,"min_match_z":8}]}`,
+			wantPreset: analyze.PresetMaximumAccuracy,
+		},
+		{
+			name: "a raised confidence makes maximum accuracy custom",
+			body: `{"preset":"maximum_accuracy","techniques":[` +
+				`{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5},` +
+				`{"id":"mfcc","enabled":true,"when":"below_confidence","min_confidence":0.2,"min_match_z":8}]}`,
+			wantPreset: analyze.PresetCustom,
+		},
+		{
+			name:       "an absent label is derived from the list",
+			body:       `{"techniques":[{"id":"waveform","enabled":true,"when":"always","min_confidence":0.1,"min_match_z":5}]}`,
+			wantPreset: analyze.PresetBalanced,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := openStore(t)
+			if err := s.Set(ctx, KeySyncStrategy, json.RawMessage(tc.body)); err != nil {
+				t.Fatalf("Set(%s): %v", tc.body, err)
+			}
+			stored := decode[StrategyOptions](t, mustGet(t, s, ctx, KeySyncStrategy))
+			if stored.Preset != tc.wantPreset {
+				t.Fatalf("stored preset = %q, want %q", stored.Preset, tc.wantPreset)
+			}
+			if err := analyze.Strategy(stored).Validate(); err != nil {
+				t.Fatalf("stored section does not validate: %v", err)
+			}
+		})
+	}
+}
+
+// TestPresetTechniques pins the three canonical lists. `fast` is deliberately
+// identical to `balanced` (D4a): the paid-for saving is fewer checkpoints, not
+// a coarser matcher, and MFCC is never a preset.
+func TestPresetTechniques(t *testing.T) {
+	balanced := PresetTechniques(analyze.PresetBalanced)
+	fast := PresetTechniques(analyze.PresetFast)
+	maximum := PresetTechniques(analyze.PresetMaximumAccuracy)
+
+	if len(balanced) != 1 || balanced[0].ID != analyze.TechniqueWaveform || balanced[0].When != analyze.WhenAlways {
+		t.Fatalf("balanced = %+v, want one waveform/always entry", balanced)
+	}
+	if len(fast) != 1 || fast[0] != balanced[0] {
+		t.Fatalf("fast = %+v, want the balanced list (D4a)", fast)
+	}
+	if len(maximum) != 2 {
+		t.Fatalf("maximum_accuracy = %+v, want two entries", maximum)
+	}
+	if maximum[1].ID != analyze.TechniqueMFCC || maximum[1].When != analyze.WhenBelowConfidence {
+		t.Fatalf("maximum_accuracy second entry = %+v, want mfcc/below_confidence", maximum[1])
+	}
+	if maximum[1].MinConfidence != 0.15 || maximum[1].MinMatchZ != 8.0 {
+		t.Fatalf("maximum_accuracy thresholds = %v/%v, want 0.15/8.0", maximum[1].MinConfidence, maximum[1].MinMatchZ)
+	}
+	if got := PresetTechniques(analyze.PresetCustom); got != nil {
+		t.Fatalf("custom = %+v, want no canonical list", got)
+	}
+	// No preset may name MFCC first or alone: D4a forbids a coarser default.
+	for _, preset := range []string{analyze.PresetFast, analyze.PresetBalanced} {
+		for _, entry := range PresetTechniques(preset) {
+			if entry.ID != analyze.TechniqueWaveform {
+				t.Fatalf("preset %q names %q, want waveform only", preset, entry.ID)
+			}
+		}
+	}
+}

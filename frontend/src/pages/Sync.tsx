@@ -383,8 +383,10 @@ function TrendBlock({ fit }: { fit?: SyncFit }) {
 
 /**
  * D11: what a piecewise job did, why it was done and what it cost. The block
- * only appears on a report whose plan was accepted AND found a join, so it can
- * never describe a cut the worker did not apply.
+ * appears on a report whose plan was accepted and found a join, but the copy
+ * below is only the render's own account of itself: it is printed when the
+ * report records a render (see [piecewiseRendered]) and never for a plan the
+ * worker was refused before it cut anything.
  */
 const PIECEWISE_HELP =
   'The dub needed a different offset before and after a scene the two releases do ' +
@@ -394,31 +396,70 @@ const PIECEWISE_HELP =
   'was confident enough to place it.'
 
 /**
+ * The same block for a job that was analysed but never rendered: the plan was
+ * accepted and its verdict then failed the gate, so the segments are what the
+ * analysis proposed, not what was published.
+ */
+const PIECEWISE_ANALYSIS_HELP =
+  'The analysis found places where the dub needs a different offset before and ' +
+  'after a scene the two releases do not share. This job was not rendered ' +
+  'piecewise: the segments below are what the analysis proposed, and the dub ' +
+  'copy was not cut.'
+
+/**
+ * Whether the worker recorded that it rendered this plan piecewise. The plan
+ * alone is not proof: `syncworker` cuts and rejoins only when the verdict is
+ * muxable, so a job its gate refused keeps the segmentation and reports no
+ * `application` block at all — that field is written on the render path only.
+ * Without that record there is nothing to claim.
+ */
+function piecewiseRendered(report: SyncReport): boolean {
+  return report.application?.mode === 'piecewise'
+}
+
+/**
  * The segmentation a piecewise job applied (#84): one row per run of the film,
  * and the joins between them with the uncertainty the sampling step implies.
  *
- * A rejected plan renders nothing here — `piecewiseCut` is false for it — so the
- * table can only ever show a plan that was used, and the review badge is what
- * explains a fallback.
+ * `piecewiseCut` decides whether there is a table at all — a rejected plan or a
+ * single segment has none. Whether the table describes a render is a separate
+ * question, answered by `application.mode`: an accepted plan the verdict gate
+ * refused is still worth listing, but it is labelled analysis-only and the
+ * joins are withheld, because the step across a join is a claim about a render.
  */
 function PiecewiseBlock({ report }: { report: SyncReport }) {
   if (!piecewiseCut(report.piecewise)) return null
 
+  const rendered = piecewiseRendered(report)
   const segments = report.piecewise?.segments ?? []
   const boundaries = report.piecewise?.boundaries ?? []
   // The application block is the worker's own count; the list is the evidence.
   const count = report.application?.segment_count ?? segments.length
+  const review = report.review_reason?.trim()
 
   return (
     <section data-testid="sync-piecewise" className="space-y-2">
       <div className="flex items-center gap-1.5">
         <h3 className="text-[11px] uppercase tracking-wider text-zinc-500">Segments</h3>
-        <InfoTip id={helpIdFor('Segments')} label="Segments" text={PIECEWISE_HELP} />
+        <InfoTip
+          id={helpIdFor('Segments')}
+          label="Segments"
+          text={rendered ? PIECEWISE_HELP : PIECEWISE_ANALYSIS_HELP}
+        />
       </div>
-      <p data-testid="piecewise-count" className="text-xs text-zinc-400">
-        The dub was cut into {count} segments and rejoined in one pass; each segment carries its own
-        offset.
-      </p>
+      {rendered ? (
+        <p data-testid="piecewise-count" className="text-xs text-zinc-400">
+          The dub was cut into {count} segments and rejoined in one pass; each segment carries its
+          own offset.
+        </p>
+      ) : (
+        <p data-testid="piecewise-analysis-only" className="text-xs text-zinc-400">
+          Analysed only — the plan splits the film into {segments.length} segments, but this job was
+          not rendered piecewise, so the dub copy was not cut and no join was applied.
+          {review ? ` ${review}` : ''}
+        </p>
+      )}
+
       <div className="overflow-x-auto">
         <table className="w-full text-left text-xs">
           <thead>
@@ -447,7 +488,7 @@ function PiecewiseBlock({ report }: { report: SyncReport }) {
           </tbody>
         </table>
       </div>
-      {boundaries.length > 0 && (
+      {rendered && boundaries.length > 0 && (
         <div className="space-y-1">
           <h4 className="text-[11px] uppercase tracking-wider text-zinc-500">Joins</h4>
           <ul
@@ -613,9 +654,10 @@ function ReportView({ report, calculatedOffsetMs }: { report: SyncReport; calcul
       <CheckpointChart
         checkpoints={report.checkpoints}
         fit={report.fit}
-        // Only an accepted plan's joins are evidence: a rejected one keeps the
-        // dominant offset, so its boundaries are not drawn at all.
-        boundaries={piecewiseCut(report.piecewise) ? report.piecewise?.boundaries : undefined}
+        // Only a join the worker recorded that it rendered is evidence: a
+        // rejected plan keeps the dominant offset and a plan the verdict gate
+        // refused was never cut, so neither draws a marker.
+        boundaries={piecewiseRendered(report) ? report.piecewise?.boundaries : undefined}
       />
 
       <StrategySummary strategy={report.strategy} notes={report.notes} />

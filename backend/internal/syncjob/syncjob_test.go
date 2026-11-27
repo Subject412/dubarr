@@ -416,3 +416,43 @@ func TestAnalysisPolicyDefaultsLegacyPreferOriginal(t *testing.T) {
 		t.Error("analysisPolicy: PreferOriginalLanguage = false for a legacy row, want true")
 	}
 }
+
+// The setting must reach the engine's config through the same block that copies
+// the analysis windows. A row without the key (every row written before
+// U-DSP.8) means one worker, not zero.
+func TestAnalysisPolicyParallelCheckpoints(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+
+	if _, cfg := f.svc.analysisPolicy(ctx); cfg.ParallelCheckpoints != 1 {
+		t.Fatalf("seeded parallel_checkpoints = %d, want 1", cfg.ParallelCheckpoints)
+	}
+
+	legacy := `{"max_offset_sec":180,"checkpoint_positions_pct":[10,25,40,55,70,85],` +
+		`"checkpoint_window_sec":150,"preview_positions_pct":[10,25,50,75,90],"preview_window_sec":60}`
+	if _, err := f.db.DB.ExecContext(ctx,
+		`INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`,
+		settings.KeySyncDefaults, legacy); err != nil {
+		t.Fatalf("insert legacy sync.defaults: %v", err)
+	}
+	_, cfg := f.svc.analysisPolicy(ctx)
+	if cfg.ParallelCheckpoints != 1 {
+		t.Errorf("legacy row parallel_checkpoints = %d, want 1", cfg.ParallelCheckpoints)
+	}
+	if cfg.CheckpointWindowSec != 150 {
+		t.Errorf("legacy row lost the window setting: %d", cfg.CheckpointWindowSec)
+	}
+
+	stored := `{"max_offset_sec":180,"checkpoint_positions_pct":[10,25,40,55,70,85],` +
+		`"checkpoint_window_sec":150,"preview_positions_pct":[10,25,50,75,90],` +
+		`"preview_window_sec":60,"parallel_checkpoints":5}`
+	if _, err := f.db.DB.ExecContext(ctx,
+		`INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`,
+		settings.KeySyncDefaults, stored); err != nil {
+		t.Fatalf("insert stored sync.defaults: %v", err)
+	}
+	_, cfg = f.svc.analysisPolicy(ctx)
+	if cfg.ParallelCheckpoints != 5 {
+		t.Errorf("stored parallel_checkpoints = %d, want 5", cfg.ParallelCheckpoints)
+	}
+}

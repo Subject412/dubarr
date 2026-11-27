@@ -683,3 +683,66 @@ func TestMuxOutputDirIsBrowsableAndGuarded(t *testing.T) {
 		t.Fatalf("output_dir inside the vault = %d: %s, want 400", code, body)
 	}
 }
+
+// GET /api/settings serves every section verbatim, so sync.defaults must carry
+// parallel_checkpoints (U-DSP.8): the Settings page seeds its draft from this
+// payload and the field would otherwise render empty. A present 0 or 9 is
+// refused with the same wording the validator uses.
+func TestSettingsServesParallelCheckpoints(t *testing.T) {
+	h := newHarness(t)
+	h.setupAdmin()
+
+	served := func() settings.SyncDefaults {
+		t.Helper()
+		env := h.getSettings()
+		raw, ok := env.Settings[settings.KeySyncDefaults]
+		if !ok {
+			t.Fatal("GET /api/settings dropped sync.defaults")
+		}
+		var sd settings.SyncDefaults
+		if err := json.Unmarshal(raw, &sd); err != nil {
+			t.Fatalf("decode sync.defaults: %v (%s)", err, raw)
+		}
+		return sd
+	}
+
+	if got := served().ParallelCheckpoints; got != settings.DefaultParallelCheckpoints {
+		t.Fatalf("served parallel_checkpoints = %d, want %d", got, settings.DefaultParallelCheckpoints)
+	}
+
+	section := func(workers int) map[string]any {
+		return map[string]any{
+			"max_offset_sec":           180,
+			"checkpoint_positions_pct": []int{10, 25, 40, 55, 70, 85},
+			"checkpoint_window_sec":    150,
+			"preview_positions_pct":    []int{10, 25, 50, 75, 90},
+			"preview_window_sec":       60,
+			"parallel_checkpoints":     workers,
+		}
+	}
+
+	code, body := h.do(http.MethodPut, "/api/settings", map[string]any{
+		"settings": map[string]any{settings.KeySyncDefaults: section(4)},
+	})
+	if code != http.StatusOK {
+		t.Fatalf("PUT /api/settings = %d: %s", code, body)
+	}
+	if got := served().ParallelCheckpoints; got != 4 {
+		t.Errorf("served parallel_checkpoints after PUT = %d, want 4", got)
+	}
+
+	for _, workers := range []int{0, 9} {
+		code, body := h.do(http.MethodPut, "/api/settings", map[string]any{
+			"settings": map[string]any{settings.KeySyncDefaults: section(workers)},
+		})
+		if code != http.StatusBadRequest {
+			t.Errorf("PUT parallel_checkpoints=%d = %d: %s", workers, code, body)
+		}
+		if !strings.Contains(string(body), "parallel_checkpoints must be 1..8") {
+			t.Errorf("PUT parallel_checkpoints=%d body %s does not carry the message", workers, body)
+		}
+	}
+	if got := served().ParallelCheckpoints; got != 4 {
+		t.Errorf("a rejected write changed parallel_checkpoints to %d", got)
+	}
+}

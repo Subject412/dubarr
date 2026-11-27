@@ -219,20 +219,74 @@ function NumberField({
   onChange,
   hint,
   help,
+  min,
+  max,
+  boundsMessage,
 }: {
   label: string
   value: number
   onChange: (next: number) => void
   hint?: string
   help?: string
+  /** Inclusive bounds. Set one to make the field refuse an out-of-range entry. */
+  min?: number
+  max?: number
+  /** Shown when an entry is outside min..max; the draft keeps its last valid value. */
+  boundsMessage?: string
 }) {
+  const bounded = min !== undefined || max !== undefined
+  const low = min ?? Number.NEGATIVE_INFINITY
+  const high = max ?? Number.POSITIVE_INFINITY
+  // A bounded field keeps the operator's keystrokes locally so a partly typed
+  // or refused value stays visible (clearing the box must not snap back to the
+  // previous number); only a value inside the bounds reaches the draft.
+  const [text, setText] = useState(String(value))
+  const [error, setError] = useState('')
+
+  // oxlint-disable react/set-state-in-effect
+  useEffect(() => {
+    if (bounded) setText(String(value))
+  }, [bounded, value])
+  // oxlint-enable react/set-state-in-effect
+
+  const commit = (raw: string) => {
+    setText(raw)
+    if (raw.trim() === '') {
+      setError('')
+      return
+    }
+    const next = Number.parseInt(raw, 10)
+    if (Number.isNaN(next)) {
+      setError('')
+      return
+    }
+    if (next < low || next > high) {
+      setError(boundsMessage ?? `${label} is out of range`)
+      return
+    }
+    setError('')
+    onChange(next)
+  }
+
   return (
-    <Field label={label} hint={hint} help={help} htmlFor={undefined}>
+    <Field
+      label={label}
+      hint={hint}
+      help={help}
+      htmlFor={undefined}
+      error={bounded ? error : undefined}
+    >
       <Input
         type="number"
         aria-label={label}
-        value={Number.isFinite(value) ? value : 0}
-        onChange={(event) => onChange(Number.parseInt(event.target.value, 10) || 0)}
+        min={min}
+        max={max}
+        value={bounded ? text : Number.isFinite(value) ? value : 0}
+        onChange={(event) =>
+          bounded
+            ? commit(event.target.value)
+            : onChange(Number.parseInt(event.target.value, 10) || 0)
+        }
       />
     </Field>
   )
@@ -576,6 +630,18 @@ export function SettingsPage() {
                     value={draft.checkpoint_window_sec}
                     onChange={(checkpoint_window_sec) => update({ checkpoint_window_sec })}
                     help={settingsHelp('sync.defaults', 'checkpoint_window_sec')}
+                  />
+                  {/* A row stored before U-DSP.8 has no parallel_checkpoints
+                      key, so the control falls back to the shipped default
+                      instead of rendering an empty worker count. */}
+                  <NumberField
+                    label="Parallel checkpoints"
+                    value={draft.parallel_checkpoints ?? 1}
+                    onChange={(parallel_checkpoints) => update({ parallel_checkpoints })}
+                    help={settingsHelp('sync.defaults', 'parallel_checkpoints')}
+                    min={1}
+                    max={8}
+                    boundsMessage="parallel_checkpoints must be 1..8"
                   />
                   <NumberField
                     label="Preview window (s)"

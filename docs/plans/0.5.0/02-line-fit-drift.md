@@ -50,7 +50,9 @@ const (
 
 // LineFit is the trend through the checkpoint offsets, reported alongside the
 // spread. Slope is in milliseconds of offset per second of film: a 25.000 ->
-// 23.976 fps mismatch gives +42.7 ms/s (factor 1.0427).
+// 23.976 fps mismatch gives +40.96 ms/s (factor 0.95904: the dub is fast, so
+// the correction is a slow-down — atempo < 1). Slopes are measured in the
+// TARGET timeline (Window.FilmStartSec), so factor = 1 − slope/1000 exactly.
 type LineFit struct {
     SlopeMSPerSec     float64 `json:"slope_ms_per_sec"`
     InterceptMS       float64 `json:"intercept_ms"`
@@ -252,7 +254,7 @@ syncworker.processJob
 | `backend/internal/syncworker/worker.go` | `muxableReport`; tempo branch after `Execute`; intercept-as-offset; `Application` note; `transcodeStaged` log handles `NoRule`. |
 | `backend/internal/syncworker/worker_test.go` | Update the fake transcoder assertions and add the tempo tests below. |
 | `frontend/src/lib/api.ts` | `SyncReport` += `fit?: SyncFit`, `application?: { mode: string; note: string }`. New `SyncFit` type mirroring `LineFit`. |
-| `frontend/src/pages/Sync.tsx` | A **Trend** block in `ReportView`: shape badge, slope (`+42.7 ms/min`), R², tempo factor + whether it was applied, cut position when `shape === 'cut'`, and `application.note` on the job row when present. `Max drift` stays. |
+| `frontend/src/pages/Sync.tsx` | A **Trend** block in `ReportView`: shape badge, slope (`+42.7 ms/s`), R², tempo factor + whether it was applied, cut position when `shape === 'cut'`, and `application.note` on the job row when present. `Max drift` stays. |
 | `frontend/src/components/CheckpointChart.tsx` | Accept an optional `fit?: SyncFit` and draw a dashed grey polyline `y = intercept + slope·slice_start_sec` over the checkpoint dots. Omit when `shape === 'insufficient'` or the fit is absent. |
 
 ## Settings
@@ -276,13 +278,14 @@ Sitting behind `shape` means the sentence is only shown when it applies.
 `backend/internal/analyze/fit_test.go` (**new**):
 
 - `TestFitTimelineConstant` — offsets `[1200,1205,1195,1202,1198,1201]` at 10..85 % of 5400 s ⇒ `Shape == constant`, `abs(SlopeMSPerSec) < 1`, `R2 >= 0.98`, `TempoFactor == 0`.
-- `TestFitTimelineDriftRecoversTempoFactor` — offsets generated as `intercept + 42.7·t` ⇒ `Shape == drift`, `abs(SlopeMSPerSec − 42.7) < 0.2`, `abs(TempoFactor − 1.0427) < 2e-4`, `TempoApplied == false` (analyze never sets it).
+- `TestFitTimelineDriftRecoversTempoFactor` — offsets generated as `intercept + 40.96·t` ⇒ `Shape == drift`, `abs(SlopeMSPerSec − 40.96) < 0.2`, `abs(TempoFactor − 0.95904) < 2e-4`, `TempoApplied == false` (analyze never sets it). The factor must be **below 1** for a positive slope: a positive offset slope means the dub runs fast and has to be slowed.
 - `TestFitTimelineCutAtTheSplit` — two flat halves differing by 2500 ms split between 40 % and 55 % ⇒ `Shape == cut`, `CutAtSec` strictly between the two neighbouring film positions, `CutUncertaintySec == (gap/2)`, `TempoFactor == 0`.
 - `TestFitTimelineMixedWhenTheLineDoesNotHold` — random offsets ⇒ `Shape == mixed`.
 - `TestFitTimelineInsufficientBelowThreePoints` — two points ⇒ `Shape == insufficient`, slope still finite.
 - `TestFitTimelineIgnoresAnUnconfidentPoint` — five clean drift points plus one point with `quality` below the floor that sits 3 s off the line ⇒ slope is the drift's, not the outlier's, and `Points == 5`.
 - `TestFitTimelineOutlierDoesNotMoveTheSlope` — one spike among six (the `fallback_test.go` fixture shape) ⇒ `abs(SlopeMSPerSec) < 1`.
-- `TestTempoFactorForRejectsOutOfRange` — `+400 ms/s` ⇒ `(0,false)`; `+42.7` ⇒ `(1.0427,true)`; `−42.7` ⇒ `(0.9573,true)`.
+- `TestTempoFactorForRejectsOutOfRange` — honoured range is slope ∈ (−1000, +500] ms/s (atempo 0.5..2.0): `+600 ms/s` ⇒ `(0,false)`; `+40.96` ⇒ `(0.95904,true)`; `−40.96` ⇒ `(1.04096,true)`; `−1200` ⇒ `(0,false)`.
+- `TestTempoFactorForMatchesTheFramesPerSecondRatio` — the 25.000 → 23.976 pair gives `abs(TempoFactor − 23.976/25) < 1e-6`, tying the formula to the physical case it exists for.
 - `TestFitLineIsUnchangedByTheMove` — the exact `(points, slope, intercept)` tuples the existing `fallback_test.go` cases exercise, asserted against `fitLine` directly (guards the move).
 
 `backend/internal/analyze/analyze_test.go` (extend):
@@ -294,7 +297,7 @@ Sitting behind `shape` means the sentence is only shown when it applies.
 `backend/internal/syncworker/worker_test.go` (extend):
 
 - `TestMuxableReport` — table: `ok` ⇒ true; `drifting` + nil fit ⇒ false; `drifting` + `shape=cut` ⇒ false; `drifting` + `shape=drift` + `TempoApplied` ⇒ true; `drifting` + `shape=drift` + `!TempoApplied` ⇒ false.
-- `TestProcessOnceAppliesDriftTempoInOneEncode` — report `verdict=drifting`, `fit{shape:drift, tempo_factor:1.0427, tempo_applied:true, intercept_ms:−340}`; assert (a) exactly one `Transcode` call, (b) its `Plan.TempoFactor == 1.0427`, (c) `Plan.Codec == transcode.CodecFLAC` when no rule was configured, (d) the mux call received `SyncOffsetMS == −340`, (e) the persisted report's `application.note == "re-encoded (tempo 1.0427)"`.
+- `TestProcessOnceAppliesDriftTempoInOneEncode` — report `verdict=drifting`, `fit{shape:drift, tempo_factor:0.95904, tempo_applied:true, intercept_ms:−340}`; assert (a) exactly one `Transcode` call, (b) its `Plan.TempoFactor == 0.95904`, (c) `Plan.Codec == transcode.CodecFLAC` when no rule was configured, (d) the mux call received `SyncOffsetMS == round(−340 / 0.95904) == −355` — the residual constant is scaled by the tempo, not the raw intercept, (e) the persisted report's `application.note == "re-encoded (tempo 0.95904)"`.
 - `TestProcessOnceDriftingWithoutTempoStaysUnmuxable` — `shape=cut` ⇒ `ErrUnmuxableVerdict`, zero transcode calls, zero mux calls.
 - `TestProcessOnceTempoNeedsItsEncoder` — `EncoderAvailable` false ⇒ `ErrEncoderUnavailable`, positioned after `Execute` and before any transcode.
 
@@ -321,8 +324,8 @@ tempo-corrected, that is a finding to report, not a test to relax.
 
 1. `cd backend && go build ./cmd/dubarr && go test ./... && go vet ./...` exits 0; `cd frontend && npm run build && npm run lint && npm run test` exits 0.
 2. `git diff backend/internal/analyze/fallback.go` shows deletions and one pointer comment only — every rule (`Suspects`, `Accepts`, `oneStep`, `loneSpike`, `withinBand`, `flatMean`, `residualsAgainstLine`) has an unchanged body.
-3. `TestFitTimelineDriftRecoversTempoFactor` reports `1.0427 ± 0.0002` for the 25.000 → 23.976 ramp, and `TestFitTimelineCutAtTheSplit` reports `cut` with the boundary inside the known gap.
-4. A job whose six offsets ramp at 42.7 ms/s ends `completed`, and `GET /api/sync/jobs/{id}` shows `report.verdict == "drifting"`, `report.fit.shape == "drift"`, `report.fit.tempo_applied == true`, `report.application.note` starting with `re-encoded (tempo`, and `calculated_offset_ms == round(fit.intercept_ms)`.
+3. `TestFitTimelineDriftRecoversTempoFactor` reports `0.95904 ± 0.0002` for the 25.000 → 23.976 ramp (the dub is fast, so the correction slows it), and `TestFitTimelineCutAtTheSplit` reports `cut` with the boundary inside the known gap.
+4. A job whose six offsets ramp at 40.96 ms/s ends `completed`, and `GET /api/sync/jobs/{id}` shows `report.verdict == "drifting"`, `report.fit.shape == "drift"`, `report.fit.tempo_applied == true`, `report.application.note` starting with `re-encoded (tempo`, and `calculated_offset_ms == round(fit.intercept_ms / fit.tempo_factor)` — the constant is measured in the uncorrected timeline, so the tempo scales it.
 5. That same job performs exactly **one** `transcode.Transcode` call (`Transcode` invoked once is asserted by the fake) and the target's video stream hash is unchanged (existing `videoStreamHash` helper in `backend/internal/acceptance/harness_test.go`).
 6. A job whose offsets step by 2.5 s at 50 % ends `failed` with `ErrUnmuxableVerdict` and `report.fit.shape == "cut"`; nothing is muxed, nothing is transcoded.
 7. The Sync page renders `—` for the trend block on a 0.4.0 report (no `fit` key) and does not throw.
@@ -354,7 +357,8 @@ tempo-corrected, that is a finding to report, not a test to relax.
 |---|---|
 | Tempo correction quietly changes audio the operator liked. | FLAC only (no lossy generation), `atempo` preserves pitch, one pass, and `application.note` says so on the job row. An operator who does not want it can still review the job before it runs, because jobs are created explicitly. |
 | The tempo encode of a feature-length dub is slow. | It runs only for a clean drift, which is rare, and the cost is one pass at the source rate (FLAC at 8 ch / 48 kHz encodes far faster than real time). Documented in the tooltip's "cost" sentence. |
-| Intercept-vs-median mistake leaves a residual shift. | `TestProcessOnceAppliesDriftTempoInOneEncode` asserts the mux offset equals `intercept_ms`; the plan states the derivation. |
+| Tempo applied in the wrong direction doubles the drift instead of removing it, and `transcode.Verify` cannot see it (its expected duration is `duration/f`, which a wrong-signed factor satisfies). | `TestTempoFactorForMatchesTheFramesPerSecondRatio` pins `23.976/25 < 1`; `TestFitTimelineDriftRecoversTempoFactor` pins factor < 1 for a positive slope; review must confirm the sign by hand — this is the highest-consequence number in the slice. |
+| Intercept-vs-median mistake leaves a residual shift. | `TestProcessOnceAppliesDriftTempoInOneEncode` asserts the mux offset equals `round(intercept_ms / tempo_factor)`. |
 | Theil–Sen on six points is noisy at small slopes. | The `DriftSlopeFloorMSPerSec` (1 ms/s) gate means a noisy slope below 0.1 % classifies as `constant` (still muxable as today), so noise cannot trigger an encode. The #86 arithmetic (10 ms noise over a 4050 s span ⇒ ~0.002 ms/s slope SE against a 42.7 ms/s signal) is 4 orders of magnitude of margin. |
 | `oneStep` (built for 6 points) misbehaves on 160 dense points. | Slice 05 does not use `oneStep` for segmentation; it uses its own split-penalty DP. `FitTimeline` is called on dense plans only for `shape` reporting, and `ShapeCut` there is informational. |
 | R² threshold 0.98 rejects a real drift because one checkpoint is bad. | `FitTimeline` drops unconfident points first; if that leaves <3 it uses all points and reports `insufficient`-adjacent numbers rather than a wrong shape. The floor is in the table, one edit away. |

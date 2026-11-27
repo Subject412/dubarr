@@ -123,6 +123,11 @@ function ReportView({ report, calculatedOffsetMs }: { report: SyncReport; calcul
         <Badge tone="neutral">classification: {report.classification}</Badge>
         <Badge tone="accent">method: {report.sync_method}</Badge>
         <Badge tone="neutral">applied offset: {formatMs(calculatedOffsetMs)}</Badge>
+        {report.precision_ms != null && (
+          <span data-testid="sync-precision">
+            <Badge tone="neutral">±{report.precision_ms} ms</Badge>
+          </span>
+        )}
       </div>
 
       <dl className="grid gap-3 sm:grid-cols-4">
@@ -159,6 +164,7 @@ function ReportView({ report, calculatedOffsetMs }: { report: SyncReport; calcul
               <th className="py-1.5 pr-3 font-medium">Position</th>
               <th className="py-1.5 pr-3 font-medium">Offset</th>
               <th className="py-1.5 pr-3 font-medium">Quality</th>
+              <th className="py-1.5 pr-3 font-medium">Match z</th>
               <th className="py-1.5 font-medium">Slice</th>
             </tr>
           </thead>
@@ -172,6 +178,7 @@ function ReportView({ report, calculatedOffsetMs }: { report: SyncReport; calcul
                 <td className="py-1.5 pr-3">{cp.position_pct}%</td>
                 <td className="py-1.5 pr-3 font-mono">{formatMs(cp.offset_ms)}</td>
                 <td className="py-1.5 pr-3 font-mono">{cp.correlation_quality.toFixed(2)}</td>
+                <td className="py-1.5 pr-3 font-mono">{cp.match_z ? cp.match_z.toFixed(1) : '—'}</td>
                 <td className="py-1.5 text-zinc-500">
                   {cp.slice_start_sec.toFixed(1)}s + {cp.slice_len_sec.toFixed(1)}s
                 </td>

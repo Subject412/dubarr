@@ -3,6 +3,7 @@ package correlate
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"testing"
 	"time"
@@ -302,9 +303,127 @@ func TestCancelledContext(t *testing.T) {
 	})
 }
 
+// TestInterpolatedOffsetMovesOffTheSampleGrid proves the reported sub-sample
+// offset is diagnostics on top of an unchanged integer answer: a pair delayed
+// by a whole number of samples *plus a fraction* keeps the 0.4.0 argmax (the
+// integer lag of the global maximum) and reports a fractional offset within
+// half a sample of it.
+//
+// The donor is a linear interpolation between two neighbouring target samples,
+// so the true delay sits at lead+0.35 samples: the peak of the cross-correlation
+// is off the grid, which is exactly what the parabolic fit is for.
+func TestInterpolatedOffsetMovesOffTheSampleGrid(t *testing.T) {
+	const (
+		rate = uint32(8000)
+		lead = 1200
+		frac = 0.35
+		n    = 8000
+	)
+	target := whiteProgramme(n, 0xD00D)
+	donor := make([]float32, n)
+	for i := range donor {
+		if i+lead+1 >= n {
+			continue
+		}
+		donor[i] = float32((1-frac)*float64(target[i+lead]) + frac*float64(target[i+lead+1]))
+	}
+
+	got, err := Analyze(context.Background(), target, donor, rate, 0.75)
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+	// 0.4.0's answer: the integer lag of the global maximum, never moved.
+	if got.OffsetSamples != lead {
+		t.Fatalf("offset = %d samples, want the unchanged integer peak at %d", got.OffsetSamples, lead)
+	}
+	delta := got.OffsetSubSamples - float64(got.OffsetSamples)
+	if delta == 0 {
+		t.Fatalf("offset_sub_samples = %v equals the integer offset %d: the peak stayed on the grid",
+			got.OffsetSubSamples, got.OffsetSamples)
+	}
+	if math.Abs(delta) > 0.5 {
+		t.Fatalf("offset_sub_samples = %v lies %v samples off the peak: the fit cannot pass its neighbour",
+			got.OffsetSubSamples, delta)
+	}
+	if math.Abs(delta) < 0.05 {
+		t.Fatalf("offset_sub_samples = %v is %v samples off the grid for a 0.35-sample delay: want a real fraction",
+			got.OffsetSubSamples, delta)
+	}
+}
+
+// TestInterpolationAtTheFirstScoredLagIsNotFabricated pins the boundary of the
+// neighbour capture: the scan's first scored lag has no scored lag to its left,
+// so the parabolic fit must see a missing neighbour (NaN, which
+// [parabolicPeak] turns into delta 0) and never a zero value left over from the
+// previous-lag bookkeeping.
+//
+// The case puts the peak on that first lag by construction. A 0.1 s window at
+// 8000 Hz bounds the search at round(0.1*8000) = 800 samples, so the scan's
+// first iteration (i = 0) is lag -800 — the search bound, and the first lag
+// that passes the overlap rule. The donor is the same tone delayed by exactly
+// 800 samples, so that first lag is the global maximum and the peak never
+// moves: the integer answer is -800 and the sub-sample fit has no left
+// neighbour to read. A fabricated left neighbour of 0.0 pulls the fit half a
+// sample off it (-799.5015), which is the whole of the error guarded here.
+func TestInterpolationAtTheFirstScoredLagIsNotFabricated(t *testing.T) {
+	const (
+		rate  = uint32(8000)
+		hz    = 70.0
+		shift = 800
+		n     = 8000
+	)
+	target := make([]float32, n)
+	for i := range target {
+		target[i] = float32(0.5 * math.Sin(2*math.Pi*hz*float64(i)/float64(rate)))
+	}
+	donor := make([]float32, n)
+	copy(donor[shift:], target[:n-shift])
+
+	got, err := Analyze(context.Background(), target, donor, rate, 0.1)
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+	if got.OffsetSamples != -shift {
+		t.Fatalf("offset = %d samples, want %d: the peak is not on the first scored lag, so this case proves nothing",
+			got.OffsetSamples, -shift)
+	}
+	if got.OffsetSubSamples != float64(got.OffsetSamples) {
+		t.Fatalf("offset_sub_samples = %v, want exactly %d: the fit fabricated a left neighbour for the first scored lag",
+			got.OffsetSubSamples, got.OffsetSamples)
+	}
+}
+
+// TestAnalysisPrecisionIsTheAnalysisSample states the measurement precision
+// explicitly: one sample of the rate the correlation ran at.
+func TestAnalysisPrecisionIsTheAnalysisSample(t *testing.T) {
+	programme := whiteProgramme(4000, 0x7E57)
+
+	cases := []struct {
+		rate uint32
+		want float64
+	}{
+		{rate: 8000, want: 0.125},
+		{rate: 1000, want: 1.0},
+	}
+	for _, tc := range cases {
+		t.Run(fmt.Sprintf("%dHz", tc.rate), func(t *testing.T) {
+			got, err := Analyze(context.Background(), programme, programme, tc.rate, 0.1)
+			if err != nil {
+				t.Fatalf("Analyze: %v", err)
+			}
+			if got.PrecisionMS != tc.want {
+				t.Fatalf("precision_ms = %v at %d Hz, want %v", got.PrecisionMS, tc.rate, tc.want)
+			}
+		})
+	}
+}
+
 // TestScratchReuseKeepsNumbersIdentical proves the buffer pool cannot move a
 // number: repeated runs on one Scratch, and a run of a different nfft on the
 // same pool, agree exactly with a fresh run.
+//
+// The comparison is over the whole [Analysis], so the sub-sample offset, the
+// match z and the precision are covered by the same guard.
 func TestScratchReuseKeepsNumbersIdentical(t *testing.T) {
 	ctx := context.Background()
 	target := whiteProgramme(20000, 3)

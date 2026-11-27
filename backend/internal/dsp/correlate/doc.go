@@ -33,6 +33,49 @@
 // reference engine's value, which is stricter than any absolute band and cannot
 // paper over the weak Minions checkpoints by adding a floor.
 //
+// # Confidence: two numbers, one verdict
+//
+// A correlation reports two confidence numbers and one precision, and they do
+// different jobs:
+//
+//   - [Analysis.Quality] is the peak's prominence over the median lag response,
+//     `(peak - median)/(1 - median)`. It is the 0.4.0 number: its formula, its
+//     value and its stored key are unchanged, and `internal/analyze` keeps
+//     reading it as the low-quality floor. Prominence is not comparable across
+//     content — a quiet dub and a loud remaster of the same scene land in
+//     different bands — so it cannot be the only word.
+//   - [Analysis.MatchZ] is the peak's distance from the window's own lag
+//     distribution, `(peak - mean)/std` over every scored lag (the BBC
+//     `audio-offset-finder` form cited by #85). It is scale-free, so the same
+//     band means the same thing on a quiet dub and a loud one. It is computed
+//     by [matchZ] from `sum` and `sumSq` accumulated inside the lag scan: no
+//     second pass and no second allocation, which is what keeps the cost gate
+//     and the 400 MiB/worker memory model in `internal/analyze` untouched.
+//
+// D2 asked for a "robust z / MAD-based" figure. The estimator here is mean/std
+// instead, for one measured reason: a median absolute deviation needs a second
+// pass over the same ~2.9 M scores *and* a second order-statistic selection at
+// nfft = 2^22, i.e. a ~23 MB allocation and two extra O(n) passes per
+// checkpoint, against a reference workload the cost gate prices with a single
+// median extraction. That is a real risk to a gate that must not be loosened
+// for a slice's convenience, for a robustness gain the mean/std form does not
+// need on real content. Keeping the estimator in [matchZ] makes a switch to MAD
+// a one-function change if the operator asks for it.
+//
+// [Analysis.OffsetSubSamples] is the third new number and it is diagnostics,
+// not a decision: a parabola through the three lag scores around the peak gives
+// a fractional offset, reported as `offset_sub_ms` and never applied. The
+// applied offset stays `round(OffsetSamples * 1000 / rate)` — one sample at the
+// analysis rate ([Analysis.PrecisionMS], 0.125 ms at 8 kHz) — because the
+// consumer is `mkvmerge --sync 0:<integer ms>`. Its neighbours are captured
+// during the lag scan, never looked up afterwards: [peakProminence] reorders
+// `scores` in place, so after a correlation that slice is unordered and must
+// not be indexed by lag.
+//
+// The verdict itself — which bands count as reliable — lives in exactly one
+// place, `analyze.DefaultThresholds`, and the report echoes the table that
+// judged it. This package only measures.
+//
 // # Arithmetic width
 //
 // Samples, spectra and the `X * conj(Y)` product are float32, because float32

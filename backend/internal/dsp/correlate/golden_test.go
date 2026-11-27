@@ -22,6 +22,17 @@ const (
 	// Offsets are asserted exactly — the peak either moves or it does not —
 	// but quality is a ratio of float32 sums and is allowed to drift.
 	goldenQualityTolerance = 0.02
+
+	// goldenCleanQuality is the recorded prominence at or above which an entry
+	// belongs to the clean excerpt set: the goldens whose content really
+	// matches, as opposed to the Minions checkpoints that sit on spurious
+	// peaks. It is a property of the committed capture, not a verdict limit.
+	goldenCleanQuality = 0.5
+
+	// goldenMatchZGood mirrors analyze.DefaultThresholds.MatchZGood. It is a
+	// local constant because analyze imports sync, which imports this package:
+	// a test here cannot import analyze without an import cycle.
+	goldenMatchZGood = 10.0
 )
 
 // goldenFile is one committed capture: the reference engine's own output for a
@@ -99,28 +110,8 @@ func TestGoldenExcerpts(t *testing.T) {
 func checkGolden(t *testing.T, scratch *Scratch, entry goldenEntry) {
 	t.Helper()
 
-	var job goldenPayload
-	if err := json.Unmarshal([]byte(entry.Payload), &job); err != nil {
-		t.Fatalf("%s: parsing the recorded payload: %v", entry.ID, err)
-	}
+	got := replayGolden(t, scratch, entry)
 	rate := entry.Result.SampleRate
-	if rate == 0 {
-		t.Fatalf("%s: the golden records no sample rate", entry.ID)
-	}
-
-	target, err := readExcerpt(entry.TargetWav, job.SliceStartSec, job.SliceLenSec, rate)
-	if err != nil {
-		t.Fatalf("%s: target: %v", entry.ID, err)
-	}
-	donor, err := readExcerpt(entry.DonorWav, job.SliceStartSec, job.SliceLenSec, rate)
-	if err != nil {
-		t.Fatalf("%s: donor: %v", entry.ID, err)
-	}
-
-	got, err := scratch.Analyze(context.Background(), target, donor, rate, job.WindowSec)
-	if err != nil {
-		t.Fatalf("%s: analyze: %v", entry.ID, err)
-	}
 
 	wantSamples, ok := offsetSamples(entry.Result.OffsetMS, rate)
 	if !ok {
@@ -149,6 +140,84 @@ func checkGolden(t *testing.T, scratch *Scratch, entry goldenEntry) {
 	t.Logf("%s: offset %d samples (%v ms, golden %v ms), quality %v (golden %v)",
 		entry.ID, got.OffsetSamples, gotMS, entry.Result.OffsetMS,
 		got.Quality, entry.Result.CorrelationQuality)
+}
+
+// replayGolden reads one entry's excerpts exactly as the capture asked for them
+// and runs them through the correlator, returning the whole [Analysis].
+func replayGolden(t *testing.T, scratch *Scratch, entry goldenEntry) Analysis {
+	t.Helper()
+
+	var job goldenPayload
+	if err := json.Unmarshal([]byte(entry.Payload), &job); err != nil {
+		t.Fatalf("%s: parsing the recorded payload: %v", entry.ID, err)
+	}
+	rate := entry.Result.SampleRate
+	if rate == 0 {
+		t.Fatalf("%s: the golden records no sample rate", entry.ID)
+	}
+
+	target, err := readExcerpt(entry.TargetWav, job.SliceStartSec, job.SliceLenSec, rate)
+	if err != nil {
+		t.Fatalf("%s: target: %v", entry.ID, err)
+	}
+	donor, err := readExcerpt(entry.DonorWav, job.SliceStartSec, job.SliceLenSec, rate)
+	if err != nil {
+		t.Fatalf("%s: donor: %v", entry.ID, err)
+	}
+
+	got, err := scratch.Analyze(context.Background(), target, donor, rate, job.WindowSec)
+	if err != nil {
+		t.Fatalf("%s: analyze: %v", entry.ID, err)
+	}
+	return got
+}
+
+// TestGoldenExcerptsCarryAPlausibleMatchZ guards the lag-curve accumulator
+// against a sign or overflow error without pinning numbers the float32 sums may
+// move: every committed entry reports a finite, positive z, and the clean
+// excerpt set (recorded prominence >= goldenCleanQuality) clears the "likely
+// correct" band. The goldens themselves are never regenerated — TestGoldenExcerpts
+// stays the 0.4.0 parity record.
+func TestGoldenExcerptsCarryAPlausibleMatchZ(t *testing.T) {
+	paths, err := filepath.Glob(filepath.Join(testdataDir, "golden", "*.json"))
+	if err != nil {
+		t.Fatalf("globbing the goldens: %v", err)
+	}
+	if len(paths) == 0 {
+		t.Fatalf("no goldens under %s; this guard must not pass by finding nothing",
+			filepath.Join(testdataDir, "golden"))
+	}
+
+	scratch := NewScratch()
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("reading %s: %v", path, err)
+		}
+		var golden goldenFile
+		if err := json.Unmarshal(data, &golden); err != nil {
+			t.Fatalf("parsing %s: %v", path, err)
+		}
+		if len(golden.Entries) == 0 {
+			t.Fatalf("%s records no entries", path)
+		}
+		for _, entry := range golden.Entries {
+			t.Run(golden.Case+"/"+entry.ID, func(t *testing.T) {
+				got := replayGolden(t, scratch, entry)
+				z := float64(got.MatchZ)
+				if math.IsNaN(z) || math.IsInf(z, 0) {
+					t.Fatalf("%s: match_z = %v, want a finite number", entry.ID, z)
+				}
+				if z <= 0 {
+					t.Fatalf("%s: match_z = %v, want > 0 (the accumulator never saw the peak)", entry.ID, z)
+				}
+				if entry.Result.CorrelationQuality >= goldenCleanQuality && z < goldenMatchZGood {
+					t.Fatalf("%s: match_z = %v on a clean excerpt (quality %v), want >= %v",
+						entry.ID, z, entry.Result.CorrelationQuality, goldenMatchZGood)
+				}
+			})
+		}
+	}
 }
 
 // readExcerpt reads the frames the recorded job asked for, out of the committed

@@ -424,6 +424,226 @@ func TestReportJSONShape(t *testing.T) {
 	}
 }
 
+// TestVerdictUnreliableNeedsBothScores pins the conjunction D2 asks for: the
+// old quality floor must fail *and* the new z must dissent. A weak quality with
+// a strong z is the old gate alone; a healthy quality with a weak z is the
+// future gate alone. Neither is `unreliable` on its own.
+func TestVerdictUnreliableNeedsBothScores(t *testing.T) {
+	offsets := []float64{1200, 1210, 1195}
+	qualities := []float64{0.9, 0.05, 0.9}
+
+	verdict, classification, _ := classify(offsets, qualities, []float64{30, 3, 30}, testAcceptBoundMS, DefaultThresholds)
+	if verdict != VerdictUnreliable || classification != ClassificationUnreliable {
+		t.Fatalf("weak quality with a dissenting z = %q/%q, want unreliable/unreliable", verdict, classification)
+	}
+
+	verdict, classification, _ = classify(offsets, qualities, []float64{30, 12, 30}, testAcceptBoundMS, DefaultThresholds)
+	if verdict != VerdictOK || classification != ClassificationStable {
+		t.Fatalf("weak quality with an agreeing z = %q/%q, want ok/stable (the conjunction must not invent distrust)", verdict, classification)
+	}
+}
+
+// TestVerdictUnreliableOnALegacyReport is the compatibility guard: a 0.4.0
+// report carries no z at all, and a weak quality must classify exactly as it
+// did then.
+func TestVerdictUnreliableOnALegacyReport(t *testing.T) {
+	verdict, classification, drift := classify(
+		[]float64{1200, 1210, 1195},
+		[]float64{0.9, 0.05, 0.9},
+		nil,
+		testAcceptBoundMS,
+		DefaultThresholds,
+	)
+	if verdict != VerdictUnreliable || classification != ClassificationUnreliable {
+		t.Fatalf("legacy report verdict = %q/%q, want unreliable/unreliable", verdict, classification)
+	}
+	if drift != 15 {
+		t.Fatalf("max drift = %v, want 15", drift)
+	}
+}
+
+// TestVerdictCannotReclassifyA04OKCheckpoint is D2's hard requirement, one
+// checkpoint at a time: a quality 0.4.0 called fine (at or above the floor)
+// keeps its verdict whatever the z says — including the absent z (0) and a z
+// just under the "needs a human look" floor.
+func TestVerdictCannotReclassifyA04OKCheckpoint(t *testing.T) {
+	stable := []float64{1200, 1210, 1195, 1205, 1198, 1202}
+	drifting := []float64{500, 500, 500, 2000, 2000, 2000}
+
+	cases := []struct {
+		name    string
+		quality float64
+		z       float64
+		offsets []float64
+		want    string
+	}{
+		{name: "at the floor, no z", quality: 0.10, z: 0, offsets: stable, want: VerdictOK},
+		{name: "just above the floor, z 1", quality: 0.11, z: 1, offsets: stable, want: VerdictOK},
+		{name: "healthy quality, z just under the floor", quality: 0.5, z: 4.9, offsets: stable, want: VerdictOK},
+		{name: "at the floor, drifting spread", quality: 0.10, z: 0, offsets: drifting, want: VerdictDrifting},
+		{name: "just above the floor, z 1, drifting spread", quality: 0.11, z: 1, offsets: drifting, want: VerdictDrifting},
+		{name: "healthy quality, z just under the floor, drifting spread", quality: 0.5, z: 4.9, offsets: drifting, want: VerdictDrifting},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			qualities := make([]float64, len(tc.offsets))
+			matchZ := make([]float64, len(tc.offsets))
+			for i := range qualities {
+				qualities[i] = tc.quality
+				matchZ[i] = tc.z
+			}
+			verdict, _, _ := classify(tc.offsets, qualities, matchZ, testAcceptBoundMS, DefaultThresholds)
+			if verdict == VerdictUnreliable {
+				t.Fatalf("verdict = %q for quality %v, z %v: a 0.4.0 ok checkpoint reclassified (want %q)",
+					verdict, tc.quality, tc.z, tc.want)
+			}
+			if verdict != tc.want {
+				t.Fatalf("verdict = %q, want %q", verdict, tc.want)
+			}
+		})
+	}
+}
+
+// TestThresholdsTableIsTheOnlySource proves classify reads its limits from the
+// table and from nowhere else: a hand-built table with an absurd band and a
+// zero floor must change the answer, which no surviving literal could do.
+func TestThresholdsTableIsTheOnlySource(t *testing.T) {
+	if DefaultThresholds.StableSpreadMS != StableSpreadThresholdMS {
+		t.Fatalf("DefaultThresholds.StableSpreadMS = %v, want the existing constant %v",
+			DefaultThresholds.StableSpreadMS, StableSpreadThresholdMS)
+	}
+	if DefaultThresholds.LowQuality != LowQualityThreshold {
+		t.Fatalf("DefaultThresholds.LowQuality = %v, want the existing constant %v",
+			DefaultThresholds.LowQuality, LowQualityThreshold)
+	}
+	if DefaultThresholds.MatchZMaybe != 5.0 || DefaultThresholds.MatchZGood != 10.0 {
+		t.Fatalf("DefaultThresholds z bands = %v/%v, want 5/10",
+			DefaultThresholds.MatchZMaybe, DefaultThresholds.MatchZGood)
+	}
+
+	// A 5 s spread that the 40 ms band would call drifting: the table's band
+	// is the only thing that decides.
+	spread := []float64{0, 2500, 5000}
+	qualities := []float64{0.9, 0.9, 0.9}
+	wide := DefaultThresholds
+	wide.StableSpreadMS = 1e9
+	if verdict, _, _ := classify(spread, qualities, nil, testAcceptBoundMS, wide); verdict != VerdictOK {
+		t.Fatalf("verdict = %q with a 1e9 ms band, want ok", verdict)
+	}
+	if verdict, _, _ := classify(spread, qualities, nil, testAcceptBoundMS, DefaultThresholds); verdict != VerdictDrifting {
+		t.Fatalf("verdict = %q with the default band, want drifting", verdict)
+	}
+
+	// A zero floor cannot be reached, so nothing is unreliable however weak
+	// the correlation and however absent the z.
+	weak := DefaultThresholds
+	weak.LowQuality = 0
+	if verdict, _, _ := classify(spread, []float64{0.01, 0.01, 0.01}, nil, testAcceptBoundMS, weak); verdict == VerdictUnreliable {
+		t.Fatalf("verdict = %q with LowQuality 0, want anything but unreliable", verdict)
+	}
+}
+
+// TestReportJSONShapeCarriesMatchZ extends TestReportJSONShape: the new keys
+// travel with every report and the existing ones still do.
+func TestReportJSONShapeCarriesMatchZ(t *testing.T) {
+	rep := Report{
+		Verdict:        VerdictOK,
+		OffsetsMS:      []float64{1, 2},
+		Qualities:      []float64{0.5, 0.6},
+		MaxDriftMS:     1,
+		Classification: ClassificationStable,
+		Checkpoints: []Checkpoint{
+			{PositionPct: 10, OffsetMS: 1, Quality: 0.5, OffsetSubMS: 1.3, MatchZ: 27.5, PrecisionMS: 0.125},
+			{PositionPct: 25, OffsetMS: 2, Quality: 0.6, OffsetSubMS: 2.1, MatchZ: 31.0, PrecisionMS: 0.125},
+		},
+		SyncMethod:  reflang.SameLangReference,
+		MatchZ:      []float64{27.5, 31},
+		PrecisionMS: 0.125,
+		Thresholds:  DefaultThresholds,
+	}
+	raw, err := json.Marshal(rep)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for _, key := range []string{
+		"verdict", "offsets_ms", "qualities", "max_drift_ms", "classification", "sync_method",
+		"match_z", "precision_ms", "thresholds",
+	} {
+		if _, ok := fields[key]; !ok {
+			t.Fatalf("report JSON missing %q: %s", key, raw)
+		}
+	}
+	// The per-checkpoint keys are not omitempty either: 0 is the documented
+	// "not recorded" sentinel, not an absent field.
+	var checkpoints []map[string]json.RawMessage
+	if err := json.Unmarshal(fields["checkpoints"], &checkpoints); err != nil {
+		t.Fatalf("unmarshal checkpoints: %v", err)
+	}
+	for _, key := range []string{"offset_sub_ms", "match_z", "precision_ms"} {
+		if _, ok := checkpoints[0][key]; !ok {
+			t.Fatalf("checkpoint JSON missing %q: %s", key, fields["checkpoints"])
+		}
+	}
+	// A zero z is a real value, not an omission.
+	legacy := Report{Verdict: VerdictOK, OffsetsMS: []float64{1}, Qualities: []float64{0.5}, MatchZ: []float64{0}}
+	zeroRaw, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatalf("marshal zero-z report: %v", err)
+	}
+	var zeroFields map[string]json.RawMessage
+	if err := json.Unmarshal(zeroRaw, &zeroFields); err != nil {
+		t.Fatalf("unmarshal zero-z report: %v", err)
+	}
+	if string(zeroFields["match_z"]) == "" {
+		t.Fatalf("report JSON dropped a zero match_z: %s", zeroRaw)
+	}
+}
+
+// TestIntegrationConstantOffsetPrecision runs the existing constant-offset pair
+// through the real engine and adds the precision the report now states: the
+// staged WAVs are written at 1 kHz, the runner analyses them at the file's rate,
+// so one sample is 1 ms. The offsets themselves are unchanged.
+func TestIntegrationConstantOffsetPrecision(t *testing.T) {
+	eng := requireEngine(t)
+	dir := t.TempDir()
+	n := durationS * sampleRate
+	target := noiseSignal(n, 11)
+	writeWAV(t, filepath.Join(dir, "target.wav"), target)
+	writeWAV(t, filepath.Join(dir, "donor.wav"), shiftedDonor(target, 1200))
+
+	req := request(dir)
+	req.DurationSec = 0 // derive from the WAV headers
+	ctx, cancel := context.WithTimeout(context.Background(), testAnalysisBudget)
+	defer cancel()
+	rep, err := Analyze(ctx, eng, testJobConfig(), req)
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+	if rep.Verdict != VerdictOK {
+		t.Fatalf("verdict = %q (offsets %v, drift %v), want ok", rep.Verdict, rep.OffsetsMS, rep.MaxDriftMS)
+	}
+	for i, off := range rep.OffsetsMS {
+		if math.Abs(off-1200) > 5 {
+			t.Fatalf("checkpoint %d offset = %v, want ~1200", i, off)
+		}
+	}
+	if rep.PrecisionMS != 1.0 {
+		t.Fatalf("precision_ms = %v, want 1.0 (one sample of the 1 kHz fixture)", rep.PrecisionMS)
+	}
+	if len(rep.MatchZ) != len(rep.OffsetsMS) {
+		t.Fatalf("match_z has %d entries for %d checkpoints, want one each", len(rep.MatchZ), len(rep.OffsetsMS))
+	}
+	for i, z := range rep.MatchZ {
+		if !(z > 0) || math.IsNaN(z) || math.IsInf(z, 0) {
+			t.Fatalf("checkpoint %d match_z = %v on a clean pair, want a finite positive number", i, z)
+		}
+	}
+}
+
 // Integration: synthesised WAV pairs through the real Rust engine.
 
 const (

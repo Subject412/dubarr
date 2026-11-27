@@ -143,6 +143,44 @@ func TestRunSuccess(t *testing.T) {
 	assertFixtureResult(t, res)
 }
 
+// TestResultCarriesMatchZAndPrecision proves the three new numbers survive the
+// runner: the sub-sample offset is converted to milliseconds and rounded to
+// three decimals like every other reported value, the z travels as it was
+// scored, and the precision is the engine's own sample period.
+func TestResultCarriesMatchZAndPrecision(t *testing.T) {
+	r := newTestRunner(t)
+	job := fixtureJob(t)
+	r.correlate = func(context.Context, []float32, []float32, uint32, float64) (correlate.Analysis, error) {
+		return correlate.Analysis{
+			OffsetSamples:    2000,
+			Quality:          0.9,
+			OffsetSubSamples: 2000.3,
+			MatchZ:           27.5,
+			PrecisionMS:      0.125,
+		}, nil
+	}
+
+	res, err := r.Run(context.Background(), job)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.OffsetMS != 250 {
+		t.Fatalf("offset_ms = %v, want 250", res.OffsetMS)
+	}
+	if res.CorrelationQuality != 0.9 {
+		t.Fatalf("correlation_quality = %v, want 0.9", res.CorrelationQuality)
+	}
+	if res.OffsetSubMS != 250.038 {
+		t.Fatalf("offset_sub_ms = %v, want 250.038 (2000.3 samples at 8 kHz, 3 decimals)", res.OffsetSubMS)
+	}
+	if res.MatchZ != 27.5 {
+		t.Fatalf("match_z = %v, want 27.5", res.MatchZ)
+	}
+	if res.PrecisionMS != 0.125 {
+		t.Fatalf("precision_ms = %v, want 0.125", res.PrecisionMS)
+	}
+}
+
 func TestRunMismatchedRates(t *testing.T) {
 	r := newTestRunner(t)
 	dir := t.TempDir()

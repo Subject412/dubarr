@@ -314,4 +314,92 @@ describe('sync studio', () => {
     expect(analysis).toHaveTextContent('—')
     expect(analysis).not.toHaveTextContent('full')
   })
+
+  it('renders the match z column and the precision badge for a 0.5.0 report', async () => {
+    const job = makeJob({
+      id: 16,
+      report: makeReport({
+        match_z: [27.5, 24.2, 0, 18.4, 26.1],
+        precision_ms: 0.125,
+        thresholds: {
+          stable_spread_ms: 40,
+          low_quality: 0.1,
+          match_z_maybe: 5,
+          match_z_good: 10,
+        },
+        checkpoints: [
+          { position_pct: 10, slice_start_sec: 60, slice_len_sec: 3, offset_ms: 120, correlation_quality: 0.92, offset_sub_ms: 120.06, match_z: 27.5, precision_ms: 0.125 },
+          { position_pct: 30, slice_start_sec: 180, slice_len_sec: 3, offset_ms: 118, correlation_quality: 0.88, offset_sub_ms: 118.02, match_z: 24.2, precision_ms: 0.125 },
+          { position_pct: 50, slice_start_sec: 300, slice_len_sec: 3, offset_ms: 121, correlation_quality: 0.9, offset_sub_ms: 121, match_z: 0, precision_ms: 0.125 },
+          { position_pct: 70, slice_start_sec: 420, slice_len_sec: 3, offset_ms: 119, correlation_quality: 0.86, offset_sub_ms: 119.04, match_z: 18.4, precision_ms: 0.125 },
+          { position_pct: 90, slice_start_sec: 540, slice_len_sec: 3, offset_ms: 120, correlation_quality: 0.91, offset_sub_ms: 120.01, match_z: 26.1, precision_ms: 0.125 },
+        ],
+      }),
+    })
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input)
+        if (url.endsWith('/api/sync/jobs')) return jsonResponse({ items: [job] })
+        if (url.endsWith('/api/sync/jobs/16')) return jsonResponse(job)
+        return jsonResponse({ error: 'unexpected' }, 404)
+      }),
+    )
+    renderWithProviders(<SyncPage />, { route: '/sync' })
+
+    const rows = await screen.findAllByTestId(/^checkpoint-row-/)
+    expect(rows).toHaveLength(5)
+    expect(within(rows[0].closest('table') as HTMLTableElement).getByText('Match z')).toBeInTheDocument()
+    expect(within(rows[0]).getByText('27.5')).toBeInTheDocument()
+    expect(within(rows[1]).getByText('24.2')).toBeInTheDocument()
+    // match_z = 0 is the documented "not recorded" sentinel, not a score.
+    expect(within(rows[2]).getByText('—')).toBeInTheDocument()
+    expect(within(rows[4]).getByText('26.1')).toBeInTheDocument()
+
+    const precision = await screen.findByTestId('sync-precision')
+    expect(precision).toHaveTextContent('±0.125 ms')
+
+    const dot = screen.getByTestId('checkpoint-dot-0')
+    expect(dot.querySelector('title')).toHaveTextContent('z 27.5')
+  })
+
+  it('renders a 0.4.0 report without match z or precision', async () => {
+    // Exactly what a job stored before 0.5.0 returns: no match_z array, no
+    // precision_ms, and checkpoints without the new keys. The table must still
+    // render, with a dash instead of a fabricated score.
+    const legacy: SyncReport = {
+      verdict: 'ok',
+      offsets_ms: [120, 118, 121],
+      qualities: [0.92, 0.88, 0.9],
+      max_drift_ms: 3,
+      classification: 'stable',
+      checkpoints: [
+        { position_pct: 10, slice_start_sec: 60, slice_len_sec: 3, offset_ms: 120, correlation_quality: 0.92 },
+        { position_pct: 50, slice_start_sec: 300, slice_len_sec: 3, offset_ms: 121, correlation_quality: 0.9 },
+        { position_pct: 90, slice_start_sec: 540, slice_len_sec: 3, offset_ms: 120, correlation_quality: 0.91 },
+      ],
+      sync_method: 'correlation',
+    }
+    const job = makeJob({ id: 17, report: legacy })
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input)
+        if (url.endsWith('/api/sync/jobs')) return jsonResponse({ items: [job] })
+        if (url.endsWith('/api/sync/jobs/17')) return jsonResponse(job)
+        return jsonResponse({ error: 'unexpected' }, 404)
+      }),
+    )
+    renderWithProviders(<SyncPage />, { route: '/sync' })
+
+    const rows = await screen.findAllByTestId(/^checkpoint-row-/)
+    expect(rows).toHaveLength(3)
+    expect(within(rows[0].closest('table') as HTMLTableElement).getByText('Match z')).toBeInTheDocument()
+    for (const row of rows) expect(within(row).getByText('—')).toBeInTheDocument()
+    expect(screen.queryByTestId('sync-precision')).toBeNull()
+    expect(screen.queryByText(/^±/)).toBeNull()
+
+    const dot = screen.getByTestId('checkpoint-dot-0')
+    expect(dot.querySelector('title')).not.toHaveTextContent('z ')
+  })
 })

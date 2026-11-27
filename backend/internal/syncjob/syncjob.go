@@ -964,11 +964,21 @@ func acceptsRetry(windows []analyze.Window, offsets []float64, index int, w anal
 
 // replaceCheckpoint writes an accepted retry into the report at its own index,
 // leaving every other checkpoint untouched.
+//
+// The 0.5.0 diagnostics are replaced with the retry's own: a z or a sub-sample
+// offset left over from the attempt this one replaces would describe a peak the
+// report no longer carries.
 func replaceCheckpoint(report analyze.Report, index int, result sync.Result) analyze.Report {
 	report.Checkpoints[index].OffsetMS = result.OffsetMS
 	report.Checkpoints[index].Quality = result.CorrelationQuality
+	report.Checkpoints[index].OffsetSubMS = result.OffsetSubMS
+	report.Checkpoints[index].MatchZ = result.MatchZ
+	report.Checkpoints[index].PrecisionMS = result.PrecisionMS
 	report.OffsetsMS[index] = result.OffsetMS
 	report.Qualities[index] = result.CorrelationQuality
+	if index < len(report.MatchZ) {
+		report.MatchZ[index] = result.MatchZ
+	}
 	return report
 }
 

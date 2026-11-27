@@ -30,7 +30,10 @@ import (
 // The thresholds are the package's existing ones — [StableSpreadThresholdMS]
 // and [LowQualityThreshold] — and nothing new: a policy that cannot be
 // explained with the numbers classify already uses is a policy nobody can
-// check.
+// check. Both constants are now the values of [DefaultThresholds]'
+// StableSpreadMS and LowQuality fields (analyze.go), i.e. the same table
+// [classify] reads; this file keeps referring to the constants because they are
+// the fallback's own two questions, not the verdict's.
 
 // Suspect reasons, in the order [Suspects] gives them precedence.
 const (

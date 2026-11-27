@@ -270,8 +270,8 @@ func Analyze(ctx context.Context, engine Engine, cfg Config, req Request) (Repor
 		start, length := sliceWindow(duration, pct, window)
 		search := length
 		job := sync.Job{
-			Target:        sync.PathSource(req.TargetPath),
-			Donor:         sync.PathSource(req.DonorPath),
+			TargetPath:    req.TargetPath,
+			DonorPath:     req.DonorPath,
 			SliceStartSec: start,
 			SliceLenSec:   length,
 			WindowSec:     &search,

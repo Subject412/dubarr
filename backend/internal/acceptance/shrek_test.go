@@ -97,10 +97,9 @@ func TestShrekEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateSyncJob: %v", err)
 	}
-	engine, err := syncengine.New(syncBinary, syncengine.WithTimeout(testJobTimeout))
-	if err != nil {
-		t.Fatalf("sync.New: %v", err)
-	}
+	// Same construction as the other acceptance tests: the shared budget is on
+	// the runner too, so its 30 s default cannot undercut testJobTimeout.
+	engine := syncengine.New(syncengine.WithTimeout(testJobTimeout))
 	router := http.NewServeMux()
 	jobSvc := syncjob.RegisterRoutes(router, syncjob.Dependencies{
 		DB: h.st.DB, Settings: h.ss, WorkDir: h.work, Engine: budgetEngine{inner: engine},

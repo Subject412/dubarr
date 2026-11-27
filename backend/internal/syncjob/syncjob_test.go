@@ -26,49 +26,6 @@ import (
 	"github.com/Subject412/dubarr/backend/internal/sync"
 )
 
-var builtBinary string
-var buildErr error
-
-func TestMain(m *testing.M) {
-	os.Exit(runWithBuiltBinary(m))
-}
-
-func runWithBuiltBinary(m *testing.M) int {
-	root, err := filepath.Abs(filepath.Join("..", "..", ".."))
-	if err != nil {
-		buildErr = err
-		return m.Run()
-	}
-	manifest := filepath.Join(root, "sync-engine", "Cargo.toml")
-	if _, err := os.Stat(manifest); err != nil {
-		buildErr = fmt.Errorf("sync-engine source missing: %w", err)
-		return m.Run()
-	}
-	cargo, err := exec.LookPath("cargo")
-	if err != nil {
-		buildErr = fmt.Errorf("cargo not on PATH: %w", err)
-		return m.Run()
-	}
-	dir, err := os.MkdirTemp("", "dubarr-syncjob-build-")
-	if err != nil {
-		buildErr = err
-		return m.Run()
-	}
-	defer os.RemoveAll(dir)
-	cmd := exec.Command(cargo, "build", "--offline", "--manifest-path", manifest, "--target-dir", dir)
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		buildErr = fmt.Errorf("cargo build --offline: %w", err)
-		return m.Run()
-	}
-	builtBinary = filepath.Join(dir, "debug", sync.BinaryName)
-	if _, err := os.Stat(builtBinary); err != nil {
-		buildErr = fmt.Errorf("built binary missing: %w", err)
-	}
-	return m.Run()
-}
-
 type fixture struct {
 	storeDir string
 	workDir  string
@@ -354,9 +311,6 @@ func shifted(samples []int16, lead int) []int16 {
 }
 
 func TestExecuteEndToEnd(t *testing.T) {
-	if buildErr != nil {
-		t.Skipf("dubarr-sync build unavailable: %v", buildErr)
-	}
 	for _, tool := range []string{"ffmpeg", "ffprobe", "mkvmerge"} {
 		if _, err := exec.LookPath(tool); err != nil {
 			t.Skipf("%s not on PATH", tool)
@@ -402,11 +356,7 @@ func TestExecuteEndToEnd(t *testing.T) {
 		t.Fatalf("decode job: %v", err)
 	}
 
-	engine, err := sync.New(builtBinary)
-	if err != nil {
-		t.Fatalf("sync.New: %v", err)
-	}
-	f.svc.engine = engine
+	f.svc.engine = sync.New()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	report, err := f.svc.Execute(ctx, job.ID)

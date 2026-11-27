@@ -5,56 +5,37 @@ import (
 	"fmt"
 )
 
-// Kind classifies a bridge failure. The values map onto the engine's exit
-// codes (2 usage, 3 analysis) plus the failures the bridge detects itself.
+// Kind classifies an engine failure.
 type Kind string
 
 const (
-	// KindInvalidJob means the caller built a job the engine could not accept;
-	// the bridge rejects it before spawning the binary.
+	// KindInvalidJob means the caller built a job the engine cannot accept;
+	// it is rejected before any file is opened.
 	KindInvalidJob Kind = "invalid_job"
-	// KindUnavailable means the dubarr-sync binary could not be found or
-	// executed. This is the condition /api/health reports as
-	// dubarr-sync.available=false.
-	KindUnavailable Kind = "unavailable"
-	// KindUsage is exit code 2: invalid job JSON or semantically invalid job.
-	KindUsage Kind = "usage"
-	// KindAnalysis is exit code 3: the engine could not analyse the audio
-	// (unreadable/mismatched/silent slices, no valid lag, ...).
+	// KindAnalysis means the audio could not be analysed (unreadable,
+	// mismatched or silent slices, no valid lag, ...).
 	KindAnalysis Kind = "analysis"
-	// KindMalformedOutput means the engine exited 0 but its stdout was not a
-	// single valid result object.
-	KindMalformedOutput Kind = "malformed_output"
-	// KindTimeout means the job exceeded the bridge deadline and was killed.
+	// KindTimeout means the job exceeded the runner deadline.
 	KindTimeout Kind = "timeout"
-	// KindExecution covers other process failures (signals, start errors,
-	// unexpected exit codes) that fit none of the above.
+	// KindExecution covers everything else, including a recovered panic from
+	// inside the engine.
 	KindExecution Kind = "execution"
 )
 
 // Sentinel errors for errors.Is. Every *Error matches its Kind sentinel.
 var (
-	ErrInvalidJob      = errors.New("sync: invalid job")
-	ErrUnavailable     = errors.New("sync: dubarr-sync unavailable")
-	ErrUsage           = errors.New("sync: dubarr-sync usage error")
-	ErrAnalysis        = errors.New("sync: dubarr-sync analysis failed")
-	ErrMalformedOutput = errors.New("sync: malformed dubarr-sync output")
-	ErrTimeout         = errors.New("sync: dubarr-sync timed out")
-	ErrExecution       = errors.New("sync: dubarr-sync execution failed")
+	ErrInvalidJob = errors.New("sync: invalid job")
+	ErrAnalysis   = errors.New("sync: analysis failed")
+	ErrTimeout    = errors.New("sync: job timed out")
+	ErrExecution  = errors.New("sync: execution failed")
 )
 
 func sentinelFor(kind Kind) error {
 	switch kind {
 	case KindInvalidJob:
 		return ErrInvalidJob
-	case KindUnavailable:
-		return ErrUnavailable
-	case KindUsage:
-		return ErrUsage
 	case KindAnalysis:
 		return ErrAnalysis
-	case KindMalformedOutput:
-		return ErrMalformedOutput
 	case KindTimeout:
 		return ErrTimeout
 	default:
@@ -62,15 +43,15 @@ func sentinelFor(kind Kind) error {
 	}
 }
 
-// Error is the typed failure returned by [Runner.Run] and [New].
+// Error is the typed failure returned by [Runner.Run].
 //
-// Stderr carries whatever the engine wrote to stderr (already trimmed); it is
-// safe to log, as the engine never echoes secret material.
+// Stderr carries a one-line diagnostic for failures that have one — today only
+// the recovered panic's stack, collapsed onto a single line so the message can
+// be surfaced in a job status row without formatting surprises.
 type Error struct {
-	Kind     Kind
-	ExitCode int
-	Stderr   string
-	Err      error
+	Kind   Kind
+	Stderr string
+	Err    error
 }
 
 // Error implements the error interface. The message stays one line so it can be
@@ -83,9 +64,6 @@ func (e *Error) Error() string {
 	if e.Stderr != "" {
 		msg = msg + ": " + e.Stderr
 	}
-	if e.ExitCode != 0 {
-		msg = fmt.Sprintf("%s (exit %d)", msg, e.ExitCode)
-	}
 	return msg
 }
 
@@ -96,11 +74,37 @@ func (e *Error) Unwrap() error { return e.Err }
 // errors.Is(err, sync.ErrAnalysis) instead of type-switching.
 func (e *Error) Is(target error) bool { return target == sentinelFor(e.Kind) }
 
-// KindOf reports the Kind of a bridge error, if err is one (possibly wrapped).
+// KindOf reports the Kind of an engine error, if err is one (possibly wrapped).
 func KindOf(err error) (Kind, bool) {
 	var e *Error
 	if errors.As(err, &e) {
 		return e.Kind, true
 	}
 	return "", false
+}
+
+// SampleRateMismatch reports two staged WAVs sampled at different rates. The
+// message is the engine's own wording (lib.rs), so log lines keep their shape.
+type SampleRateMismatch struct {
+	Target uint32
+	Donor  uint32
+}
+
+// Error implements error.
+func (e *SampleRateMismatch) Error() string {
+	return fmt.Sprintf("sample rate mismatch: target %d Hz vs donor %d Hz (M4-1 requires identical rates)",
+		e.Target, e.Donor)
+}
+
+// SliceOutOfRange reports a requested slice that starts past the end of a
+// staged WAV.
+type SliceOutOfRange struct {
+	StartSec    float64
+	DurationSec float64
+}
+
+// Error implements error, rendering the engine's `slice starts at … beyond
+// audio duration …`.
+func (e *SliceOutOfRange) Error() string {
+	return fmt.Sprintf("slice starts at %.3fs beyond audio duration %.3fs", e.StartSec, e.DurationSec)
 }

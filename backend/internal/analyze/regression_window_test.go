@@ -52,14 +52,19 @@ func TestRangedReadsMatchWholeFileSlices(t *testing.T) {
 		}
 
 		// Former behaviour, expressed at the API level: analyse the same
-		// window sliced out of the fully decoded signals, fed as inline PCM
-		// starting at 0 s. The correlation inputs are therefore identical.
+		// window sliced out of the fully decoded signals, written to WAVs and
+		// read from frame 0. The correlation inputs are therefore identical.
 		start := int(math.Round(cp.SliceStartSec * float64(rate)))
 		length := int(math.Round(cp.SliceLenSec * float64(rate)))
 		window := cp.SliceLenSec
+		sliceDir := t.TempDir()
+		sliceTarget := filepath.Join(sliceDir, "target.wav")
+		sliceDonor := filepath.Join(sliceDir, "donor.wav")
+		writeWAVRate(t, sliceTarget, target[start:start+length], rate)
+		writeWAVRate(t, sliceDonor, donor[start:start+length], rate)
 		res, err := eng.Run(context.Background(), sync.Job{
-			Target:        sync.PCMSource(rate, target[start:start+length]),
-			Donor:         sync.PCMSource(rate, donor[start:start+length]),
+			TargetPath:    sliceTarget,
+			DonorPath:     sliceDonor,
 			SliceStartSec: 0,
 			SliceLenSec:   cp.SliceLenSec,
 			WindowSec:     &window,

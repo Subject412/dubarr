@@ -80,10 +80,7 @@ func TestMinionsLoudFail(t *testing.T) {
 		t.Fatalf("CreateSyncJob(lektor): %v", err)
 	}
 
-	engine, err := syncengine.New(syncBinary, syncengine.WithTimeout(testJobTimeout))
-	if err != nil {
-		t.Fatalf("sync.New: %v", err)
-	}
+	engine := syncengine.New(syncengine.WithTimeout(testJobTimeout))
 	jobSvc := syncjob.RegisterRoutes(http.NewServeMux(), syncjob.Dependencies{
 		DB: h.st.DB, Settings: h.ss, WorkDir: h.work, Engine: budgetEngine{inner: engine},
 	})

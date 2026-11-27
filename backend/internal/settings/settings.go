@@ -204,12 +204,16 @@ type SyncDefaults struct {
 	AnalysisSource string `json:"analysis_source"`
 }
 
-// DefaultAnalysisSource is the shipped analysis mode: both tracks decoded
-// whole, i.e. exactly the behaviour every install had before the setting
-// existed. It is the only place in the backend the default is written down, so
-// flipping it (U-WIN.9) is one constant; the SPA mirrors it in
-// DEFAULTS['sync.defaults'] and its select fallback.
-const DefaultAnalysisSource = analyze.AnalysisSourceFull
+// DefaultAnalysisSource is the shipped analysis mode: each sync job analyses a
+// track in 190 s windows decoded with a 2.0 s pre-roll, instead of decoding both
+// sources whole. It falls back to a whole-track decode whenever a window plan
+// cannot be built (unknown duration/origin, a setting that says full) or a
+// window fails twice, so the shipped mode never fails where the whole-track
+// path would have succeeded. [analyze.AnalysisSourceFull] stays selectable for
+// operators who would rather never fall back. This is the only place in the
+// backend the default is written down, so flipping it is one constant; the SPA
+// mirrors it in DEFAULTS['sync.defaults'] and its select fallback.
+const DefaultAnalysisSource = analyze.AnalysisSourceWindows
 
 // DefaultParallelCheckpoints is the shipped worker count: one checkpoint at a
 // time, i.e. exactly the behaviour every install had before the setting
@@ -219,8 +223,10 @@ const DefaultParallelCheckpoints = 1
 // UnmarshalJSON makes an absent parallel_checkpoints mean
 // [DefaultParallelCheckpoints] and an absent analysis_source mean
 // [DefaultAnalysisSource]. Legacy rows written before the keys existed must
-// keep analysing one checkpoint at a time and both tracks whole; a plain decode
-// would read them as 0 and "", and fail validation. A *present* 0 is kept as 0
+// keep analysing one checkpoint at a time; their absent analysis_source now
+// resolves to the shipped windowed mode, which falls back to a whole-track
+// decode when a window plan cannot be built. A plain decode would read the
+// two as 0 and "", and fail validation. A *present* 0 is kept as 0
 // so validateSync rejects it: treating it as "absent" would make an operator's
 // explicit 0 silently mean 1. A present-but-empty analysis_source is kept empty
 // for the same reason, so "" and absent stay distinguishable at the boundary

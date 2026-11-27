@@ -45,10 +45,11 @@ export const DEFAULT_SETTINGS: DubarrSettings = {
     preview_positions_pct: [10, 25, 50, 75, 90],
     preview_window_sec: 60,
     parallel_checkpoints: 1,
-    // Compiled default (settings.DefaultAnalysisSource): decode both tracks
-    // whole. U-WIN.9 flips this to 'windows' together with the fallback in
-    // Settings.tsx.
-    analysis_source: 'full',
+    // Compiled default (settings.DefaultAnalysisSource): analyse 190 s windows
+    // with a 2.0 s pre-roll, falling back to a whole-track decode when a window
+    // plan cannot be built. Mirrors the backend constant and the select's own
+    // fallback in Settings.tsx.
+    analysis_source: 'windows',
   },
   'security.options': {
     allow_force_tag_override: false,

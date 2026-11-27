@@ -7,10 +7,14 @@
 package api
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
+	"sort"
+	"strconv"
 
 	"github.com/Subject412/dubarr/backend/internal/secrets"
 	"github.com/Subject412/dubarr/backend/internal/settings"
@@ -94,7 +98,30 @@ func (s *Service) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "could not read settings")
 		return
 	}
+	// A stored section that is not valid JSON cannot be encoded into the
+	// envelope. Name it instead of serving a body no client can parse: the
+	// section is what the operator has to repair, and "the settings payload is
+	// broken" without the key is a puzzle, not a diagnosis.
+	for _, key := range sortedSettingKeys(all) {
+		if !json.Valid(all[key]) {
+			slog.Error("api: stored settings section is not valid JSON", "key", key)
+			writeError(w, http.StatusInternalServerError,
+				"stored settings section "+strconv.Quote(key)+" is not valid JSON; repair or delete that row")
+			return
+		}
+	}
 	writeJSON(w, http.StatusOK, settingsEnvelope{Settings: all})
+}
+
+// sortedSettingKeys gives the validation loop a deterministic order, so a
+// response names the same section every time when more than one row is bad.
+func sortedSettingKeys(all map[string]json.RawMessage) []string {
+	keys := make([]string, 0, len(all))
+	for key := range all {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // handlePutSettings applies a partial update: only the sections present in the
@@ -154,11 +181,25 @@ func (s *Service) handleExportSettings(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, exp)
 }
 
+// writeJSON encodes v before touching the ResponseWriter. Encoding after
+// WriteHeader would turn an unencodable payload into "<intended status> with an
+// empty body", which is indistinguishable from an empty success; instead the
+// encode failure is logged and answered with a 500 whose body is a constant,
+// so the error path cannot itself fail to encode.
 func writeJSON(w http.ResponseWriter, status int, v any) {
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(v); err != nil {
+		slog.Error("api: could not encode JSON response", "status", status, "error", err)
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":"could not encode response"}`))
+		return
+	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+	_, _ = w.Write(buf.Bytes())
 }
 
 func writeError(w http.ResponseWriter, status int, message string) {

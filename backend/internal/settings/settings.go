@@ -32,6 +32,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"path/filepath"
 	"regexp"
@@ -479,6 +480,11 @@ func (s *Store) Seed(ctx context.Context, dataDir string) error {
 }
 
 // Get returns the stored JSON for a writable section key.
+//
+// A row that is not valid JSON is returned as stored rather than reported as
+// absent: absence means "never configured", and a corrupt row must not be
+// mistaken for that. Callers that decode get a real error, and the settings
+// read route names the section instead of serving bytes no encoder can take.
 func (s *Store) Get(ctx context.Context, key string) (json.RawMessage, bool, error) {
 	if !isKnownKey(key) {
 		return nil, false, fmt.Errorf("settings: %q is not a settings section: %w", key, ErrUnknownKey)
@@ -636,7 +642,14 @@ func (s *Store) All(ctx context.Context) (map[string]json.RawMessage, error) {
 		if !isKnownKey(key) || IsSensitiveKey(key) {
 			continue
 		}
-		out[key] = serveable(key, value)
+		served := serveable(key, value)
+		if !json.Valid(served) {
+			// Serve the bytes as stored: absence means "never configured", and a
+			// corrupt row must not be mistaken for that. The settings read route
+			// names the section instead of handing an encoder these bytes.
+			slog.Warn("settings: stored section is not valid JSON", "key", key)
+		}
+		out[key] = served
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("settings: iterate: %w", err)

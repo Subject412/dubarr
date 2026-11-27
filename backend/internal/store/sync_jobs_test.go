@@ -15,6 +15,7 @@ import (
 // TestSyncJobOutputPathPersists covers migration 0003 and the job projection:
 // the recorded publish destination is read back by SyncJobByID and can be
 // cleared again.
+
 func TestSyncJobOutputPathPersists(t *testing.T) {
 	dir := t.TempDir()
 	st, err := Open(dir)

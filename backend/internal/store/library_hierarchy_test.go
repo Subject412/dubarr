@@ -166,8 +166,8 @@ func TestListMoviesSearchMatchesTitleAndOriginalTitle(t *testing.T) {
 	hierarchyMovie(t, s, ctx, radarr, 3, "Shrek", "", 2001, "/media/x/c.mkv", "eligible")
 
 	cases := map[string]string{
-		"AWAY":     "Spirited Away",
-		"千と千尋":    "Spirited Away",
+		"AWAY":      "Spirited Away",
+		"千と千尋":      "Spirited Away",
 		"przybycie": "Arrival",
 	}
 	for q, want := range cases {

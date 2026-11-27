@@ -111,6 +111,17 @@ func decodeError(t *testing.T, body []byte) (string, string) {
 
 // TestMoviesRouteValidatesPaging pins the documented 400 codes: a page or page
 // size below 1, a non-numeric value, and an unknown sort/dir.
+// rawJSON re-encodes a decoded resource map so a test can decode it into a
+// typed struct while still asserting the exact key set of the envelope.
+func rawJSON(t *testing.T, m map[string]json.RawMessage) []byte {
+	t.Helper()
+	b, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("re-encode resource: %v", err)
+	}
+	return b
+}
+
 func TestMoviesRouteValidatesPaging(t *testing.T) {
 	h := newHarness(t)
 	cases := []struct {
@@ -216,7 +227,7 @@ func TestMoviesRouteReturnsPagedResource(t *testing.T) {
 		VideoCodec    string `json:"video_codec"`
 		UpdatedAt     string `json:"updated_at"`
 	}
-	if err := json.Unmarshal(items[0], &movie); err != nil {
+	if err := json.Unmarshal(rawJSON(t, items[0]), &movie); err != nil {
 		t.Fatalf("decode movie: %v", err)
 	}
 	if movie.ID != id || movie.ArrID != 12 || movie.InstanceID != radarr || movie.Instance != "Radarr" {
@@ -280,7 +291,7 @@ func TestSeriesRouteReturnsNestedStatistics(t *testing.T) {
 		Eligibility      string `json:"eligibility"`
 		UpdatedAt        string `json:"updated_at"`
 	}
-	if err := json.Unmarshal(seriesItems[0], &series); err != nil {
+	if err := json.Unmarshal(rawJSON(t, seriesItems[0]), &series); err != nil {
 		t.Fatalf("decode series: %v", err)
 	}
 	if series.ID != 7 || series.InstanceID != sonarr || series.Instance != "Sonarr" ||
@@ -338,7 +349,7 @@ func TestSeriesRouteReturnsNestedStatistics(t *testing.T) {
 			PercentEpisodes  float64 `json:"percent_of_episodes"`
 		} `json:"statistics"`
 	}
-	if err := json.Unmarshal(seasons[0], &season); err != nil {
+	if err := json.Unmarshal(rawJSON(t, seasons[0]), &season); err != nil {
 		t.Fatalf("decode season: %v", err)
 	}
 	if season.SeasonNumber != 2 || season.Statistics.EpisodeCount != 3 ||
@@ -389,7 +400,7 @@ func TestSeasonEpisodesRouteShape(t *testing.T) {
 		TargetPath    string `json:"target_file_path"`
 		Eligibility   string `json:"eligibility"`
 	}
-	if err := json.Unmarshal(items[0], &episode); err != nil {
+	if err := json.Unmarshal(rawJSON(t, items[0]), &episode); err != nil {
 		t.Fatalf("decode episode: %v", err)
 	}
 	if episode.ID != id || episode.SeriesID != 7 || episode.ArrID != 7*100000+2000+3 {

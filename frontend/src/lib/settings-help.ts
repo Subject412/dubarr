@@ -63,6 +63,22 @@ export const SETTINGS_HELP: Record<SettingsSectionKey, Record<string, string>> =
     analysis_source:
       'How the analysis gets its audio. Windows (the shipped default) decodes only the checkpoint windows and falls back to a full decode if a window looks wrong, which is several times faster; Full decodes both tracks completely, which is slower but never falls back.',
   },
+  'sync.strategy': {
+    preset:
+      'Your starting point; you can edit the steps afterwards. Balanced matches the previous release: one waveform pass on every checkpoint. Fast spends three checkpoints instead of six with the same method, so a job finishes sooner but says less about cuts and drift, and it also sets the checkpoint positions in Sync defaults. Maximum accuracy adds a second, different method when the first is unsure, at roughly double the analysis time on a difficult release. Any edit turns the starting point into Custom.',
+    techniques:
+      'The methods a job may try, in order. Each enabled step runs on every checkpoint the shipped way, and the first confident answer decides that point, so one weak checkpoint is retried on its own and the whole job is never re-run. A second step costs a second analysis pass whenever its condition makes it run.',
+    technique_id:
+      'Waveform compares the actual sound samples: exact to the millisecond on clean material, but it struggles when the dub was re-encoded or broadcast-processed, so use it first. MFCC compares the shape of the sound instead, which survives heavy compression and clipping but is only accurate to about ±10 ms, so it is best used as a second opinion rather than the first step.',
+    when:
+      'Always runs the step on every checkpoint. Only when the previous result is weak runs it as a second opinion, which costs nothing on clean material. Only when the offsets disagree runs it on the points that break the straight line through the rest, which is the cheapest way to rescue one stubborn checkpoint after a mid-film edit or a bad decode.',
+    enabled:
+      'A disabled step stays in the list but never runs and costs nothing; the first step must stay enabled, because it is the one that always answers.',
+    min_confidence:
+      'How good a match must be before this step is believed. 0.10 is the shipped floor: lower accepts more answers, including wrong ones, and higher sends more checkpoints to the next step, or to review when this is the last one.',
+    min_match_z:
+      'How far the match has to stand out from the rest of the curve, in standard deviations: 5 is the point where a human should look at the result and 10 is almost certainly right. Raising it rejects doubtful matches at the cost of more checkpoints falling through to the next step; lower it only when a difficult release keeps coming back as unreliable.',
+  },
   'mux.options': {
     track_title_in_mkv: 'Track title written into the Matroska container for the muxed audio.',
     output_mode:

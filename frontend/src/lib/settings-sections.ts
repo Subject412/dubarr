@@ -47,6 +47,11 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
     description: 'Automatic offset search bounds and sampling windows.',
   },
   {
+    key: 'sync.strategy',
+    title: 'Matching techniques',
+    description: 'Which matching techniques run, in what order, and when the next one is tried.',
+  },
+  {
     key: 'mux.options',
     title: 'Mux options',
     description: 'Atomic muxing side effects.',

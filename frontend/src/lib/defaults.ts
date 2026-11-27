@@ -8,6 +8,7 @@ import type {
   SecurityOptions,
   StoragePaths,
   SyncDefaults,
+  SyncStrategy,
   TargetTagFilter,
   WatchOptions,
 } from './api'
@@ -54,6 +55,16 @@ export const DEFAULT_SETTINGS: DubarrSettings = {
   'security.options': {
     allow_force_tag_override: false,
   },
+  // The shipped strategy (#82, D4): one waveform step on every checkpoint,
+  // which is settings.PresetTechniques("balanced") — the same value the server
+  // stores on a fresh install. Fast shares this list and differs only in how
+  // many checkpoints it measures (D4a).
+  'sync.strategy': {
+    preset: 'balanced',
+    techniques: [
+      { id: 'waveform', enabled: true, when: 'always', min_confidence: 0.1, min_match_z: 5 },
+    ],
+  } as SyncStrategy,
   'mux.options': {
     track_title_in_mkv: 'Polski Dubbing',
     output_mode: 'replace',
@@ -74,6 +85,7 @@ export type {
   SecurityOptions,
   StoragePaths,
   SyncDefaults,
+  SyncStrategy,
   TargetTagFilter,
   WatchOptions,
 }

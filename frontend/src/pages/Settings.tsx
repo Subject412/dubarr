@@ -10,6 +10,7 @@ import type {
   SettingsKey,
   StoragePaths,
   SyncDefaults,
+  SyncStrategy,
   TargetTagFilter,
   WatchOptions,
 } from '../lib/api'
@@ -27,6 +28,7 @@ import {
 } from '../lib/settings-sections'
 import { ArrConnectionsSection } from '../components/ArrConnections'
 import { PathField, PathListEditor } from '../components/PathPicker'
+import { StrategyEditor } from '../components/StrategyEditor'
 import { ThemeSelector } from '../components/ThemeSelector'
 import { TranscodeRulesEditor } from '../components/TranscodeRulesEditor'
 import {
@@ -139,6 +141,7 @@ function Section<T extends object>({
   value,
   save,
   onSaved,
+  errorInBody = false,
   children,
 }: {
   sectionKey: SettingsKey
@@ -146,7 +149,13 @@ function Section<T extends object>({
   save: (key: SettingsKey, value: T) => Promise<unknown>
   /** Runs after a successful save with the saved and pre-save values. */
   onSaved?: (saved: T, previous: T) => void
-  children: (draft: T, update: (patch: Partial<T>) => void) => ReactNode
+  /**
+   * Hand the save error to the card body (a third `children` argument) instead
+   * of rendering the generic alert below the form, for editors that place the
+   * server's message beside the control it rejected.
+   */
+  errorInBody?: boolean
+  children: (draft: T, update: (patch: Partial<T>) => void, error: string) => ReactNode
 }) {
   const [draft, setDraft] = useState<T>(value)
   const { title, description } = settingsSection(sectionKey)
@@ -206,8 +215,8 @@ function Section<T extends object>({
       }
     >
       <div className="space-y-4">
-        {children(draft, update)}
-        {status === 'error' && <Alert>{error}</Alert>}
+        {children(draft, update, status === 'error' ? error : '')}
+        {status === 'error' && !errorInBody && <Alert>{error}</Alert>}
       </div>
     </Card>
   )
@@ -315,6 +324,15 @@ export function SettingsPage() {
 
   const data = settings.data?.settings
 
+  // A preset press in the Matching techniques card also rewrites the checkpoint
+  // positions, and those belong to `sync.defaults` (D4a: Fast measures fewer
+  // points). The editor cannot reach another card's draft, so the positions it
+  // chose are held here and handed to the Sync defaults card through its value —
+  // the card shows them, and its own Save persists them. The override is
+  // dropped once that card saves, so the page falls back to what the server
+  // stored and a preset never writes a section the operator did not save.
+  const [presetPositions, setPresetPositions] = useState<number[] | null>(null)
+
   // The analysis mode is a `sync.defaults` field, and a row stored before
   // U-WIN.6 carries no analysis_source. The card is seeded with the compiled
   // default (the same 'windows' the select falls back to, and the same value as
@@ -322,13 +340,12 @@ export function SettingsPage() {
   // is never blank and an untouched save sends the mode it displays instead of
   // leaving the key out of the section. The memo keeps the object identity
   // stable: Section re-seeds its draft whenever the value prop changes.
-  const syncDefaults = useMemo(
-    () =>
-      withAnalysisSource(
-        (data?.['sync.defaults'] as SyncDefaults | undefined) ?? DEFAULTS['sync.defaults'],
-      ),
-    [data],
-  )
+  const syncDefaults = useMemo(() => {
+    const base = withAnalysisSource(
+      (data?.['sync.defaults'] as SyncDefaults | undefined) ?? DEFAULTS['sync.defaults'],
+    )
+    return presetPositions ? { ...base, checkpoint_positions_pct: presetPositions } : base
+  }, [data, presetPositions])
 
   // The Mux output folder is a `storage.paths` setting, so its control stays in
   // the Storage card, but it only applies when the SAVED mux options write to a
@@ -642,6 +659,7 @@ export function SettingsPage() {
             sectionKey="sync.defaults"
             value={syncDefaults}
             save={save}
+            onSaved={() => setPresetPositions(null)}
           >
             {(draft, update) => (
               <>
@@ -712,6 +730,22 @@ export function SettingsPage() {
                   help={settingsHelp('sync.defaults', 'preview_positions_pct')}
                 />
               </>
+            )}
+          </Section>
+
+          <Section<SyncStrategy>
+            sectionKey="sync.strategy"
+            value={(data['sync.strategy'] as SyncStrategy) ?? DEFAULTS['sync.strategy']}
+            save={save}
+            errorInBody
+          >
+            {(draft, update, error) => (
+              <StrategyEditor
+                draft={draft}
+                update={update}
+                error={error}
+                onCheckpointPositions={setPresetPositions}
+              />
             )}
           </Section>
 

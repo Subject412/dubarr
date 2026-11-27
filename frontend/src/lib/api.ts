@@ -124,6 +124,43 @@ export type SyncDefaults = {
   analysis_source?: 'windows' | 'full'
 }
 
+/** A matcher the pipeline can run on a checkpoint (`analyze.TechniqueID`). */
+export type SyncTechniqueID = 'waveform' | 'mfcc'
+
+/**
+ * Whether a step runs everywhere, reacts to a weak answer, or is sent in only
+ * where the offsets break the trend (`analyze.When`).
+ */
+export type SyncWhen = 'always' | 'below_confidence' | 'above_drift'
+
+/**
+ * The name a strategy carries. It is only a label on the list: the server
+ * derives it from `techniques` and stores `custom` whenever the list is not
+ * that preset's canonical list, so the UI never has to trust its own label.
+ */
+export type SyncPreset = 'fast' | 'balanced' | 'maximum_accuracy' | 'custom'
+
+/**
+ * One step of `sync.strategy` (`analyze.Technique`). The two thresholds are
+ * this step's acceptance gates: an answer is good enough when its correlation
+ * quality is at least `min_confidence` and its peak stands at least
+ * `min_match_z` standard deviations out (`0` means the method does not report
+ * one, and is not treated as a failure).
+ */
+export type SyncTechnique = {
+  id: SyncTechniqueID
+  enabled: boolean
+  when: SyncWhen
+  min_confidence: number
+  min_match_z: number
+}
+
+/** `sync.strategy`: the ordered technique list plus the preset it came from. */
+export type SyncStrategy = {
+  preset: SyncPreset
+  techniques: SyncTechnique[]
+}
+
 export type SecurityOptions = {
   allow_force_tag_override: boolean
 }
@@ -195,6 +232,7 @@ export type DubarrSettings = {
   'languages.policy': LanguagesPolicy
   'target.tag_filter': TargetTagFilter
   'sync.defaults': SyncDefaults
+  'sync.strategy': SyncStrategy
   'security.options': SecurityOptions
   'mux.options': MuxOptions
   'audio.options': AudioOptions
@@ -393,6 +431,20 @@ export type VaultResponse = {
 
 export type SyncJobStatus = 'queued' | 'running' | 'done' | 'failed'
 
+/** One technique's try at one checkpoint (`analyze.Attempt`). */
+export type SyncAttempt = {
+  /** `waveform` | `mfcc`; kept loose so an unknown method renders as itself. */
+  technique: string
+  offset_ms: number
+  quality: number
+  match_z: number
+  precision_ms: number
+  /** Whether this try cleared its own gates. The first accepted one wins. */
+  accepted: boolean
+  /** Why the try failed outright (decode, timeout); empty for a real answer. */
+  error?: string
+}
+
 /** One multi-point correlation sample persisted in the job's DriftReport. */
 export type SyncCheckpoint = {
   position_pct: number
@@ -412,6 +464,13 @@ export type SyncCheckpoint = {
   match_z?: number
   /** One sample of the analysis rate (0.125 at 8 kHz). Absent before 0.5.0. */
   precision_ms?: number
+  /**
+   * The technique whose answer was kept here (#82). Absent before 0.5.0, and on
+   * a job that ran the shipped single technique.
+   */
+  technique?: string
+  /** Every technique that ran on this checkpoint, in list order. Absent before 0.5.0. */
+  attempts?: SyncAttempt[]
 }
 
 export type SyncVerdict = 'ok' | 'drifting' | 'unreliable' | 'out_of_range'
@@ -477,6 +536,14 @@ export type SyncReport = {
   fit?: SyncFit
   /** Absent on a plain copy; present when the dub copy was re-encoded. */
   application?: SyncApplication
+  /** What this job ran, so a report is self-describing; absent before 0.5.0. */
+  strategy?: SyncStrategy
+  /**
+   * A configured technique that did not run in this build (no engine for it),
+   * so the report says why instead of quietly doing less. Absent for the
+   * shipped strategy, which always runs.
+   */
+  notes?: string[]
   reason?: string
 }
 

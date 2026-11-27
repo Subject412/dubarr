@@ -9,7 +9,35 @@ change.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Upgrade notes
+
+- **The DSP engine is no longer a separate program.** Dubarr is now a single
+  binary: `dubarr-sync` is gone, the release archives contain `dubarr` only, and
+  `/api/health` no longer reports the engine. If you installed `dubarr-sync` on
+  `PATH` yourself, you can delete it — nothing reads it. A missing engine is no
+  longer a way for the appliance to look degraded, because it cannot be missing.
+- **Container images are smaller and build faster** for the same reason: the
+  Rust build stage is gone.
+
+### Added
+
+- `sync.defaults.parallel_checkpoints` (1..8, default `1`): how many checkpoints
+  one sync job analyses at once. The queue still runs one job at a time — this is
+  concurrency inside a job, never between jobs. The app lowers the number itself
+  when memory is short, reading the container's own limit rather than the host's.
+  Expect roughly 400 MB per worker during a job; a 4 GB container yields four.
+
+### Changed
+
+- The correlator is now pure Go and runs in-process. It reproduces the previous
+  engine's offsets exactly on the committed fixtures and on both real films
+  through the whole pipeline — the recorded reference values live in
+  `backend/internal/dsp/testdata` and are checked in CI.
+
+### Removed
+
+- `sync-engine/` (the Rust CLI), its CI job, its Docker build stage, and its
+  release-archive entry.
 
 ## [0.3.1] - 2026-11-26
 

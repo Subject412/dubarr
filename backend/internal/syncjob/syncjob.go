@@ -11,8 +11,8 @@
 // Execution is deliberately not a background worker. [Service.Execute] is the
 // seam the M5 Sync Studio / worker will call; main.go only registers the HTTP
 // routes. Execute stages the track group with internal/workdir (Copy-on-Work),
-// decodes the resolved reference pair with ffmpeg, correlates it with the Rust
-// `dubarr-sync` engine, and persists the DriftReport in checkpoints_json.
+// decodes the resolved reference pair with ffmpeg, correlates it in-process with
+// internal/dsp, and persists the DriftReport in checkpoints_json.
 package syncjob
 
 import (
@@ -65,8 +65,8 @@ type Dependencies struct {
 	// RequireAdmin wraps every route. When nil the API answers 503 rather than
 	// running unauthenticated.
 	RequireAdmin func(http.Handler) http.Handler
-	// Engine overrides the Rust bridge (tests inject the TestMain build).
-	// Nil resolves `dubarr-sync` on PATH at Execute time.
+	// Engine overrides the in-process correlator (tests inject a stub).
+	// Nil builds the default engine at Execute time.
 	Engine analyze.Engine
 	// WorkDir overrides storage.paths.work_dir (tests).
 	WorkDir string
@@ -74,8 +74,7 @@ type Dependencies struct {
 	FFmpegPath string
 	// Prober overrides the ffprobe wrapper (tests).
 	Prober *probe.Prober
-	// Logger is the central logger (nil keeps the stdlib default for the
-	// dubarr-sync bridge handshake).
+	// Logger is the central logger (nil keeps the stdlib default).
 	Logger *slog.Logger
 }
 

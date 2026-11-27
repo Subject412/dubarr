@@ -2,7 +2,7 @@
 //
 // The payload reports the backend version, database reachability, and the
 // availability and version of every external tool Dubarr shells out to
-// (ffmpeg, ffprobe, mkvmerge, dubarr-sync). It is public so the SPA can render
+// (ffmpeg, ffprobe, mkvmerge). It is public so the SPA can render
 // pre-login diagnostics, and it therefore never exposes secrets, key material
 // or user data.
 package health
@@ -19,7 +19,7 @@ import (
 )
 
 // defaultTools are the external binaries /api/health must report.
-var defaultTools = []string{"ffmpeg", "ffprobe", "mkvmerge", "dubarr-sync"}
+var defaultTools = []string{"ffmpeg", "ffprobe", "mkvmerge"}
 
 // versionProbeTimeout bounds how long a single `<tool> -version` call may take.
 //
@@ -37,7 +37,7 @@ var (
 	versionAfterWord = regexp.MustCompile(`(?i)\bversion\s+([^\s,()]+)`)
 	// versionVToken matches "mkvmerge v103.0 ('...')".
 	versionVToken = regexp.MustCompile(`(?i)\bv([0-9][0-9A-Za-z.+-]*)`)
-	// versionBareNumber matches "dubarr-sync 0.1.0" style banners.
+	// versionBareNumber matches a bare "tool 1.2.3" banner.
 	versionBareNumber = regexp.MustCompile(`\b([0-9]+\.[0-9][0-9A-Za-z.+-]*)`)
 )
 

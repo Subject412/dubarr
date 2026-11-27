@@ -4,7 +4,7 @@ import { SystemPage } from '../pages/System'
 import { jsonResponse, renderWithProviders } from '../test/helpers'
 
 describe('system health page', () => {
-  it('renders tool availability and flags a missing dubarr-sync', async () => {
+  it('renders tool availability and flags a missing mkvmerge', async () => {
     vi.stubGlobal(
       'fetch',
       vi.fn(async () =>
@@ -19,7 +19,6 @@ describe('system health page', () => {
             ffmpeg: { available: true, version: '9.0', path: '/usr/bin/ffmpeg' },
             ffprobe: { available: true, version: '9.0', path: '/usr/bin/ffprobe' },
             mkvmerge: { available: false },
-            'dubarr-sync': { available: false },
           },
         }),
       ),
@@ -30,9 +29,9 @@ describe('system health page', () => {
     expect(await screen.findByText('degraded')).toBeInTheDocument()
     expect(screen.getByText('0.1.0-test')).toBeInTheDocument()
 
-    const sync = await screen.findByTestId('tool-dubarr-sync')
-    expect(within(sync).getByText('not available')).toBeInTheDocument()
-    expect(within(sync).getByText('not built yet')).toBeInTheDocument()
+    const mkvmerge = await screen.findByTestId('tool-mkvmerge')
+    expect(within(mkvmerge).getByText('not available')).toBeInTheDocument()
+    expect(within(mkvmerge).getByText('not built yet')).toBeInTheDocument()
 
     const ffmpeg = screen.getByTestId('tool-ffmpeg')
     expect(within(ffmpeg).getByText('available')).toBeInTheDocument()

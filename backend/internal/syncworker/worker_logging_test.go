@@ -16,7 +16,7 @@ import (
 
 // errEngineGone is the underlying cause of the failing job: errors.Is must
 // still find it through the stage wrapper.
-var errEngineGone = errors.New("sync-engine exited 3")
+var errEngineGone = errors.New("engine failed")
 
 // newRingLogger builds the real logger over a throwaway stderr buffer, so these
 // tests read the ring exactly like internal/logs/logs_test.go does.

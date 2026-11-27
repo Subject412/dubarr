@@ -267,7 +267,7 @@ func TestHealthDoesNotHangOnHungTool(t *testing.T) {
 		t.Errorf("hung tool version = %v, want empty", hung["version"])
 	}
 	// A hung probe must not suppress the healthy tools' results.
-	for _, name := range []string{"ffprobe", "mkvmerge", "dubarr-sync"} {
+	for _, name := range []string{"ffprobe", "mkvmerge"} {
 		tool, ok := tools[name].(map[string]any)
 		if !ok {
 			t.Fatalf("tools[%s] missing", name)

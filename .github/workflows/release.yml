@@ -2,9 +2,8 @@ name: release
 
 # Cut a release by pushing an annotated tag that matches vX.Y.Z (see
 # docs/RELEASING.md). Everything is built on one pinned Ubuntu runner so the
-# three archives are produced from the same commit and toolchain:
+# archives are produced from the same commit and toolchain:
 #   * Go: native cross-compilation (CGO_ENABLED=0), no extra toolchain.
-#   * Rust: rustup target + distro cross GCC for linux-arm64.
 on:
   push:
     tags:
@@ -46,25 +45,6 @@ jobs:
         with:
           go-version-file: backend/go.mod
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-unknown-linux-gnu
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: sync-engine
-
-      - name: Install Rust cross linkers
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            gcc-aarch64-linux-gnu \
-            libc6-dev-arm64-cross \
-
       # The SPA is embedded by Go (backend/web), so the Vite build must run
       # before any `go build`. Vite writes into backend/web with
       # emptyOutDir=false, preserving doc.go.
@@ -92,21 +72,6 @@ jobs:
           build linux amd64 dubarr-linux-amd64
           build linux arm64 dubarr-linux-arm64
 
-      - name: Build dubarr-sync
-        working-directory: sync-engine
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Host linux/amd64 (the target of ubuntu-22.04).
-          cargo build --release --locked --target x86_64-unknown-linux-gnu
-
-          # linux/arm64: glibc target linked by the distro cross GCC. The runner
-          # is pinned to Ubuntu 22.04, so the binary requires glibc >= 2.35
-          # (Debian 12 / Ubuntu 22.04 or newer).
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
-            cargo build --release --locked --target aarch64-unknown-linux-gnu
-
-
       - name: Assemble archives
         shell: bash
         run: |
@@ -122,33 +87,30 @@ jobs:
 
           Contents
             dubarr          web UI + backend (start with: ./dubarr --data-dir ./data --listen 127.0.0.1:8080)
-            dubarr-sync     Rust DSP engine used for audio offset analysis
             LICENSE         MIT license
 
-          dubarr locates dubarr-sync on PATH. Keep both binaries in the same
-          directory and add that directory to PATH, or copy them to a directory
-          already on PATH (e.g. /usr/local/bin). Verify with GET /api/health:
-          "dubarr-sync" must report available: true.
+          The DSP engine is compiled into dubarr: this archive is a single
+          binary and nothing else has to be installed beside it.
 
-          ffmpeg, ffprobe and mkvmerge must also be installed and on PATH.
+          ffmpeg, ffprobe and mkvmerge must be installed and on PATH. Verify
+          with GET /api/health, which reports all three.
           Full notes: https://github.com/${GITHUB_REPOSITORY}/blob/main/docs/RELEASING.md
           EOF
           }
 
           stage_linux() {
-            local arch="$1" gosuffix="$2" rustdir="$3"
+            local arch="$1" gosuffix="$2"
             local dir="dubarr_${VERSION}_linux_${arch}"
             mkdir -p "${ART}/${dir}"
             cp "${BIN}/dubarr-linux-${gosuffix}" "${ART}/${dir}/dubarr"
-            cp "sync-engine/target/${rustdir}/release/dubarr-sync" "${ART}/${dir}/dubarr-sync"
             cp LICENSE "${ART}/${dir}/LICENSE"
             make_readme "linux/${arch}" > "${ART}/${dir}/README.txt"
-            chmod 0755 "${ART}/${dir}/dubarr" "${ART}/${dir}/dubarr-sync"
+            chmod 0755 "${ART}/${dir}/dubarr"
             tar -C "${ART}" -czf "${ART}/${dir}.tar.gz" "${dir}"
           }
 
-          stage_linux amd64 amd64 x86_64-unknown-linux-gnu
-          stage_linux arm64 arm64 aarch64-unknown-linux-gnu
+          stage_linux amd64 amd64
+          stage_linux arm64 arm64
 
           (cd "${ART}" && sha256sum \
             "dubarr_${VERSION}_linux_amd64.tar.gz" \

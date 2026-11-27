@@ -124,3 +124,31 @@ Generated media is gitignored; generators and the expected numbers are committed
 A user of dubarr is a media hobbyist, not a signal-processing engineer. Every option must answer, in the UI:
 *what happens if I turn this on*, *when would I want it*, *what does it cost*. Technical knobs live behind an
 "Advanced" disclosure with defaults that are correct for everybody.
+# 0.5.0 rulings — orchestrator, after the sync-engine plan review
+
+Append these to `docs/plans/0.5.0/DECISIONS.md` as D2a, D4a, D6b once slice 01 has merged (it must not ride
+in a feature branch). Until then they are binding on every slice brief.
+
+## D2a — mean/std z, not MAD
+
+`match_z` is `(peak − mean) / std` over the lag curve, accumulated in the existing scan (BBC audio-offset-finder
+form). MAD needs a second pass plus a second order statistic over the same ~2.9 M values and would risk the
+existing cost gate for robustness the mean/std form does not need on real content. It lives in one function
+(`correlate.matchZ`), so switching is a one-function change if evidence ever demands it.
+
+## D2b — one `Report.Application` shape from the start
+
+Slice 02 defines `Application` with `Mode`, `Note`, `SegmentCount` and `Segments` all present; slice 05 only
+populates the segment fields. No second shape, no additive pass on a shipped field.
+
+## D4a — the "Fast" preset keeps the waveform matcher
+
+`Fast` = FFT waveform on **fewer checkpoints** (3 instead of 6), not MFCC-only. An operator who picks "Fast"
+must not silently accept a ±10 ms error on clean material: the fast axis is *how much* is measured, not *how
+well*. MFCC stays an opt-in technique in the list, never a preset.
+
+## D6b — `held` is about gate eligibility only
+
+The #48 hold state is driven solely by the Processing Gate. An analysis verdict (`unreliable`, `drifting`, a
+rejected piecewise plan) keeps its today's meaning: the job goes to review and does not mux. The two never
+overlap: a job can be held *and* flagged for review, and it leaves `held` only when the gate clears.

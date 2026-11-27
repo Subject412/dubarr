@@ -1817,15 +1817,27 @@ func TestSyncStrategyPiecewiseRoundTrip(t *testing.T) {
 	}
 
 	// Switching it back off — the numbers as well, since the block was tuned —
-	// restores the maximum_accuracy section exactly, and with it the label.
-	off := stored
-	off.Piecewise = analyze.DefaultPiecewisePolicy()
-	if err := validateStrategy(&off); err != nil {
+	// makes the section the canonical `maximum_accuracy` one, piecewise block
+	// included: [Preset] ships `piecewise` at the documented default, so a body
+	// that restores the default techniques but leaves the block on is
+	// legitimately `custom` (asserted above), and one that restores both is
+	// `maximum_accuracy`. The label is posted with it because the server never
+	// promotes a section: a body still labelled `custom` stays `custom`, which
+	// is what makes an edit visible.
+	back := stored
+	back.Preset = analyze.PresetMaximumAccuracy
+	back.Piecewise = analyze.DefaultPiecewisePolicy()
+	if err := validateStrategy(&back); err != nil {
 		t.Fatalf("validateStrategy: %v", err)
 	}
-	if off.Preset != analyze.PresetMaximumAccuracy {
+	// Like with like: the restored section is field-for-field the preset's own
+	// section, which is the only thing a label is allowed to name.
+	if want := Preset(analyze.PresetMaximumAccuracy); !sameStrategy(analyze.Strategy(back), want) {
+		t.Fatalf("restored section = %+v, want the canonical %+v", back, want)
+	}
+	if back.Preset != analyze.PresetMaximumAccuracy {
 		t.Fatalf("preset = %q, want %q once the block is back at the default",
-			off.Preset, analyze.PresetMaximumAccuracy)
+			back.Preset, analyze.PresetMaximumAccuracy)
 	}
 }
 

@@ -1737,46 +1737,83 @@ func TestClassifyPiecewiseOutranksUnreliable(t *testing.T) {
 	}
 }
 
-// TestPiecewiseRejectionIsSurfacedForReview is D5's fallback: the plan is
-// refused, the dominant offset stands, and the report says why a human should
-// look instead of pretending the timeline was uniform.
-func TestPiecewiseRejectionIsSurfacedForReview(t *testing.T) {
-	// Twelve dense checkpoints, all at the same offset: nothing to segment.
-	offsets := make([]float64, 12)
-	for i := range offsets {
-		offsets[i] = 400
-	}
+// TestPiecewiseSingleSegmentIsAnOrdinaryConstantOffset: the dense plan found one
+// plateau, which is the answer on a clean film. That is not a rejection — the
+// job is the ordinary constant-offset job, judged exactly as it is with the
+// feature off and applied as a copy — so the fixture asserts acceptance rather
+// than the D5 fallback (that path is TestBuildSegmentsRejectsAnUnconfidentBoundary).
+//
+// The engine is scripted from the plan the analysis actually requests, not from
+// a fixed list: a fixture that guesses the grid goes stale the moment the
+// policy, the duration or MaxDenseSamples changes, and a scripted engine that
+// runs out of answers fails "unexpected extra job" instead of testing the
+// aggregation.
+func TestPiecewiseSingleSegmentIsAnOrdinaryConstantOffset(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.ParallelCheckpoints = 1
 	cfg.Piecewise.Enabled = true
 	cfg.Piecewise.StepSec = 45
 	cfg.Piecewise.WindowSec = 45
-	rep, err := Analyze(context.Background(), &scriptedEngine{offsets: offsets, qualities: fillQualities(len(offsets), 0.9)},
-		cfg, request(t.TempDir()))
+
+	req := request(t.TempDir())
+	timing := Timing{
+		Target: SourceTiming{DurationSec: req.DurationSec, OriginKnown: true},
+		Donor:  SourceTiming{DurationSec: req.DurationSec, OriginKnown: true},
+	}
+	plan, err := PlanWindowsEvery(timing, cfg.Piecewise.StepSec, cfg.Piecewise.WindowSec)
+	if err != nil {
+		t.Fatalf("PlanWindowsEvery: %v", err)
+	}
+	if len(plan) < piecewiseMinPoints {
+		t.Fatalf("dense plan = %d checkpoints, want at least %d: fewer cannot be segmented",
+			len(plan), piecewiseMinPoints)
+	}
+	// Every checkpoint answers the same offset: nothing to segment.
+	offsets := make([]float64, len(plan))
+	for i := range offsets {
+		offsets[i] = 400
+	}
+	eng := &scriptedEngine{offsets: offsets, qualities: fillQualities(len(offsets), 0.9)}
+
+	rep, err := Analyze(context.Background(), eng, cfg, req)
 	if err != nil {
 		t.Fatalf("Analyze: %v", err)
 	}
 	if rep.Piecewise == nil {
 		t.Fatal("report.Piecewise is nil: a job that ran the dense plan must say so")
 	}
-	if rep.Piecewise.RejectedReason != reasonSingleOffset {
-		t.Fatalf("rejected_reason = %q, want %q", rep.Piecewise.RejectedReason, reasonSingleOffset)
+	if rep.Piecewise.RejectedReason != "" {
+		t.Fatalf("rejected_reason = %q, want empty: one plateau is not a rejected plan",
+			rep.Piecewise.RejectedReason)
 	}
 	if len(rep.Piecewise.Segments) != 1 || len(rep.Piecewise.Boundaries) != 0 {
-		t.Fatalf("segments/boundaries = %d/%d, want 1/0",
-			len(rep.Piecewise.Segments), len(rep.Piecewise.Boundaries))
-	}
-	if rep.Verdict != VerdictOK {
-		t.Fatalf("verdict = %q, want ok: a rejected plan is not a failed job", rep.Verdict)
-	}
-	if !strings.Contains(rep.ReviewReason, reasonSingleOffset) {
-		t.Fatalf("review_reason = %q, want it to carry %q", rep.ReviewReason, reasonSingleOffset)
+		t.Fatalf("segments/boundaries = %d/%d, want 1/0: %+v",
+			len(rep.Piecewise.Segments), len(rep.Piecewise.Boundaries), rep.Piecewise.Segments)
 	}
 	if got := rep.Piecewise.DominantOffsetMS; math.Abs(got-400) > 1e-9 {
 		t.Fatalf("dominant offset = %v, want the single offset 400", got)
 	}
-	if want := len(offsets); len(rep.Checkpoints) != want {
-		t.Fatalf("checkpoints = %d, want %d: piecewise must plan the dense grid", len(rep.Checkpoints), want)
+	// The verdict is the one the job would get without the feature: one offset
+	// is `ok`/`stable` and the drift is the raw spread, not a residual.
+	if rep.Verdict != VerdictOK || rep.Classification != ClassificationStable {
+		t.Fatalf("verdict/classification = %q/%q, want %q/%q: a single-offset plan is judged as before",
+			rep.Verdict, rep.Classification, VerdictOK, ClassificationStable)
+	}
+	if rep.MaxDriftMS != 0 {
+		t.Fatalf("max_drift_ms = %v, want 0: the offsets are one number", rep.MaxDriftMS)
+	}
+	if rep.ReviewReason != "" {
+		t.Fatalf("review_reason = %q, want empty: a clean single-offset film needs no human look", rep.ReviewReason)
+	}
+	// A single offset needs no re-encode: the report records the copy it will be.
+	if rep.Application == nil {
+		t.Fatal("application is nil, want the single-offset copy application")
+	}
+	if rep.Application.Mode != "copy" || rep.Application.SegmentCount != 0 || rep.Application.Segments != nil {
+		t.Fatalf("application = %+v, want a plain copy with no segments", *rep.Application)
+	}
+	if want := len(plan); len(rep.Checkpoints) != want {
+		t.Fatalf("checkpoints = %d, want the dense plan's %d", len(rep.Checkpoints), want)
 	}
 }
 
@@ -1827,7 +1864,12 @@ func TestIntegrationPiecewiseAcceptedIsOK(t *testing.T) {
 	cfg.Piecewise.Enabled = true
 	cfg.Piecewise.StepSec = 45
 	cfg.Piecewise.WindowSec = 45
-	rep, err := Analyze(context.Background(), requireEngine(t), cfg, request(dir))
+	// The dense grid is planned from the timeline length, so the request must
+	// carry it: the shipped `request` helper describes a 600 s film, and a plan
+	// that stops at 585 s never samples the cut at 675 s.
+	req := request(dir)
+	req.DurationSec = dur
+	rep, err := Analyze(context.Background(), requireEngine(t), cfg, req)
 	if err != nil {
 		t.Fatalf("Analyze: %v", err)
 	}

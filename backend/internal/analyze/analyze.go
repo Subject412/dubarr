@@ -892,10 +892,18 @@ func Analyze(ctx context.Context, engine Engine, cfg Config, req Request) (Repor
 		built := BuildSegments(plan, report.OffsetsMS, report.Qualities, cfg.Piecewise, DefaultThresholds)
 		piecewise = &built
 		report.Piecewise = piecewise
-		if built.RejectedReason != "" {
+		switch {
+		case built.RejectedReason != "":
 			// A rejected plan is not a failure of the job (D5): the dominant
 			// offset is applied and the row says why a human should look.
 			report.ReviewReason = fmt.Sprintf("cut not confident — applied the dominant offset (%s)", built.RejectedReason)
+		case len(built.Segments) == 1:
+			// One plateau is the ordinary constant-offset job, not a rejection
+			// and not a render: the mux copies the track and applies the one
+			// offset it has. Recording that application is what keeps "the
+			// dense plan ran and found nothing to re-cut" in the row's own
+			// words, and it claims no segments because none were cut.
+			report.Application = &Application{Mode: "copy", Note: "copied untouched"}
 		}
 	}
 
@@ -1061,11 +1069,18 @@ func searchWindowSec(cfg Config) float64 {
 //
 // The piecewise rule is slice 05's one addition and it sits *below*
 // out_of_range on purpose: an out-of-range checkpoint is out of range whatever
-// the segmentation says about the rest. When the plan was accepted, the verdict
-// is `ok` and the classification says why (`piecewise`), and the drift reported
-// is the residual left by the segmentation — each point against its own
-// segment's median — not the step it removed, so a successful re-cut job reads
-// as a few milliseconds rather than as 2.5 s.
+// the segmentation says about the rest. When the plan was accepted *and found a
+// boundary*, the verdict is `ok` and the classification says why (`piecewise`),
+// and the drift reported is the residual left by the segmentation — each point
+// against its own segment's median — not the step it removed, so a successful
+// re-cut job reads as a few milliseconds rather than as 2.5 s.
+//
+// A plan accepted with a single segment (the dense grid found one plateau) does
+// not enter this rule at all: it is the ordinary constant-offset job and is
+// judged exactly as it would be with the feature off, so switching segmentation
+// on cannot change the verdict of a film that needed one offset. A *rejected*
+// plan (p.accepted() false) also falls through: its evidence is the same
+// timeline with a bad join in it, and the verdict must still say so.
 //
 // Every limit comes from th (see [Thresholds]); no literal survives here, so
 // re-tuning is one edit to [DefaultThresholds].
@@ -1106,7 +1121,7 @@ func classify(offsets, qualities, matchZ []float64, piecewise *Piecewise, maxOff
 			return VerdictOutOfRange, ClassificationOutOfRange, maxDrift
 		}
 	}
-	if piecewise.accepted() {
+	if piecewise.cut() {
 		// The step the raw spread measures is what the segmentation explains
 		// away, so the honest number is the residual it leaves behind.
 		return VerdictOK, ClassificationPiecewise, piecewise.maxResidualMS

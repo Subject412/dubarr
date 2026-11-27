@@ -87,11 +87,10 @@ const (
 	piecewiseMinPointsPerSide = 3
 )
 
-// The two rejection messages the report carries. They are constants because a
-// test and the queue row both name them; a reworded rejection is a UI change.
+// The rejection messages the report carries. They are constants because a test
+// and the queue row both name them; a reworded rejection is a UI change.
 const (
 	reasonTooFewPoints  = "too few confident checkpoints"
-	reasonSingleOffset  = "the timeline is a single offset"
 	boundaryUnconfident = "boundary at %.1f s is not confident enough (%s)"
 )
 
@@ -202,11 +201,24 @@ type Piecewise struct {
 	maxResidualMS float64
 }
 
-// accepted reports whether this segmentation is a usable multi-segment plan.
-// A rejected plan is never accepted, however many segments it left behind.
+// accepted reports whether the segmentation is a plan the job can use: nothing
+// was rejected.
+//
+// A one-segment plan is accepted as what it is — the ordinary constant-offset
+// job. The dense plan ran and found nothing to re-cut, which is the common
+// answer on a clean film, so it must not read as a rejection: an operator who
+// switched the feature on would otherwise see every clean film surfaced for
+// review and fall back to a dominant offset that differs from the only offset
+// there is.
 func (p *Piecewise) accepted() bool {
-	return p != nil && p.RejectedReason == "" && len(p.Segments) > 1
+	return p != nil && p.RejectedReason == ""
 }
+
+// cut reports whether the accepted plan actually found a boundary. Only a cut
+// is classified `piecewise`: a single offset is judged exactly as it is with
+// the feature off (see [classify]), so turning segmentation on never changes
+// the verdict of a film that needed one offset.
+func (p *Piecewise) cut() bool { return p.accepted() && len(p.Segments) > 1 }
 
 // MinStepMS is the smallest offset change that counts as a boundary: two stable
 // bands, 2 x th.StableSpreadMS (80 ms with the shipped table).
@@ -245,10 +257,11 @@ type pointRun struct {
 //     MinSegmentSec of film, the medians differ by at least th.MinStepMS(), and
 //     the checkpoint nearest the join on each side is confident. Anything else
 //     merges the two runs and records why;
-//  5. fewer than two surviving segments is "the timeline is a single offset".
+//  5. a plan left with a single run is not a rejection: it is the ordinary
+//     constant-offset job, reported as one segment and no boundaries.
 //
-// A boundary is never invented: every failure above merges rather than guesses,
-// and the job falls back to DominantOffsetMS (D5).
+// A boundary is never invented: every failure above merges rather than guesses.
+// A *rejected* plan (steps 1 and 4) falls back to DominantOffsetMS (D5).
 func BuildSegments(windows []Window, offsets, qualities []float64, p PiecewisePolicy, th Thresholds) Piecewise {
 	p = p.Normalised()
 	out := Piecewise{
@@ -279,8 +292,9 @@ func BuildSegments(windows []Window, offsets, qualities []float64, p PiecewisePo
 		}
 		kept = append(kept, i)
 	}
-	// The single offset a rejected job falls back to: the median over every
-	// point that could testify, which is the 0.4.0 fallback.
+	// The single offset a one-segment plan *is*, and the offset a rejected one
+	// falls back to: the median over every point that could testify, which is
+	// the 0.4.0 fallback.
 	out.DominantOffsetMS = medianOf(offsetsOf(offsets[:n], kept))
 	if len(kept) < piecewiseMinPoints {
 		out.RejectedReason = reasonTooFewPoints
@@ -298,9 +312,6 @@ func BuildSegments(windows []Window, offsets, qualities []float64, p PiecewisePo
 	runs, rejected := confidentRuns(runs, x, y, kept, qualities, p, th)
 	if rejected != "" {
 		out.RejectedReason = rejected
-	}
-	if len(runs) < 2 && out.RejectedReason == "" {
-		out.RejectedReason = reasonSingleOffset
 	}
 
 	out.Boundaries = make([]Boundary, 0, len(runs))
@@ -421,8 +432,8 @@ func cheapestRuns(cost [][]float64, penalty float64) []pointRun {
 //
 // "Cheapest" is the split whose removal costs the least residual, i.e. the one
 // the penalty was least justified in buying. A cap that leaves a single segment
-// is a rejection the caller states; a cap that still leaves several is not a
-// failure and says nothing in the report.
+// is the ordinary constant-offset job, not a failure; a cap that still leaves
+// several says nothing in the report.
 func capRuns(runs []pointRun, y []float64, max int) []pointRun {
 	if max < piecewiseMaxSegmentsMin {
 		max = piecewiseMaxSegmentsMin

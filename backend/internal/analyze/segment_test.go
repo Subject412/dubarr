@@ -192,7 +192,9 @@ func TestBuildSegmentsFindsOneCut(t *testing.T) {
 }
 
 // TestBuildSegmentsKeepsACleanTimelineAtOneSegment: ordinary jitter is not a
-// cut, and the report says which of the two reasons it was.
+// cut, and the one-segment answer is *accepted* — it is the ordinary
+// constant-offset job, not a rejected plan. An operator who switches
+// segmentation on must not see every clean film surfaced for review.
 func TestBuildSegmentsKeepsACleanTimelineAtOneSegment(t *testing.T) {
 	const points = 160
 	offsets := make([]float64, points)
@@ -203,8 +205,14 @@ func TestBuildSegmentsKeepsACleanTimelineAtOneSegment(t *testing.T) {
 	if len(pw.Segments) != 1 || len(pw.Boundaries) != 0 {
 		t.Fatalf("segments/boundaries = %d/%d, want 1/0: ±10 ms of jitter is not a cut", len(pw.Segments), len(pw.Boundaries))
 	}
-	if pw.RejectedReason != reasonSingleOffset {
-		t.Fatalf("rejected_reason = %q, want %q", pw.RejectedReason, reasonSingleOffset)
+	if !pw.accepted() {
+		t.Fatalf("the one-segment plan was not accepted: rejected_reason = %q", pw.RejectedReason)
+	}
+	if pw.RejectedReason != "" {
+		t.Fatalf("rejected_reason = %q, want empty: one plateau is the ordinary constant-offset job", pw.RejectedReason)
+	}
+	if pw.cut() {
+		t.Fatal("cut() is true for a single segment: nothing was split, so nothing may be classified piecewise")
 	}
 }
 

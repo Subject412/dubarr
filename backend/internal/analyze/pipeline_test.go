@@ -3,10 +3,15 @@ package analyze
 import (
 	"context"
 	"encoding/json"
+	"math"
+	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
 
+	"github.com/Subject412/dubarr/backend/internal/dsp/correlate"
+	"github.com/Subject412/dubarr/backend/internal/dsp/mfcc"
+	"github.com/Subject412/dubarr/backend/internal/dsp/wav"
 	"github.com/Subject412/dubarr/backend/internal/reflang"
 	"github.com/Subject412/dubarr/backend/internal/sync"
 )
@@ -571,5 +576,210 @@ func TestPipelineSkipsATechniqueWithNoEngine(t *testing.T) {
 	}
 	if rep.Verdict != VerdictOK {
 		t.Fatalf("verdict = %q, want ok: a skipped technique changes nothing", rep.Verdict)
+	}
+}
+
+// The committed media this test replays: the 10 s, 8 kHz excerpts under
+// internal/dsp/testdata/wav that the correlate goldens record and that
+// TestMFCCAgreesWithWaveformOnCommittedExcerpts (package mfcc) re-judges. The
+// mfcc fixture's own WAVs are gitignored, so real audio has to come from here.
+const (
+	excerptTarget = "shrek-cp40-target.wav"
+	excerptDonor  = "shrek-cp40-donor.wav"
+	excerptRate   = 8000
+	excerptLenSec = 10.0
+)
+
+// excerptMono reads one committed excerpt whole.
+func excerptMono(t *testing.T, name string) []float32 {
+	t.Helper()
+	path := filepath.Join("..", "dsp", "testdata", "wav", name)
+	reader, err := wav.Open(path)
+	if err != nil {
+		t.Fatalf("open %s: %v", path, err)
+	}
+	defer reader.Close()
+	if got := reader.SampleRate(); got != excerptRate {
+		t.Fatalf("%s: sample rate %d Hz, want %d", path, got, excerptRate)
+	}
+	mono, err := reader.ReadMono(0, reader.Frames())
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return mono
+}
+
+// unrelatedNoise builds a deterministic white-noise slice of the given length —
+// the "no match" side of the pair. The generator is a 64-bit LCG rather than the
+// standard library's, so no fixture depends on a generator that may change.
+func unrelatedNoise(seed uint64, samples int) []float32 {
+	state := seed | 1
+	out := make([]float32, samples)
+	for i := range out {
+		state = state*6364136223846793005 + 1442695040888963407
+		out[i] = float32((float64(state>>40)/8388608.0 - 1.0) * 0.1)
+	}
+	return out
+}
+
+// mfccOn runs the real mel-cepstral matcher on a slice pair. The numbers are not
+// scripted anywhere: the scale the z lives on is the whole subject of the test.
+func mfccOn(t *testing.T, target, donor []float32) correlate.Analysis {
+	t.Helper()
+	got, err := mfcc.Analyze(context.Background(), target, donor, excerptRate, excerptLenSec)
+	if err != nil {
+		t.Fatalf("mfcc.Analyze: %v", err)
+	}
+	return got
+}
+
+// seamResult maps one matcher's answer onto the engine seam's result, the way
+// the engine registered for that technique does.
+func seamResult(a correlate.Analysis, rate uint32) sync.Result {
+	ms := 1000 / float64(rate)
+	return sync.Result{
+		OffsetMS:           float64(a.OffsetSamples) * ms,
+		OffsetSubMS:        a.OffsetSubSamples * ms,
+		CorrelationQuality: float64(a.Quality),
+		MatchZ:             float64(a.MatchZ),
+		PrecisionMS:        a.PrecisionMS,
+	}
+}
+
+// shippedMaximumAccuracy is settings.PresetTechniques(analyze.PresetMaximumAccuracy)
+// spelled out. This package cannot import settings — settings imports analyze —
+// so the list is repeated here; settings' TestPresetTechniques pins the same
+// values, which is what keeps the two in step.
+func shippedMaximumAccuracy() Strategy {
+	return strategyOf(PresetMaximumAccuracy,
+		Technique{ID: TechniqueWaveform, Enabled: true, When: WhenAlways,
+			MinConfidence: LowQualityThreshold, MinMatchZ: DefaultThresholds.MatchZMaybe, ZGate: true},
+		// Judged on quality alone: the mel-cepstral matcher's z is a diagnostic
+		// on a different curve, so the shipped step carries no σ band for it.
+		Technique{ID: TechniqueMFCC, Enabled: true, When: WhenBelowConfidence,
+			MinConfidence: 0.15, MinMatchZ: 0, ZGate: false},
+	)
+}
+
+// TestMFCCIsGatedByQualityNotZ replaces
+// TestMFCCMatchZUsesTheSameScaleAsWaveform, which was empirically false on real
+// material: a correct mel-cepstral answer scores z 5.3 while the waveform matcher
+// scores 21-28 on the same pair, because this matcher scores a few thousand
+// heavily overlapping hop lags where the sample correlator scores ~8·10⁴
+// near-independent ones. A shared 5/10 σ band therefore refuses the very answers
+// MFCC exists for, so the shipped maximum_accuracy step judges its mfcc entry on
+// quality and records the z it saw.
+func TestMFCCIsGatedByQualityNotZ(t *testing.T) {
+	const oldBand = 8.0 // the min_match_z the shipped step used to carry
+
+	mfccStep := shippedMaximumAccuracy().Techniques[1]
+	if mfccStep.ZGate || mfccStep.MinMatchZ != 0 {
+		t.Fatalf("the shipped mfcc step = %+v, want it judged on quality alone", mfccStep)
+	}
+
+	target := excerptMono(t, excerptTarget)
+	donor := excerptMono(t, excerptDonor)
+	clean := seamResult(mfccOn(t, target, donor), excerptRate)
+	noise := seamResult(mfccOn(t, target, unrelatedNoise(0x5eed, len(target))), excerptRate)
+
+	// A correct answer on committed audio: quality clears the step's floor and
+	// the z sits well under the band the step used to carry.
+	if clean.CorrelationQuality < mfccStep.MinConfidence {
+		t.Fatalf("the correct excerpt scored quality %v, want >= %v: the pair stopped being a match",
+			clean.CorrelationQuality, mfccStep.MinConfidence)
+	}
+	if clean.MatchZ == 0 || clean.MatchZ >= oldBand {
+		t.Fatalf("the correct excerpt scored z %v, want a recorded value under %v: this test exists because the band refuses it",
+			clean.MatchZ, oldBand)
+	}
+	if !accepts(mfccStep, clean) {
+		t.Fatalf("the shipped maximum_accuracy step refused a correct answer (quality %v, z %v)",
+			clean.CorrelationQuality, clean.MatchZ)
+	}
+	// The same entry with the z gate on — the shape the step had before the
+	// ruling — refuses it. That is the defect, stated as an assertion.
+	gated := mfccStep
+	gated.ZGate = true
+	gated.MinMatchZ = oldBand
+	if accepts(gated, clean) {
+		t.Fatalf("a %vσ z-gated entry accepted the correct answer (z %v): if the band no longer refuses it, this test's premise is gone",
+			oldBand, clean.MatchZ)
+	}
+
+	// An unrelated pair is refused, and it is MinConfidence that refuses it: the
+	// z gate is off, so nothing else is consulted.
+	if noise.CorrelationQuality >= mfccStep.MinConfidence {
+		t.Fatalf("the unrelated-noise pair scored quality %v, want under %v: pick a pair that really is unrelated instead of lowering the floor",
+			noise.CorrelationQuality, mfccStep.MinConfidence)
+	}
+	if accepts(mfccStep, noise) {
+		t.Fatalf("the unrelated-noise pair was accepted (quality %v, z %v), want it refused on confidence",
+			noise.CorrelationQuality, noise.MatchZ)
+	}
+
+	// Through the pipeline: the waveform answer is weak (which is what makes a
+	// second opinion run at all), the mfcc step answers with the measured values,
+	// and the attempt records the z without being gated by it.
+	cfgFor := func(second *scriptedEngine) Config {
+		cfg := pipelineConfig()
+		cfg.Strategy = shippedMaximumAccuracy()
+		cfg.Engines = map[TechniqueID]Engine{
+			TechniqueWaveform: &scriptedEngine{offsets: []float64{0}, qualities: []float64{0.05}},
+			TechniqueMFCC:     second,
+		}
+		return cfg
+	}
+	window := Window{PositionPct: 25, LenSec: excerptLenSec}
+	slicer := &recordingSlicer{target: excerptTarget, donor: excerptDonor}
+
+	scripted := func(r sync.Result) *scriptedEngine {
+		return &scriptedEngine{
+			offsets:    []float64{r.OffsetMS},
+			qualities:  []float64{r.CorrelationQuality},
+			matchZ:     []float64{r.MatchZ},
+			precisions: []float64{r.PrecisionMS},
+		}
+	}
+
+	cp, err := evaluateCheckpoint(context.Background(), cfgFor(scripted(clean)), slicer, window)
+	if err != nil {
+		t.Fatalf("evaluateCheckpoint: %v", err)
+	}
+	if len(cp.Attempts) != 2 {
+		t.Fatalf("attempts = %+v, want the waveform answer and the mfcc second opinion", cp.Attempts)
+	}
+	if cp.Attempts[0].Technique != string(TechniqueWaveform) || cp.Attempts[0].Accepted {
+		t.Fatalf("first attempt = %+v, want the refused waveform answer", cp.Attempts[0])
+	}
+	second := cp.Attempts[1]
+	if second.Technique != string(TechniqueMFCC) || !second.Accepted {
+		t.Fatalf("the mfcc attempt = %+v, want an accepted answer: quality %v clears %v and the σ gate is off",
+			second, clean.CorrelationQuality, mfccStep.MinConfidence)
+	}
+	if second.MatchZ == 0 || second.MatchZ != clean.MatchZ {
+		t.Fatalf("attempt match_z = %v, want the %v the matcher reported: z is recorded as a diagnostic",
+			second.MatchZ, clean.MatchZ)
+	}
+	if cp.Technique != string(TechniqueMFCC) {
+		t.Fatalf("checkpoint technique = %q, want %q", cp.Technique, TechniqueMFCC)
+	}
+	if math.Abs(cp.OffsetMS-clean.OffsetMS) > 10 {
+		t.Fatalf("checkpoint offset = %v ms, want %v ms ± 10 (the hop)", cp.OffsetMS, clean.OffsetMS)
+	}
+
+	// The same pipeline on the unrelated pair: no answer is accepted, and the z
+	// is still there to read.
+	cp, err = evaluateCheckpoint(context.Background(), cfgFor(scripted(noise)), slicer, window)
+	if err != nil {
+		t.Fatalf("evaluateCheckpoint (noise): %v", err)
+	}
+	if len(cp.Attempts) != 2 {
+		t.Fatalf("attempts = %+v, want both techniques attempted on the noise pair", cp.Attempts)
+	}
+	if cp.Attempts[1].Accepted {
+		t.Fatalf("the noise attempt = %+v, want it refused on confidence", cp.Attempts[1])
+	}
+	if cp.Attempts[1].MatchZ != noise.MatchZ {
+		t.Fatalf("noise attempt match_z = %v, want the recorded %v", cp.Attempts[1].MatchZ, noise.MatchZ)
 	}
 }

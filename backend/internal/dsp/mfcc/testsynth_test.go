@@ -179,25 +179,6 @@ func chirpProgramme(seconds float64) []float32 {
 	return out
 }
 
-// noiseProgramme builds a signal unrelated to programme(): coloured noise under
-// its own slow envelope, drawn from a different seed. It is the "no match" side
-// of the match-z test.
-func noiseProgramme(seed uint64, seconds float64) []float32 {
-	rate := float64(synthRate)
-	n := int(math.Round(seconds * rate))
-	rng := newSynthLCG(seed)
-
-	out := make([]float32, n)
-	var lp float64
-	for i := range out {
-		t := float64(i) / rate
-		lp = 0.85*lp + 0.15*rng.next()
-		env := 0.4 + 0.6*(0.5+0.5*math.Sin(2*math.Pi*0.23*t))
-		out[i] = clamp32(float32(0.3*env*(0.4*lp+0.6*rng.next())), -0.95, 0.95)
-	}
-	return out
-}
-
 // boundaryPair builds the two slices
 // [TestMFCCPinsABoundaryPeakToTheSearchEdge] correlates: one swept source cut
 // into two 4 s slices whose true lag sits two hops past the 1 s search bound.

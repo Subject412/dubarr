@@ -19,10 +19,13 @@ import (
 // this package cannot import analyze without an import cycle. Slice 01 and
 // correlate's golden test mirror the same table the same way; if
 // analyze.DefaultThresholds changes, these three move with it.
+//
+// There is deliberately no MatchZGood here: this matcher is not z-gated, so the
+// "almost certainly right" band judges nothing of its own (see the ruling in
+// docs/plans/0.5.0/04-mfcc-matcher.md and analyze.Technique.ZGate).
 const (
 	thresholdLowQuality  = 0.10 // analyze.DefaultThresholds.LowQuality (LowQualityThreshold)
 	thresholdMatchZMaybe = 5.0  // analyze.DefaultThresholds.MatchZMaybe
-	thresholdMatchZGood  = 10.0 // analyze.DefaultThresholds.MatchZGood
 )
 
 // expectedFile is testdata/expected.json: the fixture's gates, written by
@@ -143,33 +146,6 @@ func TestMFCCQuantisesToTheHop(t *testing.T) {
 	}
 	if got.PrecisionMS != 10 {
 		t.Errorf("PrecisionMS = %v, want 10", got.PrecisionMS)
-	}
-}
-
-// TestMFCCMatchZUsesTheSameScaleAsWaveform checks the confidence numbers are
-// the waveform matcher's numbers: a clean shifted pair clears MatchZGood and an
-// unrelated pair stays under MatchZMaybe.
-func TestMFCCMatchZUsesTheSameScaleAsWaveform(t *testing.T) {
-	const rate = uint32(8000)
-	// Twelve seconds of programme, cut so the target's copy starts 250 ms
-	// earlier: broadband, never stationary, and no silent head for the
-	// standardisation to amplify.
-	const seconds = 12.0
-	target, donor := pairAtLag(2000, seconds)
-
-	clean := mustAnalyze(t, target, donor, rate, 1.0)
-	if z := float64(clean.MatchZ); z <= thresholdMatchZGood {
-		t.Errorf("clean pair: match_z = %v, want > %v (MatchZGood)", z, thresholdMatchZGood)
-	}
-	if clean.Quality < 0.9 {
-		t.Errorf("clean pair: quality = %v, want >= 0.9", clean.Quality)
-	}
-	t.Logf("clean pair: match_z %v, quality %v", clean.MatchZ, clean.Quality)
-
-	unrelated := noiseProgramme(0x1234abcd, seconds)
-	other := mustAnalyze(t, target, unrelated, rate, 0.25)
-	if z := float64(other.MatchZ); z >= thresholdMatchZMaybe {
-		t.Errorf("unrelated pair: match_z = %v, want < %v (MatchZMaybe)", z, thresholdMatchZMaybe)
 	}
 }
 

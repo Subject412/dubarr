@@ -247,6 +247,14 @@ func DenseStepSec(durationSec, stepSec float64) float64 {
 // centred in its slot, for as long as a whole window still fits inside the
 // timeline (the same margin, clamping and sample snapping [PlanWindows] applies).
 //
+// The grid deliberately stops short of the end: a window must fit inside the
+// max_offset_sec search bound, so the distance from the last planned window's
+// end to the film's end is the margin at best and a whole step past it at worst
+// (310 s at a 300 s step). That is a limit on what the analysis *samples*, not
+// on what it can describe: an accepted segmentation is tiled to the film's own
+// duration ([Piecewise.tileToFilm]) before it is reported, so the tail is
+// covered by the last run's offset instead of being dropped from the plan.
+//
 // The grid is what turns a re-cut into a measurable discontinuity: six
 // percentage checkpoints cannot locate a boundary, a grid 45 s apart locates it
 // to within about ±step/2. Positions are still reported as percentages so an

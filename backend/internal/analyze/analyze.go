@@ -890,20 +890,20 @@ func Analyze(ctx context.Context, engine Engine, cfg Config, req Request) (Repor
 	var piecewise *Piecewise
 	if cfg.Piecewise.Enabled {
 		built := BuildSegments(plan, report.OffsetsMS, report.Qualities, cfg.Piecewise, DefaultThresholds)
+		// The plan is finalised here, where the film's length is known: an
+		// accepted segmentation tiles the target timeline from 0 to the film's
+		// own duration. The segmenter's edges are the windows it sampled — a
+		// margin short of the end and, whenever the opening checkpoints could
+		// not testify, tens of seconds in — and the renderer concatenates the
+		// runs in plan order, so those edges would lose the tail and shift the
+		// head. The report the UI and the worker read is the tiled plan.
+		built.tileToFilm(targetDur)
 		piecewise = &built
 		report.Piecewise = piecewise
-		switch {
-		case built.RejectedReason != "":
+		if built.RejectedReason != "" {
 			// A rejected plan is not a failure of the job (D5): the dominant
 			// offset is applied and the row says why a human should look.
 			report.ReviewReason = fmt.Sprintf("cut not confident — applied the dominant offset (%s)", built.RejectedReason)
-		case len(built.Segments) == 1:
-			// One plateau is the ordinary constant-offset job, not a rejection
-			// and not a render: the mux copies the track and applies the one
-			// offset it has. Recording that application is what keeps "the
-			// dense plan ran and found nothing to re-cut" in the row's own
-			// words, and it claims no segments because none were cut.
-			report.Application = &Application{Mode: "copy", Note: "copied untouched"}
 		}
 	}
 
@@ -912,6 +912,16 @@ func Analyze(ctx context.Context, engine Engine, cfg Config, req Request) (Repor
 	report.Verdict = verdict
 	report.Classification = classification
 	report.MaxDriftMS = drift
+	// One plateau is the ordinary constant-offset job, not a rejection and not a
+	// render: the mux copies the track and applies the one offset it has.
+	// Recording that application is what keeps "the dense plan ran and found
+	// nothing to re-cut" in the row's own words, and it claims no segments
+	// because none were cut — but it is recorded only for a verdict that is
+	// actually published: an unreliable or drifting one copies nothing, and the
+	// row must not say it did.
+	if piecewise != nil && piecewise.accepted() && len(piecewise.Segments) == 1 && verdict == VerdictOK {
+		report.Application = &Application{Mode: "copy", Note: "copied untouched"}
+	}
 	return report, nil
 }
 

@@ -525,11 +525,17 @@ func (w *Worker) processJob(ctx context.Context, id int64) error {
 	// trend: on a linear ramp it leaves half the drift in place. A report
 	// without a fit (a 0.4.0 row) keeps the median.
 	//
-	// #84: a piecewise render needs no shift at all — every segment was cut and
-	// padded to its absolute position, so the track is already aligned and the
-	// stored 0 plus application.mode is the signature of that mechanism. A
-	// rejected segmentation keeps the median, and uses the plan's dominant
-	// offset when analyze reported one: that is the 0.4.0 fallback D5 promises.
+	// #84: a piecewise render needs no shift at all, and that is a claim about
+	// the plan rather than about mkvmerge. concat stacks the runs in plan order,
+	// so the track is aligned only because analyze tiles an accepted plan from 0
+	// to the film's end: the first run really does land at time 0 and the last
+	// one on the film's last frame. transcode refuses any other shape, which is
+	// what keeps this 0 honest — with a plan that started at the first kept
+	// window, concat would still place it at 0 and the published track would be
+	// early by that much. The stored 0 plus application.mode is the signature of
+	// that mechanism. A rejected segmentation keeps the median, and uses the
+	// plan's dominant offset when analyze reported one: that is the 0.4.0
+	// fallback D5 promises.
 	offset := medianOffsetMS(report.OffsetsMS)
 	switch {
 	case len(segments) > 0:

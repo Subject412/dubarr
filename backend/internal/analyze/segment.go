@@ -20,10 +20,16 @@ import (
 // produces these; the type is fixed here so [Application] never grows a second
 // shape (D2b).
 //
-// The outer edges are the audio the segmentation has evidence for: the first
-// segment starts at the first window it kept and the last one ends at the last
-// kept window's end. A caller that must cover the whole target timeline extends
-// them to its own duration; the analysis never claims film it did not sample.
+// [BuildSegments] states each segment over the windows it actually sampled: the
+// first run starts at its first kept window and the last ends at its last one,
+// because the segmenter is never handed the film's length. An accepted plan is
+// finalised by [Piecewise.tileToFilm], which is what analyze stores: the first
+// segment starts at 0, the last ends at the film's duration and the interior
+// stays contiguous. That tiling is not decoration — the renderer concatenates
+// the runs in plan order, so a plan that started at the first kept window would
+// shift the whole published track and one that stopped at the last kept window
+// would lose the tail. The part of the film beyond the dub's own length is
+// silence, which is the honest result for a dub that does not cover it.
 type Segment struct {
 	StartSec   float64 `json:"start_sec"`
 	EndSec     float64 `json:"end_sec"`
@@ -219,6 +225,41 @@ func (p *Piecewise) accepted() bool {
 // the feature off (see [classify]), so turning segmentation on never changes
 // the verdict of a film that needed one offset.
 func (p *Piecewise) cut() bool { return p.accepted() && len(p.Segments) > 1 }
+
+// tileToFilm finalises an accepted plan: the first segment starts at 0, the
+// interior stays contiguous and the last segment ends at the film's duration.
+//
+// The segmenter cannot do this itself — it is handed windows, not a film — and
+// without it the render is wrong in two ways. The dense grid stops a margin
+// short of the end (a window has to fit inside the offset search bound), so a
+// plan that ended at the last kept window would publish a track missing its
+// tail; and a checkpoint that cannot testify — a quiet or fade-in opening — puts
+// the first kept window tens of seconds in, which concat would silently place at
+// time 0, shifting the whole track earlier. Tiling fixes both where the truth is
+// known: in the report the UI reads, not in the worker that renders it.
+//
+// The offset of an extended edge is the nearest run's offset, so the part of the
+// film beyond the dub's own length renders as silence — the honest answer for a
+// dub that does not cover it.
+//
+// A rejected plan is left exactly as it is: it is never applied (the job falls
+// back to the dominant offset and fails for review), so extending it would claim
+// film the analysis refused to stand behind.
+func (p *Piecewise) tileToFilm(durationSec float64) {
+	if p == nil || !p.accepted() || len(p.Segments) == 0 {
+		return
+	}
+	if durationSec <= 0 || math.IsNaN(durationSec) || math.IsInf(durationSec, 0) {
+		return
+	}
+	p.Segments[0].StartSec = 0
+	for k := 1; k < len(p.Segments); k++ {
+		// The join is one number, shared by the two segments either side of it:
+		// copying it is what makes the tiling exact instead of merely close.
+		p.Segments[k].StartSec = p.Segments[k-1].EndSec
+	}
+	p.Segments[len(p.Segments)-1].EndSec = durationSec
+}
 
 // MinStepMS is the smallest offset change that counts as a boundary: two stable
 // bands, 2 x th.StableSpreadMS (80 ms with the shipped table).

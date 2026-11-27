@@ -31,10 +31,43 @@ const statusView: Record<SyncJobStatus, { tone: Tone; label: string }> = {
   running: { tone: 'accent', label: 'running' },
   done: { tone: 'success', label: 'done' },
   failed: { tone: 'danger', label: 'failed' },
+  // #48: approved, and the job exists, but its target is not eligible yet. It
+  // reads as waiting — nothing is broken, nothing is running, nothing is ready.
+  held: { tone: 'warning', label: 'waiting' },
+  // A withdrawn approval: the operator rejected the queue row before the job
+  // started. Also not a failure.
+  cancelled: { tone: 'neutral', label: 'cancelled' },
 }
 
 function statusBadge(status: string) {
   return statusView[status as SyncJobStatus] ?? { tone: 'neutral' as Tone, label: status }
+}
+
+/**
+ * The hold reason as an operator sentence. `held_reason` is a closed vocabulary
+ * on the server (`store.HeldReason*`) and the UI translates the code: free text
+ * never reaches it, so this map is exhaustive by construction. A code this build
+ * does not know is shown as itself rather than guessed into a cause.
+ */
+const heldReasonCopy: Record<string, string> = {
+  waiting_for_tags:
+    'Waiting for tags — the job starts by itself once the target carries the required filename tags.',
+  missing_target:
+    'Waiting for the target file — the job starts by itself once the file is back on disk.',
+  target_changed:
+    'Waiting while the target is re-checked — the arrival row now points at a different file.',
+  cancelled_by_rejection: 'Cancelled because the approval was rejected before the job started.',
+}
+
+function heldReasonText(status: string, reason?: string): string {
+  const code = (reason ?? '').trim()
+  const cancelled = status === 'cancelled'
+  if (!code) {
+    return cancelled
+      ? 'Cancelled before the job started.'
+      : 'Waiting — Dubarr did not report a reason.'
+  }
+  return heldReasonCopy[code] ?? `${cancelled ? 'Cancelled' : 'Waiting'}: ${code}`
 }
 
 const verdictView: Record<string, { tone: Tone; label: string }> = {
@@ -574,8 +607,34 @@ function JobRow({
               {applicationNote}
             </span>
           )}
+          {/* Why it waits, on the row itself: the badge alone would leave the
+              operator guessing, and the detail is one click away only if they
+              know to take it. */}
+          {job.status === 'held' && (
+            <span
+              data-testid={`sync-job-held-${job.id}`}
+              className="text-[11px] text-amber-300/90"
+            >
+              {heldReasonText(job.status, job.held_reason)}
+            </span>
+          )}
+          {job.status === 'cancelled' && (
+            <span
+              data-testid={`sync-job-cancelled-${job.id}`}
+              className="text-[11px] text-zinc-500"
+            >
+              {heldReasonText(job.status, job.held_reason)}
+            </span>
+          )}
         </div>
         <div className="flex flex-wrap items-center gap-1.5">
+          {/* A job that skipped the tag gate says so: otherwise a queued job on
+              an ineligible target is indistinguishable from a lucky one. */}
+          {job.force_ignore_tag_filter && (
+            <span data-testid={`sync-job-forced-${job.id}`}>
+              <Badge tone="warning">started without waiting</Badge>
+            </span>
+          )}
           <Badge tone={status.tone}>{status.label}</Badge>
           {verdict && <Badge tone={verdict.tone}>{verdict.label}</Badge>}
           <span className="text-[11px] text-zinc-500">{createdAtLabel(job.created_at)}</span>
@@ -775,13 +834,40 @@ function JobDetail({
           <Alert>Sync failed: {data.error_message}</Alert>
         )}
 
+        {/* A held job is a live job with a condition, so it gets prose, not an
+            error colour: nothing failed and nothing needs fixing by hand. */}
+        {data.status === 'held' && (
+          <Alert tone="warning">
+            <span data-testid="sync-detail-held">
+              {heldReasonText(data.status, data.held_reason)}
+            </span>
+          </Alert>
+        )}
+
+        {data.status === 'cancelled' && (
+          <Alert tone="info">
+            <span data-testid="sync-detail-cancelled">
+              {heldReasonText(data.status, data.held_reason)}
+            </span>
+          </Alert>
+        )}
+
+        {data.force_ignore_tag_filter && (
+          <p data-testid="sync-detail-forced" className="text-xs text-zinc-400">
+            Started without waiting for tags: the tag gate was bypassed for this job, so the
+            mux may land in a file the pipeline replaces later.
+          </p>
+        )}
+
         {data.report ? (
           <ReportView report={data.report} calculatedOffsetMs={data.calculated_offset_ms} />
         ) : (
           <p className="text-sm text-zinc-500">
             {data.status === 'done'
               ? 'This job finished without a report.'
-              : 'Waiting for the analysis worker to persist a report…'}
+              : data.status === 'held'
+                ? 'No report yet: the job waits for its target to become eligible.'
+                : 'Waiting for the analysis worker to persist a report…'}
           </p>
         )}
       </div>
@@ -902,12 +988,23 @@ function ExecutePanel({ onCreated }: { onCreated: (job: SyncJob) => void }) {
 }
 
 export function SyncPage() {
-  const jobs = useSyncJobs()
+  // `waiting` is the held tab (#48): a job that exists and is approved but not
+  // eligible yet. It is asked for on the wire (`?status=held`) and applied again
+  // here, so a server that answers the filter with the full list still cannot
+  // file a finished job under "Waiting".
+  const [waitingOnly, setWaitingOnly] = useState(false)
+  const jobs = useSyncJobs(waitingOnly ? 'held' : undefined)
   const [selectedId, setSelectedId] = useState<number | null>(null)
   const create = useCreateSyncJob()
-  const items = jobs.data?.items ?? []
-  // Land on the newest job (server order) until the operator picks another.
-  const activeId = selectedId ?? items[0]?.id ?? null
+  const allItems = jobs.data?.items ?? []
+  const items = waitingOnly ? allItems.filter((job) => job.status === 'held') : allItems
+  // Land on the newest job (server order) until the operator picks another. A
+  // selection the current filter hides must not keep the detail panel alive;
+  // outside the filter, an explicit pick still wins even before the refreshed
+  // list has caught up with a job just created.
+  const selectedIsVisible =
+    selectedId !== null && (!waitingOnly || items.some((job) => job.id === selectedId))
+  const activeId = (selectedIsVisible ? selectedId : null) ?? items[0]?.id ?? null
 
   const rerun = (job: SyncJob) => {
     create.mutate(
@@ -939,11 +1036,40 @@ export function SyncPage() {
       <ExecutePanel onCreated={(job) => setSelectedId(job.id)} />
 
       <Card title="Jobs" description="Newest first.">
+        <div
+          className="mb-3 flex items-center gap-1"
+          role="tablist"
+          aria-label="Sync job status"
+        >
+          {[
+            { key: false, label: 'All jobs' },
+            { key: true, label: 'Waiting' },
+          ].map((tab) => (
+            <button
+              key={String(tab.key)}
+              type="button"
+              role="tab"
+              aria-selected={waitingOnly === tab.key}
+              data-testid={`sync-filter-${tab.key ? 'held' : 'all'}`}
+              onClick={() => setWaitingOnly(tab.key)}
+              className={
+                'rounded-md px-2.5 py-1 text-xs transition-colors ' +
+                (waitingOnly === tab.key
+                  ? 'bg-accent-500/15 text-accent-400'
+                  : 'text-zinc-500 hover:bg-ink-800 hover:text-zinc-300')
+              }
+            >
+              {tab.label}
+            </button>
+          ))}
+        </div>
         {jobs.isLoading && <Spinner label="Loading sync jobs" />}
         {jobs.error && <Alert>Could not load sync jobs: {jobs.error.message}</Alert>}
         {!jobs.isLoading && !jobs.error && items.length === 0 && (
           <p className="py-6 text-center text-sm text-zinc-500">
-            No sync jobs yet. Pick a vault track and a library target above and execute.
+            {waitingOnly
+              ? 'No job is waiting. A job waits when its target does not carry the required tags yet; it starts by itself once the target is eligible.'
+              : 'No sync jobs yet. Pick a vault track and a library target above and execute.'}
           </p>
         )}
         {items.length > 0 && (

@@ -357,9 +357,10 @@ export type QueueDiagnostics = {
   sync_health_available?: boolean
   /**
    * Whether `security.options.allow_force_tag_override` is on: a global
-   * setting, not a per-row fact. When it is, the server accepts a gate-ineligible
-   * target, so its rows arrive as `match_state: 'ready'` and the card enables
-   * Approve without any separate eligibility rule. Absent on older payloads.
+   * setting, not a per-row fact. It changes no verdict any more (#48): an
+   * ineligible pair is approvable with the switch either way. All it decides now
+   * is whether a card offers the "start without waiting" checkbox, which makes
+   * that one job skip the hold. Absent on older payloads.
    */
   force_tag_override?: boolean
 }
@@ -420,6 +421,28 @@ export type QueueTransition = {
   status: string
 }
 
+/**
+ * POST /api/queue/{id}/approve response (#48). Approval only records intent:
+ * extraction writes the vault track and the sync job is born from it, so the
+ * body carries no job id. Refresh the queue instead, and read the job from
+ * GET /api/sync/jobs once it exists.
+ */
+export type QueueApproveResponse = {
+  approved: boolean
+}
+
+/** The optional approve body: a manual match, and the force "start now" intent. */
+export type ApproveQueueOptions = {
+  /** Manual arr library match for a row the automatic parse could not identify. */
+  libraryCacheId?: number
+  /**
+   * Skip the tag gate for this one job. The server records it only while
+   * `security.options.allow_force_tag_override` is on, so a request cannot grant
+   * itself the escape hatch.
+   */
+  forceIgnoreTagFilter?: boolean
+}
+
 export type VaultItem = {
   id: number
   title: string
@@ -443,7 +466,29 @@ export type VaultResponse = {
   items: VaultItem[]
 }
 
-export type SyncJobStatus = 'queued' | 'running' | 'done' | 'failed'
+/**
+ * Public status of GET /api/sync/jobs. `held` means the approval is recorded and
+ * the job exists but waits for its target to become eligible (#48) — it is not
+ * running, not finished and not broken. `cancelled` is a withdrawn approval; the
+ * server only cancels a job that had not started, so it is never a failure.
+ */
+export type SyncJobStatus =
+  | 'queued'
+  | 'running'
+  | 'done'
+  | 'failed'
+  | 'held'
+  | 'cancelled'
+
+/**
+ * The closed vocabulary a held (or cancelled) job carries (`store.HeldReason*`).
+ * The server never puts free text here: the UI translates the code.
+ */
+export type SyncHeldReason =
+  | 'waiting_for_tags'
+  | 'missing_target'
+  | 'target_changed'
+  | 'cancelled_by_rejection'
 
 /** One technique's try at one checkpoint (`analyze.Attempt`). */
 export type SyncAttempt = {
@@ -691,6 +736,22 @@ export type SyncJob = {
   /** Why the requested mode was abandoned (e.g. `2-suspect-windows`); empty when it ran as asked. */
   analysis_fallback?: string
   error_message?: string
+  /**
+   * Why a job is `held` — or why a `cancelled` approval was withdrawn — as a
+   * closed-set code (`SyncHeldReason`). A running or finished job carries no
+   * reason. Kept loose so a code this build does not know renders as itself
+   * rather than being guessed into a cause.
+   */
+  held_reason?: string
+  /**
+   * The operator approved this job with the force override: it skipped the tag
+   * gate, is born `queued` and is never re-held
+   * (`security.options.allow_force_tag_override`). Absent on older payloads and
+   * on a job nobody forced.
+   */
+  force_ignore_tag_filter?: boolean
+  /** The import_queue row whose approval created this job; 0/absent for a Studio job. */
+  origin_queue_id?: number
   created_at?: string
   updated_at?: string
 }
@@ -886,19 +947,31 @@ export const api = {
   searchLibrary: (q: string) =>
     request<LibrarySearchResponse>(`/api/imports/search-library?q=${encodeURIComponent(q)}`),
   vault: () => request<VaultResponse>('/api/vault'),
-  syncJobs: () => request<SyncJobsResponse>('/api/sync/jobs'),
+  syncJobs: (status?: SyncJobStatus) =>
+    request<SyncJobsResponse>(
+      `/api/sync/jobs${status ? `?status=${encodeURIComponent(status)}` : ''}`,
+    ),
   syncJob: (id: number) => request<SyncJob>(`/api/sync/jobs/${id}`),
   createSyncJob: (body: CreateSyncJobBody) =>
     request<SyncJob>('/api/sync/jobs', {
       method: 'POST',
       body: JSON.stringify(body),
     }),
-  approveQueueItem: (id: number, libraryCacheId?: number) =>
-    request<QueueTransition>(`/api/queue/${id}/approve`, {
+  /**
+   * Records the operator's approval intent (#48). Only the keys with an intent
+   * behind them are sent: an empty body keeps the arr-matched, hold-if-ineligible
+   * behaviour, and `force_ignore_tag_filter` is never sent as `false` because
+   * "no opinion" and "do not force" are the same thing to the server.
+   */
+  approveQueueItem: (id: number, opts: ApproveQueueOptions = {}) => {
+    const body: { library_cache_id?: number; force_ignore_tag_filter?: boolean } = {}
+    if (opts.libraryCacheId != null) body.library_cache_id = opts.libraryCacheId
+    if (opts.forceIgnoreTagFilter) body.force_ignore_tag_filter = true
+    return request<QueueApproveResponse>(`/api/queue/${id}/approve`, {
       method: 'POST',
-      body:
-        libraryCacheId == null ? undefined : JSON.stringify({ library_cache_id: libraryCacheId }),
-    }),
+      body: Object.keys(body).length === 0 ? undefined : JSON.stringify(body),
+    })
+  },
   rejectQueueItem: (id: number) => request<QueueTransition>(`/api/queue/${id}/reject`, { method: 'POST' }),
   /**
    * Asks arr's own parser to identify the release; title overrides the filename

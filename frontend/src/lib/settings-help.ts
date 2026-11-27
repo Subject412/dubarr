@@ -48,7 +48,7 @@ export const SETTINGS_HELP: Record<SettingsSectionKey, Record<string, string>> =
   },
   'security.options': {
     allow_force_tag_override:
-      'Let an operator bypass the processing filter for a single item. Off by default.',
+      'Offers a "start without waiting" checkbox when an operator approves a Target that fails the tag filter: that one job bypasses the gate, queues at once and is never re-held. Off by default, and an approval that does not tick the box still holds the job until the Target is eligible.',
   },
   'sync.defaults': {
     max_offset_sec:

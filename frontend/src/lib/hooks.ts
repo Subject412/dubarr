@@ -24,12 +24,14 @@ import {
   type LogLevel,
   type LogsQuery,
   type LogsResponse,
+  type QueueApproveResponse,
   type QueueIdentifyResponse,
   type QueueMatchResponse,
   type QueueResponse,
   type QueueTransition,
   type SettingsEnvelope,
   type SyncJob,
+  type SyncJobStatus,
   type SyncJobsResponse,
   type User,
   type VaultResponse,
@@ -43,6 +45,11 @@ export const queryKeys = {
   queue: ['queue'] as const,
   vault: ['vault'] as const,
   syncJobs: ['sync', 'jobs'] as const,
+  /**
+   * One job list, keyed by its status filter. The bare `syncJobs` key stays the
+   * invalidation prefix, so a write drops every filter and the detail at once.
+   */
+  syncJobsList: (status?: SyncJobStatus) => ['sync', 'jobs', 'list', status ?? 'all'] as const,
   syncJob: (id: number) => ['sync', 'jobs', id] as const,
   browse: (path: string) => ['browse', path] as const,
   librarySearch: (q: string) => ['library', 'search', q] as const,
@@ -162,10 +169,14 @@ export function useVault(): UseQueryResult<VaultResponse> {
   })
 }
 
-export function useSyncJobs(): UseQueryResult<SyncJobsResponse> {
+/**
+ * The job list, optionally narrowed to one public status. `held` is the
+ * server-side filter (`?status=held`) for jobs that exist but wait (#48).
+ */
+export function useSyncJobs(status?: SyncJobStatus): UseQueryResult<SyncJobsResponse> {
   return useQuery({
-    queryKey: queryKeys.syncJobs,
-    queryFn: api.syncJobs,
+    queryKey: queryKeys.syncJobsList(status),
+    queryFn: () => api.syncJobs(status),
     staleTime: 5_000,
   })
 }
@@ -201,18 +212,25 @@ export type ApproveQueueVariables = {
   id: number
   /** Manual arr library match for a queue row the automatic parse could not identify. */
   libraryCacheId?: number
+  /** "Start now": skip the tag gate for this one job (setting-gated server-side). */
+  forceIgnoreTagFilter?: boolean
 }
 
 export function useApproveQueueItem(): UseMutationResult<
-  QueueTransition,
+  QueueApproveResponse,
   Error,
   ApproveQueueVariables
 > {
   const client = useQueryClient()
   return useMutation({
-    mutationFn: ({ id, libraryCacheId }) => api.approveQueueItem(id, libraryCacheId),
+    mutationFn: ({ id, libraryCacheId, forceIgnoreTagFilter }) =>
+      api.approveQueueItem(id, { libraryCacheId, forceIgnoreTagFilter }),
     onSuccess: () => {
+      // No job id comes back any more: the row leaves the pending list and the
+      // job is born during extraction, so the list is refreshed and the Studio's
+      // cache is dropped rather than holding a stale "no job yet" read.
       void client.invalidateQueries({ queryKey: queryKeys.queue })
+      void client.invalidateQueries({ queryKey: queryKeys.syncJobs })
     },
   })
 }

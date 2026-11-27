@@ -326,7 +326,9 @@ tempo-corrected, that is a finding to report, not a test to relax.
 5. That same job performs exactly **one** `transcode.Transcode` call (`Transcode` invoked once is asserted by the fake) and the target's video stream hash is unchanged (existing `videoStreamHash` helper in `backend/internal/acceptance/harness_test.go`).
 6. A job whose offsets step by 2.5 s at 50 % ends `failed` with `ErrUnmuxableVerdict` and `report.fit.shape == "cut"`; nothing is muxed, nothing is transcoded.
 7. The Sync page renders `—` for the trend block on a 0.4.0 report (no `fit` key) and does not throw.
-8. `git diff` touches none of: `backend/schema.sql`, `backend/internal/store/migrations/**`, `docs/adr/**`, `backend/internal/mux/**`.
+8. `git diff` touches none of: `backend/schema.sql`, `backend/internal/store/migrations/**`, `docs/adr/**`. The ONLY change inside `backend/internal/mux/**` is the `checkVerdict` widening in item 9 — `checkAmbiguity`, the publication protocol, `ErrVerdict`'s message and every other function are untouched.
+9. **Amended (orchestrator ruling, after the implementer hit the contradiction):** `mux.checkVerdict` accepts a corrected drifting report, because the guard exists to stop misaligned audio and a tempo-corrected track is aligned. The predicate is exactly: `verdict` is `ok`/`stable` as before, **or** (`verdict == drifting` **and** `report.Fit != nil` **and** `Fit.Shape == drift` **and** `Fit.TempoApplied` **and** `report.Application != nil`). Every other verdict still returns `ErrVerdict` with the same message. `TestCheckVerdictAcceptsACorrectedDrift` and `TestCheckVerdictStillRefusesADriftingCut` pin both sides.
+10. `TestCheckVerdictStillRefusesAnUncorrectedDrift` covers the trap: a drifting report with the fit present but `TempoApplied == false` (or `Application == nil`) is still refused — the widening cannot be satisfied by a report that merely looks like a drift.
 
 ## Migration / compatibility
 
@@ -361,7 +363,9 @@ tempo-corrected, that is a finding to report, not a test to relax.
 
 - `backend/internal/analyze/fallback.go`'s rules — the suspect/retry policy is
   the guard for the windowed path; this slice only relocates its arithmetic.
-- `backend/internal/mux/**` — the offset is an input, not this slice's business.
+- `backend/internal/mux/**` — untouched except the `checkVerdict` widening ruled in
+  Acceptance #9: the offset is an input, and the guard must not refuse a track the
+  engine has already corrected. Nothing else in `mux` moves.
 - `backend/internal/transcode/transcode.go`'s `BuildArgs` precedence
   (tempo → layout → codec) and `ValidateTempo`'s 0.5..2.0 range.
 - `backend/internal/transcode/rule.go`'s Match/Validate logic.

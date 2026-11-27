@@ -1,6 +1,8 @@
-// Package vaultapi exposes the read-only Audio Vault listing consumed by the
-// /vault page. It never serves vault file contents (out of scope for M3) and
-// never mutates archived tracks.
+// Package vaultapi exposes the Audio Vault: the read-only listing consumed by
+// the /vault page, plus the operator-driven reorganisation (#47) that renames
+// archived files inside the vault after a preview. It never serves vault file
+// contents and never rewrites a file's bytes — a reorganisation changes paths
+// only, and only when an operator applies a previewed plan.
 package vaultapi
 
 import (
@@ -9,7 +11,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 
+	"github.com/Subject412/dubarr/backend/internal/settings"
 	"github.com/Subject412/dubarr/backend/internal/store"
 )
 
@@ -24,16 +28,30 @@ type Dependencies struct {
 // Service holds the resolved dependencies for the registered handlers.
 type Service struct {
 	store        *store.Store
+	settings     *settings.Store
 	requireAdmin func(http.Handler) http.Handler
+
+	// plans caches previewed organise plans (10 minutes, in memory only) and
+	// applyMu serialises applies: two operators cannot move files at once.
+	plans   *planCache
+	applyMu sync.Mutex
+	// renameFile is os.Rename. Tests swap it to inject a mid-apply failure;
+	// production never does.
+	renameFile func(oldpath, newpath string) error
 }
 
 // RegisterRoutes mounts:
 //
-//	GET /api/vault    archived audio tracks, newest first, read-only
+//	GET  /api/vault                     archived audio tracks, newest first, read-only
+//	POST /api/vault/organise/preview    plan a rename; writes nothing
+//	POST /api/vault/organise/apply      apply a previewed plan, all-or-nothing
+//	GET  /api/vault/organise/runs       audit history
 func RegisterRoutes(mux *http.ServeMux, deps Dependencies) *Service {
 	svc := &Service{
 		store:        &store.Store{DB: deps.DB},
+		settings:     settings.New(deps.DB),
 		requireAdmin: deps.RequireAdmin,
+		plans:        newPlanCache(),
 	}
 	admin := func(h http.HandlerFunc) http.Handler {
 		if svc.requireAdmin == nil {
@@ -44,6 +62,9 @@ func RegisterRoutes(mux *http.ServeMux, deps Dependencies) *Service {
 		return svc.requireAdmin(h)
 	}
 	mux.Handle("GET /api/vault", admin(svc.handleList))
+	mux.Handle("POST /api/vault/organise/preview", admin(svc.handleOrganisePreview))
+	mux.Handle("POST /api/vault/organise/apply", admin(svc.handleOrganiseApply))
+	mux.Handle("GET /api/vault/organise/runs", admin(svc.handleOrganiseRuns))
 	return svc
 }
 

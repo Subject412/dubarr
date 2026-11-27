@@ -163,7 +163,15 @@ func TestPiecewiseEndToEndKeepsTailAndHead(t *testing.T) {
 	// 3. The donor dub: FLAC, so the markers the assertion reads are the exact
 	// samples the fixture wrote and the published track is measured without a
 	// codec's own transient shaping in the way.
-	dubMedia := filepath.Join(dir, "dub.mka")
+	//
+	// It is encoded into WORK_DIR/extract, not into this test's scratch dir:
+	// the vault archives only a track staged inside work/extract (ADR-0002/
+	// 0015), the same place a manual pick leaves one (stageDonorStream).
+	stagingDir := filepath.Join(h.work, "extract", "manual")
+	if err := os.MkdirAll(stagingDir, 0o700); err != nil {
+		t.Fatalf("mkdir staging %s: %v", stagingDir, err)
+	}
+	dubMedia := filepath.Join(stagingDir, "piecewise-dub.mka")
 	runTool(t, "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
 		"-i", dubWAV, "-c:a", "flac", dubMedia)
 

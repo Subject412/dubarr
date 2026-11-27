@@ -32,6 +32,8 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/go-fft/fft"
+
 	"github.com/Subject412/dubarr/backend/internal/dsp/correlate"
 	"github.com/Subject412/dubarr/backend/internal/dsp/mfcc"
 )
@@ -52,13 +54,30 @@ const (
 	degradedMFCCMinConfidence  = 0.10
 )
 
+// The fixture's texture: a bank of band-limited noise streams, each under its
+// own aperiodic gain contour. See testsynth_test.go — the copy is the contract.
 const (
-	// The degradation chain, in the order it applies. Tighten these — not the
-	// tests' assertions — if the waveform matcher ever clears the floor above.
-	taps  = 4
-	drive = 2.5
-	bits  = 6
-	snrDB = -10.0
+	bandCount      = 8
+	bandResonance  = 0.85
+	programmeLevel = 0.16
+)
+
+var (
+	bandCentres = [bandCount]float64{250, 520, 820, 1180, 1600, 2050, 2580, 3250}
+	driftHz     = [bandCount]float64{6.1, 9.7, 13.3, 4.9, 17.1, 7.9, 21.7, 11.3}
+)
+
+// The codec emulation's knobs, in the order the chain applies them.
+const (
+	degradedLowPass = 0.6
+	degradedDrive   = 2.5
+
+	codecFFT     = 1024
+	codecHop     = codecFFT / 2
+	codecMagBits = 4
+	codecRangeDB = 48.0
+
+	degradedBits = 6
 )
 
 // lcg is the fixture's random source: the same generator as the test package's.
@@ -76,87 +95,171 @@ func clamp(v, lo, hi float64) float64 { return min(max(v, lo), hi) }
 // clamp32 is the test package's clamp32, so the two builders round identically.
 func clamp32(v, lo, hi float32) float32 { return min(max(v, lo), hi) }
 
-// programme is the test package's programme(), sample for sample.
-func programme() []float32 {
-	freqs := [5]float64{1500, 1900, 2400, 3000, 3600}
-	envHz := [5]float64{0.37, 0.71, 1.13, 1.71, 2.29}
-	envPhase := [5]float64{0.11, 1.37, 2.51, 4.19, 5.53}
+// sumSquares is the test package's.
+func sumSquares(values []float32) float64 {
+	var total float64
+	for _, v := range values {
+		total += float64(v) * float64(v)
+	}
+	return total
+}
 
+// scaleToProgrammeLevel is the test package's.
+func scaleToProgrammeLevel(samples []float32, sumsq float64) []float32 {
+	if rms := math.Sqrt(sumsq / float64(len(samples))); rms > 1e-12 {
+		scale := float32(programmeLevel / rms)
+		for i := range samples {
+			samples[i] = clamp32(samples[i]*scale, -0.95, 0.95)
+		}
+	}
+	return samples
+}
+
+// bandNoise is the test package's bandNoise, sample for sample.
+func bandNoise(secs float64, s uint64) []float32 {
 	rateF := float64(rate)
-	n := int(math.Round(seconds * rateF))
-	rng := newLCG(seed)
+	n := int(math.Round(secs * rateF))
+	rng := newLCG(s)
 
-	clickEvery := int(math.Round(0.5 * rateF))
-	clickDecay := math.Exp(-1 / (0.004 * rateF))
-	countdown := 0
-	clickEnv, clickHz := 0.0, 1200.0
+	var cosW, pole [bandCount]float64
+	for b, f := range bandCentres {
+		cosW[b] = math.Cos(2 * math.Pi * f / rateF)
+		pole[b] = math.Exp(-2 * math.Pi * driftHz[b] / rateF)
+	}
 
 	out := make([]float32, n)
+	var y1, y2, walk [bandCount]float64
 	for i := range out {
-		t := float64(i) / rateF
-		if countdown <= 0 {
-			clickEnv = 0.7 + 0.5*rng.next()
-			clickHz = 900 + 800*(0.5+0.5*rng.next())
-			countdown = clickEvery
-		}
-		countdown--
-
+		carrier := rng.next()
+		envelope := rng.next()
 		var v float64
-		for k := range freqs {
-			env := 0.25 + 0.75*(0.5+0.5*math.Sin(2*math.Pi*envHz[k]*t+envPhase[k]))
-			v += env * math.Sin(2*math.Pi*freqs[k]*t+envPhase[k])
-		}
-		v *= 0.6 + 0.4*(0.5+0.5*math.Sin(2*math.Pi*0.1*t))
-		v += clickEnv * math.Sin(2*math.Pi*clickHz*t)
-		clickEnv *= clickDecay
-		v += 0.02 * rng.next()
+		for b := 0; b < bandCount; b++ {
+			y := 2*bandResonance*cosW[b]*y1[b] - bandResonance*bandResonance*y2[b] + (1-bandResonance)*carrier
+			y2[b], y1[b] = y1[b], y
 
-		out[i] = clamp32(float32(0.22*v), -0.95, 0.95)
+			walk[b] = pole[b]*walk[b] + (1-pole[b])*envelope
+			deviation := math.Sqrt((1 - pole[b]) / (1 + pole[b]))
+			unit := clamp(0.5+0.8*walk[b]/deviation, 0, 1)
+			v += (0.12 + 0.95*unit) * y
+		}
+		out[i] = float32(v)
 	}
-	return out
+	return scaleToProgrammeLevel(out, sumSquares(out))
 }
 
-// delay shifts samples later by samples of delay, padding the head with zeros.
-func delay(in []float32, samples int) []float32 {
-	out := make([]float32, len(in))
-	for i := range out {
-		if j := i - samples; j >= 0 {
-			out[i] = in[j]
-		}
-	}
-	return out
+// programmeAt is the test package's programmeAt, sample for sample.
+func programmeAt(secs float64) []float32 { return bandNoise(secs, seed) }
+
+// pairAtLag is the test package's pairAtLag: two slices of one source, lag
+// samples apart, cut rather than zero-padded so neither carries a silent head.
+func pairAtLag(lag int, secs float64) (target, donor []float32) {
+	source := programmeAt(secs + float64(lag)/float64(rate))
+	n := int(math.Round(secs * float64(rate)))
+	return source[:n], source[lag : lag+n]
 }
 
-// degrade is the test package's chain: low-pass, clip, quantise, noise.
+// degrade is the test package's chain: band-limit, clip, STFT round trip, PCM.
 func degrade(in []float32) []float32 {
 	lp := make([]float32, len(in))
-	for i := range in {
-		var sum float32
-		for k := 0; k < taps; k++ {
-			if j := i - k; j >= 0 {
-				sum += in[j]
+	var state float64
+	for i, v := range in {
+		state += degradedLowPass * (float64(v) - state)
+		lp[i] = float32(state)
+	}
+	for i, v := range lp {
+		lp[i] = float32(math.Tanh(3 * degradedDrive * float64(v)))
+	}
+
+	codec := codecRoundTrip(lp)
+
+	levels := float64(int(1) << (degradedBits - 1))
+	for i, v := range codec {
+		codec[i] = clamp32(float32(math.Round(float64(v)*levels)/levels), -1, 1)
+	}
+	return codec
+}
+
+// codecRoundTrip is the test package's lossy-codec emulation.
+func codecRoundTrip(in []float32) []float32 {
+	nfft, hop := codecFFT, codecHop
+	window := hannWindow(nfft)
+	opts := fft.Options{NoFMA: true}
+	buf := make([]complex64, nfft)
+
+	var reference float64
+	for start := 0; start < len(in); start += hop {
+		windowedFrame(buf, in, start, window)
+		for k, bin := range fft.FFT32With(buf, opts) {
+			if k > nfft/2 {
+				break
 			}
+			reference = max(reference, math.Hypot(float64(real(bin)), float64(imag(bin))))
 		}
-		lp[i] = sum / taps
 	}
-	for i, v := range lp {
-		lp[i] = float32(math.Tanh(3 * drive * float64(v)))
+	if reference <= 0 {
+		return make([]float32, len(in))
 	}
-	levels := float64(int(1) << (bits - 1))
-	for i, v := range lp {
-		lp[i] = float32(math.Round(float64(v)*levels) / levels)
+
+	step := codecRangeDB * math.Ln10 / 20 / float64(int(1)<<codecMagBits)
+	floorLevel := -float64(int(1)<<codecMagBits - 1)
+	quantise := func(magnitude float64) float64 {
+		level := math.Round(math.Log(magnitude/reference) / step)
+		return reference * math.Exp(max(level, floorLevel)*step)
 	}
-	var squares float64
-	for _, v := range lp {
-		squares += float64(v) * float64(v)
-	}
-	rms := math.Sqrt(squares / float64(len(lp)))
-	scale := rms / math.Pow(10, snrDB/20) * math.Sqrt(3)
+
+	out := make([]float64, len(in)+nfft)
+	norm := make([]float64, len(in)+nfft)
 	rng := newLCG(seed ^ 0x5eed)
-	for i := range lp {
-		lp[i] = clamp32(lp[i]+float32(scale*rng.next()), -1, 1)
+
+	for start := 0; start < len(in); start += hop {
+		windowedFrame(buf, in, start, window)
+		spectrum := fft.FFT32With(buf, opts)
+
+		dc := float64(real(spectrum[0]))
+		spectrum[0] = complex(float32(math.Copysign(quantise(math.Abs(dc)), dc)), 0)
+		for k := 1; k < nfft/2; k++ {
+			magnitude := quantise(math.Hypot(float64(real(spectrum[k])), float64(imag(spectrum[k]))))
+			phase := math.Pi * rng.next()
+			bin := complex(float32(magnitude*math.Cos(phase)), float32(magnitude*math.Sin(phase)))
+			spectrum[k] = bin
+			spectrum[nfft-k] = complex(real(bin), -imag(bin))
+		}
+		spectrum[nfft/2] = complex(float32(quantise(math.Abs(float64(real(spectrum[nfft/2]))))), 0)
+
+		frame := fft.IFFT32With(spectrum, opts)
+		for i := 0; i < nfft; i++ {
+			out[start+i] += float64(window[i]) * float64(real(frame[i]))
+			norm[start+i] += float64(window[i]) * float64(window[i])
+		}
 	}
-	return lp
+
+	round := make([]float32, len(in))
+	for i := range round {
+		if n := norm[i]; n > 1e-9 {
+			round[i] = float32(out[i] / n)
+		}
+	}
+	return round
+}
+
+// windowedFrame is the test package's, sample for sample.
+func windowedFrame(buf []complex64, samples []float32, start int, window []float32) {
+	for i := range buf {
+		if j := start + i; j < len(samples) {
+			buf[i] = complex(samples[j]*window[i], 0)
+		} else {
+			buf[i] = 0
+		}
+	}
+}
+
+// hannWindow is the test package's window.
+func hannWindow(n int) []float32 {
+	out := make([]float32, n)
+	for i := range out {
+		out[i] = float32(0.5 - 0.5*math.Cos(2*math.Pi*float64(i)/float64(n-1)))
+	}
+	return out
 }
 
 // writeWav writes mono PCM s16 and returns the payload it wrote, which is what
@@ -197,12 +300,11 @@ func pcmHash(payload []byte) uint32 {
 func main() {
 	dir := "internal/dsp/mfcc/testdata"
 
-	// The target carries the delay, so the answer is +delayMS by correlate's
-	// sign convention (offset = t_target − t_donor); a delayed donor would
-	// answer the same magnitude, negated.
-	donor := programme()
-	shift := int(math.Round(float64(delayMS) / 1000 * float64(rate)))
-	target := delay(donor, shift)
+	// The target is the earlier slice, so the answer is +delayMS by correlate's
+	// sign convention (offset = t_target − t_donor); the two slices swapped
+	// would answer the same magnitude, negated.
+	delay := int(math.Round(float64(delayMS) / 1000 * float64(rate)))
+	target, donor := pairAtLag(delay, seconds)
 	degraded := degrade(donor)
 
 	payload, err := writeWav(filepath.Join(dir, "target.wav"), target)
@@ -259,7 +361,7 @@ func main() {
 	}
 	if float64(wave.Quality) >= degradedWaveformQualityMax {
 		fmt.Fprintf(os.Stderr, "gen: the degradation chain is too gentle: waveform quality %v >= %v; "+
-			"tighten taps/drive/bits/snrDB (in this file and testsynth_test.go), do not relax the test\n",
+			"tighten the codec round trip (in this file and testsynth_test.go), do not relax the test\n",
 			wave.Quality, degradedWaveformQualityMax)
 		os.Exit(1)
 	}
@@ -270,13 +372,13 @@ func main() {
 	}
 
 	expected := map[string]any{
-		"offset_ms":                    delayMS,
-		"precision_ms":                 hopMS,
-		"mfcc_max_error_ms":            mfccErrMS,
+		"offset_ms":                     delayMS,
+		"precision_ms":                  hopMS,
+		"mfcc_max_error_ms":             mfccErrMS,
 		"degraded_waveform_quality_max": degradedWaveformQualityMax,
-		"degraded_mfcc_min_confidence": degradedMFCCMinConfidence,
-		"degraded_mfcc_max_error_ms":   degradedMFCCErrMS,
-		"sample_hash":                  fmt.Sprintf("0x%08x", pcmHash(payload)),
+		"degraded_mfcc_min_confidence":  degradedMFCCMinConfidence,
+		"degraded_mfcc_max_error_ms":    degradedMFCCErrMS,
+		"sample_hash":                   fmt.Sprintf("0x%08x", pcmHash(payload)),
 	}
 	encoded, err := json.MarshalIndent(expected, "", "  ")
 	if err != nil {

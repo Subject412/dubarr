@@ -151,17 +151,22 @@ func TestMFCCQuantisesToTheHop(t *testing.T) {
 // unrelated pair stays under MatchZMaybe.
 func TestMFCCMatchZUsesTheSameScaleAsWaveform(t *testing.T) {
 	const rate = uint32(8000)
-	target := programme()
+	// Twelve seconds of programme, cut so the target's copy starts 250 ms
+	// earlier: broadband, never stationary, and no silent head for the
+	// standardisation to amplify.
+	const seconds = 12.0
+	target, donor := pairAtLag(2000, seconds)
 
-	clean := mustAnalyze(t, delaySamples(target, 2000), target, rate, 1.0)
+	clean := mustAnalyze(t, target, donor, rate, 1.0)
 	if z := float64(clean.MatchZ); z <= thresholdMatchZGood {
 		t.Errorf("clean pair: match_z = %v, want > %v (MatchZGood)", z, thresholdMatchZGood)
 	}
 	if clean.Quality < 0.9 {
 		t.Errorf("clean pair: quality = %v, want >= 0.9", clean.Quality)
 	}
+	t.Logf("clean pair: match_z %v, quality %v", clean.MatchZ, clean.Quality)
 
-	unrelated := noiseProgramme(0x1234abcd, synthSeconds)
+	unrelated := noiseProgramme(0x1234abcd, seconds)
 	other := mustAnalyze(t, target, unrelated, rate, 0.25)
 	if z := float64(other.MatchZ); z >= thresholdMatchZMaybe {
 		t.Errorf("unrelated pair: match_z = %v, want < %v (MatchZMaybe)", z, thresholdMatchZMaybe)
@@ -169,14 +174,18 @@ func TestMFCCMatchZUsesTheSameScaleAsWaveform(t *testing.T) {
 }
 
 // TestMFCCSurvivesClippingAndLowPass is #83's acceptance in one test: on the
-// degraded fixture (4-tap low-pass, tanh(3x) clipping, 6-bit quantisation,
-// noise at −10 dB SNR) the mel-cepstral matcher still clears LowQuality with an
-// offset within 30 ms, while the waveform matcher on the same input does not.
+// degraded fixture — a low-bitrate re-encode emulated as the codec's band-limit,
+// a loudness push past the encoder's knee, an STFT round trip that keeps the band
+// energies and regenerates the fine structure as noise, and a 6-bit output — the
+// mel-cepstral matcher still clears LowQuality with an offset within 30 ms, while
+// the waveform matcher on the same input does not.
 //
-// The degradation is tuned in the fixture builders — this test's synthesis and
+// The chain is tuned in the fixture builders — this test's synthesis and
 // testdata/gen carry the same copy — and the assertion is never relaxed; if the
-// chain does not clear it, the chain is tightened and expected.json's git
-// history records that.
+// chain does not clear it, the chain is tightened and expected.json's git history
+// records that. Additive noise is deliberately not part of it: it costs both
+// matchers the same SNR-bounded amount, so it can never isolate the cepstral
+// advantage, which lives on envelope-preserving processing.
 func TestMFCCSurvivesClippingAndLowPass(t *testing.T) {
 	const rate = uint32(8000)
 	exp := loadExpected(t)
@@ -250,11 +259,11 @@ func TestMFCCRejectsAShortSlice(t *testing.T) {
 func TestMFCCRejectsABadWindow(t *testing.T) {
 	samples := programme()[:16000]
 	cases := []struct {
-		name       string
-		rate       uint32
-		windowSec  float64
-		target     []float32
-		donor      []float32
+		name      string
+		rate      uint32
+		windowSec float64
+		target    []float32
+		donor     []float32
 	}{
 		{name: "zero window", rate: 8000, windowSec: 0, target: samples, donor: samples},
 		{name: "negative window", rate: 8000, windowSec: -1, target: samples, donor: samples},
@@ -285,14 +294,14 @@ func TestMFCCRejectsABadWindow(t *testing.T) {
 // z stays under MatchZMaybe so the strategy pipeline cannot read the window's
 // boundary as evidence.
 //
-// The pair is a slow chirp: its cepstral sequences drift monotonically, so the
-// correlation rises towards the edge nearest the true delay instead of peaking
-// inside the window, which makes the edge assertion a property of the fixture
-// rather than of the noise.
+// The pair is [boundaryPair]: two slices cut out of one swept source, with no
+// silent head, whose true lag sits two hops past the 1 s bound. The sweep's
+// cepstral sequences drift monotonically, so the correlation rises towards the
+// edge nearest the true delay instead of peaking inside the window, which makes
+// the edge assertion a property of the fixture rather than of the noise.
 func TestMFCCPinsABoundaryPeakToTheSearchEdge(t *testing.T) {
 	const rate = uint32(8000)
-	donor := chirp(4.0)
-	target := delaySamples(donor, 2*int(rate)) // 2 s, twice the window
+	target, donor := boundaryPair()
 
 	got := mustAnalyze(t, target, donor, rate, 1.0)
 	hop := int64(hopSamples(rate))

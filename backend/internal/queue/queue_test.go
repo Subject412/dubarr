@@ -46,6 +46,9 @@ type harness struct {
 	mux      *http.ServeMux
 	media    string
 	settings *settings.Store
+	// seq keeps the vault paths seedSyncJob writes unique per test: audio_tracks
+	// .file_path is UNIQUE.
+	seq int
 }
 
 func newHarness(t *testing.T) *harness {
@@ -533,12 +536,12 @@ func TestQueueMatchStateReady(t *testing.T) {
 func TestQueueMatchStateIneligibleTarget(t *testing.T) {
 	h := newHarness(t)
 	h.seedCandidate(t, "Shrek (2001) [Remux].mkv", "waiting_for_tags", `["en"]`)
-	// A donor exists, but the target is not gate-eligible: the row must not
-	// claim `ready`. handleApprove refuses exactly this row (ADR-0005/ADR-0009:
-	// an ineligible target is left completely alone and rejected at sync-job
-	// creation), so the card must not advertise it as approvable either — the
-	// ready verdict is a claim about the gate, not about the donor listing, and
-	// donors are never tag-gated.
+	// A donor exists, but the target is not gate-eligible. The card's `ready`
+	// is still the gate projection here, so the row must not claim it: the
+	// state is what the operator reads the tag verdict from, and donors are
+	// never tag-gated. Approving such a row no longer consults the gate at all
+	// (see TestApproveIneligibleTargetRecordsIntent) — widening `ready` to
+	// "no gate verdict blocks approval" is the follow-up this projection owes.
 	h.writeDonor(t)
 
 	item := onlyMatchItem(t, h.listMatchItems(t))
@@ -1365,31 +1368,117 @@ func TestApproveRejectsForeignLibraryMatch(t *testing.T) {
 	}
 }
 
-// TestApproveRejectsIneligibleTarget pins ADR-0005 (as amended by ADR-0009): an
-// ineligible target is left completely alone — no sync, no Studio preview, no
-// mux — and the pair is rejected at sync-job creation. Approve must therefore
-// refuse it too, or the operator is left with a row that is approved and can
-// never run. The refusal names the blocker with the card's own wording, and a
-// donor next to the target must not admit the pair (donors are never tag-gated,
-// but the TARGET is).
-func TestApproveRejectsIneligibleTarget(t *testing.T) {
+// TestApproveIneligibleTargetRecordsIntent pins the ruling this slice encodes:
+// approval records intent and never consults the Processing Gate. A target that
+// is not tag-ready approves fine — the job is born after extraction and starts
+// held, so an operator can say "dub this title" days before the upstream
+// pipeline tags the file. Approve itself creates no sync job (its target track
+// does not exist yet) and records no force override nobody asked for.
+func TestApproveIneligibleTargetRecordsIntent(t *testing.T) {
 	h := newHarness(t)
 	target := "Shrek (2001) [ArcA310] [X].mkv"
 	id := h.seedCandidate(t, target, "waiting_for_tags", `["en"]`)
 	// A real gate verdict: required tag present, excluded tag carried, so the
-	// row proves the exclusion rather than a missing tag.
+	// row proves an exclusion rather than a missing tag.
 	rule := gate.Rule{Required: []string{"[ArcA310]"}, Excluded: []string{"[X]"}, Mode: gate.MatchAny, Enforce: true}
 	h.applyGate(t, id, filepath.Join(h.media, target), rule.Classify(target))
 	h.writeDonor(t)
 
 	rec := h.request(http.MethodPost, "/api/queue/"+itoa(id)+"/approve")
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("approve ineligible target = %d, want 409, body %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("approve ineligible target = %d, want 200, body %s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "not eligible") || !strings.Contains(rec.Body.String(), "excluded tag") {
-		t.Errorf("body = %s, want the gate's excluded-tag wording", rec.Body.String())
+	var body struct {
+		Approved bool `json:"approved"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode approve body: %v", err)
+	}
+	if !body.Approved {
+		t.Errorf("body = %s, want approved true", rec.Body.String())
 	}
 
+	var status string
+	if err := h.db.QueryRow(`SELECT status FROM import_queue WHERE id = ?`, id).Scan(&status); err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if status != "extracting" {
+		t.Errorf("status = %q, want extracting", status)
+	}
+	if n := countSyncJobs(t, h, id); n != 0 {
+		t.Errorf("sync jobs = %d, want 0: approve records intent, extraction breeds the job", n)
+	}
+	job, ok, err := (&store.Store{DB: h.db}).NextImportExtraction(context.Background())
+	if err != nil || !ok {
+		t.Fatalf("NextImportExtraction = (ok=%v, err=%v)", ok, err)
+	}
+	if job.ForceIgnoreTagFilter {
+		t.Error("force_ignore_tag_filter recorded although the request never asked for it")
+	}
+	if job.DonorPath != filepath.Join(h.media, donorName) {
+		t.Errorf("donor = %q, want the paired donor", job.DonorPath)
+	}
+}
+
+// TestApproveRecordsForceOnlyWhenTheSettingAllows pins the escape hatch: a
+// request may ask for "approve without waiting for tags", but the intent is
+// recorded only when security.options.allow_force_tag_override is on. The same
+// body proves both halves, so the setting is the only difference between them.
+func TestApproveRecordsForceOnlyWhenTheSettingAllows(t *testing.T) {
+	tests := []struct {
+		name      string
+		enable    bool
+		wantForce bool
+	}{
+		{name: "setting off ignores the request", enable: false, wantForce: false},
+		{name: "setting on records the request", enable: true, wantForce: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			id := h.seedCandidate(t, "Shrek (2001) [ArcA310] [X].mkv", "waiting_for_tags", `["en"]`)
+			h.writeDonor(t)
+			if tc.enable {
+				h.enableForceTagOverride(t)
+			}
+
+			rec := h.postJSON(t, "/api/queue/"+itoa(id)+"/approve", `{"force_ignore_tag_filter":true}`)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("approve with force = %d, want 200, body %s", rec.Code, rec.Body.String())
+			}
+			job, ok, err := (&store.Store{DB: h.db}).NextImportExtraction(context.Background())
+			if err != nil || !ok {
+				t.Fatalf("NextImportExtraction = (ok=%v, err=%v)", ok, err)
+			}
+			if job.ForceIgnoreTagFilter != tc.wantForce {
+				t.Errorf("force_ignore_tag_filter = %v, want %v", job.ForceIgnoreTagFilter, tc.wantForce)
+			}
+		})
+	}
+}
+
+// TestApproveRefusesWithoutTargetFile pins the target-file half of the four
+// unformable cases: a matched identity whose target path is gone has nothing to
+// pair a donor with, so approve answers 409 and leaves the row pending.
+func TestApproveRefusesWithoutTargetFile(t *testing.T) {
+	h := newHarness(t)
+	id := h.seedCandidate(t, "Target [ArcA310].mkv", "eligible", `["en"]`)
+	h.writeDonor(t)
+	// The match survives, its target file does not: the target is read from the
+	// cache row and the stored gate verdict, so both have to go.
+	if _, err := h.db.Exec(`UPDATE arr_library_cache SET target_file_path = NULL
+		WHERE id = (SELECT matched_library_cache_id FROM import_queue WHERE id = ?)`, id); err != nil {
+		t.Fatalf("clear cache target: %v", err)
+	}
+	h.clearGateVerdict(t, id)
+
+	rec := h.request(http.MethodPost, "/api/queue/"+itoa(id)+"/approve")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("approve without target file = %d, want 409, body %s", rec.Code, rec.Body.String())
+	}
+	if body := rec.Body.String(); !strings.Contains(body, "no target file") {
+		t.Errorf("body = %s, want it to name the missing target file", body)
+	}
 	var status string
 	if err := h.db.QueryRow(`SELECT status FROM import_queue WHERE id = ?`, id).Scan(&status); err != nil {
 		t.Fatalf("status: %v", err)
@@ -1399,66 +1488,212 @@ func TestApproveRejectsIneligibleTarget(t *testing.T) {
 	}
 }
 
-// TestApproveIneligibleTargetWithForceOverride pins the one escape hatch: with
-// settings.security.options.allow_force_tag_override on, approve admits a target
-// it refuses with the setting off, because approving may not be stricter than
-// the job-creation gate it anticipates.
-//
-// The SAME fixture row as TestApproveRejectsIneligibleTarget is used — the same
-// target path with its real gate verdict (required tag present, excluded tag
-// carried) and the same donor — so the flip is the only difference between the
-// two requests: refused 409 and left pending with the override off, accepted and
-// moved out of pending_approval with it on. A different row would prove only
-// that some other shape is acceptable.
-func TestApproveIneligibleTargetWithForceOverride(t *testing.T) {
+// TestApproveWithLiveJobIsIdempotent pins approval's idempotence in time: once
+// the row's extraction has bred a live job, a second approve answers success
+// instead of breeding another job or resetting the first one's progress. The
+// row is already extracting here, so without the live-job check this would be a
+// 409.
+func TestApproveWithLiveJobIsIdempotent(t *testing.T) {
 	h := newHarness(t)
-	target := "Shrek (2001) [ArcA310] [X].mkv"
-	id := h.seedCandidate(t, target, "waiting_for_tags", `["en"]`)
-	// The same verdict TestApproveRejectsIneligibleTarget records: the
-	// exclusion is proven, not a missing required tag.
-	rule := gate.Rule{Required: []string{"[ArcA310]"}, Excluded: []string{"[X]"}, Mode: gate.MatchAny, Enforce: true}
-	h.applyGate(t, id, filepath.Join(h.media, target), rule.Classify(target))
+	id := h.seedCandidate(t, "Target [ArcA310].mkv", "eligible", `["en"]`)
 	h.writeDonor(t)
 
-	statusOf := func() string {
-		t.Helper()
-		var status string
-		if err := h.db.QueryRow(`SELECT status FROM import_queue WHERE id = ?`, id).Scan(&status); err != nil {
-			t.Fatalf("status: %v", err)
-		}
-		return status
+	if rec := h.request(http.MethodPost, "/api/queue/"+itoa(id)+"/approve"); rec.Code != http.StatusOK {
+		t.Fatalf("first approve = %d, body %s", rec.Code, rec.Body.String())
 	}
-
-	// Override OFF: this exact row is refused, so the row itself is proven
-	// ineligible rather than the test merely taking a different fixture.
-	refused := h.request(http.MethodPost, "/api/queue/"+itoa(id)+"/approve")
-	if refused.Code != http.StatusConflict {
-		t.Fatalf("approve with the override off = %d, want 409, body %s", refused.Code, refused.Body.String())
+	jobID := h.seedSyncJob(t, id, store.SyncJobHeld, store.HeldReasonWaitingForTags, false)
+	var intentBefore string
+	if err := h.db.QueryRow(`SELECT parsed_raw_json FROM import_queue WHERE id = ?`, id).Scan(&intentBefore); err != nil {
+		t.Fatalf("read intent: %v", err)
 	}
-	if body := refused.Body.String(); !strings.Contains(body, "not eligible") || !strings.Contains(body, "excluded tag") {
-		t.Errorf("body = %s, want the gate's excluded-tag wording", body)
-	}
-	if status := statusOf(); status != "pending_approval" {
-		t.Fatalf("status with the override off = %q, want pending_approval", status)
-	}
-
-	// Override ON: the same row is now accepted and leaves the queue.
-	h.enableForceTagOverride(t)
 
 	rec := h.request(http.MethodPost, "/api/queue/"+itoa(id)+"/approve")
 	if rec.Code != http.StatusOK {
-		t.Fatalf("approve with force override = %d, want 200, body %s", rec.Code, rec.Body.String())
+		t.Fatalf("second approve = %d, want 200, body %s", rec.Code, rec.Body.String())
 	}
-	if status := statusOf(); status != "extracting" {
-		t.Errorf("status = %q, want extracting once the override admits the target", status)
+	var body struct {
+		Approved bool `json:"approved"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode approve body: %v", err)
+	}
+	if !body.Approved {
+		t.Errorf("body = %s, want approved true", rec.Body.String())
+	}
+
+	if n := countSyncJobs(t, h, id); n != 1 {
+		t.Errorf("sync jobs = %d, want 1: a retry must not breed a second job", n)
+	}
+	if got := syncJobStatusOf(t, h, jobID); got != store.SyncJobHeld {
+		t.Errorf("job status = %q, want %q: a retry must not touch progress", got, store.SyncJobHeld)
+	}
+	var intentAfter, rowStatus string
+	if err := h.db.QueryRow(`SELECT parsed_raw_json, status FROM import_queue WHERE id = ?`, id).
+		Scan(&intentAfter, &rowStatus); err != nil {
+		t.Fatalf("read row after retry: %v", err)
+	}
+	if intentAfter != intentBefore {
+		t.Errorf("parsed_raw_json changed on retry: %q -> %q", intentBefore, intentAfter)
+	}
+	if rowStatus != "extracting" {
+		t.Errorf("status = %q, want extracting (unchanged by the retry)", rowStatus)
 	}
 }
 
-// TestQueueMatchStateReadyUnderForceOverride pins that the card agrees with the
-// server once the override is on: an otherwise-ready row (a target file and a
-// paired donor) whose only blocker is the gate verdict reports ready, because
-// approve WILL accept it. Hiding the control the server would honour is the bug
-// this rules out. With the override off the same row keeps today's verdict.
+// seedSyncJob inserts the vault track a sync job requires and creates one job
+// owned by the queue row — the ledger shape extract.BirthSyncJob writes after
+// the extraction archived the track, so approve and reject run against a real
+// row instead of a stub.
+func (h *harness) seedSyncJob(t *testing.T, queueID int64, status, heldReason string, force bool) int64 {
+	t.Helper()
+	ctx := context.Background()
+	var cacheID int64
+	if err := h.db.QueryRowContext(ctx,
+		`SELECT COALESCE(matched_library_cache_id, 0) FROM import_queue WHERE id = ?`,
+		queueID).Scan(&cacheID); err != nil {
+		t.Fatalf("queue row cache id: %v", err)
+	}
+	if cacheID == 0 {
+		t.Fatalf("queue row %d has no matched library target to key a job on", queueID)
+	}
+
+	h.seq++
+	res, err := h.db.ExecContext(ctx,
+		`INSERT INTO vault_media (media_type, title, vault_folder_path)
+		 VALUES ('movie', 'Minions and Monsters', ?)`, h.media)
+	if err != nil {
+		t.Fatalf("insert vault media: %v", err)
+	}
+	mediaID, err := res.LastInsertId()
+	if err != nil {
+		t.Fatalf("vault media id: %v", err)
+	}
+	res, err = h.db.ExecContext(ctx,
+		`INSERT INTO audio_tracks
+		 (vault_media_id, group_uuid, lang_iso2, variant, file_path, sha256,
+		  codec, channels, channel_count)
+		 VALUES (?, ?, 'pl', 'dubbing', ?, 'sha', 'pcm_s16le', '2.0', 2)`,
+		mediaID, "group-"+itoa(int64(h.seq)),
+		filepath.Join(h.media, "track-"+itoa(int64(h.seq))+".pl.mka"))
+	if err != nil {
+		t.Fatalf("insert audio track: %v", err)
+	}
+	trackID, err := res.LastInsertId()
+	if err != nil {
+		t.Fatalf("audio track id: %v", err)
+	}
+
+	// Only queued|held may be born, so a terminal status is reached the way the
+	// worker reaches it: by transitioning an existing job.
+	born, bornReason := status, heldReason
+	if born != store.SyncJobQueued && born != store.SyncJobHeld {
+		born, bornReason = store.SyncJobQueued, ""
+	}
+	origin := queueID
+	rec, err := (&store.Store{DB: h.db}).CreateSyncJob(ctx, store.SyncJobCreate{
+		VaultTrackID:         trackID,
+		TargetLibraryCacheID: cacheID,
+		TargetVideoPath:      filepath.Join(h.media, "Target [ArcA310].mkv"),
+		TargetLangISO2:       "pl",
+		Status:               born,
+		HeldReason:           bornReason,
+		ForceIgnoreTagFilter: force,
+		OriginQueueID:        &origin,
+	})
+	if err != nil {
+		t.Fatalf("create sync job (%s): %v", born, err)
+	}
+	if born != status {
+		if _, err := h.db.ExecContext(ctx,
+			`UPDATE sync_mux_jobs SET status = ? WHERE id = ?`, status, rec.ID); err != nil {
+			t.Fatalf("move sync job %d to %q: %v", rec.ID, status, err)
+		}
+	}
+	return rec.ID
+}
+
+// countSyncJobs counts the jobs an approval bred, by origin.
+func countSyncJobs(t *testing.T, h *harness, queueID int64) int {
+	t.Helper()
+	var n int
+	if err := h.db.QueryRow(
+		`SELECT count(*) FROM sync_mux_jobs WHERE origin_queue_id = ?`, queueID).Scan(&n); err != nil {
+		t.Fatalf("count sync jobs: %v", err)
+	}
+	return n
+}
+
+// syncJobStatusOf reads one job's status, so a test can prove the handler left
+// it alone.
+func syncJobStatusOf(t *testing.T, h *harness, jobID int64) string {
+	t.Helper()
+	var status string
+	if err := h.db.QueryRow(`SELECT status FROM sync_mux_jobs WHERE id = ?`, jobID).Scan(&status); err != nil {
+		t.Fatalf("sync job %d status: %v", jobID, err)
+	}
+	return status
+}
+
+// TestRejectCancelsHeldJobByOrigin pins rejection's other half: withdrawing the
+// intent cancels the job it bred while that job is still queued|held, so a
+// released-later mux cannot happen behind a rejected row.
+func TestRejectCancelsHeldJobByOrigin(t *testing.T) {
+	h := newHarness(t)
+	id := h.seedCandidate(t, "Target [ArcA310].mkv", "waiting_for_tags", `["en"]`)
+	jobID := h.seedSyncJob(t, id, store.SyncJobHeld, store.HeldReasonWaitingForTags, false)
+
+	if rec := h.request(http.MethodPost, "/api/queue/"+itoa(id)+"/reject"); rec.Code != http.StatusOK {
+		t.Fatalf("reject = %d, body %s", rec.Code, rec.Body.String())
+	}
+	var rowStatus string
+	if err := h.db.QueryRow(`SELECT status FROM import_queue WHERE id = ?`, id).Scan(&rowStatus); err != nil {
+		t.Fatalf("row status: %v", err)
+	}
+	if rowStatus != "ignored" {
+		t.Errorf("row status = %q, want ignored", rowStatus)
+	}
+	if got := syncJobStatusOf(t, h, jobID); got != store.SyncJobCancelled {
+		t.Errorf("job status = %q, want %q", got, store.SyncJobCancelled)
+	}
+	var reason string
+	if err := h.db.QueryRow(`SELECT COALESCE(held_reason, '') FROM sync_mux_jobs WHERE id = ?`, jobID).Scan(&reason); err != nil {
+		t.Fatalf("job reason: %v", err)
+	}
+	if reason != store.CancelReasonRejection {
+		t.Errorf("held_reason = %q, want %q", reason, store.CancelReasonRejection)
+	}
+}
+
+// TestRejectLeavesCompletedJobAlone pins the guard on the cancel: rejection
+// withdraws an intent, it never rewrites history, so a job that already
+// completed keeps its status while the still-live one next to it is cancelled.
+func TestRejectLeavesCompletedJobAlone(t *testing.T) {
+	h := newHarness(t)
+	id := h.seedCandidate(t, "Target [ArcA310].mkv", "waiting_for_tags", `["en"]`)
+	completed := h.seedSyncJob(t, id, store.SyncJobCompleted, "", false)
+	held := h.seedSyncJob(t, id, store.SyncJobHeld, store.HeldReasonWaitingForTags, false)
+
+	if rec := h.request(http.MethodPost, "/api/queue/"+itoa(id)+"/reject"); rec.Code != http.StatusOK {
+		t.Fatalf("reject = %d, body %s", rec.Code, rec.Body.String())
+	}
+	if got := syncJobStatusOf(t, h, completed); got != store.SyncJobCompleted {
+		t.Errorf("completed job status = %q, want %q (terminal rows are untouched)", got, store.SyncJobCompleted)
+	}
+	if got := syncJobStatusOf(t, h, held); got != store.SyncJobCancelled {
+		t.Errorf("held job status = %q, want %q", got, store.SyncJobCancelled)
+	}
+}
+
+// TestQueueMatchStateReadyUnderForceOverride pins the card's force-override
+// projection: with security.options.allow_force_tag_override on, an
+// otherwise-ready row (a target file and a paired donor) whose only blocker is
+// the gate verdict reports ready, and the diagnostics report the flag; with it
+// off the same row keeps the gate verdict.
+//
+// Approve itself no longer consults the gate
+// (TestApproveIneligibleTargetRecordsIntent), so this projection now trails the
+// handler: widening `ready` to "no gate verdict blocks approval", and the card
+// that enables Approve on it, is the follow-up this slice does not take.
 func TestQueueMatchStateReadyUnderForceOverride(t *testing.T) {
 	h := newHarness(t)
 	target := "Shrek (2001) [ArcA310] [X].mkv"

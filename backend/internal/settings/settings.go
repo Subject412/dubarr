@@ -53,6 +53,7 @@ const (
 	KeyLanguagesPolicy = "languages.policy"
 	KeyTargetTagFilter = "target.tag_filter"
 	KeySyncDefaults    = "sync.defaults"
+	KeySyncStrategy    = "sync.strategy"
 	KeySecurityOptions = "security.options"
 	KeyMuxOptions      = "mux.options"
 	KeyWatchOptions    = "watch.options"
@@ -64,8 +65,8 @@ const (
 
 var knownKeys = []string{
 	KeyStoragePaths, KeyLanguagesPolicy, KeyTargetTagFilter, KeySyncDefaults,
-	KeySecurityOptions, KeyMuxOptions, KeyWatchOptions, KeyArrOptions,
-	KeyArrConnections, KeyImportsOptions, KeyAudioOptions,
+	KeySyncStrategy, KeySecurityOptions, KeyMuxOptions, KeyWatchOptions,
+	KeyArrOptions, KeyArrConnections, KeyImportsOptions, KeyAudioOptions,
 }
 
 // KnownKeys returns the writable section keys in stable order.
@@ -255,6 +256,47 @@ func (s *SyncDefaults) UnmarshalJSON(data []byte) error {
 	} else {
 		s.AnalysisSource = *aux.AnalysisSource
 	}
+	return nil
+}
+
+// StrategyOptions is the sync.strategy section: which sync techniques run, in
+// what order, and where each one's answer has to clear to be used (#82).
+//
+// It is the analyzer's [analyze.Strategy] with a settings-side decoder,
+// so the JSON the UI sends, the JSON that is stored, and the value the pipeline
+// runs are one schema — no translation layer to drift.
+type StrategyOptions analyze.Strategy
+
+// UnmarshalJSON materialises the shipped strategy when the section does not
+// carry a list.
+//
+// Three cases need it. A row written before 0.5.0 has no `techniques` key at
+// all; the SPA's generic section editor posts back exactly what it was served;
+// and an operator who deletes the list from the advanced editor must not end up
+// with a pipeline that has nothing to run. An explicit empty list is a
+// *present* key and stays empty, so [validateStrategy] can reject it with the
+// message the operator needs rather than silently replacing their edit.
+func (o *StrategyOptions) UnmarshalJSON(data []byte) error {
+	var aux struct {
+		Preset     *string              `json:"preset"`
+		Techniques *[]analyze.Technique `json:"techniques"`
+	}
+	// Unknown fields are rejected here, not only by the caller's decoder: the
+	// section is served back to the UI as it was stored, so a stray key
+	// (`checkpoints`, a field of a different section) must fail the save.
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&aux); err != nil {
+		return err
+	}
+	strategy := analyze.DefaultStrategy()
+	if aux.Preset != nil {
+		strategy.Preset = *aux.Preset
+	}
+	if aux.Techniques != nil {
+		strategy.Techniques = *aux.Techniques
+	}
+	*o = StrategyOptions(strategy)
 	return nil
 }
 
@@ -450,6 +492,10 @@ func Defaults(dataDir string) map[string]any {
 			// Shipped default: no rules, no transcoding (ADR-0010).
 			Rules: []transcode.Rule{},
 		},
+		// Shipped default: the D4 list — one waveform entry on every
+		// checkpoint — so a fresh install's offsets are the ones 0.4.0
+		// produced until the operator adds a technique.
+		KeySyncStrategy: StrategyOptions(analyze.DefaultStrategy()),
 	}
 }
 
@@ -614,6 +660,21 @@ func serveable(key, value string) json.RawMessage {
 		var p AudioOptions
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return raw
+		}
+		blob, err := json.Marshal(p)
+		if err != nil {
+			return raw
+		}
+		return blob
+	case KeySyncStrategy:
+		// A row written before 0.5.0 carries neither key, and a hand-edited
+		// one may carry only some of them. Decoding into the current schema
+		// resolves an absent list to the shipped strategy and re-marshalling
+		// serves a section that always has something to run. The stored row is
+		// left untouched.
+		var p StrategyOptions
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return raw // a malformed legacy row keeps its raw bytes
 		}
 		blob, err := json.Marshal(p)
 		if err != nil {
@@ -908,6 +969,13 @@ func normalize(key string, raw json.RawMessage) (string, error) {
 			err = transcode.ValidateOptions(&p)
 		}
 		v = p
+	case KeySyncStrategy:
+		var p StrategyOptions
+		err = strict(raw, &p)
+		if err == nil {
+			err = validateStrategy(&p)
+		}
+		v = p
 	}
 	if err != nil {
 		return "", fmt.Errorf("%w: %s: %v", ErrInvalidValue, key, err)
@@ -1173,6 +1241,107 @@ func validateSync(p *SyncDefaults) error {
 	default:
 		return errors.New("analysis_source must be windows or full")
 	}
+}
+
+// PresetTechniques is the one place a preset's technique list exists. The
+// server never expands a preset into a list at run time and the UI must not
+// either: both read it from here, and a settings test asserts the SPA's
+// DEFAULT_SETTINGS['sync.strategy'] is this value, so the two cannot drift.
+//
+// `custom` has no canonical list — it is what every other list is called — and
+// returns nil.
+//
+// D4a: `fast` keeps the waveform matcher and spends fewer checkpoints instead
+// (3 rather than 6, a sync.defaults decision), so its list is `balanced`'s.
+// MFCC is never a preset: its hop error is only acceptable once an operator
+// opts in.
+func PresetTechniques(name string) []analyze.Technique {
+	switch name {
+	case analyze.PresetFast:
+		return PresetTechniques(analyze.PresetBalanced)
+	case analyze.PresetBalanced:
+		// A copy: the caller may edit the list it gets back (the editor
+		// does), and the shipped strategy must not change with it.
+		return append([]analyze.Technique(nil), analyze.DefaultStrategy().Techniques...)
+	case analyze.PresetMaximumAccuracy:
+		return []analyze.Technique{
+			{
+				ID:            analyze.TechniqueWaveform,
+				Enabled:       true,
+				When:          analyze.WhenAlways,
+				MinConfidence: analyze.LowQualityThreshold,
+				MinMatchZ:     analyze.DefaultThresholds.MatchZMaybe,
+			},
+			{
+				// A second opinion only where the waveform answer was weak:
+				// every checkpoint would pay a decode for no gain.
+				ID:            analyze.TechniqueMFCC,
+				Enabled:       true,
+				When:          analyze.WhenBelowConfidence,
+				MinConfidence: 0.15,
+				MinMatchZ:     8.0,
+			},
+		}
+	default:
+		return nil
+	}
+}
+
+// validateStrategy enforces the #82 table on the way in, and stores the preset
+// name the list actually is.
+//
+// The label is derived, never trusted: a client that posts preset "maximum
+// accuracy" with the balanced list gets "balanced" stored, and one that posts a
+// hand-edited list gets "custom". Only an unknown label and an unsound list are
+// errors.
+func validateStrategy(p *StrategyOptions) error {
+	s := analyze.Strategy(*p)
+	s.Preset = resolvePreset(s.Preset, s.Techniques)
+	if err := s.Validate(); err != nil {
+		return fmt.Errorf("%s: %w", KeySyncStrategy, err)
+	}
+	*p = StrategyOptions(s)
+	return nil
+}
+
+// resolvePreset answers "which name does this list have?".
+//
+// A label that matches its own preset's canonical list is kept — `fast` and
+// `balanced` share a list, so the label is the only thing that tells them
+// apart, and it is what the operator picked. Anything else is re-derived from
+// the list, and a list that is nobody's canonical list is `custom`. An unknown
+// label is passed through untouched so [analyze.Strategy.Validate] rejects it
+// instead of quietly renaming the operator's choice.
+func resolvePreset(label string, techniques []analyze.Technique) string {
+	switch label {
+	case "", analyze.PresetFast, analyze.PresetBalanced, analyze.PresetMaximumAccuracy, analyze.PresetCustom:
+	default:
+		return label
+	}
+	if label != "" && label != analyze.PresetCustom && sameTechniques(techniques, PresetTechniques(label)) {
+		return label
+	}
+	for _, name := range []string{analyze.PresetBalanced, analyze.PresetMaximumAccuracy} {
+		if sameTechniques(techniques, PresetTechniques(name)) {
+			return name
+		}
+	}
+	return analyze.PresetCustom
+}
+
+// sameTechniques compares two lists element for element. Both sides come from
+// the same JSON schema, so exact equality is the right test: a threshold the
+// operator changed by one thousandth is a different strategy.
+func sameTechniques(a, b []analyze.Technique) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // maskFields walks a JSON value and replaces the value of any

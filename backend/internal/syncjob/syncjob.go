@@ -581,11 +581,18 @@ func (s *Service) runAnalysis(ctx context.Context, rec store.SyncJobRecord) (ana
 	if engine == nil {
 		engine = sync.New(sync.WithTimeout(analyze.JobTimeout(cfg)), sync.WithLogger(s.logger))
 	}
+	// Every technique this build can run, by id. Slice #83 adds
+	// analyze.TechniqueMFCC here; until then a strategy naming it is skipped
+	// with a note in the report instead of failing every job.
+	engines := map[analyze.TechniqueID]analyze.Engine{
+		analyze.TechniqueWaveform: engine,
+	}
 
 	jr := jobRun{
 		jobID:    rec.ID,
 		mode:     mode,
 		cfg:      cfg,
+		engines:  engines,
 		timings:  timings,
 		wholeSec: wholeDecodeSeconds(timings),
 		req: analyze.Request{
@@ -647,9 +654,13 @@ type analysisDecode struct {
 // jobRun is everything the analysis phase needs for one job, resolved once so
 // neither path re-probes, re-plans or re-resolves anything.
 type jobRun struct {
-	jobID   int64
-	mode    analysisMode
-	cfg     analyze.Config
+	jobID int64
+	mode  analysisMode
+	cfg   analyze.Config
+	// engines registers the techniques this build can actually run. It is
+	// resolved once, beside the engine itself, so a configured technique with
+	// no engine is a report note rather than a per-checkpoint surprise.
+	engines map[analyze.TechniqueID]analyze.Engine
 	timings SourceTimings
 	// wholeSec is how much audio the two whole-track decodes produce, in
 	// seconds (0 when the containers stated no durations).
@@ -816,6 +827,7 @@ func (s *Service) runWhole(ctx context.Context, engine analyze.Engine, jr jobRun
 	cfg := jr.cfg
 	cfg.Slicer = nil
 	cfg.AnalysisSource = analyze.AnalysisSourceFull
+	cfg.Engines = jr.engines
 	report, err := analyze.Analyze(ctx, engine, cfg, jr.req)
 	if err != nil {
 		return analysisRun{}, err
@@ -839,6 +851,7 @@ func (s *Service) runWindowed(ctx context.Context, engine analyze.Engine, jr job
 	cfg := jr.cfg
 	cfg.Slicer = slicer
 	cfg.AnalysisSource = analyze.AnalysisSourceWindows
+	cfg.Engines = jr.engines
 	report, err := analyze.Analyze(ctx, engine, cfg, jr.req)
 	if err != nil {
 		// A window that could not be decoded or was cut short is not an
@@ -1152,6 +1165,10 @@ func (s *Service) configuredWorkDir(ctx context.Context) string {
 func (s *Service) analysisPolicy(ctx context.Context) (reflang.Languages, analyze.Config) {
 	policy := reflang.Languages{}
 	cfg := analyze.DefaultConfig()
+	// The shipped strategy is the default until a row says otherwise, so a job
+	// with no settings service (or an unreadable row) still runs the 0.4.0
+	// pipeline.
+	cfg.Strategy = analyze.DefaultStrategy()
 	if s.settings == nil {
 		return policy, cfg
 	}
@@ -1200,7 +1217,46 @@ func (s *Service) analysisPolicy(ctx context.Context) (reflang.Languages, analyz
 			}
 		}
 	}
+	if raw, ok, err := s.settings.Get(ctx, settings.KeySyncStrategy); err == nil && ok {
+		var so settings.StrategyOptions
+		if json.Unmarshal(raw, &so) == nil {
+			cfg.Strategy = sanitizeStrategy(analyze.Strategy(so))
+		}
+	}
 	return policy, cfg
+}
+
+// sanitizeStrategy drops what this build cannot run and keeps the rest.
+//
+// A stored row can name a technique from a newer release than the binary, or a
+// list that skipped validation (a direct insert, an imported backup). Neither is
+// a reason to fail a job: an unknown id goes, the rest stays, and a list left
+// with nothing runnable — or with no enabled entry, or with an unsound first
+// step — falls back to the shipped strategy. The pipeline is never empty.
+func sanitizeStrategy(s analyze.Strategy) analyze.Strategy {
+	out := analyze.Strategy{
+		Preset:     s.Preset,
+		Techniques: make([]analyze.Technique, 0, len(s.Techniques)),
+	}
+	for _, entry := range s.Techniques {
+		if !entry.ID.Known() || !entry.When.Known() {
+			continue
+		}
+		out.Techniques = append(out.Techniques, entry)
+	}
+	if len(out.Techniques) == 0 {
+		return analyze.DefaultStrategy()
+	}
+	if out.Preset == "" {
+		// A row without a label is whatever its list is; the settings layer
+		// derives the name on the way in, so an unlabelled row here is one
+		// that skipped it.
+		out.Preset = analyze.PresetCustom
+	}
+	if err := out.Validate(); err != nil {
+		return analyze.DefaultStrategy()
+	}
+	return out
 }
 
 func (s *Service) resolveFFmpeg() (string, error) {

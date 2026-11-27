@@ -443,6 +443,16 @@ type Config struct {
 	// duration must come from the request rather than from the staged WAVs
 	// (see [ErrNoDuration]).
 	AnalysisSource string `json:"-"`
+	// Strategy is the technique pipeline. The zero value means
+	// [DefaultStrategy], so a caller that has never heard of a strategy gets
+	// 0.4.0's behaviour: one waveform entry on every checkpoint.
+	Strategy Strategy `json:"strategy"`
+	// Engines maps a technique onto the seam that runs it. A missing (or nil)
+	// key means "this build cannot run that technique": [Analyze] skips it and
+	// says so in the report, rather than failing every job until slice 04
+	// registers its engine. [Analyze]'s own engine argument satisfies
+	// — and, when unset here, fills in — the waveform entry.
+	Engines map[TechniqueID]Engine `json:"-"`
 }
 
 // windowed reports whether cfg asks for windows cut at the planned positions
@@ -508,6 +518,26 @@ type Request struct {
 	OriginalLanguage string
 }
 
+// Attempt is one technique's answer on one checkpoint, whether or not it was
+// good enough to be used.
+//
+// It is recorded for every technique that ran, so a report can explain why a
+// checkpoint fell through to the next step and which answer won. Error is the
+// engine's own failure, verbatim: an attempt that errored carries no offset, and
+// a zero offset is never substituted for one.
+type Attempt struct {
+	Technique   string  `json:"technique"`
+	OffsetMS    float64 `json:"offset_ms"`
+	Quality     float64 `json:"quality"`
+	MatchZ      float64 `json:"match_z"`
+	PrecisionMS float64 `json:"precision_ms"`
+	// OffsetSubMS is the interpolated sub-sample part of OffsetMS, carried
+	// per attempt so the winning answer's own value reaches the checkpoint.
+	OffsetSubMS float64 `json:"offset_sub_ms"`
+	Accepted    bool    `json:"accepted"`
+	Error       string  `json:"error,omitempty"`
+}
+
 // Checkpoint is one correlation point in the report.
 //
 // OffsetSubMS, MatchZ and PrecisionMS are the 0.5.0 diagnostics and are never
@@ -515,15 +545,21 @@ type Request struct {
 // recorded" sentinel a 0.4.0 row decodes to. MatchZ in particular is 0 both for
 // "scored no z" and for "written before 0.5.0", and both mean the same thing to
 // the verdict: no z evidence.
+//
+// Technique names the winning entry and Attempts carries every technique that
+// ran here (#82). Both are additive: a 0.4.0 row decodes with an empty
+// technique and no attempts, which the UI renders as the old single-line row.
 type Checkpoint struct {
-	PositionPct   int     `json:"position_pct"`
-	SliceStartSec float64 `json:"slice_start_sec"`
-	SliceLenSec   float64 `json:"slice_len_sec"`
-	OffsetMS      float64 `json:"offset_ms"`
-	Quality       float64 `json:"correlation_quality"`
-	OffsetSubMS   float64 `json:"offset_sub_ms"`
-	MatchZ        float64 `json:"match_z"`
-	PrecisionMS   float64 `json:"precision_ms"`
+	PositionPct   int       `json:"position_pct"`
+	SliceStartSec float64   `json:"slice_start_sec"`
+	SliceLenSec   float64   `json:"slice_len_sec"`
+	OffsetMS      float64   `json:"offset_ms"`
+	Quality       float64   `json:"correlation_quality"`
+	OffsetSubMS   float64   `json:"offset_sub_ms"`
+	MatchZ        float64   `json:"match_z"`
+	PrecisionMS   float64   `json:"precision_ms"`
+	Technique     string    `json:"technique"`
+	Attempts      []Attempt `json:"attempts,omitempty"`
 }
 
 // Report is the persisted multi-point analysis (sync_jobs.checkpoints_json).
@@ -557,6 +593,15 @@ type Report struct {
 	Thresholds     Thresholds     `json:"thresholds"`
 	Fit            *LineFit       `json:"fit,omitempty"`
 	Application    *Application   `json:"application,omitempty"`
+	// Strategy is what this job was asked to run, so a report is
+	// self-describing: two reports are comparable only when the same
+	// techniques produced them.
+	Strategy Strategy `json:"strategy"`
+	// Notes explains a configured technique that did not run — this build has
+	// no engine for it — so a strategy naming `mfcc` says why it was ignored
+	// instead of quietly doing less. Empty (and absent) for the shipped
+	// strategy, which always runs.
+	Notes []string `json:"notes,omitempty"`
 }
 
 // Application records what was done to the dub copy before the mux, so the job
@@ -674,11 +719,27 @@ type Segment struct {
 // sync.WithTimeout: the runner's own default is shorter than a 190 s
 // correlation job.
 func Analyze(ctx context.Context, engine Engine, cfg Config, req Request) (Report, error) {
-	if engine == nil {
+	if engine == nil && len(cfg.Engines) == 0 {
 		return Report{}, fmt.Errorf("analyze: nil engine")
 	}
 	if err := cfg.validate(); err != nil {
 		return Report{}, err
+	}
+	// The strategy and the engines are resolved once, here, before a single
+	// checkpoint runs: a zero strategy is the shipped one, the engine argument
+	// is the waveform engine, and a technique this build cannot run is dropped
+	// with a note instead of being discovered per checkpoint.
+	strategy := cfg.Strategy.normalised()
+	if err := strategy.Validate(); err != nil {
+		return Report{}, fmt.Errorf("analyze: %w", err)
+	}
+	cfg.Strategy = strategy
+	cfg.Engines = mergeEngines(cfg.Engines, engine)
+	if len(cfg.entries()) == 0 {
+		// Every enabled technique is unavailable: that is a composition-root
+		// bug, not a settings row, so it is loud and immediate — six
+		// checkpoints failing one by one would say much less.
+		return Report{}, fmt.Errorf("analyze: no enabled technique has an engine")
 	}
 	// A windowed plan is a percentage of the probed duration, so a missing
 	// one must fail before any slicer is asked for audio: the alternative is
@@ -742,10 +803,23 @@ func Analyze(ctx context.Context, engine Engine, cfg Config, req Request) (Repor
 		Qualities:   make([]float64, len(pcts)),
 		MatchZ:      make([]float64, len(pcts)),
 		Thresholds:  DefaultThresholds,
+		Strategy:    cfg.Strategy,
+	}
+	for _, id := range cfg.skipped() {
+		report.Notes = append(report.Notes,
+			fmt.Sprintf("technique %q skipped: no engine registered", id))
 	}
 
-	runs, err := runCheckpoints(ctx, engine, cfg, cfg.slicer(req), plan, workers)
+	slicer := cfg.slicer(req)
+	runs, err := runCheckpoints(ctx, cfg, slicer, plan, workers)
 	if err != nil {
+		return Report{}, err
+	}
+	// Phase 2: the drift-driven second pass, which runs only when a strategy
+	// names an `above_drift` technique (normally: never) and reads every
+	// checkpoint's first answer to find the outliers. It is one sequential
+	// pass, before the aggregation, so the report states the final answers.
+	if err := applyAboveDrift(ctx, cfg, slicer, plan, runs); err != nil {
 		return Report{}, err
 	}
 
@@ -756,8 +830,9 @@ func Analyze(ctx context.Context, engine Engine, cfg Config, req Request) (Repor
 		report.OffsetsMS[i] = run.checkpoint.OffsetMS
 		report.Qualities[i] = run.checkpoint.Quality
 		report.MatchZ[i] = run.checkpoint.MatchZ
-		// The coarsest precision wins: a report must never claim more
-		// resolution than its worst checkpoint.
+		// The coarsest answer wins: a report must never claim more
+		// resolution than its worst checkpoint, and a checkpoint contributes
+		// the precision of the technique that answered it.
 		if run.checkpoint.PrecisionMS > report.PrecisionMS {
 			report.PrecisionMS = run.checkpoint.PrecisionMS
 		}
@@ -780,6 +855,11 @@ func Analyze(ctx context.Context, engine Engine, cfg Config, req Request) (Repor
 // checkpointRun is one checkpoint's slot in the dispatch. Exactly one worker
 // writes a given slot and nothing else does, so the slice needs no lock: the
 // join is the happens-before edge.
+//
+// The slot carries the whole [Checkpoint], attempts included: a technique runs
+// in the worker that owns the checkpoint, so nothing is appended from a
+// goroutine into shared state and the aggregation loop copies the attempts in
+// checkpoint order after the join.
 type checkpointRun struct {
 	checkpoint Checkpoint
 	// cause is the worker's failure, already wrapped as
@@ -798,8 +878,9 @@ type checkpointRun struct {
 //
 // One slicer call per checkpoint, from the worker that owns that checkpoint:
 // the Slicer contract makes that safe for any worker count, and the worker
-// writes only its own slot.
-func runCheckpoints(ctx context.Context, engine Engine, cfg Config, slicer Slicer, plan []Window, workers int) ([]checkpointRun, error) {
+// writes only its own slot. Every technique on that checkpoint then reads the
+// same slice (see [evaluateCheckpoint]).
+func runCheckpoints(ctx context.Context, cfg Config, slicer Slicer, plan []Window, workers int) ([]checkpointRun, error) {
 	runs := make([]checkpointRun, len(plan))
 
 	runCtx, cancel := context.WithCancel(ctx)
@@ -828,8 +909,7 @@ func runCheckpoints(ctx context.Context, engine Engine, cfg Config, slicer Slice
 				// offset and length of the audio the slicer handed it, and
 				// neither is derived from the other.
 				window := plan[i]
-				pct := window.PositionPct
-				result, err := runWindow(runCtx, engine, cfg, slicer, window)
+				checkpoint, err := evaluateCheckpoint(runCtx, cfg, slicer, window)
 				if err != nil {
 					// A checkpoint cancelled by a sibling's failure says
 					// nothing about its own audio, so it must never outrank
@@ -840,7 +920,7 @@ func runCheckpoints(ctx context.Context, engine Engine, cfg Config, slicer Slice
 					// report its own failure.
 					casualty := errors.Is(err, context.Canceled) && runCtx.Err() != nil
 					runs[i] = checkpointRun{
-						cause:    fmt.Errorf("analyze: checkpoint %d%%: %w", pct, err),
+						cause:    fmt.Errorf("analyze: checkpoint %d%%: %w", window.PositionPct, err),
 						casualty: casualty,
 					}
 					if !casualty {
@@ -851,20 +931,7 @@ func runCheckpoints(ctx context.Context, engine Engine, cfg Config, slicer Slice
 					}
 					return
 				}
-				runs[i] = checkpointRun{checkpoint: Checkpoint{
-					PositionPct: pct,
-					// The report states where the window sits in the film,
-					// never where the engine read it: result.Analyzed.Start
-					// is the engine's own echo and carries no position the
-					// report may use.
-					SliceStartSec: window.FilmStartSec,
-					SliceLenSec:   window.LenSec,
-					OffsetMS:      result.OffsetMS,
-					Quality:       result.CorrelationQuality,
-					OffsetSubMS:   result.OffsetSubMS,
-					MatchZ:        result.MatchZ,
-					PrecisionMS:   result.PrecisionMS,
-				}}
+				runs[i] = checkpointRun{checkpoint: checkpoint}
 			}
 		}()
 	}
@@ -910,7 +977,15 @@ func runWindow(ctx context.Context, engine Engine, cfg Config, slicer Slicer, w 
 	// Every attempt is released, success or not: a window implementation
 	// keeps at most one checkpoint's files per worker.
 	defer slicer.Release(w)
+	return runJob(ctx, engine, cfg, slice, w)
+}
 
+// runJob is one correlation over one already-cut slice: the engine call, its
+// per-job timeout, and the echo check that the engine saw the audio the plan
+// asked for. [runWindow] is its single-technique wrapper and
+// [evaluateCheckpoint] runs it once per technique on the same slice, so the
+// single-technique path and the pipeline cannot drift apart.
+func runJob(ctx context.Context, engine Engine, cfg Config, slice Slice, w Window) (sync.Result, error) {
 	length := slice.LenSec
 	job := sync.Job{
 		TargetPath:    slice.TargetPath,

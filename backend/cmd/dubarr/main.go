@@ -602,7 +602,7 @@ func wireExtractWorker(ctx context.Context, deps extractWiring) (*extract.Worker
 		Settings:  deps.Settings,
 		DataDir:   deps.DataDir,
 		Interval:  deps.Interval,
-		VaultHook: newVaultHook(writer),
+		VaultHook: newVaultHook(writer, deps.Store, deps.Settings),
 		Logf:      logf,
 		Debugf:    deps.Debugf,
 	})
@@ -682,6 +682,12 @@ func wireSyncWorker(ctx context.Context, deps syncWiring) (*syncworker.Worker, e
 		return nil, fmt.Errorf("arr rescanner: %w", err)
 	}
 
+	// #48: release before the worker exists. The hold is state, not a timer, so
+	// a job held when the appliance last stopped has to be re-projected against
+	// the tags as they are now; otherwise it waits for an arr pass that may be
+	// hours away. This is the same projection the poller runs after a pass.
+	releaseHeldSyncJobs(ctx, deps.Store, deps.Settings, logf)
+
 	worker, err := syncworker.New(syncworker.Dependencies{
 		Store:     deps.Store,
 		Settings:  deps.Settings,
@@ -697,6 +703,29 @@ func wireSyncWorker(ctx context.Context, deps syncWiring) (*syncworker.Worker, e
 		return nil, fmt.Errorf("sync worker: %w", err)
 	}
 	return worker, nil
+}
+
+// releaseHeldSyncJobs runs one eligibility projection over the held sync jobs.
+// It is called before the sync worker starts (boot, and a post-boot activation
+// of the same wiring) so a job whose target is already tagged runs on the first
+// drain instead of waiting for the next arr pass.
+//
+// A failure is logged and swallowed: an unreadable tag filter must not disable
+// the worker, and the next pass re-projects.
+func releaseHeldSyncJobs(ctx context.Context, st *store.Store, settingsStore *settings.Store, logf func(string, ...any)) {
+	rule, err := loadGateRule(ctx, settingsStore)
+	if err != nil {
+		logf("dubarr: release held sync jobs: %v", err)
+		return
+	}
+	n, err := st.ReleaseHeldJobs(ctx, arrsync.HeldEligible(rule))
+	if err != nil {
+		logf("dubarr: release held sync jobs: %v", err)
+		return
+	}
+	if n > 0 {
+		logf("dubarr: released %d held sync job(s) whose target is now eligible", n)
+	}
 }
 
 // arrSyncWiring is the collaborator set for the M6-1 library poller.
@@ -815,7 +844,20 @@ func loadArrSyncInterval(ctx context.Context, st *settings.Store) (time.Duration
 
 // newVaultHook adapts vault.Writer to extract.VaultHook: one Write per staged
 // track, all sharing a Donor Group UUID so sibling tracks stay linked.
-func newVaultHook(writer *vault.Writer) extract.VaultHook {
+//
+// It is also the only place a sync job is born (#48). Approval records intent
+// and cannot create the row — sync_mux_jobs.target_track_id is NOT NULL and
+// references the vault track this hook has just archived — so the job is created
+// here, from the archived entry, with the queue row's force flag and matched
+// library target. The gate is consulted at that birth (extract.BirthSyncJob):
+// an eligible pair is born queued, an ineligible one born held with a reason and
+// promoted later by the release projection.
+//
+// The approval pairs one donor with one target, so exactly one job is bred per
+// queue row: the first archived track is the one the export policy selected for
+// the target, and the sibling tracks it also archived are references, never
+// muxed on their own.
+func newVaultHook(writer *vault.Writer, st *store.Store, settingsStore *settings.Store) extract.VaultHook {
 	return func(ctx context.Context, job store.ImportExtractionJob, tracks []extract.StagedTrack) error {
 		media, baseName, err := vaultMediaFor(job)
 		if err != nil {
@@ -825,8 +867,9 @@ func newVaultHook(writer *vault.Writer) extract.VaultHook {
 		if err != nil {
 			return err
 		}
+		var first *vault.Entry
 		for _, track := range tracks {
-			if _, err := writer.Write(ctx, vault.Request{
+			entry, err := writer.Write(ctx, vault.Request{
 				StagedPath:        track.Path,
 				BaseName:          baseName,
 				Language:          track.Language,
@@ -842,9 +885,26 @@ func newVaultHook(writer *vault.Writer) extract.VaultHook {
 				SampleRate:        track.SampleRate,
 				DurationMS:        track.Duration.Milliseconds(),
 				SourceReleaseName: job.Filename,
-			}); err != nil {
+			})
+			if err != nil {
 				return fmt.Errorf("archive %s: %w", filepath.Base(track.Path), err)
 			}
+			if first == nil {
+				first = entry
+			}
+		}
+		if first == nil {
+			return nil
+		}
+		// A birth failure fails the queue row instead of leaving an archived
+		// track with no job to mux it: the intent was approved, and a silent
+		// half-import would only surface as a dub nobody can find.
+		rule, err := loadGateRule(ctx, settingsStore)
+		if err != nil {
+			return fmt.Errorf("birth sync job for queue row %d: %w", job.ID, err)
+		}
+		if _, err := extract.BirthSyncJob(ctx, st, rule, job, first.ID, first.LanguageISO2); err != nil {
+			return err
 		}
 		return nil
 	}

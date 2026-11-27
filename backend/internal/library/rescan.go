@@ -117,8 +117,41 @@ func (s *Service) handleRescan(w http.ResponseWriter, r *http.Request) {
 	if err := step.reread(ctx); err != nil {
 		resp.Reread = "failed"
 		resp.RereadError = truncateRereadError(logs.Redact(err.Error()))
+	} else {
+		// The row's tags and target path are fresh now, so this is an epoch for
+		// the eligibility projection: jobs held on this target may be runnable
+		// and nothing else will look before the next sync pass.
+		s.releaseHeld(ctx)
 	}
 	writeJSON(w, http.StatusAccepted, resp)
+}
+
+// releaseHeld promotes every held sync job whose target passes the gate now,
+// after a rescan refreshed the row it waits on. Failures are logged and
+// swallowed: the rescan itself succeeded, and the next epoch retries.
+func (s *Service) releaseHeld(ctx context.Context) {
+	if s.store == nil || s.store.DB == nil {
+		return
+	}
+	rule, err := s.gateRule(ctx)
+	if err != nil {
+		log.Printf("library: read tag filter for the held jobs projection: %v", err)
+		return
+	}
+	n, err := s.store.ReleaseHeldJobs(ctx, func(job store.HeldJob) bool {
+		return rule.EligiblePath(job.TargetVideoPath, gate.ArrMetadata{
+			Found:      job.HasArrRow,
+			Tags:       job.ArrTags,
+			RootFolder: job.ArrRootFolder,
+		})
+	})
+	if err != nil {
+		log.Printf("library: release held sync jobs: %v", err)
+		return
+	}
+	if n > 0 {
+		log.Printf("library: released %d held sync job(s) whose target is now eligible", n)
+	}
 }
 
 // rescanStep is the pair of arr calls one rescan makes: the command, and the

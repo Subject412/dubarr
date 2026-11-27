@@ -400,6 +400,34 @@ describe('security options (vault_read_only and AV1 switches retired)', () => {
     expect(screen.queryByRole('switch', { name: /AV1/i })).toBeNull()
     expect(screen.queryByText(/AV1/i)).toBeNull()
   })
+
+  it('round-trips the force tag override toggle through the settings payload', async () => {
+    // #48 reads the same switch at approval time, so flipping it must reach the
+    // server as the stored section, not just as local state.
+    const user = userEvent.setup()
+    const fetchMock = mockSecurityFetch()
+    renderWithProviders(<SettingsPage />, { route: '/settings' })
+
+    const control = await screen.findByRole('switch', { name: 'Allow force tag override' })
+    expect(control).toHaveAttribute('aria-checked', 'false')
+
+    await user.click(control)
+    expect(control).toHaveAttribute('aria-checked', 'true')
+
+    await user.click(screen.getByLabelText('Save Security options'))
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([, init]) => isMethod(init, 'PUT'))).toBe(true)
+    })
+
+    const put = fetchMock.mock.calls.find(([, init]) => isMethod(init, 'PUT'))
+    const body = JSON.parse(String(put?.[1]?.body)) as {
+      settings: { 'security.options': { allow_force_tag_override: boolean } }
+    }
+    expect(body.settings['security.options']).toEqual({ allow_force_tag_override: true })
+    // The help text documents the new reach of the switch (#48) without turning
+    // every approval into a force run.
+    expect(SETTINGS_HELP['security.options'].allow_force_tag_override).toMatch(/one job|one approved job|single item/i)
+  })
 })
 
 describe('tag match mode (ADR-0005)', () => {

@@ -1123,3 +1123,112 @@ describe('piecewise report (#84)', () => {
     expect(await screen.findAllByTestId(/^boundary-marker-/)).toHaveLength(1)
   })
 })
+
+/** A held job (#48): approved, waiting for its target, no report yet. */
+function heldJob(overrides: Partial<SyncJob> = {}): SyncJob {
+  // The report is cleared: a waiting job has not been analysed, and the detail
+  // must not imply the worker is mid-flight.
+  return makeJob({
+    id: 50,
+    status: 'held',
+    report: undefined,
+    calculated_offset_ms: 0,
+    held_reason: 'waiting_for_tags',
+    force_ignore_tag_filter: false,
+    origin_queue_id: 7,
+    ...overrides,
+  })
+}
+
+/**
+ * Serves the job list (all, or `?status=held`) and any detail for a job this
+ * stub knows. The filter branch is what proves the page asks the server rather
+ * than hunting through a full list.
+ */
+function stubJobList(jobs: SyncJob[]) {
+  const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input)
+    const detail = jobs.find((job) => url.endsWith(`/api/sync/jobs/${job.id}`))
+    if (detail) return jsonResponse(detail)
+    if (url.endsWith('/api/sync/jobs?status=held')) {
+      return jsonResponse({ items: jobs.filter((job) => job.status === 'held') })
+    }
+    if (url.endsWith('/api/sync/jobs')) return jsonResponse({ items: jobs })
+    return jsonResponse({ error: 'unexpected' }, 404)
+  })
+  vi.stubGlobal('fetch', fetchMock)
+  return fetchMock
+}
+
+describe('held jobs (#48)', () => {
+  it('reads as waiting with its reason, never as failed or ready', async () => {
+    stubJobList([heldJob()])
+    renderWithProviders(<SyncPage />, { route: '/sync' })
+
+    const row = await screen.findByTestId('sync-job-row-50')
+    expect(within(row).getByText('waiting')).toBeInTheDocument()
+    expect(within(row).queryByText('failed')).toBeNull()
+    expect(within(row).queryByText('done')).toBeNull()
+    expect(within(row).queryByText('ready')).toBeNull()
+    expect(within(row).getByTestId('sync-job-held-50')).toHaveTextContent(
+      /once the target carries the required filename tags/,
+    )
+
+    // The detail repeats the hold instead of claiming an analysis is running.
+    const detail = await screen.findByTestId('sync-detail-held')
+    expect(detail).toHaveTextContent(/waiting for tags/i)
+    expect(screen.getByTestId('sync-status')).toHaveTextContent('waiting')
+    expect(screen.queryByText(/Waiting for the analysis worker/)).toBeNull()
+  })
+
+  it('names a missing target as what the job waits for', async () => {
+    stubJobList([heldJob({ id: 51, held_reason: 'missing_target' })])
+    renderWithProviders(<SyncPage />, { route: '/sync' })
+
+    const row = await screen.findByTestId('sync-job-row-51')
+    const reason = within(row).getByTestId('sync-job-held-51')
+    expect(reason).toHaveTextContent(/target file/i)
+    expect(reason).not.toHaveTextContent(/tags/i)
+  })
+
+  it('filters the list to waiting jobs and asks the server for them', async () => {
+    const user = userEvent.setup()
+    const done = makeJob({ id: 60, status: 'done' })
+    const fetchMock = stubJobList([done, heldJob({ id: 61 })])
+    renderWithProviders(<SyncPage />, { route: '/sync' })
+
+    await screen.findByTestId('sync-job-row-60')
+    await user.click(screen.getByRole('tab', { name: 'Waiting' }))
+
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.some(([url]) => String(url).includes('/api/sync/jobs?status=held')),
+      ).toBe(true)
+    })
+
+    const list = await screen.findByTestId('sync-job-list')
+    const rows = within(list).getAllByTestId(/^sync-job-row-/)
+    expect(rows.map((row) => row.getAttribute('data-testid'))).toEqual(['sync-job-row-61'])
+    // A finished job must never appear under the waiting filter, even if a
+    // server answered the filter with the full list.
+    expect(within(list).queryByTestId('sync-job-row-60')).toBeNull()
+  })
+
+  it('marks a job that skipped the tag gate as forced', async () => {
+    const forced = makeJob({
+      id: 70,
+      status: 'queued',
+      report: undefined,
+      force_ignore_tag_filter: true,
+      origin_queue_id: 9,
+    })
+    stubJobList([forced])
+    renderWithProviders(<SyncPage />, { route: '/sync' })
+
+    const row = await screen.findByTestId('sync-job-row-70')
+    expect(within(row).getByTestId('sync-job-forced-70')).toHaveTextContent(
+      'started without waiting',
+    )
+    expect(within(row).queryByTestId('sync-job-held-70')).toBeNull()
+  })
+})

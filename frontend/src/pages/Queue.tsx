@@ -117,10 +117,15 @@ function instructionFor(item: QueueItem): { state: QueueMatchState; text: string
 }
 
 /**
- * Why Approve cannot be clicked, or null when it can. A row that is not `ready`
- * is never approvable — handleApprove answers 409 for exactly those cases (no
- * match, no target file, unreadable folder, no donor, an ineligible target) —
- * so the reason is `match_reason` rather than a second vocabulary.
+ * Why Approve cannot be clicked, or null when it can. `match_state` is the
+ * server's own "approve would accept this" verdict (ready = matched target with
+ * a target file, a readable folder and a donor), so the card follows it rather
+ * than re-deriving the rule.
+ *
+ * The Processing Gate verdict is deliberately NOT part of it (#48): approve
+ * records intent and the job is born after the extraction, so an ineligible
+ * target is approvable and simply enters the job list held. What the gate
+ * decides is when the job starts, which [approveOutcomeFor] words.
  *
  * A local manual pick is the one exception, and only while the server still
  * reports the row unmatched: handleApprove accepts a client-supplied
@@ -134,6 +139,24 @@ function approveBlockReason(item: QueueItem, manualMatch: LibrarySearchItem | nu
   if (matchStateOf(item) === 'ready') return null
   if (!item.matched) return 'Match this release to an arr library item first.'
   return (item.match_reason ?? '').trim() || 'This release is not ready to approve yet.'
+}
+
+/**
+ * What pressing Approve will actually do, in the operator's words (#48). The
+ * gate verdict no longer withholds the button, so this sentence is where the
+ * consequence lives: an eligible pair queues at once, an ineligible one is
+ * approved now and waits for the world to change.
+ */
+const approveOutcomeCopy: Record<QueueEligibility, string> = {
+  eligible: 'Approve to queue it — the dub is extracted now and the job starts right after.',
+  waiting_for_tags:
+    'Approve now, it waits for tags — the job starts by itself once the target carries your required tags.',
+  missing_target:
+    'Approve now, it waits for the target file — the job starts by itself once the file is back.',
+}
+
+function approveOutcomeFor(item: QueueItem): string {
+  return approveOutcomeCopy[item.eligibility] ?? approveOutcomeCopy.missing_target
 }
 
 /** Which empty state an empty queue is in, from the server's diagnostics. */
@@ -432,9 +455,10 @@ function QueueCard({
   rejecting,
   identifying,
   identifyingKind,
+  forceAllowed,
 }: {
   item: QueueItem
-  onApprove: (id: number, libraryCacheId?: number) => void
+  onApprove: (id: number, libraryCacheId?: number, forceIgnoreTagFilter?: boolean) => void
   onReject: (id: number) => void
   onIdentify: (id: number, kind?: string) => Promise<QueueIdentifyResponse>
   onMatch: (id: number, candidate: QueueIdentifyCandidate) => Promise<unknown>
@@ -443,6 +467,8 @@ function QueueCard({
   identifying: boolean
   /** The arr library the in-flight identify request named, when it named one. */
   identifyingKind?: string
+  /** `security.options.allow_force_tag_override`: the server only offers it when on. */
+  forceAllowed: boolean
 }) {
   const view = eligibilityView[item.eligibility] ?? eligibilityView.missing_target
   // A missing or unexpected match_state must not mislabel a matched row, so the
@@ -459,6 +485,12 @@ function QueueCard({
   const [pickingId, setPickingId] = useState<number | null>(null)
   const [pickError, setPickError] = useState<Error | null>(null)
   const blockReason = approveBlockReason(item, manualMatch)
+  // "Start now" is only offered where it changes something: the setting must be
+  // on and the row must be waiting for tags. It cannot conjure a missing target
+  // file, so a missing-target row keeps its hold and no checkbox.
+  const [force, setForce] = useState(false)
+  const offerForce =
+    forceAllowed && blockReason === null && item.eligibility === 'waiting_for_tags'
   // One id per card, so the disabled control describes exactly its own hint.
   const blockHintId = useId()
 
@@ -593,6 +625,29 @@ function QueueCard({
         </p>
       )}
 
+      {/* The override, worded as what it does and how far it reaches: one job,
+          one tag gate, and a file the pipeline may still replace later. */}
+      {offerForce && (
+        <label
+          data-testid="approve-force"
+          className="mt-3 flex cursor-pointer items-start gap-2 rounded-lg border border-ink-800 bg-ink-950/60 p-3"
+        >
+          <input
+            type="checkbox"
+            className="mt-0.5 size-3.5 accent-amber-500"
+            checked={force}
+            onChange={(event) => setForce(event.target.checked)}
+          />
+          <span className="text-xs">
+            <span className="font-medium text-zinc-200">Start without waiting for tags</span>
+            <span className="mt-0.5 block text-zinc-500">
+              Bypasses the tag gate for this one job: it queues now instead of waiting, and the
+              mux may land in a file the pipeline replaces later.
+            </span>
+          </span>
+        </label>
+      )}
+
       {/* One instruction per match state. `unmatched` already carries the
           identify panel (with the same sentence as its heading), so it needs
           nothing here. */}
@@ -623,6 +678,14 @@ function QueueCard({
             Approve unavailable: {blockReason}
           </p>
         )}
+        {!blockReason && (
+          // The gate verdict no longer withholds the button, so the card owes the
+          // operator the consequence instead: queue now, or wait for the world to
+          // change. Same line for every row, from the eligibility projection.
+          <p data-testid="approve-outcome" className="mr-auto text-xs text-zinc-500">
+            {approveOutcomeFor(item)}
+          </p>
+        )}
         <Button
           variant="secondary"
           size="sm"
@@ -636,7 +699,7 @@ function QueueCard({
           size="sm"
           disabled={busy || blockReason !== null}
           aria-describedby={blockReason ? blockHintId : undefined}
-          onClick={() => onApprove(item.id, manualMatch?.id)}
+          onClick={() => onApprove(item.id, manualMatch?.id, offerForce && force)}
         >
           {approving ? 'Approving…' : 'Approve'}
         </Button>
@@ -823,7 +886,7 @@ export function QueuePage() {
     <div>
       <PageHeader
         title="Approval Queue"
-        description="Donor drops wait here until you approve them. Target, donor, languages and Processing Gate eligibility are pre-selected, and every card says what is still blocking it and what to do next."
+        description="Donor drops wait here until you approve them. Target, donor, languages and Processing Gate eligibility are pre-selected, and every card says what is still blocking it and what to do next. A target that is not eligible yet does not block approval: the job is created and waits for the tags, then starts on its own."
         actions={
           <>
             <Badge tone={items.length > 0 ? 'accent' : 'neutral'}>{items.length} pending</Badge>
@@ -855,7 +918,9 @@ export function QueuePage() {
           <QueueCard
             key={item.id}
             item={item}
-            onApprove={(id, libraryCacheId) => approve.mutate({ id, libraryCacheId })}
+            onApprove={(id, libraryCacheId, forceIgnoreTagFilter) =>
+              approve.mutate({ id, libraryCacheId, forceIgnoreTagFilter })
+            }
             onReject={(id) => reject.mutate(id)}
             onIdentify={(id, kind) => identify.mutateAsync({ id, kind })}
             onMatch={(id, candidate) =>
@@ -876,6 +941,9 @@ export function QueuePage() {
                 ? identify.variables?.kind
                 : undefined
             }
+            // One switch on the server decides whether any card offers the
+            // escape hatch; the diagnostics field is that switch (#48).
+            forceAllowed={queue.data?.diagnostics?.force_tag_override === true}
           />
         ))}
       </div>

@@ -191,6 +191,19 @@ func (r Rule) Classify(filename string, arr ...ArrMetadata) Result {
 	return res
 }
 
+// EligiblePath answers the only question the eligibility projection asks: does
+// this target pass the configured rule right now? It is Classify's verdict
+// reduced to one boolean, so the projection can never drift from the gate the
+// mux and the queue already enforce.
+//
+// A missing arr row fails closed exactly as Classify does (ADR-0009), and the
+// neutral rule (Enforce=false, ADR-0012) is eligible for every target. Force
+// override is deliberately not modelled here: the caller owns the operator's
+// escape hatch and skips the projection for a forced job.
+func (r Rule) EligiblePath(path string, meta ArrMetadata) bool {
+	return r.Classify(path, meta).Status == StatusEligible
+}
+
 // classifyFilename evaluates the filename source and reports whether it blocks
 // eligibility. An empty required list is a no-op (ADR-0012 neutral default),
 // but excluded filename tags still block whenever the gate is enforced.

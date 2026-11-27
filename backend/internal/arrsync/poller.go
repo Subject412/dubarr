@@ -101,6 +101,10 @@ type LibraryStore interface {
 	// that); the store redacts and caps it again before persisting.
 	RecordArrInstanceSyncFailure(ctx context.Context, id int64, cause string) error
 	SyncLibraryCache(ctx context.Context, instanceID int64, items []store.LibraryCacheItem) (store.LibrarySyncStats, error)
+	// ReleaseHeldJobs promotes the held sync jobs the projection now finds
+	// eligible. A pass is the epoch that refreshes the arr columns the gate
+	// reads, so it is also the moment a held job may become runnable.
+	ReleaseHeldJobs(ctx context.Context, nowEligible func(store.HeldJob) bool) (int, error)
 }
 
 // SecretStore is the subset of secrets.Service the poller uses: read the
@@ -837,7 +841,51 @@ func (p *Poller) syncPass(ctx context.Context) bool {
 		}
 	}()
 	_, _ = p.Sync(ctx)
+	// A pass is the epoch the gate cares about: the cache rows (and the tags on
+	// them) have just been refreshed, so every held job is re-projected against
+	// what the pass wrote. Release is idempotent and cheap; the projection never
+	// promotes a forced job and never re-holds a queued one.
+	p.releaseHeld(ctx)
 	return true
+}
+
+// releaseHeld promotes every held sync job whose target passes the gate now.
+//
+// It is the same projection the store applies at boot and after a rescan: the
+// held reason is a snapshot of an old verdict, and this is where an arr tag
+// edit turns into a runnable job. A settings or store failure is logged and
+// swallowed — a failed projection must not fail the pass that just succeeded,
+// and the next epoch retries.
+func (p *Poller) releaseHeld(ctx context.Context) {
+	rule, err := p.gateRule(ctx)
+	if err != nil {
+		p.logf("arrsync: release held sync jobs: %v", err)
+		return
+	}
+	n, err := p.store.ReleaseHeldJobs(ctx, HeldEligible(rule))
+	if err != nil {
+		p.logf("arrsync: release held sync jobs: %v", err)
+		return
+	}
+	if n > 0 {
+		p.logf("arrsync: released %d held sync job(s) whose target is now eligible", n)
+	}
+}
+
+// HeldEligible is the eligibility projection every release point passes to
+// store.ReleaseHeldJobs: the gate verdict on the target the job recorded, using
+// the arr columns the store joined for it (a missing arr row fails closed when
+// the arr source is active). The poller's pass and the boot release share this
+// one projection, so neither epoch can disagree with the other (the rescan route
+// applies the same gate on the row it just re-read).
+func HeldEligible(rule gate.Rule) func(store.HeldJob) bool {
+	return func(job store.HeldJob) bool {
+		return rule.EligiblePath(job.TargetVideoPath, gate.ArrMetadata{
+			Found:      job.HasArrRow,
+			Tags:       job.ArrTags,
+			RootFolder: job.ArrRootFolder,
+		})
+	}
 }
 
 // beginPass takes the poller's single pass slot. false means a pass already
@@ -903,6 +951,9 @@ func (p *Poller) Trigger(ctx context.Context, kind string) error {
 		if _, err := p.syncKind(runCtx, kind); err != nil {
 			p.logf("arrsync: manual pass (%s): %v", kindOrAll(kind), err)
 		}
+		// A manual pass is an epoch too: the operator just refreshed a library
+		// (or fixed its tags) and expects the jobs waiting on it to start.
+		p.releaseHeld(runCtx)
 	}()
 	return nil
 }

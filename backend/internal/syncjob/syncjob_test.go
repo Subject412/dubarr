@@ -271,6 +271,165 @@ func TestListAndGetJobs(t *testing.T) {
 	}
 }
 
+// TestJobInfoReportsHoldFields pins the #48 additions to the job payload: the
+// hold reason, the persisted force override and the originating queue row, and
+// that a held status is its own public state rather than a finished one.
+func TestJobInfoReportsHoldFields(t *testing.T) {
+	info := jobInfo(store.SyncJobRecord{
+		ID: 7, Status: store.SyncJobHeld, HeldReason: store.HeldReasonMissingTarget,
+	})
+	if info.Status != StatusHeld || info.HeldReason != store.HeldReasonMissingTarget {
+		t.Fatalf("held job info = status %q reason %q, want held/missing_target",
+			info.Status, info.HeldReason)
+	}
+
+	forced := jobInfo(store.SyncJobRecord{
+		ID: 8, Status: store.SyncJobQueued, ForceIgnoreTagFilter: true, OriginQueueID: 42,
+	})
+	if !forced.ForceIgnoreTagFilter || forced.OriginQueueID != 42 {
+		t.Fatalf("forced job info = force %v origin %d, want true/42",
+			forced.ForceIgnoreTagFilter, forced.OriginQueueID)
+	}
+
+	for _, tc := range []struct{ schema, want string }{
+		{store.SyncJobHeld, StatusHeld},
+		{store.SyncJobCancelled, StatusCancelled},
+		{store.SyncJobCompleted, StatusDone},
+		{store.SyncJobFailed, StatusFailed},
+		{store.SyncJobAnalyzing, StatusRunning},
+	} {
+		if got := publicStatus(tc.schema); got != tc.want {
+			t.Errorf("publicStatus(%q) = %q, want %q", tc.schema, got, tc.want)
+		}
+	}
+}
+
+// TestListNarrowsByStatusAndCarriesHoldState is the #48 backend contract: a
+// held row says why it waits, the detail agrees with the list row, ?status=held
+// returns only held jobs, and an unknown status is a 400 rather than a silent
+// "everything".
+func TestListNarrowsByStatusAndCarriesHoldState(t *testing.T) {
+	f := newFixture(t)
+	mediaID := insertMedia(t, f.db)
+	dir := t.TempDir()
+	trackPath := filepath.Join(dir, "pl.mka")
+	if err := os.WriteFile(trackPath, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	trackID := insertTrack(t, f.db.DB, mediaID, "g", "pl", trackPath)
+	libID := insertLibrary(t, f.db.DB, filepath.Join(dir, "t.mkv"), "eligible", "eng")
+
+	ctx := context.Background()
+	held, err := f.db.CreateSyncJob(ctx, store.SyncJobCreate{
+		VaultTrackID: trackID, TargetLibraryCacheID: libID,
+		TargetVideoPath: filepath.Join(dir, "t.mkv"), TargetLangISO2: "pl",
+		Status: store.SyncJobHeld, HeldReason: store.HeldReasonWaitingForTags,
+	})
+	if err != nil {
+		t.Fatalf("create held job: %v", err)
+	}
+	forced, err := f.db.CreateSyncJob(ctx, store.SyncJobCreate{
+		VaultTrackID: trackID, TargetLibraryCacheID: libID,
+		TargetVideoPath: filepath.Join(dir, "t.mkv"), TargetLangISO2: "pl",
+		ForceIgnoreTagFilter: true,
+	})
+	if err != nil {
+		t.Fatalf("create forced job: %v", err)
+	}
+	plain := postJob(t, f.mux,
+		fmt.Sprintf(`{"vault_track_id":%d,"target_library_cache_id":%d}`, trackID, libID))
+	if plain.Code != http.StatusCreated {
+		t.Fatalf("create queued job = %d %s", plain.Code, plain.Body)
+	}
+	var plainJob JobInfo
+	if err := json.Unmarshal(plain.Body.Bytes(), &plainJob); err != nil {
+		t.Fatalf("decode created job: %v", err)
+	}
+
+	listJobs := func(query string) (*httptest.ResponseRecorder, []JobInfo) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, "/api/sync/jobs"+query, nil)
+		rec := httptest.NewRecorder()
+		f.mux.ServeHTTP(rec, req)
+		var body struct {
+			Items []JobInfo `json:"items"`
+		}
+		_ = json.Unmarshal(rec.Body.Bytes(), &body)
+		return rec, body.Items
+	}
+
+	rec, items := listJobs("")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list = %d %s", rec.Code, rec.Body)
+	}
+	// The wire names are part of the contract the UI was written against.
+	for _, want := range []string{
+		`"held_reason":"waiting_for_tags"`,
+		`"force_ignore_tag_filter":true`,
+	} {
+		if !strings.Contains(rec.Body.String(), want) {
+			t.Fatalf("list JSON lacks %s: %s", want, rec.Body)
+		}
+	}
+	if len(items) != 3 {
+		t.Fatalf("unfiltered list = %d jobs, want 3: %+v", len(items), items)
+	}
+	byID := make(map[int64]JobInfo, len(items))
+	for _, item := range items {
+		byID[item.ID] = item
+	}
+
+	heldRow, ok := byID[held.ID]
+	if !ok {
+		t.Fatalf("list is missing the held job %d: %+v", held.ID, items)
+	}
+	if heldRow.Status != StatusHeld || heldRow.HeldReason != store.HeldReasonWaitingForTags {
+		t.Fatalf("held row = status %q reason %q, want held/waiting_for_tags",
+			heldRow.Status, heldRow.HeldReason)
+	}
+	if heldRow.ForceIgnoreTagFilter {
+		t.Error("held row claims force_ignore_tag_filter = true")
+	}
+
+	forcedRow, ok := byID[forced.ID]
+	if !ok {
+		t.Fatalf("list is missing the forced job %d: %+v", forced.ID, items)
+	}
+	if !forcedRow.ForceIgnoreTagFilter || forcedRow.Status != StatusQueued {
+		t.Fatalf("forced row = status %q force %v, want queued/true",
+			forcedRow.Status, forcedRow.ForceIgnoreTagFilter)
+	}
+	if plainRow := byID[plainJob.ID]; plainRow.ForceIgnoreTagFilter || plainRow.Status != StatusQueued {
+		t.Fatalf("plain row = status %q force %v, want queued/false",
+			plainRow.Status, plainRow.ForceIgnoreTagFilter)
+	}
+
+	// The detail must serve the same row: one jobInfo, one answer.
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/sync/jobs/%d", held.ID), nil)
+	detailRec := httptest.NewRecorder()
+	f.mux.ServeHTTP(detailRec, req)
+	if detailRec.Code != http.StatusOK {
+		t.Fatalf("held detail = %d %s", detailRec.Code, detailRec.Body)
+	}
+	var detail JobInfo
+	if err := json.Unmarshal(detailRec.Body.Bytes(), &detail); err != nil {
+		t.Fatalf("decode held detail: %v", err)
+	}
+	if !reflect.DeepEqual(detail, heldRow) {
+		t.Fatalf("detail = %+v, list row = %+v; the two must agree", detail, heldRow)
+	}
+
+	rec, narrowed := listJobs("?status=held")
+	if rec.Code != http.StatusOK || len(narrowed) != 1 || narrowed[0].ID != held.ID {
+		t.Fatalf("?status=held = %d %+v, want only job %d", rec.Code, narrowed, held.ID)
+	}
+
+	rec, _ = listJobs("?status=nonsense")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("?status=nonsense = %d %s, want 400", rec.Code, rec.Body)
+	}
+}
+
 // --- integration with the real Rust engine --------------------------------
 
 func writePCM16WAV(t *testing.T, path string, samples []int16, sampleRate int) {

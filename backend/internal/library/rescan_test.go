@@ -781,3 +781,99 @@ func TestLibraryRescanThenSyncPassIsNotAChange(t *testing.T) {
 		t.Errorf("target_file_path = %q, want the re-read file", target)
 	}
 }
+
+// seedHeldRescanJob inserts one held sync job against a cache row, on a real
+// vault track (the job's target_track_id is a foreign key). The job starts held
+// for its tags, exactly as the birth site would have written it before the row
+// carried the arr tag.
+func seedHeldRescanJob(t *testing.T, st *store.Store, libID int64, target string) int64 {
+	t.Helper()
+	ctx := context.Background()
+	res, err := st.DB.ExecContext(ctx,
+		`INSERT INTO vault_media (media_type, title, year, vault_folder_path)
+		 VALUES ('movie', 'Shrek', 2001, '/vault/Shrek (2001)')`)
+	if err != nil {
+		t.Fatalf("insert vault media: %v", err)
+	}
+	mediaID, err := res.LastInsertId()
+	if err != nil {
+		t.Fatalf("vault media id: %v", err)
+	}
+	res, err = st.DB.ExecContext(ctx,
+		`INSERT INTO audio_tracks
+		 (vault_media_id, group_uuid, lang_iso2, lang_iso3, variant, file_path, sha256, codec, channels, channel_count)
+		 VALUES (?, 'rescan-group', 'pl', 'pol', 'dubbing', ?, '00', 'opus', '2.0', 2)`,
+		mediaID, "/vault/Shrek (2001)/track-"+strconv.FormatInt(libID, 10)+".pl.mka")
+	if err != nil {
+		t.Fatalf("insert audio track: %v", err)
+	}
+	trackID, err := res.LastInsertId()
+	if err != nil {
+		t.Fatalf("audio track id: %v", err)
+	}
+	rec, err := st.CreateSyncJob(ctx, store.SyncJobCreate{
+		VaultTrackID:         trackID,
+		TargetLibraryCacheID: libID,
+		TargetVideoPath:      target,
+		TargetLangISO2:       "pl",
+		Status:               store.SyncJobHeld,
+		HeldReason:           store.HeldReasonWaitingForTags,
+	})
+	if err != nil {
+		t.Fatalf("CreateSyncJob(held): %v", err)
+	}
+	return rec.ID
+}
+
+// rescanJobStatus reads the persisted status and held reason of one sync job.
+func rescanJobStatus(t *testing.T, st *store.Store, id int64) (string, string) {
+	t.Helper()
+	rec, ok, err := st.SyncJobByID(context.Background(), id)
+	if err != nil || !ok {
+		t.Fatalf("SyncJobByID(%d) = (ok=%v, err=%v)", id, ok, err)
+	}
+	return rec.Status, rec.HeldReason
+}
+
+// TestLibraryRescanReleasesHeldJobForItem pins the rescan release point: the
+// re-read refreshes the arr tag snapshot the held job waits on, so the same
+// accepted request promotes it to queued.
+func TestLibraryRescanReleasesHeldJobForItem(t *testing.T) {
+	env := newRescanEnv(t, true)
+	srv := radarrFixture(t, "radarr-rescan-key")
+	instanceID := env.instance("radarr", srv.URL, srv.APIKey(), true)
+	rowID := env.movieRow(instanceID, 7, "Shrek (stale)")
+
+	ctx := context.Background()
+	raw, err := json.Marshal(settings.TargetTagFilter{
+		RequiredArrTags:  []string{"PL.DUB"},
+		TagMatchMode:     "ANY",
+		SourceMode:       settings.SourceModeArr,
+		EnforceTagFilter: true,
+	})
+	if err != nil {
+		t.Fatalf("marshal tag filter: %v", err)
+	}
+	if err := env.settings.Set(ctx, settings.KeyTargetTagFilter, raw); err != nil {
+		t.Fatalf("set tag filter: %v", err)
+	}
+
+	target := "/media/movies/Shrek (2001)/Shrek.2001.mkv"
+	jobID := seedHeldRescanJob(t, env.db, rowID, target)
+	if status, _ := rescanJobStatus(t, env.db, jobID); status != store.SyncJobHeld {
+		t.Fatalf("job before the rescan = %q, want %q", status, store.SyncJobHeld)
+	}
+
+	rec := env.post("/api/library/items/" + itoa(rowID) + "/rescan")
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("POST rescan = %d, want 202 (body %s)", rec.Code, rec.Body.String())
+	}
+	if body := decodeRescan(t, rec); body.Reread != "ok" {
+		t.Fatalf("reread = %q (%s), want ok", body.Reread, body.RereadError)
+	}
+
+	if status, reason := rescanJobStatus(t, env.db, jobID); status != store.SyncJobQueued {
+		t.Errorf("job after the rescan = %q (%s), want %q: the re-read made its target eligible",
+			status, reason, store.SyncJobQueued)
+	}
+}

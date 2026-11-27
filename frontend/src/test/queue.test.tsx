@@ -89,12 +89,14 @@ const items = [
     target_path: '/media/Shrek 2 (2004) [Remux].mkv',
     original_language: 'en',
     audio_languages: ['en'],
+    // #48: the gate verdict is a projection, not a veto. This pair has a target
+    // and a donor, so approve accepts it; the job is born held afterwards.
     eligibility: 'waiting_for_tags',
     matched: true,
     library_title: 'Shrek 2',
-    match_state: 'matched_no_donor',
-    match_reason: 'Target is not eligible for processing (missing required target tags: [ArcA310]).',
-    match_blocker: 'gate_tags',
+    match_state: 'ready',
+    match_reason: 'Ready to approve.',
+    match_blocker: 'none',
     matched_tags: [],
     missing_tags: ['[ArcA310]'],
     donor_candidates: [
@@ -125,13 +127,15 @@ function queueFetch() {
       return jsonResponse({ items })
     }
     if (url.includes('/api/queue/1/approve')) {
-      return jsonResponse({ id: 1, status: 'extracting' })
+      // #48: approval records intent; the job is born after the extraction, so
+      // the response carries no job id.
+      return jsonResponse({ approved: true })
     }
     if (url.includes('/api/imports/search-library')) {
       return jsonResponse({ items: libraryResults })
     }
     if (url.includes('/api/queue/3/approve')) {
-      return jsonResponse({ id: 3, status: 'extracting' })
+      return jsonResponse({ approved: true })
     }
     if (url.includes('/api/queue/2/reject')) {
       return jsonResponse({ id: 2, status: 'ignored' })
@@ -297,19 +301,24 @@ describe('approval queue page', () => {
     expect(within(card).queryByText('Not matched')).not.toBeInTheDocument()
   })
 
-  it('badges an ineligible release that has a donor as not ready', async () => {
+  it('badges an ineligible release that has a donor as approvable and says it will wait', async () => {
     vi.stubGlobal('fetch', queueFetch())
     renderWithProviders(<QueuePage />, { route: '/queue' })
 
     const card = await screen.findByTestId('queue-item-4')
-    expect(within(card).getByText('Matched, not ready')).toBeInTheDocument()
-    expect(within(card).queryByText('Ready')).not.toBeInTheDocument()
-    // The reason is visible prose next to the badge, not a title attribute.
-    expect(
-      within(card).getByText(
-        'Target is not eligible for processing (missing required target tags: [ArcA310]).',
-      ),
-    ).toBeInTheDocument()
+    // #48: a target that fails the gate is not a blocker any more — the pair is
+    // formable, so approve accepts it and the job is born held.
+    expect(within(card).getByText('Ready')).toBeInTheDocument()
+    expect(within(card).queryByText('Matched, not ready')).not.toBeInTheDocument()
+    expect(within(card).getByText('waiting for tags')).toBeInTheDocument()
+    expect(within(card).getByRole('button', { name: /approve/i })).toBeEnabled()
+    expect(within(card).queryByTestId('approve-blocked')).not.toBeInTheDocument()
+    // The card says what approving will do, in plain language.
+    expect(within(card).getByTestId('approve-outcome')).toHaveTextContent(
+      'Approve now, it waits for tags',
+    )
+    // The override is off in this installation, so it must not be offered.
+    expect(within(card).queryByTestId('approve-force')).not.toBeInTheDocument()
   })
 
   it('badges an unmatched release', async () => {
@@ -791,6 +800,9 @@ describe('approval queue page', () => {
     const excluded = {
       ...items[3],
       id: 41,
+      // A payload from before #48 can still name the gate blockers; the closed
+      // set keeps them so their next step stays available.
+      match_state: 'matched_no_donor',
       match_reason: 'Target is not eligible for processing (the target carries an excluded tag).',
       match_blocker: 'gate_excluded',
     }
@@ -873,16 +885,12 @@ describe('approval queue page', () => {
     )
     expect(noDonorApprove).not.toHaveAttribute('title')
 
-    // A gate-blocked target: the same control, the gate's reason, and a next
-    // step aimed at the target's tags rather than the donor.
+    // An ineligible target with a donor is not a blocker any more (#48): the
+    // control stays live and the card states that the job will wait.
     const gated = screen.getByTestId('queue-item-4')
-    expect(within(gated).getByRole('button', { name: /approve/i })).toBeDisabled()
-    expect(within(gated).getByTestId('approve-blocked')).toHaveTextContent(
-      'Target is not eligible for processing (missing required target tags: [ArcA310]).',
-    )
-    expect(within(gated).getByTestId('queue-instruction')).toHaveTextContent(
-      /add the required filename tag/i,
-    )
+    expect(within(gated).getByRole('button', { name: /approve/i })).toBeEnabled()
+    expect(within(gated).queryByTestId('approve-blocked')).not.toBeInTheDocument()
+    expect(within(gated).getByTestId('approve-outcome')).toHaveTextContent(/waits for tags/i)
 
     // Not matched at all: nothing to approve until a library target is picked.
     const unmatched = screen.getByTestId('queue-item-3')
@@ -892,58 +900,120 @@ describe('approval queue page', () => {
     )
   })
 
-  it('enables approve when the force override makes the row ready', async () => {
-    // The same gate-blocked shape as queue-item-4, but the server now reports
-    // the row ready because the force override makes approve accept it. The
-    // card must follow match_state, never the eligibility badge, or the
-    // operator loses a control the server would honour.
-    const overridden = {
-      ...items[3],
-      id: 5,
-      source_file_path: '/watch/Shrek 3 2007 PL.DUB.mkv',
-      filename: 'Shrek 3 2007 PL.DUB.mkv',
-      title: 'Shrek 3',
-      match_state: 'ready',
-      match_reason: 'Ready to approve under the force tag override.',
-      match_blocker: 'none',
-    }
-    vi.stubGlobal(
-      'fetch',
-      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-        const url = String(input)
-        if (url.endsWith('/api/queue') && isMethod(init, 'GET')) {
-          return jsonResponse({
-            items: [...items, overridden],
-            diagnostics: {
-              instances_configured: 1,
-              never_synced: 0,
-              sync_failed: 0,
-              last_pass_at: null,
-              cache_items: items.length + 1,
-              sync_health_available: true,
-              force_tag_override: true,
-            },
-          })
-        }
-        if (url.includes('/api/queue/5/approve')) {
-          return jsonResponse({ id: 5, status: 'extracting' })
-        }
-        return jsonResponse({ error: 'unexpected' }, 404)
-      }),
-    )
+  it('offers the force override for an ineligible pair when the setting allows it', async () => {
+    // #48: the escape hatch is no longer an alternative verdict — the row is
+    // approvable either way. The checkbox only decides whether the job is born
+    // queued instead of held.
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.endsWith('/api/queue') && isMethod(init, 'GET')) {
+        return jsonResponse({
+          items,
+          diagnostics: {
+            instances_configured: 1,
+            never_synced: 0,
+            sync_failed: 0,
+            last_pass_at: null,
+            cache_items: items.length,
+            sync_health_available: true,
+            force_tag_override: true,
+          },
+        })
+      }
+      if (url.includes('/api/queue/4/approve')) {
+        return jsonResponse({ approved: true })
+      }
+      return jsonResponse({ error: 'unexpected' }, 404)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
     renderWithProviders(<QueuePage />, { route: '/queue' })
 
-    const forced = await screen.findByTestId('queue-item-5')
-    expect(forced).toHaveTextContent('waiting for tags')
-    expect(within(forced).getByRole('button', { name: /approve/i })).toBeEnabled()
-    expect(within(forced).queryByTestId('approve-blocked')).not.toBeInTheDocument()
-    expect(within(forced).getByTestId('queue-instruction')).toHaveTextContent('Ready to approve.')
+    const gated = await screen.findByTestId('queue-item-4')
+    const override = within(gated).getByTestId('approve-force')
+    // One line saying what it does and how far it reaches.
+    expect(override).toHaveTextContent(/bypasses the tag gate/i)
+    expect(override).toHaveTextContent(/this one job/i)
+    expect(within(override).getByRole('checkbox')).not.toBeChecked()
 
-    // The neighbouring gate-blocked row keeps its disabled control: the
-    // override is an installation-wide setting, the verdict still per row.
-    const gated = screen.getByTestId('queue-item-4')
-    expect(within(gated).getByRole('button', { name: /approve/i })).toBeDisabled()
+    await user.click(within(override).getByRole('checkbox'))
+    expect(within(override).getByRole('checkbox')).toBeChecked()
+
+    await user.click(within(gated).getByRole('button', { name: /approve/i }))
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find(
+        ([url, init]) => String(url).includes('/api/queue/4/approve') && isMethod(init, 'POST'),
+      )
+      expect(call).toBeTruthy()
+      expect(JSON.parse(String(call?.[1]?.body))).toEqual({ force_ignore_tag_filter: true })
+    })
+
+    // An eligible neighbour has nothing to override.
+    const ready = screen.getByTestId('queue-item-1')
+    expect(within(ready).queryByTestId('approve-force')).not.toBeInTheDocument()
   })
+
+  it('refreshes the list after approving instead of reading a job id from the response', async () => {
+    // The response is `{approved: true}`: the job is born after the extraction,
+    // so there is no id in the body and nothing may crash without one.
+    const fetchMock = queueFetch()
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    renderWithProviders(<QueuePage />, { route: '/queue' })
+
+    const card = await screen.findByTestId('queue-item-1')
+    const listCalls = () =>
+      fetchMock.mock.calls.filter(
+        ([url, init]) =>
+          String(url).endsWith('/api/queue') &&
+          isMethod(init as RequestInit | undefined, 'GET'),
+      ).length
+
+    const before = listCalls()
+    await user.click(within(card).getByRole('button', { name: /approve/i }))
+
+    await waitFor(() => expect(listCalls()).toBeGreaterThan(before))
+    // The control settles back to its idle label: a response shaped
+    // `{approved: true}` was read without a missing job id throwing.
+    expect(await within(card).findByRole('button', { name: 'Approve' })).toBeEnabled()
+  })
+
+  // The four unformable cases approve still refuses. The card renders the
+  // server's sentence as given for every one of them: they are errors, never a
+  // quiet hold, and none of them is re-worded client-side.
+  const approveRefusals = [
+    'no matched library target',
+    'matched library target has no target file to pair a donor with',
+    'the target folder could not be read - check the library mount',
+    'no donor paired: no sibling file is eligible as a donor',
+  ]
+
+  for (const message of approveRefusals) {
+    it(`renders the server's 409 as an error: ${message}`, async () => {
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+          const url = String(input)
+          if (url.endsWith('/api/queue') && isMethod(init, 'GET')) {
+            return jsonResponse({ items: [items[0]] })
+          }
+          if (url.includes('/api/queue/1/approve')) {
+            return jsonResponse({ error: message }, 409)
+          }
+          return jsonResponse({ error: 'unexpected' }, 404)
+        }),
+      )
+      const user = userEvent.setup()
+      renderWithProviders(<QueuePage />, { route: '/queue' })
+
+      const card = await screen.findByTestId('queue-item-1')
+      await user.click(within(card).getByRole('button', { name: /approve/i }))
+
+      expect(
+        await screen.findByText(`Could not update the queue item: ${message}`),
+      ).toBeInTheDocument()
+    })
+  }
 
   it('explains an empty queue with no instances configured', async () => {
     vi.stubGlobal(

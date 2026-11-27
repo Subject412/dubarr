@@ -91,6 +91,12 @@ const gateJSONKey = "gate"
 // selected at approval time. Like gateJSONKey it needs no migration.
 const donorJSONKey = "donor"
 
+// forceJSONKey is the parsed_raw_json member holding the approval's "approve
+// without waiting for tags" intent. import_queue has no column for it and its
+// status CHECK is frozen, so the intent rides in the same document as the gate
+// verdict and the donor: it belongs to one approval, not to the queue state.
+const forceJSONKey = "force_ignore_tag_filter"
+
 // SetImportCandidateGate records the gate classification for sourcePath,
 // preserving any arr parse payload already stored in parsed_raw_json.
 //
@@ -256,6 +262,20 @@ func (s *Store) SetImportCandidateDonor(ctx context.Context, id int64, donorPath
 	return s.SetImportCandidateApproval(ctx, id, donorPath, 0)
 }
 
+// ImportApproval is the intent one approval records on a queue row. Approve no
+// longer creates the sync job — its target track does not exist until the
+// extraction writes it — so everything the birth needs travels here.
+type ImportApproval struct {
+	// DonorPath is the donor the operator paired with the target.
+	DonorPath string
+	// LibraryCacheID is the manual arr match the operator picked; 0 keeps the
+	// row's existing match.
+	LibraryCacheID int64
+	// ForceIgnoreTagFilter records "approve without waiting for tags": the job
+	// born from this row starts queued even when the gate refuses the target.
+	ForceIgnoreTagFilter bool
+}
+
 // SetImportCandidateApproval is SetImportCandidateDonor plus an optional manual
 // library match: when libraryCacheID is positive it is validated against
 // arr_library_cache and persisted into import_queue.matched_library_cache_id in
@@ -266,6 +286,17 @@ func (s *Store) SetImportCandidateDonor(ctx context.Context, id int64, donorPath
 // ErrImportCandidateMatchMismatch; an unknown id is ErrLibraryCacheNotFound.
 // Both leave the row pending_approval.
 func (s *Store) SetImportCandidateApproval(ctx context.Context, id int64, donorPath string, libraryCacheID int64) error {
+	return s.ApproveImportCandidate(ctx, id, ImportApproval{DonorPath: donorPath, LibraryCacheID: libraryCacheID})
+}
+
+// ApproveImportCandidate records an approval's intent — donor, optional manual
+// match and the force-tag override — and moves the candidate from
+// pending_approval to extracting in one transaction. It never consults the gate
+// and never creates a sync job: the job is born where its target track is, and
+// that is after this row has been extracted and archived.
+func (s *Store) ApproveImportCandidate(ctx context.Context, id int64, approval ImportApproval) error {
+	donorPath := approval.DonorPath
+	libraryCacheID := approval.LibraryCacheID
 	if strings.TrimSpace(donorPath) == "" {
 		return fmt.Errorf("store: import candidate %d: donor path is empty", id)
 	}
@@ -328,6 +359,9 @@ func (s *Store) SetImportCandidateApproval(ctx context.Context, id int64, donorP
 		}
 	}
 	doc[donorJSONKey] = donorRaw
+	if approval.ForceIgnoreTagFilter {
+		doc[forceJSONKey] = json.RawMessage("true")
+	}
 	encoded, err := json.Marshal(doc)
 	if err != nil {
 		return fmt.Errorf("store: encode import candidate donor: %w", err)
@@ -563,6 +597,17 @@ type ImportExtractionJob struct {
 	// extracts from it; an empty value is a row that was never paired and must
 	// not fall back to SourceFilePath.
 	DonorPath string
+	// MatchedLibraryCacheID is the arr_library_cache row this approval targets
+	// (0 when the row has no match). The extraction→sync-job step needs it: the
+	// job is keyed by the target track and the library identity together.
+	MatchedLibraryCacheID int64
+	// TargetVideoPath is the file the extracted dub is destined for: the gate
+	// verdict's target when one was recorded, else the matched cache row's.
+	TargetVideoPath string
+	// ForceIgnoreTagFilter is the operator's "approve without waiting for tags"
+	// intent, recorded on the queue row at approval. It wins over the gate where
+	// the sync job is born.
+	ForceIgnoreTagFilter bool
 	// Match metadata from arr_library_cache (media_type is "movie" or
 	// "episode"; empty when the donor has no matched target).
 	Title         string
@@ -581,26 +626,31 @@ func (s *Store) NextImportExtraction(ctx context.Context) (ImportExtractionJob, 
 	var (
 		job                               ImportExtractionJob
 		orig, title, mediaType, raw       sql.NullString
+		cacheTarget                       sql.NullString
+		cacheID                           sql.NullInt64
 		year, tmdb, tvdb, season, episode sql.NullInt64
 	)
 	err := s.DB.QueryRowContext(ctx, `
 		SELECT iq.id, iq.source_file_path, iq.filename, iq.file_size,
 		       iq.selected_exports_json, iq.parsed_raw_json, alc.original_language_iso2,
 		       alc.title, alc.media_type, alc.year, alc.tmdb_id, alc.tvdb_id,
-		       alc.season_number, alc.episode_number
+		       alc.season_number, alc.episode_number, alc.target_file_path,
+		       iq.matched_library_cache_id
 		FROM import_queue iq
 		LEFT JOIN arr_library_cache alc ON alc.id = iq.matched_library_cache_id
 		WHERE iq.status = 'extracting'
 		ORDER BY iq.created_at, iq.id
 		LIMIT 1`).Scan(&job.ID, &job.SourceFilePath, &job.Filename, &job.FileSize,
 		&job.SelectedExports, &raw, &orig, &title, &mediaType, &year, &tmdb, &tvdb,
-		&season, &episode)
+		&season, &episode, &cacheTarget, &cacheID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ImportExtractionJob{}, false, nil
 	}
 	if err != nil {
 		return ImportExtractionJob{}, false, fmt.Errorf("store: next import extraction: %w", err)
 	}
+	job.TargetVideoPath = cacheTarget.String
+	job.MatchedLibraryCacheID = cacheID.Int64
 	if payload := strings.TrimSpace(raw.String); raw.Valid && payload != "" && payload != "null" {
 		var doc map[string]json.RawMessage
 		if err := json.Unmarshal([]byte(payload), &doc); err != nil {
@@ -609,6 +659,20 @@ func (s *Store) NextImportExtraction(ctx context.Context) (ImportExtractionJob, 
 		if blob, ok := doc[donorJSONKey]; ok {
 			if err := json.Unmarshal(blob, &job.DonorPath); err != nil {
 				return ImportExtractionJob{}, false, fmt.Errorf("store: next import extraction %d: decode donor: %w", job.ID, err)
+			}
+		}
+		if blob, ok := doc[forceJSONKey]; ok {
+			if err := json.Unmarshal(blob, &job.ForceIgnoreTagFilter); err != nil {
+				return ImportExtractionJob{}, false, fmt.Errorf("store: next import extraction %d: decode force override: %w", job.ID, err)
+			}
+		}
+		if blob, ok := doc[gateJSONKey]; ok {
+			var verdict ImportGateStatus
+			if err := json.Unmarshal(blob, &verdict); err != nil {
+				return ImportExtractionJob{}, false, fmt.Errorf("store: next import extraction %d: decode gate: %w", job.ID, err)
+			}
+			if verdict.TargetPath != "" {
+				job.TargetVideoPath = verdict.TargetPath
 			}
 		}
 	}

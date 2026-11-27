@@ -283,3 +283,98 @@ func TestRuleFromTagFilterLegacyDefaults(t *testing.T) {
 		t.Errorf("rule = %+v, want arr source with criteria", r)
 	}
 }
+
+// TestEligiblePath pins the projection seam: it is Classify's verdict reduced to
+// one boolean, so the eligibility projection asks one question with the same
+// rules the mux re-check enforces. Force override is not modelled here — the
+// caller owns the override — and a missing arr row fails closed exactly as
+// Classify already does (ADR-0009).
+func TestEligiblePath(t *testing.T) {
+	filenameTagged := Rule{Required: []string{"[ArcA310]"}, Mode: MatchAny, Enforce: true}
+	arrTagged := Rule{
+		SourceMode: SourceArr, RequiredArrTags: []string{"dub"},
+		Mode: MatchAny, Enforce: true,
+	}
+	arrRooted := Rule{
+		SourceMode: SourceArr, RootFolderPaths: []string{"/media/movies"},
+		Mode: MatchAny, Enforce: true,
+	}
+
+	tests := []struct {
+		name string
+		rule Rule
+		path string
+		meta ArrMetadata
+		want bool
+	}{
+		{
+			// The neutral default (ADR-0012): nothing is required, so every
+			// target is eligible and no hold is ever recorded for it.
+			name: "neutral rule is eligible",
+			rule: Rule{Enforce: false},
+			path: "/media/movies/Shrek (2001).mkv",
+			want: true,
+		},
+		{
+			name: "filename tag present",
+			rule: filenameTagged,
+			path: "/media/movies/Shrek (2001) [ArcA310].mkv",
+			want: true,
+		},
+		{
+			name: "filename tag missing",
+			rule: filenameTagged,
+			path: "/media/movies/Shrek (2001).mkv",
+			want: false,
+		},
+		{
+			name: "excluded filename tag blocks",
+			rule: Rule{Excluded: []string{"[WIP]"}, Mode: MatchAny, Enforce: true},
+			path: "/media/movies/Shrek [WIP].mkv",
+			want: false,
+		},
+		{
+			// Fail closed: no arr row means the arr criterion cannot be proven.
+			name: "arr source without a cache row",
+			rule: arrTagged,
+			path: "/media/movies/Shrek (2001).mkv",
+			meta: ArrMetadata{Found: false, Tags: []string{"dub"}},
+			want: false,
+		},
+		{
+			name: "arr source with the tag",
+			rule: arrTagged,
+			path: "/media/movies/Shrek (2001).mkv",
+			meta: ArrMetadata{Found: true, Tags: []string{"dub"}},
+			want: true,
+		},
+		{
+			name: "arr source missing the tag",
+			rule: arrTagged,
+			path: "/media/movies/Shrek (2001).mkv",
+			meta: ArrMetadata{Found: true, Tags: []string{"keep"}},
+			want: false,
+		},
+		{
+			name: "root folder outside the allowlist",
+			rule: arrRooted,
+			path: "/media/movies/Shrek (2001).mkv",
+			meta: ArrMetadata{Found: true, RootFolder: "/media/anime"},
+			want: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.rule.EligiblePath(tc.path, tc.meta); got != tc.want {
+				t.Fatalf("EligiblePath = %v, want %v", got, tc.want)
+			}
+			// One rule, one verdict: the wrapper must never disagree with the
+			// classification the mux and the queue already read.
+			classified := tc.rule.Classify(tc.path, tc.meta).Status == StatusEligible
+			if classified != tc.want {
+				t.Errorf("Classify disagrees with EligiblePath: %v vs %v", classified, tc.want)
+			}
+		})
+	}
+}

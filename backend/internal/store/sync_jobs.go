@@ -8,10 +8,55 @@ import (
 	"fmt"
 )
 
+// Sync job statuses persisted in sync_mux_jobs.status. Migration 0008 added
+// held and cancelled; only SyncJobQueued is claimable, so a held job is
+// invisible to the worker until ReleaseHeldJobs promotes it.
+const (
+	SyncJobQueued         = "queued"
+	SyncJobHeld           = "held"
+	SyncJobAnalyzing      = "analyzing"
+	SyncJobReadyForReview = "ready_for_review"
+	SyncJobMuxing         = "muxing"
+	SyncJobCompleted      = "completed"
+	SyncJobFailed         = "failed"
+	SyncJobCancelled      = "cancelled"
+)
+
+// The held/cancel reason vocabulary is closed on purpose: the UI translates the
+// code, so a free-text error string must never reach held_reason.
+const (
+	// HeldReasonWaitingForTags means the target does not carry the configured
+	// tags yet; the projection releases the job when it does.
+	HeldReasonWaitingForTags = "waiting_for_tags"
+	// HeldReasonMissingTarget means the approved target file is no longer on
+	// disk; the projection releases the job when a file reappears.
+	HeldReasonMissingTarget = "missing_target"
+	// HeldReasonTargetChanged means the arr row now points at a different file,
+	// so the intent has to be re-derived before it muxes.
+	HeldReasonTargetChanged = "target_changed"
+	// CancelReasonRejection means the import_queue row was rejected, which
+	// cancels the intent approval created.
+	CancelReasonRejection = "cancelled_by_rejection"
+)
+
+// validHoldReason reports whether reason may be recorded by HoldSyncJob.
+func validHoldReason(reason string) bool {
+	switch reason {
+	case HeldReasonWaitingForTags, HeldReasonMissingTarget, HeldReasonTargetChanged:
+		return true
+	}
+	return false
+}
+
+// validCancelReason reports whether reason may be recorded by a cancellation.
+func validCancelReason(reason string) bool {
+	return reason == CancelReasonRejection || reason == HeldReasonTargetChanged
+}
+
 // SyncJobRecord is one row of sync_mux_jobs (schema.sql) as the sync
 // job API needs it. Status holds the persisted schema value
-// (queued/analyzing/ready_for_review/muxing/completed/failed); the API layer
-// maps it onto the public queued/running/done/failed vocabulary.
+// (queued/held/analyzing/ready_for_review/muxing/completed/failed/cancelled);
+// the API layer maps it onto the public queued/running/done/failed vocabulary.
 type SyncJobRecord struct {
 	ID                   int64
 	TargetTrackID        int64
@@ -38,17 +83,61 @@ type SyncJobRecord struct {
 	// migration 0007.
 	AnalysisSource   string
 	AnalysisFallback string
+	// ForceIgnoreTagFilter is the persisted operator override (migration 0008):
+	// the job runs regardless of the gate and is never re-held.
+	ForceIgnoreTagFilter bool
+	// HeldReason is the closed-vocabulary code explaining a hold or a
+	// cancellation, empty on a row that has neither.
+	HeldReason string
+	// OriginQueueID is the import_queue row approval created this job for; 0
+	// for a manual Studio job.
+	OriginQueueID int64
 }
 
-// SyncJobCreate is the insert shape for POST /api/sync/jobs.
+// HeldJob is one held row plus everything the eligibility projection needs,
+// joined once so the projection performs no N+1 queries.
+//
+// ArrTitle, ArrRootFolder and ArrTags come from the job's arr_library_cache row
+// (title, root_folder_path and the decoded arr_tag_labels_json snapshot); they
+// are empty and HasArrRow is false when no row maps to the target, which the
+// gate reads as "no arr metadata" and fails closed on when the arr source is
+// active (ADR-0009).
+type HeldJob struct {
+	ID                   int64
+	TargetVideoPath      string
+	TargetLibraryCacheID sql.NullInt64
+	ForceIgnoreTagFilter bool
+	HeldReason           string
+	ArrTitle             string
+	ArrRootFolder        string
+	ArrTags              []string
+	HasArrRow            bool
+}
+
+// SyncJobCreate is the insert shape for POST /api/sync/jobs and for the intent
+// approval records.
 type SyncJobCreate struct {
 	VaultTrackID         int64
 	TargetLibraryCacheID int64
 	TargetVideoPath      string
 	TargetLangISO2       string
+	// Status is the state the intent is recorded in: "" means queued, and
+	// SyncJobHeld is used when the gate refuses the target right now.
+	Status string
+	// ForceIgnoreTagFilter records the operator's override instead of deriving
+	// it again. A forced job is inserted queued and the projection never
+	// re-holds it, so it can never be combined with Status held.
+	ForceIgnoreTagFilter bool
+	// HeldReason is required when Status is held (closed vocabulary).
+	HeldReason string
+	// OriginQueueID is the import_queue row this approval created the job for;
+	// nil for a manual Studio job.
+	OriginQueueID *int64
 }
 
-// CreateSyncJob inserts a queued job and returns the persisted row.
+// CreateSyncJob inserts a job and returns the persisted row. The status is
+// queued unless the caller records a held intent, which is how approval stops
+// deciding eligibility and starts recording it.
 func (s *Store) CreateSyncJob(ctx context.Context, c SyncJobCreate) (SyncJobRecord, error) {
 	if c.VaultTrackID <= 0 || c.TargetLibraryCacheID <= 0 {
 		return SyncJobRecord{}, errors.New("store: sync job ids must be positive")
@@ -56,12 +145,43 @@ func (s *Store) CreateSyncJob(ctx context.Context, c SyncJobCreate) (SyncJobReco
 	if c.TargetVideoPath == "" || c.TargetLangISO2 == "" {
 		return SyncJobRecord{}, errors.New("store: sync job target path and language are required")
 	}
+
+	status := c.Status
+	if status == "" {
+		status = SyncJobQueued
+	}
+	heldReason := ""
+	switch status {
+	case SyncJobQueued:
+		// A queued job carries no hold: the reason belongs to the state.
+	case SyncJobHeld:
+		if c.ForceIgnoreTagFilter {
+			return SyncJobRecord{}, errors.New("store: a forced sync job cannot be held")
+		}
+		if !validHoldReason(c.HeldReason) {
+			return SyncJobRecord{}, fmt.Errorf("store: sync job held reason %q is not in the vocabulary", c.HeldReason)
+		}
+		heldReason = c.HeldReason
+	default:
+		return SyncJobRecord{}, fmt.Errorf("store: sync job cannot be created in status %q", status)
+	}
+
+	var origin any
+	if c.OriginQueueID != nil {
+		if *c.OriginQueueID <= 0 {
+			return SyncJobRecord{}, errors.New("store: sync job origin queue id must be positive")
+		}
+		origin = *c.OriginQueueID
+	}
+
 	res, err := s.DB.ExecContext(ctx, `
 		INSERT INTO sync_mux_jobs
 		    (target_track_id, target_library_cache_id, target_video_path,
-		     target_lang_iso2, status)
-		VALUES (?, ?, ?, ?, 'queued')`,
-		c.VaultTrackID, c.TargetLibraryCacheID, c.TargetVideoPath, c.TargetLangISO2)
+		     target_lang_iso2, status, force_ignore_tag_filter, held_reason,
+		     origin_queue_id)
+		VALUES (?, ?, ?, ?, ?, ?, NULLIF(?, ''), ?)`,
+		c.VaultTrackID, c.TargetLibraryCacheID, c.TargetVideoPath,
+		c.TargetLangISO2, status, boolInt(c.ForceIgnoreTagFilter), heldReason, origin)
 	if err != nil {
 		return SyncJobRecord{}, fmt.Errorf("store: insert sync job: %w", err)
 	}
@@ -79,6 +199,14 @@ func (s *Store) CreateSyncJob(ctx context.Context, c SyncJobCreate) (SyncJobReco
 	return rec, nil
 }
 
+// boolInt renders a Go bool as the 0/1 the schema CHECK expects.
+func boolInt(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
+}
+
 const syncJobColumns = `
 	SELECT id, target_track_id, COALESCE(target_library_cache_id, 0),
 	       COALESCE(target_video_path, ''), target_lang_iso2,
@@ -88,7 +216,9 @@ const syncJobColumns = `
 	       COALESCE(error_message, ''),
 	       COALESCE(created_at, ''), COALESCE(updated_at, ''),
 	       COALESCE(work_dir_path, ''), COALESCE(output_path, ''),
-	       COALESCE(analysis_source, ''), COALESCE(analysis_fallback, '')
+	       COALESCE(analysis_source, ''), COALESCE(analysis_fallback, ''),
+	       COALESCE(force_ignore_tag_filter, 0), COALESCE(held_reason, ''),
+	       COALESCE(origin_queue_id, 0)
 	FROM sync_mux_jobs`
 
 func scanSyncJob(scanner interface{ Scan(...any) error }) (SyncJobRecord, error) {
@@ -97,7 +227,8 @@ func scanSyncJob(scanner interface{ Scan(...any) error }) (SyncJobRecord, error)
 		&rec.TargetVideoPath, &rec.TargetLangISO2, &rec.Status, &rec.SyncMethod,
 		&rec.CalculatedOffsetMS, &rec.CheckpointsJSON, &rec.ErrorMessage,
 		&rec.CreatedAt, &rec.UpdatedAt, &rec.WorkDirPath, &rec.OutputPath,
-		&rec.AnalysisSource, &rec.AnalysisFallback)
+		&rec.AnalysisSource, &rec.AnalysisFallback,
+		&rec.ForceIgnoreTagFilter, &rec.HeldReason, &rec.OriginQueueID)
 	return rec, err
 }
 
@@ -132,6 +263,204 @@ func (s *Store) ListSyncJobs(ctx context.Context) ([]SyncJobRecord, error) {
 		return nil, fmt.Errorf("store: iterate sync jobs: %w", err)
 	}
 	return out, nil
+}
+
+// syncJobQuerier is the read surface HeldJobs needs, so the projection can run
+// inside ReleaseHeldJobs' transaction and outside it with one implementation.
+type syncJobQuerier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+// HeldJobs returns every held job with its arr metadata in one query.
+func (s *Store) HeldJobs(ctx context.Context) ([]HeldJob, error) {
+	return heldJobs(ctx, s.DB)
+}
+
+// heldJobs is the single-query read behind both HeldJobs and ReleaseHeldJobs.
+// The arr columns come from a LEFT JOIN so a job whose cache row disappeared
+// (ON DELETE SET NULL, or a row written before it existed) still reports its own
+// state and asserts no arr metadata.
+func heldJobs(ctx context.Context, q syncJobQuerier) ([]HeldJob, error) {
+	rows, err := q.QueryContext(ctx, `
+		SELECT j.id, COALESCE(j.target_video_path, ''), j.target_library_cache_id,
+		       COALESCE(j.force_ignore_tag_filter, 0), COALESCE(j.held_reason, ''),
+		       CASE WHEN c.id IS NULL THEN 0 ELSE 1 END,
+		       COALESCE(c.title, ''), COALESCE(c.root_folder_path, ''),
+		       COALESCE(c.arr_tag_labels_json, '[]')
+		FROM sync_mux_jobs j
+		LEFT JOIN arr_library_cache c ON c.id = j.target_library_cache_id
+		WHERE j.status = 'held'
+		ORDER BY j.id`)
+	if err != nil {
+		return nil, fmt.Errorf("store: list held sync jobs: %w", err)
+	}
+	defer rows.Close()
+
+	out := []HeldJob{}
+	for rows.Next() {
+		var (
+			job    HeldJob
+			labels string
+		)
+		if err := rows.Scan(&job.ID, &job.TargetVideoPath, &job.TargetLibraryCacheID,
+			&job.ForceIgnoreTagFilter, &job.HeldReason, &job.HasArrRow,
+			&job.ArrTitle, &job.ArrRootFolder, &labels); err != nil {
+			return nil, fmt.Errorf("store: scan held sync job: %w", err)
+		}
+		// A malformed snapshot is reported rather than read as "no tags",
+		// which would silently change an arr gate verdict (ADR-0009).
+		var snapshot LibraryCacheItem
+		if err := decodeArrTagSnapshot("[]", labels, &snapshot); err != nil {
+			return nil, fmt.Errorf("store: held sync job %d: %w", job.ID, err)
+		}
+		job.ArrTags = snapshot.ArrTagLabels
+		out = append(out, job)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate held sync jobs: %w", err)
+	}
+	return out, nil
+}
+
+// ReleaseHeldJobs evaluates nowEligible for each held job and flips the ones
+// that pass to 'queued' in one transaction. It never touches force-approved
+// rows. Returns the number released. Safe to call concurrently and at boot.
+//
+// Release is a projection of eligibility, not a timer: this is the only writer
+// of held -> queued. The UPDATE is guarded on status='held', so two pollers
+// racing cannot double-release and a job whose target changed between the read
+// and the write is left for the next pass.
+func (s *Store) ReleaseHeldJobs(ctx context.Context, nowEligible func(HeldJob) bool) (int, error) {
+	if nowEligible == nil {
+		return 0, errors.New("store: release held jobs needs an eligibility projection")
+	}
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("store: begin release held jobs: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op once committed
+
+	held, err := heldJobs(ctx, tx)
+	if err != nil {
+		return 0, err
+	}
+
+	released := 0
+	for _, job := range held {
+		if job.ForceIgnoreTagFilter || !nowEligible(job) {
+			continue
+		}
+		res, err := tx.ExecContext(ctx, `
+			UPDATE sync_mux_jobs
+			SET status = ?, held_reason = NULL, updated_at = CURRENT_TIMESTAMP
+			WHERE id = ? AND status = ? AND force_ignore_tag_filter = 0`,
+			SyncJobQueued, job.ID, SyncJobHeld)
+		if err != nil {
+			return 0, fmt.Errorf("store: release sync job %d: %w", job.ID, err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return 0, fmt.Errorf("store: release sync job %d rows: %w", job.ID, err)
+		}
+		released += int(n)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("store: commit release held jobs: %w", err)
+	}
+	return released, nil
+}
+
+// HoldSyncJob demotes a claimed job back to held. Guards on the current status
+// so a completed job can never be re-held: only a claimed job (analyzing or
+// muxing) may return to the projection, which makes the claim-time re-check
+// one-way per attempt. reported=false means the guard refused the transition.
+func (s *Store) HoldSyncJob(ctx context.Context, id int64, reason string) (bool, error) {
+	if !validHoldReason(reason) {
+		return false, fmt.Errorf("store: hold sync job %d: reason %q is not in the vocabulary", id, reason)
+	}
+	res, err := s.DB.ExecContext(ctx, `
+		UPDATE sync_mux_jobs
+		SET status = ?, held_reason = ?, updated_at = CURRENT_TIMESTAMP
+		WHERE id = ? AND status IN (?, ?)`,
+		SyncJobHeld, reason, id, SyncJobAnalyzing, SyncJobMuxing)
+	if err != nil {
+		return false, fmt.Errorf("store: hold sync job %d: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("store: hold sync job %d rows: %w", id, err)
+	}
+	return n == 1, nil
+}
+
+// CancelSyncJob cancels a job by id; only queued|held may transition, so a
+// running job is left to the worker and cancelled stays terminal.
+func (s *Store) CancelSyncJob(ctx context.Context, id int64, reason string) (bool, error) {
+	if !validCancelReason(reason) {
+		return false, fmt.Errorf("store: cancel sync job %d: reason %q is not in the vocabulary", id, reason)
+	}
+	res, err := s.DB.ExecContext(ctx, `
+		UPDATE sync_mux_jobs
+		SET status = ?, held_reason = ?, updated_at = CURRENT_TIMESTAMP
+		WHERE id = ? AND status IN (?, ?)`,
+		SyncJobCancelled, reason, id, SyncJobQueued, SyncJobHeld)
+	if err != nil {
+		return false, fmt.Errorf("store: cancel sync job %d: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("store: cancel sync job %d rows: %w", id, err)
+	}
+	return n == 1, nil
+}
+
+// CancelSyncJobsByOrigin cancels every queued|held job created by a queue row:
+// rejection withdraws the intent approval recorded. A finished job is untouched
+// and a running one is left to the worker (cancel is a queued|held transition),
+// so no work dir is orphaned mid-mux.
+func (s *Store) CancelSyncJobsByOrigin(ctx context.Context, queueID int64, reason string) (int, error) {
+	if queueID <= 0 {
+		return 0, errors.New("store: cancel sync jobs: queue id must be positive")
+	}
+	if !validCancelReason(reason) {
+		return 0, fmt.Errorf("store: cancel sync jobs of queue row %d: reason %q is not in the vocabulary", queueID, reason)
+	}
+	res, err := s.DB.ExecContext(ctx, `
+		UPDATE sync_mux_jobs
+		SET status = ?, held_reason = ?, updated_at = CURRENT_TIMESTAMP
+		WHERE origin_queue_id = ? AND status IN (?, ?)`,
+		SyncJobCancelled, reason, queueID, SyncJobQueued, SyncJobHeld)
+	if err != nil {
+		return 0, fmt.Errorf("store: cancel sync jobs of queue row %d: %w", queueID, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("store: cancel sync jobs of queue row %d rows: %w", queueID, err)
+	}
+	return int(n), nil
+}
+
+// OriginHasLiveSyncJob reports whether an approval already owns a job that can
+// still run (queued, held, analyzing, ready_for_review or muxing). Approve uses
+// it to stay idempotent: a second POST for a row whose extraction already bred
+// the job must answer success, not breed another one.
+func (s *Store) OriginHasLiveSyncJob(ctx context.Context, queueID int64) (bool, error) {
+	if queueID <= 0 {
+		return false, errors.New("store: live sync job of queue row: queue id must be positive")
+	}
+	var one int
+	err := s.DB.QueryRowContext(ctx, `
+		SELECT 1 FROM sync_mux_jobs
+		WHERE origin_queue_id = ? AND status IN (?, ?, ?, ?, ?)
+		LIMIT 1`, queueID, SyncJobQueued, SyncJobHeld, SyncJobAnalyzing,
+		SyncJobReadyForReview, SyncJobMuxing).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("store: read live sync job of queue row %d: %w", queueID, err)
+	}
+	return true, nil
 }
 
 // FinishSyncJobAnalysis persists the terminal state of an analysis run.

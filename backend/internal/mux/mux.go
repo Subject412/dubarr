@@ -530,15 +530,22 @@ func (j Job) normalize() (target, workDir, jobDir, lang string, err error) {
 	return target, workDir, jobDir, lang, nil
 }
 
-// checkVerdict accepts only the settled ok/stable reports. Drifting,
-// unreliable, out-of-range and missing verdicts fail loudly (PLAN.md M5-1).
+// checkVerdict accepts the settled ok/stable reports, and a drifting report
+// the fitter classified as a clean drift whose tempo factor the worker has
+// already folded into the job's single encode: that track is aligned, so the
+// guard has nothing to refuse (#86). Every other drifting report — a cut, an
+// uncorrected drift, a missing application record — plus unreliable,
+// out-of-range and missing verdicts fail loudly (PLAN.md M5-1).
 func checkVerdict(r analyze.Report) error {
 	switch strings.ToLower(strings.TrimSpace(r.Verdict)) {
 	case analyze.VerdictOK, analyze.ClassificationStable:
 		return nil
-	default:
-		return fmt.Errorf("%w: verdict %q (classification %q)", ErrVerdict, r.Verdict, r.Classification)
+	case analyze.VerdictDrifting:
+		if r.Fit != nil && r.Fit.Shape == analyze.ShapeDrift && r.Fit.TempoApplied && r.Application != nil {
+			return nil
+		}
 	}
+	return fmt.Errorf("%w: verdict %q (classification %q)", ErrVerdict, r.Verdict, r.Classification)
 }
 
 // checkAmbiguity enforces the loud-fail rule before any write.

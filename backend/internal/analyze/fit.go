@@ -314,6 +314,6 @@ func medianOf(values []float64) float64 {
 	return (sorted[mid-1] + sorted[mid]) / 2
 }
 
-// abs is math.Abs, kept local so the millisecond arithmetic below reads as
-// the rules it implements.
+// abs is math.Abs, kept local so the millisecond arithmetic in this file reads
+// as the rules it implements.
 func abs(v float64) float64 { return math.Abs(v) }

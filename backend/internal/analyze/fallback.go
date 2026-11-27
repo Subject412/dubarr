@@ -18,8 +18,8 @@ package analyze
 // spike, a peak pinned to the engine's search edge, or a collapse in
 // correlation quality — makes a window untrustworthy.
 //
-// Drift is deliberately *not* reported here. Fitting a slope and writing it
-// into the report is issue #86; this file only decides which points to
+// Drift is deliberately *not* classified here. Fitting a slope and publishing
+// the shape is [FitTimeline] in fit.go; this file only decides which points to
 // re-decode.
 //
 // The thresholds are the package's existing ones — [StableSpreadThresholdMS]

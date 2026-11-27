@@ -19,6 +19,18 @@ export const SETTINGS_HELP: Record<SettingsSectionKey, Record<string, string>> =
     media_roots:
       'Library folders Dubarr is allowed to read Targets from. Paths are canonicalized and confined to these roots.',
   },
+  'vault.naming': {
+    preset:
+      'Fills the name patterns below. Arr style matches what Sonarr and Radarr would produce. You can edit any pattern afterwards. This changes the inside of the Audio Vault only — your videos and audio files are never renamed, moved or re-encoded, and nothing changes until you preview and apply a plan on the Vault page.',
+    movie_template:
+      'The name of the audio file, without the language suffix — Dubarr always adds .pl.mka (or the track\'s own language), because that suffix is how the vault finds a track. Tokens: {Title}, {Year}, {Variant}, {Codec}, {Channels}. This renames files inside the vault only: nothing on disk changes until you press Preview changes and then apply that plan.',
+    episode_template:
+      'Same idea for TV episodes. {Season:00} and {Episode:00} pad with zeroes, so season 2 episode 3 becomes S02E03, and {Episode Title} is dropped cleanly when the episode was not matched. Cost: none — a pattern is text until you apply a plan, and only files inside the Audio Vault ever move.',
+    season_folder:
+      "Where episodes go inside the show's folder. Leave blank to keep them beside the show folder. The default is Season 02. Cost: applying a plan creates the folder inside the Audio Vault — it never touches your video library.",
+    preview:
+      'A live example rendered with the sample the server validates patterns with. It updates as you type, runs entirely in this page, and changes nothing on disk.',
+  },
   'languages.policy': {
     target_import_languages:
       'Target Language codes (two-letter ISO-639-1, e.g. pl): the dub/lektor tracks the Export Policy pre-selects from a donor.',

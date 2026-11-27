@@ -34,6 +34,10 @@ import {
   type SyncJobStatus,
   type SyncJobsResponse,
   type User,
+  type VaultApplyResponse,
+  type VaultOrganiseRunsResponse,
+  type VaultOrganiseScope,
+  type VaultPlanResponse,
   type VaultResponse,
 } from './api'
 
@@ -44,6 +48,7 @@ export const queryKeys = {
   health: ['health'] as const,
   queue: ['queue'] as const,
   vault: ['vault'] as const,
+  organiseRuns: ['vault', 'organise', 'runs'] as const,
   syncJobs: ['sync', 'jobs'] as const,
   /**
    * One job list, keyed by its status filter. The bare `syncJobs` key stays the
@@ -166,6 +171,42 @@ export function useVault(): UseQueryResult<VaultResponse> {
     queryKey: queryKeys.vault,
     queryFn: api.vault,
     staleTime: 10_000,
+  })
+}
+
+/** Audit history of applied rollbacks and renames (#47), newest first. */
+export function useOrganiseRuns(): UseQueryResult<VaultOrganiseRunsResponse> {
+  return useQuery({
+    queryKey: queryKeys.organiseRuns,
+    queryFn: () => api.vaultOrganiseRuns(),
+    staleTime: 10_000,
+    retry: false,
+  })
+}
+
+/** Plans a rename; writes nothing, so a press is always safe to repeat. */
+export function useOrganisePreview(): UseMutationResult<
+  VaultPlanResponse,
+  Error,
+  VaultOrganiseScope
+> {
+  return useMutation({
+    mutationFn: (scope) => api.vaultOrganisePreview(scope),
+  })
+}
+
+/**
+ * Applies a previewed plan. A success makes both the vault listing and the
+ * history stale: the paths changed and a new audit run exists.
+ */
+export function useOrganiseApply(): UseMutationResult<VaultApplyResponse, Error, string> {
+  const client = useQueryClient()
+  return useMutation({
+    mutationFn: (planId) => api.vaultOrganiseApply(planId),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: queryKeys.vault })
+      void client.invalidateQueries({ queryKey: queryKeys.organiseRuns })
+    },
   })
 }
 

@@ -14,6 +14,7 @@
 //	watch.options      watch-folder scan cadence and stability window
 //	arr.options        Radarr/Sonarr polling cadence
 //	arr.connections    Radarr/Sonarr instances (API keys live in internal/secrets)
+//	vault.naming       arr-style vault file name patterns and the season folder
 //
 // mux/watch/arr sections are an extension of the original key list: the spec
 // only names the first five, but the settled defaults for the track title,
@@ -43,6 +44,7 @@ import (
 
 	"github.com/Subject412/dubarr/backend/internal/analyze"
 	"github.com/Subject412/dubarr/backend/internal/langtoken"
+	"github.com/Subject412/dubarr/backend/internal/naming"
 	"github.com/Subject412/dubarr/backend/internal/secrets"
 	"github.com/Subject412/dubarr/backend/internal/transcode"
 )
@@ -61,12 +63,14 @@ const (
 	KeyArrConnections  = "arr.connections"
 	KeyImportsOptions  = "imports.options"
 	KeyAudioOptions    = "audio.options"
+	KeyVaultNaming     = "vault.naming"
 )
 
 var knownKeys = []string{
 	KeyStoragePaths, KeyLanguagesPolicy, KeyTargetTagFilter, KeySyncDefaults,
 	KeySyncStrategy, KeySecurityOptions, KeyMuxOptions, KeyWatchOptions,
 	KeyArrOptions, KeyArrConnections, KeyImportsOptions, KeyAudioOptions,
+	KeyVaultNaming,
 }
 
 // KnownKeys returns the writable section keys in stable order.
@@ -412,6 +416,34 @@ type ArrConnections struct {
 	Instances []ArrConnection `json:"instances"`
 }
 
+// The shipped vault naming patterns (#47). They are the arr-style names the
+// settings UI's "Arr style (recommended)" preset fills in, and the values the
+// plan documents byte for byte.
+const (
+	DefaultMovieTemplate   = "{Title} ({Year}) [{Variant} {Codec} {Channels}]"
+	DefaultEpisodeTemplate = "{Title} - S{Season:00}E{Episode:00} - {Episode Title} [{Variant} {Codec} {Channels}]"
+	// DefaultSeasonFolder is the season subfolder inside a show's folder. A
+	// blank value means "keep episodes beside the show folder".
+	DefaultSeasonFolder = "Season {Season:00}"
+)
+
+// VaultNaming is the vault.naming section: the patterns that decide the *stem*
+// of an archived track inside the folder Dubarr already owns.
+//
+// The templates never carry the extension — every vault file ends in
+// ".<iso2>.mka" (internal/naming.VaultPath appends it) — which is why
+// {Language} is refused here with the documented message rather than stored and
+// later contradicted by the suffix.
+//
+// Nothing in this section renames anything: an apply is always an explicit
+// operator action against a fresh preview.
+type VaultNaming struct {
+	MovieTemplate   string `json:"movie_template"`
+	EpisodeTemplate string `json:"episode_template"`
+	// SeasonFolder is rendered per episode; blank disables the subfolder.
+	SeasonFolder string `json:"season_folder"`
+}
+
 // Store reads and writes settings sections on the shared database handle.
 type Store struct {
 	db *sql.DB
@@ -526,6 +558,11 @@ func Defaults(dataDir string) map[string]any {
 		// checkpoint — so a fresh install's offsets are the ones 0.4.0
 		// produced until the operator adds a technique.
 		KeySyncStrategy: StrategyOptions(analyze.DefaultStrategy()),
+		KeyVaultNaming: VaultNaming{
+			MovieTemplate:   DefaultMovieTemplate,
+			EpisodeTemplate: DefaultEpisodeTemplate,
+			SeasonFolder:    DefaultSeasonFolder,
+		},
 	}
 }
 
@@ -1006,6 +1043,13 @@ func normalize(key string, raw json.RawMessage) (string, error) {
 			err = validateStrategy(&p)
 		}
 		v = p
+	case KeyVaultNaming:
+		var p VaultNaming
+		err = strict(raw, &p)
+		if err == nil {
+			err = validateVaultNaming(&p)
+		}
+		v = p
 	}
 	if err != nil {
 		return "", fmt.Errorf("%w: %s: %v", ErrInvalidValue, key, err)
@@ -1232,6 +1276,41 @@ func validateImports(p *ImportsOptions) error {
 		if strings.TrimSpace(pattern) == "" {
 			return errors.New("donor_patterns entries must not be empty")
 		}
+	}
+	return nil
+}
+
+// validateVaultNaming is the one gate a naming pattern must pass, and it is the
+// same gate every other invalid setting passes: a pattern that fails
+// naming.Validate is refused here, with the section and field named, and the
+// stored row is left untouched.
+//
+// Trimming is the only rewriting performed: a blank season folder is a
+// meaningful value ("no subfolder"), so it is preserved as blank rather than
+// defaulted, while the two file patterns must be present and render something.
+func validateVaultNaming(p *VaultNaming) error {
+	p.MovieTemplate = strings.TrimSpace(p.MovieTemplate)
+	p.EpisodeTemplate = strings.TrimSpace(p.EpisodeTemplate)
+	p.SeasonFolder = strings.TrimSpace(p.SeasonFolder)
+
+	if err := naming.Validate(p.MovieTemplate); err != nil {
+		return fmt.Errorf("movie_template: %w", err)
+	}
+	if err := naming.Validate(p.EpisodeTemplate); err != nil {
+		return fmt.Errorf("episode_template: %w", err)
+	}
+	if p.SeasonFolder == "" {
+		// Blank = "keep episodes beside the show folder".
+		return nil
+	}
+	// A season folder is one directory name, never a path: a separator here
+	// would either escape the media folder or be silently flattened by the
+	// cleaner, and both are surprises an operator should not get on save.
+	if strings.ContainsAny(p.SeasonFolder, `/\`) {
+		return errors.New("season_folder must be a single folder name, not a path")
+	}
+	if err := naming.Validate(p.SeasonFolder); err != nil {
+		return fmt.Errorf("season_folder: %w", err)
 	}
 	return nil
 }

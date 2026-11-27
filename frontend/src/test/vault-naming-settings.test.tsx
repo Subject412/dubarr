@@ -1,0 +1,119 @@
+import { fireEvent, screen, waitFor, within } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import { describe, expect, it, vi } from 'vitest'
+import { SettingsPage } from '../pages/Settings'
+import { isMethod, jsonResponse, renderWithProviders } from '../test/helpers'
+
+const NAMING = {
+  movie_template: '{Title} ({Year}) [{Variant} {Codec} {Channels}]',
+  episode_template: '{Title} - S{Season:00}E{Episode:00} - {Episode Title} [{Variant} {Codec} {Channels}]',
+  season_folder: 'Season {Season:00}',
+}
+
+const SETTINGS = { 'vault.naming': NAMING }
+
+function mockSettings() {
+  const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input)
+    if (url.includes('/api/settings') && isMethod(init, 'PUT')) {
+      return jsonResponse({ settings: SETTINGS })
+    }
+    if (url.includes('/api/settings')) {
+      return jsonResponse({ settings: SETTINGS })
+    }
+    return jsonResponse({ error: 'unexpected' }, 404)
+  })
+  vi.stubGlobal('fetch', fetchMock)
+  return fetchMock
+}
+
+async function renderSettings() {
+  const fetchMock = mockSettings()
+  renderWithProviders(<SettingsPage />, { route: '/settings' })
+  expect(await screen.findByRole('heading', { name: 'Storage paths' })).toBeInTheDocument()
+  return fetchMock
+}
+
+describe('vault naming settings (#47)', () => {
+  it('shows the two patterns and saves them back unchanged', async () => {
+    const user = userEvent.setup()
+    const fetchMock = await renderSettings()
+
+    const movie = screen.getByLabelText('Movie file name')
+    expect(movie).toHaveValue(NAMING.movie_template)
+    expect(screen.getByLabelText('Episode file name')).toHaveValue(NAMING.episode_template)
+    expect(screen.getByLabelText('Season folder')).toHaveValue(NAMING.season_folder)
+    expect(screen.getByLabelText('Naming style')).toHaveValue('arr')
+
+    fireEvent.change(movie, { target: { value: '{Title} ({Year})' } })
+    await user.click(screen.getByLabelText('Save Vault naming'))
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([, init]) => isMethod(init, 'PUT'))).toBe(true)
+    })
+
+    const put = fetchMock.mock.calls.find(([, init]) => isMethod(init, 'PUT'))
+    const body = JSON.parse(String(put?.[1]?.body))
+    expect(body.settings['vault.naming']).toEqual({
+      movie_template: '{Title} ({Year})',
+      episode_template: NAMING.episode_template,
+      season_folder: NAMING.season_folder,
+    })
+  })
+
+  it('renders the live sample and updates it as the pattern changes, without a request', async () => {
+    const user = userEvent.setup()
+    const fetchMock = await renderSettings()
+
+    expect(screen.getByTestId('vault-naming-preview-movie')).toHaveTextContent(
+      'Spirited Away (2001) [Dubbing EAC3 5.1].pl.mka',
+    )
+    expect(screen.getByTestId('vault-naming-preview-episode')).toHaveTextContent(
+      'The Office - S02E03 - Office Olympics [Lektor EAC3 2.0].pl.mka',
+    )
+
+    fireEvent.change(screen.getByLabelText('Movie file name'), {
+      target: { value: '{Title} ({Year}) [{Variant}]' },
+    })
+
+    expect(screen.getByTestId('vault-naming-preview-movie')).toHaveTextContent(
+      'Spirited Away (2001) [Dubbing].pl.mka',
+    )
+
+    // A preset fills both patterns, and the previews follow at once.
+    await user.selectOptions(screen.getByLabelText('Naming style'), 'title_year')
+    expect(screen.getByLabelText('Movie file name')).toHaveValue('{Title} ({Year})')
+    expect(screen.getByTestId('vault-naming-preview-movie')).toHaveTextContent(
+      'Spirited Away (2001).pl.mka',
+    )
+    expect(screen.getByTestId('vault-naming-preview-episode')).toHaveTextContent(
+      'The Office - S02E03.pl.mka',
+    )
+
+    // The preview is local: it never asks the server for a sample.
+    expect(fetchMock.mock.calls.filter(([, init]) => isMethod(init, 'POST'))).toHaveLength(0)
+  })
+
+  it('shows the {Language} refusal against the movie field, not the episode field', async () => {
+    await renderSettings()
+
+    fireEvent.change(screen.getByLabelText('Movie file name'), {
+      target: { value: '{Title} {Language}' },
+    })
+
+    const movie = screen.getByTestId('vault-naming-movie')
+    const alert = within(movie).getByRole('alert')
+    expect(alert).toHaveTextContent('{Language} is not available')
+    expect(alert).toHaveTextContent('.<language>.mka')
+    expect(within(screen.getByTestId('vault-naming-episode')).queryByRole('alert')).toBeNull()
+  })
+
+  it('refuses a season folder that is a path, against the season folder field', async () => {
+    await renderSettings()
+
+    fireEvent.change(screen.getByLabelText('Season folder'), { target: { value: 'Season/02' } })
+
+    expect(within(screen.getByTestId('vault-naming-season')).getByRole('alert')).toHaveTextContent(
+      'single folder name',
+    )
+  })
+})

@@ -1005,4 +1005,121 @@ describe('piecewise report (#84)', () => {
     expect(screen.queryByTestId('sync-piecewise')).toBeNull()
     expect(screen.queryByTestId(/^boundary-marker-/)).toBeNull()
   })
+
+  it('shows an accepted plan as analysis-only when the worker recorded no render', async () => {
+    // An accepted two-segment plan is not proof of a cut: the worker renders it
+    // only when the verdict is muxable (`piecewiseRender`), so a job the gate
+    // refused carries the segments and no application block at all. The table is
+    // still worth showing — it is what the analysis found — but nothing may
+    // claim a render that never ran.
+    const job = makeJob({
+      id: 43,
+      status: 'failed',
+      error_message: 'syncworker: sync report is not muxable: verdict "unreliable" (matches too weak)',
+      report: makeReport({
+        verdict: 'unreliable',
+        classification: 'unreliable',
+        max_drift_ms: 2500,
+        checkpoints: denseCheckpoints(),
+        piecewise: {
+          segments: PIECEWISE_SEGMENTS,
+          boundaries: PIECEWISE_BOUNDARIES,
+          dominant_offset_ms: 0,
+          step_sec: 45,
+        },
+        review_reason: 'cut not confident — applied the dominant offset',
+      }),
+    })
+    stubJob(job)
+    renderWithProviders(<SyncPage />, { route: '/sync' })
+
+    const section = await screen.findByTestId('sync-piecewise')
+    const rows = within(section).getAllByTestId(/^piecewise-row-/)
+    expect(rows).toHaveLength(2)
+    expect(rows[1]).toHaveTextContent('2500 ms')
+
+    const analysisOnly = within(section).getByTestId('piecewise-analysis-only')
+    expect(analysisOnly).toHaveTextContent('2 segments')
+    expect(analysisOnly).toHaveTextContent('cut not confident — applied the dominant offset')
+
+    // No render was recorded, so neither the copy nor the chart may say one was.
+    expect(screen.queryByTestId('piecewise-count')).toBeNull()
+    expect(screen.queryByText(/rejoined in one pass/)).toBeNull()
+    expect(screen.queryByTestId('sync-piecewise-boundaries')).toBeNull()
+    expect(screen.queryByTestId(/^boundary-marker-/)).toBeNull()
+  })
+
+  it('treats an out_of_range verdict with an accepted plan as analysis-only', async () => {
+    // `out_of_range` is refused before any transcode, exactly like `unreliable`:
+    // the plan is accepted and multi-segment, yet the dub copy was never cut.
+    const job = makeJob({
+      id: 44,
+      status: 'failed',
+      error_message:
+        'syncworker: sync report is not muxable: verdict "out_of_range" (max drift 2500 ms)',
+      report: makeReport({
+        verdict: 'out_of_range',
+        classification: 'out_of_range',
+        max_drift_ms: 2500,
+        checkpoints: denseCheckpoints(),
+        piecewise: {
+          segments: PIECEWISE_SEGMENTS,
+          boundaries: PIECEWISE_BOUNDARIES,
+          dominant_offset_ms: 0,
+          step_sec: 45,
+        },
+        review_reason: 'cut not confident — applied the dominant offset',
+      }),
+    })
+    stubJob(job)
+    renderWithProviders(<SyncPage />, { route: '/sync' })
+
+    expect(await screen.findByTestId('verdict-badge')).toHaveTextContent('out of range')
+
+    const section = await screen.findByTestId('sync-piecewise')
+    expect(within(section).getAllByTestId(/^piecewise-row-/)).toHaveLength(2)
+    expect(within(section).getByTestId('piecewise-analysis-only')).toHaveTextContent(
+      'not rendered piecewise',
+    )
+    expect(screen.queryByTestId('piecewise-count')).toBeNull()
+    expect(screen.queryByText(/rejoined in one pass/)).toBeNull()
+    expect(screen.queryByTestId('sync-piecewise-boundaries')).toBeNull()
+    expect(screen.queryByTestId(/^boundary-marker-/)).toBeNull()
+  })
+
+  it('keeps the rejoin copy and the join marker when the worker recorded the render', async () => {
+    // The gate is the server's own record, not the plan: with
+    // `application.mode === 'piecewise'` the worker did cut and rejoin the copy,
+    // so the sentence and the marker are exactly what happened.
+    const job = makeJob({
+      id: 45,
+      calculated_offset_ms: 0,
+      report: makeReport({
+        verdict: 'ok',
+        classification: 'piecewise',
+        checkpoints: denseCheckpoints(),
+        piecewise: {
+          segments: PIECEWISE_SEGMENTS,
+          boundaries: PIECEWISE_BOUNDARIES,
+          dominant_offset_ms: 0,
+          step_sec: 45,
+        },
+        application: {
+          mode: 'piecewise',
+          note: 're-encoded (piecewise, 2 segments)',
+          segment_count: 2,
+          segments: PIECEWISE_SEGMENTS,
+        },
+      }),
+    })
+    stubJob(job)
+    renderWithProviders(<SyncPage />, { route: '/sync' })
+
+    expect(await screen.findByTestId('piecewise-count')).toHaveTextContent(
+      'The dub was cut into 2 segments and rejoined in one pass',
+    )
+    expect(screen.queryByTestId('piecewise-analysis-only')).toBeNull()
+    expect(screen.getByTestId('sync-piecewise-boundaries')).toBeInTheDocument()
+    expect(await screen.findAllByTestId(/^boundary-marker-/)).toHaveLength(1)
+  })
 })

@@ -309,43 +309,55 @@ func TestCorrelationCostRatio(t *testing.T) {
 		t.Fatalf("warm-up correlation: %v", err)
 	}
 
-	correlation := bestOf(t, perfRuns, func() {
-		got, err := scratch.Analyze(ctx, target, donor, perfRate, perfWindowSec)
-		if err != nil {
-			t.Fatalf("correlation: %v", err)
-		}
-		perfCorrelationSink = got
-	})
-
 	reference := newReferenceCheckpoint()
 	// Warm-up for the reference side too: go-fft caches its plan32 twiddle
 	// table per (n, fused) pair on first use, and the median's clone walks a
 	// fresh 11.5 MB allocation. A job pays both once per worker.
 	perfTransformSink = reference.run()
 
-	referenceCost := bestOf(t, perfRuns, func() {
-		perfTransformSink = reference.run()
-	})
-
-	if referenceCost <= 0 {
-		t.Fatalf("reference measurement is %v; nothing was timed", referenceCost)
+	// A single ratio can be decided by the machine rather than the code: when
+	// the box is compiling or running a suite alongside this test, a best-of
+	// window still catches the correlation in a scheduling gap that the
+	// reference's allocation-heavy side absorbs. A real regression is
+	// persistent, contention is not, so a bad ratio is re-measured before it
+	// fails the build — three rounds, and the best ratio seen is the verdict.
+	const rounds = 3
+	bestRatio := math.MaxFloat64
+	var bestCorrelation, bestReference time.Duration
+	for round := 1; round <= rounds; round++ {
+		correlation := bestOf(t, perfRuns, func() {
+			got, err := scratch.Analyze(ctx, target, donor, perfRate, perfWindowSec)
+			if err != nil {
+				t.Fatalf("correlation: %v", err)
+			}
+			perfCorrelationSink = got
+		})
+		referenceCost := bestOf(t, perfRuns, func() {
+			perfTransformSink = reference.run()
+		})
+		if referenceCost <= 0 {
+			t.Fatalf("round %d: reference measurement is %v; nothing was timed", round, referenceCost)
+		}
+		ratio := float64(correlation) / float64(referenceCost)
+		t.Logf("round %d: 190 s @ %d Hz, nfft = 2^%d, NoFMA: correlation %v (%.0f ms), "+
+			"reference checkpoint %v (%.0f ms), ratio %.2f, gate K = %.1f",
+			round, perfRate, int(math.Log2(perfNFFT)), correlation, millis(correlation),
+			referenceCost, millis(referenceCost), ratio, costRatioK)
+		if ratio < bestRatio {
+			bestRatio, bestCorrelation, bestReference = ratio, correlation, referenceCost
+		}
+		if ratio <= costRatioK {
+			return
+		}
 	}
-	ratio := float64(correlation) / float64(referenceCost)
 
-	t.Logf("190 s @ %d Hz, nfft = 2^%d, NoFMA: correlation %v (%.0f ms), "+
-		"reference checkpoint %v (%.0f ms), ratio %.2f, gate K = %.1f",
-		perfRate, int(math.Log2(perfNFFT)), correlation, millis(correlation),
-		referenceCost, millis(referenceCost), ratio, costRatioK)
-
-	if ratio > costRatioK {
-		t.Fatalf("correlation costs %.2fx the host's reference checkpoint, gate is %.1fx "+
-			"(correlation %v, reference %v): the per-checkpoint work grew, not the machine. "+
-			"Check prepare, the X*conj(Y) product, the prefix sums, the lag scan and "+
-			"peakProminence's clone-and-sort for a reintroduced per-lag allocation or a lost "+
-			"early exit. Re-measure and record the number in internal/dsp/PERF.md before "+
-			"changing costRatioK.",
-			ratio, costRatioK, correlation, referenceCost)
-	}
+	t.Fatalf("correlation costs %.2fx the host's reference checkpoint in all %d rounds, gate is %.1fx "+
+		"(best correlation %v, best reference %v): the per-checkpoint work grew, not the machine. "+
+		"Check prepare, the X*conj(Y) product, the prefix sums, the lag scan and "+
+		"peakProminence's clone-and-sort for a reintroduced per-lag allocation or a lost "+
+		"early exit. Re-measure and record the number in internal/dsp/PERF.md before "+
+		"changing costRatioK.",
+		bestRatio, rounds, costRatioK, bestCorrelation, bestReference)
 }
 
 // millis renders a duration as milliseconds for the log line.

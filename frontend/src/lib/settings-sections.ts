@@ -26,6 +26,12 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
     description: 'Watch folder, Audio Vault, temp folder and media roots (absolute paths).',
   },
   {
+    key: 'vault.naming',
+    title: 'Vault naming',
+    description:
+      'How audio files are named inside the Audio Vault. This only changes the inside of the vault: your videos and audio are never renamed, moved or re-encoded, and nothing changes until you preview and apply a plan on the Vault page.',
+  },
+  {
     key: 'languages.policy',
     title: 'Languages policy',
     description: 'Which dubbing tracks are imported and which reference tracks are kept.',

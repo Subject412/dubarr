@@ -241,6 +241,19 @@ export type ImportsOptions = {
   donor_patterns: string[]
 }
 
+/**
+ * `vault.naming`: the patterns that decide the *stem* of an archived track
+ * inside the folder Dubarr already owns (#47). They never carry the extension —
+ * every vault file still ends in ".<language>.mka" — and nothing is renamed
+ * until an operator previews and applies a plan on the Vault page.
+ */
+export type VaultNaming = {
+  movie_template: string
+  episode_template: string
+  /** A single folder name rendered per episode; blank keeps episodes beside the show folder. */
+  season_folder: string
+}
+
 export type DubarrSettings = {
   'storage.paths': StoragePaths
   'languages.policy': LanguagesPolicy
@@ -253,6 +266,7 @@ export type DubarrSettings = {
   'watch.options': WatchOptions
   'arr.options': ArrOptions
   'imports.options': ImportsOptions
+  'vault.naming': VaultNaming
 }
 
 export type SettingsKey = keyof DubarrSettings
@@ -587,6 +601,85 @@ export type VaultItem = {
 
 export type VaultResponse = {
   items: VaultItem[]
+}
+
+/** Which archived tracks a rename plan covers (#47). */
+export type VaultOrganiseScope = {
+  media_type: 'movie' | 'series' | 'all'
+  ids?: number[]
+}
+
+/**
+ * One row of the plan table: the file where it is now and where the naming
+ * pattern would put it. `conflict` is the machine name of the plan-wide
+ * conflict this row takes part in (`destination_duplicate`,
+ * `destination_exists`, `source_missing`, `destination_parent`) — the UI
+ * translates it and never parses the free text.
+ */
+export type VaultPlanFile = {
+  track_id: number
+  media_id: number
+  source: string
+  destination: string
+  changed: boolean
+  reason: string
+  conflict: string | null
+}
+
+/** One name a plan cannot produce, with every track involved. */
+export type VaultPlanConflict = {
+  kind: string
+  destination: string
+  track_ids: number[]
+}
+
+export type VaultPlanImpact = {
+  renamed: number
+  unchanged: number
+  /** Jobs referencing these tracks by id; a rename does not break them. */
+  jobs_referencing_tracks: number
+  /** Non-zero exactly when apply would be refused for a job in analyzing/muxing. */
+  jobs_blocked: number
+  library_rows_affected: number
+}
+
+/**
+ * POST /api/vault/organise/preview response. `plan_id` is absent whenever the
+ * plan carries any conflict: apply takes a plan_id, so a conflicted plan
+ * cannot be applied at all.
+ */
+export type VaultPlanResponse = {
+  plan_id?: string
+  expires_at?: string
+  files: VaultPlanFile[]
+  conflicts: VaultPlanConflict[]
+  impact: VaultPlanImpact
+}
+
+/** POST /api/vault/organise/apply response: what the run actually did. */
+export type VaultApplyResponse = {
+  run_id: number
+  status: string
+  file_count: number
+  renamed: number
+  unchanged: number
+}
+
+/** One audit run of GET /api/vault/organise/runs, newest first. */
+export type VaultOrganiseRun = {
+  id: number
+  started_at: string
+  finished_at?: string
+  /** `applied` | `rolled_back` | `needs_attention`; kept loose for the future. */
+  status: string
+  plan_hash: string
+  file_count: number
+  actor?: string
+  detail?: string
+}
+
+export type VaultOrganiseRunsResponse = {
+  items: VaultOrganiseRun[]
 }
 
 /**
@@ -1095,6 +1188,25 @@ export const api = {
     )
   },
   vault: () => request<VaultResponse>('/api/vault'),
+  /**
+   * Plans a rename for the scope and returns every row. It writes nothing: no
+   * directories, no files, no rows. A plan with a conflict comes back without a
+   * `plan_id`, which is how the UI knows it cannot be applied.
+   */
+  vaultOrganisePreview: (scope: VaultOrganiseScope) =>
+    request<VaultPlanResponse>('/api/vault/organise/preview', {
+      method: 'POST',
+      body: JSON.stringify({ scope }),
+    }),
+  /** Applies a previewed plan; the server re-checks the hash and refuses `stale_plan`. */
+  vaultOrganiseApply: (planId: string) =>
+    request<VaultApplyResponse>('/api/vault/organise/apply', {
+      method: 'POST',
+      body: JSON.stringify({ plan_id: planId, confirm: true }),
+    }),
+  /** Audit history, newest first. Reads the database only, so it survives a restart. */
+  vaultOrganiseRuns: (limit = 50) =>
+    request<VaultOrganiseRunsResponse>(`/api/vault/organise/runs?limit=${limit}`),
   syncJobs: (status?: SyncJobStatus) =>
     request<SyncJobsResponse>(
       `/api/sync/jobs${status ? `?status=${encodeURIComponent(status)}` : ''}`,

@@ -10,6 +10,7 @@ import type {
   SyncDefaults,
   SyncStrategy,
   TargetTagFilter,
+  VaultNaming,
   WatchOptions,
 } from './api'
 
@@ -98,6 +99,14 @@ export const DEFAULT_SETTINGS: DubarrSettings = {
   'watch.options': { scan_interval_sec: 10, stability_check_interval_sec: 4 },
   'arr.options': { poll_interval_sec: 300 },
   'imports.options': { donor_patterns: ['PL.DUB'] },
+  // The shipped naming patterns (#47, `settings.Default*`). Nothing is renamed
+  // until an operator previews and applies a plan on the Vault page.
+  'vault.naming': {
+    movie_template: '{Title} ({Year}) [{Variant} {Codec} {Channels}]',
+    episode_template:
+      '{Title} - S{Season:00}E{Episode:00} - {Episode Title} [{Variant} {Codec} {Channels}]',
+    season_folder: 'Season {Season:00}',
+  },
 }
 
 export type {
@@ -111,5 +120,6 @@ export type {
   SyncDefaults,
   SyncStrategy,
   TargetTagFilter,
+  VaultNaming,
   WatchOptions,
 }

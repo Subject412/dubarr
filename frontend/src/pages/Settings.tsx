@@ -12,6 +12,7 @@ import type {
   SyncDefaults,
   SyncStrategy,
   TargetTagFilter,
+  VaultNaming,
   WatchOptions,
 } from '../lib/api'
 import { api } from '../lib/api'
@@ -32,6 +33,7 @@ import { PathField, PathListEditor } from '../components/PathPicker'
 import { StrategyEditor } from '../components/StrategyEditor'
 import { ThemeSelector } from '../components/ThemeSelector'
 import { TranscodeRulesEditor } from '../components/TranscodeRulesEditor'
+import { VaultNamingSettings } from '../components/VaultNamingSettings'
 import {
   Alert,
   Badge,
@@ -550,6 +552,17 @@ export function SettingsPage() {
                   help={settingsHelp('storage.paths', 'media_roots')}
                 />
               </>
+            )}
+          </Section>
+
+          <Section<VaultNaming>
+            sectionKey="vault.naming"
+            value={(data['vault.naming'] as VaultNaming) ?? DEFAULTS['vault.naming']}
+            save={save}
+            errorInBody
+          >
+            {(draft, update, error) => (
+              <VaultNamingSettings value={draft} onChange={update} error={error} />
             )}
           </Section>
 

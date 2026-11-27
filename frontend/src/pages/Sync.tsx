@@ -451,6 +451,17 @@ function piecewiseRendered(report: SyncReport): boolean {
 }
 
 /**
+ * The tail silence as an operator reads it: whole seconds when the value is a
+ * whole number of seconds, one decimal otherwise (12500 -> "12.5"). The
+ * backend only reports a tail of at least a second (#129), so this never has
+ * to render a fraction of the padding noise.
+ */
+function tailSilenceSeconds(ms: number): string {
+  const seconds = ms / 1000
+  return Number.isInteger(seconds) ? String(seconds) : seconds.toFixed(1)
+}
+
+/**
  * The segmentation a piecewise job applied (#84): one row per run of the film,
  * and the joins between them with the uncertainty the sampling step implies.
  *
@@ -469,6 +480,10 @@ function PiecewiseBlock({ report }: { report: SyncReport }) {
   // The application block is the worker's own count; the list is the evidence.
   const count = report.application?.segment_count ?? segments.length
   const review = report.review_reason?.trim()
+  // #129: the worker only records a tail once it passes a second, so a listed
+  // value is a finding, not padding noise. Absent means the dub covers the film.
+  const tailMS = report.application?.tail_silence_ms ?? 0
+  const tail = rendered && tailMS >= 1000 ? tailSilenceSeconds(tailMS) : ''
 
   return (
     <section data-testid="sync-piecewise" className="space-y-2">
@@ -481,10 +496,18 @@ function PiecewiseBlock({ report }: { report: SyncReport }) {
         />
       </div>
       {rendered ? (
-        <p data-testid="piecewise-count" className="text-xs text-zinc-400">
-          The dub was cut into {count} segments and rejoined in one pass; each segment carries its
-          own offset.
-        </p>
+        <>
+          <p data-testid="piecewise-count" className="text-xs text-zinc-400">
+            The dub was cut into {count} segments and rejoined in one pass; each segment carries its
+            own offset.
+          </p>
+          {tail ? (
+            <p data-testid="piecewise-tail-silence" className="text-xs text-zinc-400">
+              The dub ends {tail} s before the film, so the last {tail} s of the film has no dub
+              audio.
+            </p>
+          ) : null}
+        </>
       ) : (
         <p data-testid="piecewise-analysis-only" className="text-xs text-zinc-400">
           Analysed only — the plan splits the film into {segments.length} segments, but this job was

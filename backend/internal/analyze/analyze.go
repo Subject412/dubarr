@@ -642,6 +642,12 @@ type Application struct {
 	// the film were cut and placed separately.
 	SegmentCount int       `json:"segment_count,omitempty"`
 	Segments     []Segment `json:"segments,omitempty"`
+	// TailSilenceMS is how many milliseconds of the film's end no dub audio
+	// covers after the render: a short dub under a longer film leaves that
+	// much silence, and it is a finding the operator should see rather than
+	// a clean success with a segment count. Zero (and absent) when the dub
+	// covers the film or the length is unknown (#129).
+	TailSilenceMS int64 `json:"tail_silence_ms,omitempty"`
 }
 
 // Segment, and the rest of the piecewise shape, live in segment.go with the

@@ -173,8 +173,16 @@ const RESERVED_NAMES = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i
 
 /** A catalog value as a name-safe component; never fails, may clean to "". */
 export function cleanVaultTitle(value: string): string {
-  const withoutSeparators = value.replace(/[/\\:*?"<>|\u0000-\u001f\u007f]/g, ' ')
-  return withoutSeparators.replace(/\s+/g, ' ').replace(/^[ .]+/, '').replace(/[ .]+$/, '')
+  // Forbidden on every filesystem Dubarr writes to, plus control characters.
+  // Filtered by code point rather than by a regex class so the intent is
+  // readable and no linter has to guess what a control-character range means.
+  let cleaned = ''
+  for (const ch of value) {
+    const code = ch.codePointAt(0) ?? 0
+    const forbidden = code < 0x20 || code === 0x7f || '/\\:*?"<>|'.includes(ch)
+    cleaned += forbidden ? ' ' : ch
+  }
+  return cleaned.replace(/\s+/g, ' ').replace(/^[ .]+/, '').replace(/[ .]+$/, '')
 }
 
 function padNumber(value: number, pad: number): string {

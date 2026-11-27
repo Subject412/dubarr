@@ -57,6 +57,19 @@ func requireEngine(t *testing.T) Engine {
 	return sync.New(sync.WithTimeout(testJobTimeout))
 }
 
+// echoResult is a successful engine answer that echoes the slice the job asked
+// for, as the real engine does. The analyser reads the echo to detect a short
+// slice, so a stub that leaves Analyzed.Len at zero is claiming it analysed
+// nothing.
+func echoResult(job sync.Job, offset, quality float64) sync.Result {
+	return sync.Result{
+		OffsetMS:           offset,
+		CorrelationQuality: quality,
+		SampleRate:         8000,
+		Analyzed:           sync.Analyzed{Start: job.SliceStartSec, Len: job.SliceLenSec},
+	}
+}
+
 // scriptedEngine is the aggregation seam: it returns canned offsets per job so
 // the classification logic is unit-tested without the Rust binary.
 type scriptedEngine struct {
@@ -79,7 +92,7 @@ func (e *scriptedEngine) Run(_ context.Context, job sync.Job) (sync.Result, erro
 	if i < len(e.qualities) {
 		q = e.qualities[i]
 	}
-	return sync.Result{OffsetMS: e.offsets[i], CorrelationQuality: q, SampleRate: 8000}, nil
+	return echoResult(job, e.offsets[i], q), nil
 }
 
 func sameLangRefs() ([]probe.AudioTrack, []probe.AudioTrack, reflang.Languages, string) {
@@ -708,7 +721,7 @@ func (e *reverseOrderEngine) Run(ctx context.Context, job sync.Job) (sync.Result
 			return sync.Result{}, ctx.Err()
 		}
 	}
-	return sync.Result{OffsetMS: e.offsets[idx], CorrelationQuality: 0.9 + float64(idx)/100}, nil
+	return echoResult(job, e.offsets[idx], 0.9+float64(idx)/100), nil
 }
 
 // TestParallelReportIsOrderIndependent is the invariant: the marshalled report
@@ -770,7 +783,7 @@ func newCountingEngine(together int32, hold time.Duration) *countingEngine {
 	return e
 }
 
-func (e *countingEngine) Run(ctx context.Context, _ sync.Job) (sync.Result, error) {
+func (e *countingEngine) Run(ctx context.Context, job sync.Job) (sync.Result, error) {
 	cur := e.inFlight.Add(1)
 	defer e.inFlight.Add(-1)
 	for {
@@ -790,7 +803,7 @@ func (e *countingEngine) Run(ctx context.Context, _ sync.Job) (sync.Result, erro
 		case <-time.After(10 * time.Second):
 			return sync.Result{}, fmt.Errorf("%d checkpoints never ran together, want %d", e.max.Load(), e.together)
 		}
-		return sync.Result{OffsetMS: 1200, CorrelationQuality: 0.9}, nil
+		return echoResult(job, 1200, 0.9), nil
 	}
 	if e.hold > 0 {
 		select {
@@ -799,7 +812,7 @@ func (e *countingEngine) Run(ctx context.Context, _ sync.Job) (sync.Result, erro
 			return sync.Result{}, ctx.Err()
 		}
 	}
-	return sync.Result{OffsetMS: 1200, CorrelationQuality: 0.9}, nil
+	return echoResult(job, 1200, 0.9), nil
 }
 
 // TestParallelConcurrencyCap proves the workers are really concurrent and never
@@ -836,7 +849,7 @@ func (e *failingEngine) Run(_ context.Context, job sync.Job) (sync.Result, error
 	if msg, bad := e.fail[idx]; bad {
 		return sync.Result{}, errors.New(msg)
 	}
-	return sync.Result{OffsetMS: 1200, CorrelationQuality: 0.9}, nil
+	return echoResult(job, 1200, 0.9), nil
 }
 
 // TestParallelErrorIsLowestIndex pins the deterministic first error: the higher

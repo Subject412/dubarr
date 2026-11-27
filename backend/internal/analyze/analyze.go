@@ -21,8 +21,10 @@
 //     lowpass_fallback? This comes from internal/reflang and travels in the
 //     report so the accuracy of a low-pass match is visible downstream.
 //
-// The package performs no FFmpeg work and never writes files: callers stage
-// the WAV windows (M4-3 Copy-on-Work) and own the sync job lifecycle.
+// The package performs no FFmpeg work itself and writes no files: the
+// [Slicer] in [Config] produces the audio each checkpoint reads (the default
+// whole-file slicer simply names the staged WAVs), and callers own the sync
+// job lifecycle and the staging (M4-3 Copy-on-Work).
 package analyze
 
 import (
@@ -377,6 +379,32 @@ type Config struct {
 	// [DefaultJobTimeout] for the analysed slice; callers that construct a
 	// sync.Runner should pass the same value via sync.WithTimeout.
 	JobTimeout time.Duration `json:"-"`
+	// Slicer produces the audio each checkpoint's engine job reads. Nil
+	// selects a [wholeFileSlicer] over Request's paths, which is the
+	// whole-file behaviour. It must be safe for concurrent use (see
+	// [Slicer]).
+	Slicer Slicer `json:"-"`
+	// AnalysisSource is [AnalysisSourceWindows], [AnalysisSourceFull], or
+	// empty for full. It is not a report input: it decides whether the
+	// duration must come from the request rather than from the staged WAVs
+	// (see [ErrNoDuration]).
+	AnalysisSource string `json:"-"`
+}
+
+// windowed reports whether cfg asks for windows cut at the planned positions
+// instead of the whole decoded sources. Only the explicit windows value does;
+// empty, full and anything unrecognised mean the whole-file path.
+func (c Config) windowed() bool {
+	return c.AnalysisSource == AnalysisSourceWindows
+}
+
+// slicer returns the slicer to run the plan against: cfg's own when set, else
+// the whole-file identity over the request's staged paths.
+func (c Config) slicer(req Request) Slicer {
+	if c.Slicer != nil {
+		return c.Slicer
+	}
+	return wholeFileSlicer{TargetPath: req.TargetPath, DonorPath: req.DonorPath}
 }
 
 // DefaultConfig returns the settled sync.defaults checkpoint policy.
@@ -501,6 +529,32 @@ type Report struct {
 // WindowSec is set to the planned length, so the engine searches the whole
 // analysed slice.
 //
+// # Report position and engine offset
+//
+// Each checkpoint asks cfg's [Slicer] for the audio it must read and builds
+// the engine job from that [Slice] — its two paths, its EngineStartSec and its
+// LenSec. The report, in turn, states the plan's film position and length
+// ([Window.FilmStartSec], [Window.LenSec]). The two are deliberately not the
+// same number: in windowed mode the slice starts at a pre-roll inside a small
+// window file, and reporting that as the checkpoint's position is what made
+// every window look like it sat at the start of the film. A nil Slicer means a
+// [wholeFileSlicer] over Request's paths, whose engine start is the film
+// position because a fully decoded WAV begins at it.
+//
+// The engine's echo of what it analysed (sync.Analyzed.Len) is read for one
+// purpose only: a checkpoint whose slice came back more than one sample shorter
+// than planned fails with [ErrShortWindow], checkpoint-indexed, and no report
+// is returned. It never contributes a position.
+//
+// # A windowed plan needs a duration
+//
+// When cfg.AnalysisSource is [AnalysisSourceWindows], Request.DurationSec must
+// be positive and is used verbatim: the percentages are taken of it rather than
+// of a staged WAV, which a windowed decode does not produce. A missing duration
+// is [ErrNoDuration] before any slicer call, instead of six checkpoints clamped
+// to 0 that would agree with each other and look stable. On the whole-file path
+// a zero duration is still derived from the two staged WAV headers.
+//
 // Each checkpoint runs with its own deadline, [JobTimeout] (120 s for the
 // settled slice, or [Config.JobTimeout] when set), derived from the shared
 // context so one failure or a caller cancel reaches every worker. A
@@ -513,6 +567,13 @@ func Analyze(ctx context.Context, engine Engine, cfg Config, req Request) (Repor
 	}
 	if err := cfg.validate(); err != nil {
 		return Report{}, err
+	}
+	// A windowed plan is a percentage of the probed duration, so a missing
+	// one must fail before any slicer is asked for audio: the alternative is
+	// six checkpoints clamped to 0 that look like a stable report.
+	if cfg.windowed() && req.DurationSec <= 0 {
+		return Report{}, fmt.Errorf("analyze: analysis_source %s: %w (got %v)",
+			cfg.AnalysisSource, ErrNoDuration, req.DurationSec)
 	}
 	resolved := reflang.Resolve(req.TargetTracks, req.VaultTracks, req.Policy, req.OriginalLanguage)
 	if len(resolved.Pairs) == 0 {
@@ -548,11 +609,10 @@ func Analyze(ctx context.Context, engine Engine, cfg Config, req Request) (Repor
 
 	// One plan for the whole job, computed once: the film positions and
 	// lengths every checkpoint reports, and the correction that would be
-	// applied to each source's seek. This unit analyses whole files, whose
-	// frame 0 is film 0, so both corrections are a known zero and the engine's
-	// start is the film start — but the plan is the same object a windowed
-	// decode will consume (U-WIN.4), which is what keeps both modes' reports
-	// comparable.
+	// applied to each source's seek. The plan is the same object both
+	// analysis sources consume, which is what keeps their reports
+	// comparable; where each source's audio actually starts inside the files
+	// it reads is the slicer's business (see [Slicer]).
 	timing := Timing{
 		Target: SourceTiming{DurationSec: targetDur, OriginKnown: true},
 		Donor:  SourceTiming{DurationSec: donorDur, OriginKnown: true},
@@ -570,7 +630,7 @@ func Analyze(ctx context.Context, engine Engine, cfg Config, req Request) (Repor
 		Qualities:   make([]float64, len(pcts)),
 	}
 
-	runs, err := runCheckpoints(ctx, engine, cfg, req, plan, workers)
+	runs, err := runCheckpoints(ctx, engine, cfg, cfg.slicer(req), plan, workers)
 	if err != nil {
 		return Report{}, err
 	}
@@ -608,7 +668,11 @@ type checkpointRun struct {
 // most workers of them in flight, and returns their slots. A non-nil error is
 // the deterministic pick described on [Analyze]: the lowest checkpoint index
 // that genuinely failed, else the lowest one a cancellation stopped.
-func runCheckpoints(ctx context.Context, engine Engine, cfg Config, req Request, plan []Window, workers int) ([]checkpointRun, error) {
+//
+// One slicer call per checkpoint, from the worker that owns that checkpoint:
+// the Slicer contract makes that safe for any worker count, and the worker
+// writes only its own slot.
+func runCheckpoints(ctx context.Context, engine Engine, cfg Config, slicer Slicer, plan []Window, workers int) ([]checkpointRun, error) {
 	runs := make([]checkpointRun, len(plan))
 
 	runCtx, cancel := context.WithCancel(ctx)
@@ -624,28 +688,21 @@ func runCheckpoints(ctx context.Context, engine Engine, cfg Config, req Request,
 
 	// The internal sync package owns the name `sync` in this file, so the
 	// join is a channel: every worker reports exactly once on its way out.
+	// The Slicer is one shared instance and must be safe for that (see
+	// [Slicer]); one call is made per checkpoint, from the worker that owns
+	// it.
 	done := make(chan struct{}, workers)
 	for w := 0; w < workers; w++ {
 		go func() {
 			defer func() { done <- struct{}{} }()
 			for i := range queue {
 				// The window is data, planned once for the whole job: the
-				// report takes its film position and the engine takes its
-				// start and length, and neither is derived from the other.
+				// report takes its film position and the engine takes the
+				// offset and length of the audio the slicer handed it, and
+				// neither is derived from the other.
 				window := plan[i]
 				pct := window.PositionPct
-				length := window.LenSec
-				search := length
-				job := sync.Job{
-					TargetPath:    req.TargetPath,
-					DonorPath:     req.DonorPath,
-					SliceStartSec: window.FilmStartSec,
-					SliceLenSec:   length,
-					WindowSec:     &search,
-				}
-				jobCtx, cancelJob := context.WithTimeout(runCtx, JobTimeout(cfg))
-				result, err := engine.Run(jobCtx, job)
-				cancelJob()
+				result, err := runWindow(runCtx, engine, cfg, slicer, window)
 				if err != nil {
 					// A checkpoint cancelled by a sibling's failure says
 					// nothing about its own audio, so it must never outrank
@@ -668,9 +725,13 @@ func runCheckpoints(ctx context.Context, engine Engine, cfg Config, req Request,
 					return
 				}
 				runs[i] = checkpointRun{checkpoint: Checkpoint{
-					PositionPct:   pct,
+					PositionPct: pct,
+					// The report states where the window sits in the film,
+					// never where the engine read it: result.Analyzed.Start
+					// is the engine's own echo and carries no position the
+					// report may use.
 					SliceStartSec: window.FilmStartSec,
-					SliceLenSec:   length,
+					SliceLenSec:   window.LenSec,
 					OffsetMS:      result.OffsetMS,
 					Quality:       result.CorrelationQuality,
 				}}
@@ -700,6 +761,49 @@ func runCheckpoints(ctx context.Context, engine Engine, cfg Config, req Request,
 		return nil, fmt.Errorf("analyze: checkpoint %d%%: %w", plan[0].PositionPct, err)
 	}
 	return runs, nil
+}
+
+// runWindow turns one planned window into one engine result: it asks the
+// slicer for the audio, builds the job from that slice alone, releases the
+// slice whatever happens, and checks the engine's echo.
+//
+// The job's start and length come from the Slice, never from the Window: the
+// Window's FilmStartSec is a position in the movie and the engine addresses
+// the files it was handed, which is the whole point of the seam. WindowSec is
+// the planned length — the same length the whole-file path searches — so
+// max_lag and min_overlap do not change with the analysis source.
+func runWindow(ctx context.Context, engine Engine, cfg Config, slicer Slicer, w Window) (sync.Result, error) {
+	slice, err := slicer.Slice(ctx, w)
+	if err != nil {
+		return sync.Result{}, err
+	}
+	// Every attempt is released, success or not: a window implementation
+	// keeps at most one checkpoint's files per worker.
+	defer slicer.Release(w)
+
+	length := slice.LenSec
+	job := sync.Job{
+		TargetPath:    slice.TargetPath,
+		DonorPath:     slice.DonorPath,
+		SliceStartSec: slice.EngineStartSec,
+		SliceLenSec:   slice.LenSec,
+		WindowSec:     &length,
+	}
+	jobCtx, cancelJob := context.WithTimeout(ctx, JobTimeout(cfg))
+	defer cancelJob()
+
+	result, err := engine.Run(jobCtx, job)
+	if err != nil {
+		return sync.Result{}, err
+	}
+	// The echo is used for exactly one thing: did the engine see the audio
+	// the plan asked for? One sample of slack absorbs rounding; anything
+	// more is a slice that lost material, whose peak is not data.
+	if result.Analyzed.Len < w.LenSec-1.0/analysisSampleRate {
+		return sync.Result{}, fmt.Errorf("%w: analyzed.len %.6f s, planned %.6f s",
+			ErrShortWindow, result.Analyzed.Len, w.LenSec)
+	}
+	return result, nil
 }
 
 // searchWindowSec is the analysed slice length. It is at least the settled

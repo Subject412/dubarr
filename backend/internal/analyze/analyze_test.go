@@ -1,13 +1,19 @@
 package analyze
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -480,11 +486,11 @@ func writeWAV(t *testing.T, path string, samples []float32) {
 }
 
 // writeWAVRate is writeWAV with an explicit sample rate.
-func writeWAVRate(t *testing.T, path string, samples []float32, rate uint32) {
-	t.Helper()
+func writeWAVRate(tb testing.TB, path string, samples []float32, rate uint32) {
+	tb.Helper()
 	f, err := os.Create(path)
 	if err != nil {
-		t.Fatalf("create %s: %v", path, err)
+		tb.Fatalf("create %s: %v", path, err)
 	}
 	defer f.Close()
 
@@ -505,20 +511,20 @@ func writeWAVRate(t *testing.T, path string, samples []float32, rate uint32) {
 	copy(h[36:40], "data")
 	binary.LittleEndian.PutUint32(h[40:44], uint32(dataLen))
 	if _, err := f.Write(h[:]); err != nil {
-		t.Fatalf("write header: %v", err)
+		tb.Fatalf("write header: %v", err)
 	}
 	buf := make([]byte, 0, 64*1024)
 	for _, s := range samples {
 		buf = binary.LittleEndian.AppendUint32(buf, math.Float32bits(s))
 		if len(buf) >= 64*1024 {
 			if _, err := f.Write(buf); err != nil {
-				t.Fatalf("write samples: %v", err)
+				tb.Fatalf("write samples: %v", err)
 			}
 			buf = buf[:0]
 		}
 	}
 	if _, err := f.Write(buf); err != nil {
-		t.Fatalf("write tail: %v", err)
+		tb.Fatalf("write tail: %v", err)
 	}
 }
 
@@ -658,5 +664,528 @@ func TestIntegrationOffsetWithinSearchWindow(t *testing.T) {
 	// 165 s is inside the settled 180 s acceptance bound.
 	if rep.Verdict != VerdictOK || rep.Classification != ClassificationStable {
 		t.Fatalf("verdict/classification = %q/%q (offsets %v), want ok/stable", rep.Verdict, rep.Classification, rep.OffsetsMS)
+	}
+}
+
+// Parallel checkpoints (U-DSP.7).
+//
+// The invariant under test is the report, not the speed: it must be
+// byte-identical for any worker count, and the error must be the lowest failing
+// checkpoint whatever order the goroutines finished in.
+
+// withMemAvailable substitutes the effective-memory-limit seam for one test.
+// The package's tests are sequential (none calls t.Parallel), so a plain
+// variable swap is enough; restore happens on cleanup even after a fatal
+// assertion.
+func withMemAvailable(t *testing.T, available uint64, ok bool) {
+	t.Helper()
+	prev := memAvailable
+	memAvailable = func() (uint64, bool) { return available, ok }
+	t.Cleanup(func() { memAvailable = prev })
+}
+
+// parallelConfig is the settled config with n workers and a budget that lets n
+// of them through, so a test that is not about the memory ceiling cannot be
+// silently reduced by this host's free RAM.
+func parallelConfig(t *testing.T, n int) Config {
+	t.Helper()
+	withMemAvailable(t, 2*checkpointBytes(MaxParallelCheckpoints), true)
+	cfg := DefaultConfig()
+	cfg.ParallelCheckpoints = n
+	return cfg
+}
+
+// checkpointStarts maps a checkpoint's slice start to its index, so a stub
+// engine can answer per checkpoint instead of per call order — which is what
+// makes a completion-order bug visible.
+func checkpointStarts(cfg Config) map[float64]int {
+	window := searchWindowSec(cfg)
+	starts := make(map[float64]int, len(cfg.CheckpointPositionsPct))
+	for i, pct := range cfg.CheckpointPositionsPct {
+		start, _ := sliceWindow(600, pct, window)
+		starts[start] = i
+	}
+	return starts
+}
+
+// reverseOrderEngine answers per checkpoint but finishes in reverse: the last
+// checkpoint returns first. A report assembled in completion order would be
+// reversed, so n=1 equality is a real assertion, not a tautology.
+type reverseOrderEngine struct {
+	starts  map[float64]int
+	offsets []float64
+}
+
+func (e *reverseOrderEngine) Run(ctx context.Context, job sync.Job) (sync.Result, error) {
+	idx, ok := e.starts[job.SliceStartSec]
+	if !ok {
+		return sync.Result{}, fmt.Errorf("unstubbed slice start %v", job.SliceStartSec)
+	}
+	if d := time.Duration(len(e.offsets)-1-idx) * 5 * time.Millisecond; d > 0 {
+		select {
+		case <-time.After(d):
+		case <-ctx.Done():
+			return sync.Result{}, ctx.Err()
+		}
+	}
+	return sync.Result{OffsetMS: e.offsets[idx], CorrelationQuality: 0.9 + float64(idx)/100}, nil
+}
+
+// TestParallelReportIsOrderIndependent is the invariant: the marshalled report
+// for n workers equals the n=1 report byte for byte, while the stub completes
+// the checkpoints in the opposite order.
+func TestParallelReportIsOrderIndependent(t *testing.T) {
+	base := DefaultConfig()
+	starts := checkpointStarts(base)
+	offsets := []float64{1200, 1203, 1201, 1204, 1202, 1205}
+
+	var want []byte
+	for _, n := range []int{1, 2, 4, 6} {
+		cfg := parallelConfig(t, n)
+		eng := &reverseOrderEngine{starts: starts, offsets: offsets}
+		rep, err := Analyze(context.Background(), eng, cfg, request(t.TempDir()))
+		if err != nil {
+			t.Fatalf("n=%d: Analyze: %v", n, err)
+		}
+		raw, err := json.Marshal(rep)
+		if err != nil {
+			t.Fatalf("n=%d: marshal: %v", n, err)
+		}
+		if n == 1 {
+			want = raw
+			if len(rep.Checkpoints) != len(offsets) {
+				t.Fatalf("checkpoints = %d, want %d", len(rep.Checkpoints), len(offsets))
+			}
+			for i, cp := range rep.Checkpoints {
+				if cp.PositionPct != base.CheckpointPositionsPct[i] || cp.OffsetMS != offsets[i] {
+					t.Fatalf("checkpoint %d = %+v, want position %d offset %v",
+						i, cp, base.CheckpointPositionsPct[i], offsets[i])
+				}
+			}
+			continue
+		}
+		if !bytes.Equal(raw, want) {
+			t.Fatalf("n=%d report differs from n=1:\n got %s\nwant %s", n, raw, want)
+		}
+	}
+}
+
+// countingEngine tracks how many Run calls are in flight at once. With
+// together > 0 it also holds every call until that many are in flight
+// together, so the observed maximum is exact rather than a timing guess.
+type countingEngine struct {
+	together int32
+	hold     time.Duration
+	open     chan struct{}
+	opened   atomic.Bool
+	inFlight atomic.Int32
+	max      atomic.Int32
+}
+
+func newCountingEngine(together int32, hold time.Duration) *countingEngine {
+	e := &countingEngine{together: together, hold: hold}
+	if together > 0 {
+		e.open = make(chan struct{})
+	}
+	return e
+}
+
+func (e *countingEngine) Run(ctx context.Context, _ sync.Job) (sync.Result, error) {
+	cur := e.inFlight.Add(1)
+	defer e.inFlight.Add(-1)
+	for {
+		max := e.max.Load()
+		if cur <= max || e.max.CompareAndSwap(max, cur) {
+			break
+		}
+	}
+	if e.together > 0 {
+		if cur >= e.together && e.opened.CompareAndSwap(false, true) {
+			close(e.open)
+		}
+		select {
+		case <-e.open:
+		case <-ctx.Done():
+			return sync.Result{}, ctx.Err()
+		case <-time.After(10 * time.Second):
+			return sync.Result{}, fmt.Errorf("%d checkpoints never ran together, want %d", e.max.Load(), e.together)
+		}
+		return sync.Result{OffsetMS: 1200, CorrelationQuality: 0.9}, nil
+	}
+	if e.hold > 0 {
+		select {
+		case <-time.After(e.hold):
+		case <-ctx.Done():
+			return sync.Result{}, ctx.Err()
+		}
+	}
+	return sync.Result{OffsetMS: 1200, CorrelationQuality: 0.9}, nil
+}
+
+// TestParallelConcurrencyCap proves the workers are really concurrent and never
+// exceed the clamp: maxInFlight is exactly min(n, checkpoints), never more.
+func TestParallelConcurrencyCap(t *testing.T) {
+	for _, n := range []int{1, 3, 6} {
+		cfg := parallelConfig(t, n)
+		want := int32(min(n, len(cfg.CheckpointPositionsPct)))
+		eng := newCountingEngine(want, 0)
+		if _, err := Analyze(context.Background(), eng, cfg, request(t.TempDir())); err != nil {
+			t.Fatalf("n=%d: Analyze: %v", n, err)
+		}
+		if got := eng.max.Load(); got != want {
+			t.Fatalf("n=%d: max in flight = %d, want %d", n, got, want)
+		}
+	}
+}
+
+// failingEngine fails the checkpoints in fail, with a per-checkpoint delay, and
+// deliberately ignores the context: a checkpoint's own failure must be
+// observable even after a sibling has already cancelled the job.
+type failingEngine struct {
+	starts map[float64]int
+	fail   map[int]string
+	delay  map[int]time.Duration
+}
+
+func (e *failingEngine) Run(_ context.Context, job sync.Job) (sync.Result, error) {
+	idx, ok := e.starts[job.SliceStartSec]
+	if !ok {
+		return sync.Result{}, fmt.Errorf("unstubbed slice start %v", job.SliceStartSec)
+	}
+	time.Sleep(e.delay[idx])
+	if msg, bad := e.fail[idx]; bad {
+		return sync.Result{}, errors.New(msg)
+	}
+	return sync.Result{OffsetMS: 1200, CorrelationQuality: 0.9}, nil
+}
+
+// TestParallelErrorIsLowestIndex pins the deterministic first error: the higher
+// checkpoint fails FASTER, so returning whichever error arrived first would name
+// checkpoint 55%; every worker count must name checkpoint 25% instead.
+func TestParallelErrorIsLowestIndex(t *testing.T) {
+	starts := checkpointStarts(DefaultConfig())
+	const wantErr = "analyze: checkpoint 25%: checkpoint 25 exploded"
+
+	for _, n := range []int{1, 2, 3, 6} {
+		cfg := parallelConfig(t, n)
+		// Repeated so a scheduler-dependent implementation has twenty chances
+		// to lose the race differently.
+		for attempt := 0; attempt < 20; attempt++ {
+			eng := &failingEngine{
+				starts: starts,
+				fail:   map[int]string{1: "checkpoint 25 exploded", 4: "checkpoint 55 exploded"},
+				delay:  map[int]time.Duration{1: 8 * time.Millisecond, 4: time.Millisecond},
+			}
+			_, err := Analyze(context.Background(), eng, cfg, request(t.TempDir()))
+			if err == nil {
+				t.Fatalf("n=%d attempt %d: Analyze succeeded, want checkpoint 25%%", n, attempt)
+			}
+			if err.Error() != wantErr {
+				t.Fatalf("n=%d attempt %d: error = %q, want %q", n, attempt, err, wantErr)
+			}
+		}
+	}
+}
+
+// blockEngine parks every call until its context is done, as the real engine's
+// cooperative cancellation does.
+type blockEngine struct{ started chan struct{} }
+
+func (e *blockEngine) Run(ctx context.Context, _ sync.Job) (sync.Result, error) {
+	select {
+	case e.started <- struct{}{}:
+	default:
+	}
+	<-ctx.Done()
+	return sync.Result{}, ctx.Err()
+}
+
+// TestParallelCancelStopsAll cancels mid-run: every worker must return, Analyze
+// must report one typed error, and no goroutine may be left behind.
+func TestParallelCancelStopsAll(t *testing.T) {
+	before := runtime.NumGoroutine()
+
+	cfg := parallelConfig(t, 4)
+	eng := &blockEngine{started: make(chan struct{}, 1)}
+	req := request(t.TempDir())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	finished := make(chan error, 1)
+	go func() {
+		_, err := Analyze(ctx, eng, cfg, req)
+		finished <- err
+	}()
+
+	select {
+	case <-eng.started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("no checkpoint reached the engine")
+	}
+	cancel()
+
+	select {
+	case err := <-finished:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Analyze error = %v, want a wrapped context.Canceled", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Analyze did not return after the cancel: a worker is still parked")
+	}
+
+	// Every worker exits before Analyze returns; the poll only absorbs the
+	// runtime's own bookkeeping.
+	deadline := time.Now().Add(5 * time.Second)
+	for runtime.NumGoroutine() > before && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if after := runtime.NumGoroutine(); after > before {
+		t.Fatalf("goroutines before/after = %d/%d, want no leak", before, after)
+	}
+}
+
+// TestMemoryCeilingReducesWorkers gives the seam a budget that fits exactly
+// three workers: n is reduced from 4, the reduction is logged once, and the
+// report is still the n=1 report.
+func TestMemoryCeilingReducesWorkers(t *testing.T) {
+	withMemAvailable(t, 2*checkpointBytes(3), true)
+
+	// The package's tests are sequential, and the reduction is logged from
+	// this test's own goroutine, so an unlocked buffer is enough.
+	var logged bytes.Buffer
+	prevLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logged, nil)))
+	t.Cleanup(func() { slog.SetDefault(prevLogger) })
+
+	req := request(t.TempDir())
+	single := DefaultConfig()
+	single.ParallelCheckpoints = 1
+	eng := newCountingEngine(0, 0)
+	want, err := Analyze(context.Background(), eng, single, req)
+	if err != nil {
+		t.Fatalf("n=1: Analyze: %v", err)
+	}
+	wantJSON, err := json.Marshal(want)
+	if err != nil {
+		t.Fatalf("marshal n=1: %v", err)
+	}
+
+	cfg := DefaultConfig()
+	cfg.ParallelCheckpoints = 4
+	reduced := newCountingEngine(0, 20*time.Millisecond)
+	rep, err := Analyze(context.Background(), reduced, cfg, req)
+	if err != nil {
+		t.Fatalf("reduced: Analyze: %v", err)
+	}
+	repJSON, err := json.Marshal(rep)
+	if err != nil {
+		t.Fatalf("marshal reduced: %v", err)
+	}
+	if !bytes.Equal(repJSON, wantJSON) {
+		t.Fatalf("reduced report differs from n=1:\n got %s\nwant %s", repJSON, wantJSON)
+	}
+
+	const line = "analyze: parallel checkpoints reduced 4 → 3 (memory budget)"
+	text := logged.String()
+	if !strings.Contains(text, line) {
+		t.Fatalf("log = %q, want %q", text, line)
+	}
+	if n := strings.Count(text, "\n"); n != 1 {
+		t.Fatalf("log lines = %d, want exactly 1: %q", n, text)
+	}
+	if got := reduced.max.Load(); got != 3 {
+		t.Fatalf("max in flight = %d, want the reduced 3", got)
+	}
+}
+
+// TestParallelWorkerClamp guards the clamp order independently of the engine:
+// the setting is 0/negative → 1, capped at MaxParallelCheckpoints and at the
+// checkpoint count, and only then reduced by memory.
+func TestParallelWorkerClamp(t *testing.T) {
+	withMemAvailable(t, 1<<62, true)
+	cases := []struct {
+		name      string
+		workers   int
+		positions []int
+		want      int
+	}{
+		{"zero means one", 0, DefaultCheckpointPositionsPct, 1},
+		{"negative means one", -3, DefaultCheckpointPositionsPct, 1},
+		{"configured value stands", 4, DefaultCheckpointPositionsPct, 4},
+		{"the whole list", 6, DefaultCheckpointPositionsPct, 6},
+		{"capped at the hard bound", 99, []int{10, 20, 30, 40, 50, 60, 70, 80, 90}, MaxParallelCheckpoints},
+		{"capped at the checkpoint count", 8, []int{10, 20, 30}, 3},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.ParallelCheckpoints = tc.workers
+			cfg.CheckpointPositionsPct = tc.positions
+			if got := parallelWorkers(cfg); got != tc.want {
+				t.Fatalf("parallelWorkers(%d workers, %d checkpoints) = %d, want %d",
+					tc.workers, len(tc.positions), got, tc.want)
+			}
+		})
+	}
+}
+
+// The effective memory limit.
+//
+// The guard exists for a container on a larger host, and MemAvailable there
+// describes the host: reading only /proc/meminfo would permit every worker on
+// a 4 GB container in a 128 GB TrueNAS box and let the OOM killer decide.
+// These tests pin the resolution order — cgroup v2, then cgroup v1, then
+// MemAvailable, and the smaller of the cgroup limit and MemAvailable.
+
+// withCgroupRoot points the production reader at a temporary cgroup tree.
+func withCgroupRoot(t *testing.T, root string) {
+	t.Helper()
+	prev := cgroupRoot
+	cgroupRoot = root
+	t.Cleanup(func() { cgroupRoot = prev })
+}
+
+// writeCgroupLimit creates one cgroup memory-limit file under root, with
+// parents. An empty content means "the file does not exist".
+func writeCgroupLimit(t *testing.T, root, rel, content string) {
+	t.Helper()
+	if content == "" {
+		return
+	}
+	path := filepath.Join(root, rel)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir for %s: %v", rel, err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write %s: %v", rel, err)
+	}
+}
+
+func TestEffectiveMemLimit(t *testing.T) {
+	// A 4 GiB container limit, and what MemAvailable reports on a large host.
+	const container = uint64(4) << 30
+	const host = uint64(120) << 30
+	// What cgroup v1 writes when the group has no limit: page-aligned 2^63,
+	// i.e. "unlimited", not 8 EiB of RAM.
+	const v1Unlimited = "9223372036854771712\n"
+	cases := []struct {
+		name      string
+		v2        string
+		v1        string
+		meminfo   uint64
+		meminfoOK bool
+		want      uint64
+		wantOK    bool
+	}{
+		{"v2 limit beats a large MemAvailable", "4294967296\n", "", host, true, container, true},
+		{"v2 max means unlimited and falls through", "max\n", "", host, true, host, true},
+		{"v1 limit", "", "4294967296\n", host, true, container, true},
+		{"v1 near-2^63 means unlimited", "", v1Unlimited, host, true, host, true},
+		{"no cgroup file uses MemAvailable", "", "", host, true, host, true},
+		{"nothing readable is unknown", "", "", 0, false, 0, false},
+		{"MemAvailable wins when it is the smaller ceiling", "17179869184\n", "", container, true, container, true},
+		{"v2 wins over v1", "2147483648\n", "4294967296\n", host, true, 2 << 30, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			writeCgroupLimit(t, root, "memory.max", tc.v2)
+			writeCgroupLimit(t, root, "memory/memory.limit_in_bytes", tc.v1)
+			meminfo := func() (uint64, bool) { return tc.meminfo, tc.meminfoOK }
+			got, ok := effectiveMemLimit(root, meminfo)
+			if got != tc.want || ok != tc.wantOK {
+				t.Fatalf("effectiveMemLimit = (%d, %v), want (%d, %v)", got, ok, tc.want, tc.wantOK)
+			}
+		})
+	}
+}
+
+// TestReadEffectiveMemLimitReadsCgroupRoot checks the production wiring: the
+// seam's default reader consults cgroupRoot, so a 2 GiB memory.max caps the
+// budget whatever this host's MemAvailable happens to be.
+func TestReadEffectiveMemLimitReadsCgroupRoot(t *testing.T) {
+	root := t.TempDir()
+	writeCgroupLimit(t, root, "memory.max", "2147483648\n")
+	withCgroupRoot(t, root)
+
+	got, ok := readEffectiveMemLimit()
+	if !ok {
+		t.Fatal("readEffectiveMemLimit reported no limit with a 2 GiB memory.max present")
+	}
+	if got > 2<<30 {
+		t.Fatalf("readEffectiveMemLimit = %d, want at most the 2 GiB cgroup limit", got)
+	}
+}
+
+// The cost model.
+
+// TestCheckpointCostModel pins total(n) = 200 MiB + n x 400 MiB, the arithmetic
+// written out in the constants' doc comment.
+func TestCheckpointCostModel(t *testing.T) {
+	cases := map[int]uint64{0: 0, 1: 600 << 20, 2: 1000 << 20, 3: 1400 << 20, 4: 1800 << 20, 8: 3400 << 20}
+	for n, want := range cases {
+		if got := checkpointBytes(n); got != want {
+			t.Errorf("checkpointBytes(%d) = %d MiB, want %d MiB", n, got>>20, want>>20)
+		}
+	}
+}
+
+// TestWorkerClampForContainerSizes pins the worker counts quoted in
+// [parallelWorkers] and in internal/dsp/PERF.md, so the documentation cannot
+// drift from the model. The setting is the full 8 in every case, so what is
+// measured is the ceiling, not the setting. The checkpoint count is a ceiling
+// of its own — the settled policy has six — which is why the last two rows use
+// a nine-checkpoint config to see the memory ceiling alone.
+func TestWorkerClampForContainerSizes(t *testing.T) {
+	const GiB = uint64(1) << 30
+	nine := []int{10, 20, 30, 40, 50, 60, 70, 80, 90}
+	cases := []struct {
+		name      string
+		container uint64
+		positions []int // nil keeps the settled six
+		want      int
+	}{
+		{"1 GiB, settled six", 1 * GiB, nil, 1},
+		{"2 GiB, settled six", 2 * GiB, nil, 2},
+		{"4 GiB, settled six", 4 * GiB, nil, 4},
+		{"6 GiB, settled six: budget allows 7, the six checkpoints cap it", 6 * GiB, nil, 6},
+		{"6 GiB, nine checkpoints", 6 * GiB, nine, 7},
+		{"16 GiB, settled six", 16 * GiB, nil, 6},
+		{"16 GiB, nine checkpoints: the hard bound", 16 * GiB, nine, MaxParallelCheckpoints},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			withMemAvailable(t, tc.container, true)
+			cfg := DefaultConfig()
+			cfg.ParallelCheckpoints = MaxParallelCheckpoints
+			if tc.positions != nil {
+				cfg.CheckpointPositionsPct = tc.positions
+			}
+			if got := parallelWorkers(cfg); got != tc.want {
+				t.Fatalf("container %d GiB: parallelWorkers = %d, want %d",
+					tc.container/GiB, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestContainerBytesForFourWorkers pins the second documented figure: 3600 MiB
+// is the smallest container whose half-budget holds four workers, and one byte
+// less drops to three.
+func TestContainerBytesForFourWorkers(t *testing.T) {
+	const need = 3600 << 20
+	if got := 2 * checkpointBytes(4); got != need {
+		t.Fatalf("2 x checkpointBytes(4) = %d MiB, want the documented 3600 MiB", got>>20)
+	}
+	cfg := DefaultConfig()
+	cfg.ParallelCheckpoints = 4
+
+	withMemAvailable(t, need, true)
+	if got := parallelWorkers(cfg); got != 4 {
+		t.Fatalf("container 3600 MiB: parallelWorkers = %d, want 4", got)
+	}
+	withMemAvailable(t, need-1, true)
+	if got := parallelWorkers(cfg); got != 3 {
+		t.Fatalf("container 3600 MiB - 1: parallelWorkers = %d, want 3", got)
 	}
 }

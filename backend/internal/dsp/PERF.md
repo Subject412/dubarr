@@ -198,3 +198,155 @@ model suggested. Two caveats, both load-bearing:
   3.7x on the job, because it replaces two whole-track decodes with twelve short
   window seeks. Concurrency (U-DSP.7) buys almost nothing until that lands: it
   can at most remove the ~4-6 s of correlation from a 125 s job.
+
+## Parallel checkpoints (U-DSP.7): what one worker costs
+
+`analyze.Analyze` can run N checkpoints of one job at once
+(`Config.ParallelCheckpoints`, clamped to 1..8, then to the checkpoint count,
+then reduced by the memory guard below — see
+[The limit is the container's](#the-limit-is-the-containers-not-the-hosts)).
+Everything here is measured, not summed, because the buffer sum is misleading:
+`X`, `Y`, the inverse output and one pooled scratch (4 x 33.55 MB) plus two f32
+slices and two f64 prefix arrays is ~171 MB of *live* buffers, and a checkpoint
+also clones 23 MB of `float64` scores for the median — but the resident peak is
+what the collector lets the heap reach, which is a larger number.
+
+**Method.** `BenchmarkParallelCheckpoints` (`internal/analyze`, real engine,
+`-benchtime 1x`) analyses the settled six checkpoints of 600 s / 8 kHz WAVs and
+takes `/proc/self/status` `VmHWM` immediately before and after the analysis.
+`VmHWM` is a high-water mark that only rises, so each worker count is measured
+in its own process:
+
+```
+go test ./internal/analyze -run '^$' -bench 'ParallelCheckpoints/n=1$' -benchtime 1x -v
+go test ./internal/analyze -run '^$' -bench 'ParallelCheckpoints/n=4$' -benchtime 1x -v
+```
+
+The benchmark substitutes a large effective limit through the seam, so it
+measures the cost of N workers rather than what the host allows.
+
+**Host:** AMD Ryzen 5 2500U (4 cores / 8 threads), 8 GB RAM, MemAvailable
+4.1 GB, go1.27.4, GOGC default. **Date:** 2026-11-27.
+
+| workers | VmHWM base | VmHWM peak | delta/job | per worker | wall clock, 6 checkpoints |
+|---|---|---|---|---|---|
+| 1 | 44.6 MiB | 554.8-560.9 MiB | 510.6-516.3 MiB | **495-516 MiB** | 7.07-7.12 s |
+| 4 | 44.0-45.8 MiB | 1 412-1 655 MiB | 1 367-1 609 MiB | **342-402 MiB** | 3.99-4.51 s |
+
+(Two to three runs per row; `VmHWM` deltas of this size vary ~15 % between
+processes because they inherit the collector's heap sizing, which is why the
+ranges are given rather than a single figure.)
+
+Two readings from the table:
+
+1. **A worker costs ~0.5 GiB at n=1, not 171 MB**, and the gap is the
+   collector, not a leak — see [Measured RSS is 3x the live
+   buffers](#measured-rss-is-3x-the-live-buffers).
+2. **The cost is not linear in N.** Per-worker drops to 342-402 MiB at n=4
+   because four workers share one collector cycle instead of four heap
+   doublings, so the process's own footprint (44-46 MiB `VmHWM` before the
+   analysis) is charged to the single worker at n=1.
+
+### The cost model: a base plus a per-worker term
+
+A flat per-worker constant cannot describe both rows: charging the n=1 figure
+per worker over-charges small N and under-charges large N, which is backwards
+for an OOM guard. Two terms fit both measured points:
+
+```
+total(n) = base + n x perWorker
+
+perWorker = (1488 - 513) / 3 = 325 MiB      -> rounded up to 400 MiB
+base      =  513 - 325       = 188 MiB      -> rounded up to 200 MiB
+```
+
+using the central values of the two rows (513 MiB at n=1, 1488 MiB at n=4). The
+constants are `analyze.CheckpointFixedBytes = 200 MiB` and
+`analyze.CheckpointBytesPerWorker = 400 MiB`, both rounded up so the model is
+never optimistic. What it charges:
+
+| workers | modelled | measured |
+|---|---|---|
+| 1 | 600 MiB | 511-516 MiB |
+| 2 | 1000 MiB | not measured |
+| 4 | 1800 MiB | 1367-1609 MiB |
+| 8 | 3400 MiB | not measured (extrapolated) |
+
+`analyze.checkpointBytes(n)` and `TestCheckpointCostModel` /
+`TestWorkerClampForContainerSizes` pin these numbers, so this table cannot drift
+from the code.
+
+### The limit is the container's, not the host's
+
+The guard's budget is **half of the effective memory limit**, where the
+effective limit is resolved in this order:
+
+1. cgroup v2 `/sys/fs/cgroup/memory.max` (the literal `max` means unlimited);
+2. cgroup v1 `/sys/fs/cgroup/memory/memory.limit_in_bytes` (a value within
+   reach of 2^63 is the kernel's "unlimited" sentinel);
+3. `/proc/meminfo` `MemAvailable`.
+
+When both a cgroup limit and `MemAvailable` are readable the **smaller** wins.
+Reading only `MemAvailable` would be a bug in the deployment that matters:
+`MemAvailable` describes the *host*, so a 4 GB dubarr container on a 128 GB
+TrueNAS box would report ~120 GB, the guard would permit all 8 workers, and the
+container would be OOM-killed — exactly what the guard exists to prevent. Inside
+a container, the cgroup limit is the ceiling that kills.
+
+### What the clamp yields
+
+| container | effective limit | budget (half) | workers by budget | workers, settled six |
+|---|---|---|---|---|
+| 1 GiB | 1 GiB | 512 MiB | 1 (floor) | 1 |
+| 2 GiB | 2 GiB | 1024 MiB | 2 (1000 MiB) | 2 |
+| **4 GiB** | **4 GiB** | **2048 MiB** | **4 (1800 MiB)** | **4** |
+| 6 GiB | 6 GiB | 3072 MiB | 7 (3000 MiB) | 6 |
+| 16 GiB | 16 GiB | 8192 MiB | 8 (3400 MiB, hard bound) | 6 |
+
+So on the **4 GB deployment target** the setting of 8 is reduced to **4**
+workers: 5 would model 2200 MiB against a 2048 MiB budget. **Four workers need a
+container of 2 x 1800 MiB = 3600 MiB (~3.5 GiB)**, so a 4 GB container is that
+plus ~0.5 GiB of slack for the runtime, the rest of dubarr and its ffmpeg
+children — which is the reason for the 0.5 factor, not wasted headroom. The
+reduction is logged once, as
+`analyze: parallel checkpoints reduced 8 → 4 (memory budget)`.
+
+The checkpoint count is a ceiling of its own: the settled policy has six, which
+is why 6 GiB and up land on six even though the budget would allow 7 and 8. The
+budget is what decides at 4 GiB and below — the sizes that matter for a
+container.
+
+These are the numbers the measurement gives; they were not tuned to make a
+particular container size fit. A smaller container clamps harder, monotonically:
+the `0.5 x limit` rule and the floor of one worker are the whole policy.
+
+### Measured RSS is 3x the live buffers
+
+The plan estimated ~171 MB of live buffers per checkpoint and the process
+measures 511-516 MiB of RSS for the same work. That factor of ~3 is Go's
+garbage-collector headroom, not a leak and not a bug. With `GOGC` at its default
+100, the heap is allowed to grow to roughly twice the live set before a cycle
+runs; each checkpoint allocates its ~207 MB of buffers (three 33.55 MB
+`[]complex64` transform outputs, the inverse output, the pooled scratch) and
+clones 23 MB of `float64` scores for the median, then drops most of it, and the
+peak lands near twice the live set rather than at it. The buffers are freed —
+the memory is retained for reuse — which is why VmHWM, not the buffer sum, is
+the number that decides whether a container survives. That is why the guard
+charges RSS.
+
+The gap can be narrowed, and both ways are future options rather than part of
+this slice: a lower `GOGC` (or `debug.SetMemoryLimit`) trades CPU for headroom,
+and reusing the transform outputs instead of the `...With` allocations
+(`correlate/doc.go` explains why the pinned library forces the allocation)
+removes the churn that makes the heap double in the first place. Either changes
+timing and allocation behaviour, so neither belongs in a parallelism change.
+
+**What the setting buys today: little.** Six checkpoints take 7.1 s at n=1 and
+~4.3 s at n=4 on this host — 1.6x on the correlation, which is a
+memory-bandwidth-bound workload on a 4-core laptop, not 4x. Against a 125 s job
+that is ~4.5 s saved of 125 s: correlation is only ~3 % of a job because decode
+is 97 %, so the parallelism setting's payoff arrives with #89 (window-only
+decode), not now. It is in the tree now because the report is
+order-independent by construction and because #87's requirement was about one
+job using several cores, which is exactly what this does: N concurrent
+checkpoint reads and correlations, never N jobs and never N ffmpeg decodes.

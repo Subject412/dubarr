@@ -27,8 +27,14 @@ package analyze
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"math"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Subject412/dubarr/backend/internal/probe"
@@ -110,6 +116,230 @@ func JobTimeout(cfg Config) time.Duration {
 	return DefaultJobTimeout(searchWindowSec(cfg))
 }
 
+// Parallelism ceiling and the measured cost model that the memory guard uses.
+const (
+	// MaxParallelCheckpoints is the hard upper bound on concurrent checkpoint
+	// workers, whatever the setting says (the setting itself is 1..8,
+	// U-DSP.8). At the modelled cost below, 8 workers is 3400 MiB, so on the
+	// 4 GB deployment target the runtime ceiling — not this bound — is what
+	// reduces the setting.
+	MaxParallelCheckpoints = 8
+
+	// CheckpointFixedBytes and CheckpointBytesPerWorker model one analysis'
+	// resident cost as
+	//
+	//	total(n) = CheckpointFixedBytes + n x CheckpointBytesPerWorker
+	//
+	// Measured with /proc/self/status VmHWM taken before and after a
+	// 6-checkpoint analysis of 190 s / 8 kHz slices through the real engine
+	// (BenchmarkParallelCheckpoints; the run is recorded in
+	// internal/dsp/PERF.md): the analysis grew the process by 511-516 MiB at
+	// n=1 and by 1367-1609 MiB at n=4.
+	//
+	// A flat per-worker figure cannot describe both points: the n=1
+	// measurement bundles the process's own footprint into its single
+	// worker, so charging it per worker over-charges small n and
+	// under-charges large n — the wrong direction for an OOM guard. Fitting
+	// the two terms to the central values, 513 MiB at n=1 and 1488 MiB at
+	// n=4:
+	//
+	//	perWorker = (1488 - 513) / 3 = 325 MiB
+	//	base      = 513 - 325       = 188 MiB
+	//
+	// rounded up to 400 MiB and 200 MiB so the model is never optimistic:
+	// it charges 600 MiB at n=1 (measured 511-516) and 1800 MiB at n=4
+	// (measured 1367-1609). The base is the process's own footprint plus the
+	// collector headroom that a single worker would otherwise be charged
+	// for; the per-worker term is what each additional concurrent
+	// correlation adds on top.
+	CheckpointFixedBytes     = 200 << 20
+	CheckpointBytesPerWorker = 400 << 20
+)
+
+// checkpointBytes is the modelled resident cost of n concurrent checkpoint
+// workers: [CheckpointFixedBytes] once, plus [CheckpointBytesPerWorker] each.
+func checkpointBytes(n int) uint64 {
+	if n <= 0 {
+		return 0
+	}
+	return CheckpointFixedBytes + uint64(n)*CheckpointBytesPerWorker
+}
+
+// cgroupRoot is the cgroup mount point the container's memory limit is read
+// from. A variable, not a constant, so a test can point it at a temporary
+// directory holding either candidate file.
+var cgroupRoot = "/sys/fs/cgroup"
+
+// cgroupUnlimited is the threshold above which a cgroup memory limit means "no
+// limit": cgroup v1 writes a page-aligned sentinel just below 2^63, and no real
+// container is 4 EiB.
+const cgroupUnlimited = uint64(1) << 62
+
+// memAvailable reports the *effective* memory limit in bytes: the container's
+// cgroup limit when there is one, otherwise the kernel's MemAvailable. It is a
+// variable, not a call, so a test can substitute a budget.
+//
+// It is deliberately not a bare /proc/meminfo read. dubarr ships in a
+// container on a larger host, and MemAvailable there describes the host: a
+// 4 GB container on a 128 GB TrueNAS box would report ~120 GB, the guard would
+// permit every worker, and the container would be OOM-killed — the exact
+// failure the guard exists to prevent.
+var memAvailable = readEffectiveMemLimit
+
+// readEffectiveMemLimit returns min(cgroup memory limit, MemAvailable), or
+// whichever of the two exists, or false when there is neither.
+func readEffectiveMemLimit() (uint64, bool) {
+	return effectiveMemLimit(cgroupRoot, readMeminfoAvailable)
+}
+
+// effectiveMemLimit resolves the budget from root and meminfo, first source
+// wins in this order: cgroup v2 /sys/fs/cgroup/memory.max, cgroup v1
+// /sys/fs/cgroup/memory/memory.limit_in_bytes, then MemAvailable. When both a
+// cgroup limit and MemAvailable are known the smaller wins, because inside a
+// container both are real ceilings: the cgroup can be smaller than the host's
+// free memory (the deployment that matters), and the host can be smaller than
+// a generous cgroup.
+func effectiveMemLimit(root string, meminfo func() (uint64, bool)) (uint64, bool) {
+	limit, limited := cgroupMemoryLimit(root)
+	available, ok := meminfo()
+	switch {
+	case limited && ok:
+		return min(limit, available), true
+	case limited:
+		return limit, true
+	case ok:
+		return available, true
+	}
+	return 0, false
+}
+
+// cgroupMemoryLimit reads the container's memory limit, unified hierarchy
+// first. A missing file, an unparseable one, `max`, or a v1 near-2^63 sentinel
+// all fall through to the next source.
+func cgroupMemoryLimit(root string) (uint64, bool) {
+	for _, rel := range []string{"memory.max", "memory/memory.limit_in_bytes"} {
+		if n, ok := cgroupLimitBytes(filepath.Join(root, rel)); ok {
+			return n, true
+		}
+	}
+	return 0, false
+}
+
+// cgroupLimitBytes parses one cgroup memory-limit file. "max", a missing or
+// empty file, a zero limit and anything at or above [cgroupUnlimited] mean
+// "no limit here", not "zero bytes", so the caller moves on to the next
+// source instead of pinning the worker count to the floor.
+func cgroupLimitBytes(path string) (uint64, bool) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return 0, false
+	}
+	text := strings.TrimSpace(string(raw))
+	if text == "" || text == "max" {
+		return 0, false
+	}
+	n, err := strconv.ParseUint(text, 10, 64)
+	if err != nil || n == 0 || n >= cgroupUnlimited {
+		return 0, false
+	}
+	return n, true
+}
+
+// readMeminfoAvailable parses MemAvailable from /proc/meminfo.
+func readMeminfoAvailable() (uint64, bool) {
+	return procFieldBytes("/proc/meminfo", "MemAvailable")
+}
+
+// procFieldBytes reads a "Key: <n> kB" value from a /proc file as bytes.
+func procFieldBytes(path, key string) (uint64, bool) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return 0, false
+	}
+	prefix := key + ":"
+	for _, line := range strings.Split(string(raw), "\n") {
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			return 0, false
+		}
+		kb, err := strconv.ParseUint(fields[1], 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		return kb * 1024, true
+	}
+	return 0, false
+}
+
+// parallelWorkers decides how many checkpoints this job may analyse at once.
+//
+// The order is fixed. First the setting is clamped to
+// [1, min([MaxParallelCheckpoints], len(cfg.CheckpointPositionsPct))]; zero and
+// negatives mean one. Then the memory ceiling reduces it until the modelled
+// footprint of n workers — [checkpointBytes], i.e.
+// [CheckpointFixedBytes] + n x [CheckpointBytesPerWorker] — fits in half of the
+// effective memory limit, never below one: one worker is always allowed,
+// because refusing to analyse at all is worse than exceeding the budget. When
+// the limit is unknown (no cgroup limit and no /proc) the configured value
+// stands.
+//
+// The limit is the *effective* one, not /proc/meminfo's MemAvailable: inside a
+// container MemAvailable describes the host, so on a 4 GB container in a large
+// TrueNAS box it would permit every worker and let the OOM killer decide. See
+// [memAvailable] for the resolution order.
+//
+// What that yields, at 200 MiB + 400 MiB per worker and a budget of half the
+// limit (8 workers models 3400 MiB, so below a 6.6 GiB limit it is the budget,
+// not the setting, that decides):
+//
+//	container 1 GiB  → budget  512 MiB → 1 worker  (the floor)
+//	container 2 GiB  → budget 1024 MiB → 2 workers (1000 MiB)
+//	container 4 GiB  → budget 2048 MiB → 4 workers (1800 MiB; 5 would be 2200)
+//	container 6 GiB  → budget 3072 MiB → 7 workers (3000 MiB) by budget
+//	container 16 GiB → budget 8192 MiB → 8 workers (3400 MiB), the hard bound
+//
+// The checkpoint count caps all of that: the settled policy has six, so from 6
+// GiB up a job with six checkpoints runs six workers whatever the budget would
+// allow.
+//
+// Four workers need a container of 2 x 1800 MiB = 3600 MiB (~3.5 GiB), so a
+// 4 GB container is that plus ~0.5 GiB of slack. The figures are reported, not
+// tuned.
+//
+// A reduction is logged once, because it is the only case where the operator's
+// setting is silently overridden.
+func parallelWorkers(cfg Config) (n int) {
+	n = cfg.ParallelCheckpoints
+	if n < 1 {
+		n = 1
+	}
+	if n > MaxParallelCheckpoints {
+		n = MaxParallelCheckpoints
+	}
+	if n > len(cfg.CheckpointPositionsPct) {
+		n = len(cfg.CheckpointPositionsPct)
+	}
+	if n <= 1 {
+		return n
+	}
+	limit, ok := memAvailable()
+	if !ok || limit == 0 {
+		return n
+	}
+	configured := n
+	budget := limit / 2
+	for n > 1 && checkpointBytes(n) > budget {
+		n--
+	}
+	if n < configured {
+		slog.Default().Info(fmt.Sprintf("analyze: parallel checkpoints reduced %d → %d (memory budget)", configured, n))
+	}
+	return n
+}
+
 // Verdicts reported to the sync job status and consumed by M5.
 const (
 	VerdictOK         = "ok"
@@ -137,6 +367,12 @@ type Config struct {
 	CheckpointPositionsPct []int `json:"checkpoint_positions_pct"`
 	CheckpointWindowSec    int   `json:"checkpoint_window_sec"`
 	MaxOffsetSec           int   `json:"max_offset_sec"`
+	// ParallelCheckpoints is how many checkpoints one job analyses at once.
+	// Zero means one. It is clamped to
+	// [1, min([MaxParallelCheckpoints], len(CheckpointPositionsPct))] and then
+	// reduced further by the memory ceiling (see [Analyze]); it never changes
+	// the report.
+	ParallelCheckpoints int `json:"-"`
 	// JobTimeout bounds one engine job per checkpoint. Zero selects
 	// [DefaultJobTimeout] for the analysed slice; callers that construct a
 	// sync.Runner should pass the same value via sync.WithTimeout.
@@ -209,8 +445,45 @@ type Report struct {
 	Reason         string         `json:"reason,omitempty"`
 }
 
-// Analyze resolves the reference strategy, runs one correlation per checkpoint
-// sequentially, and aggregates the drift report.
+// Analyze resolves the reference strategy, runs one correlation per checkpoint,
+// and aggregates the drift report.
+//
+// # One job, N checkpoints at a time
+//
+// A job analyses up to [Config.ParallelCheckpoints] checkpoints concurrently.
+// That is concurrency *inside* one job and nothing more: the queue still runs
+// one job at a time (syncworker's single ProcessOnce loop), so this function
+// adds no job-level concurrency. It also adds no decoders — the staged decode
+// stays exactly two sequential ffmpeg runs per job (syncjob), so "N concurrent
+// checkpoints" means N concurrent reads and correlations of the already-staged
+// WAVs, never N ffmpeg processes. *sync.Runner holds no per-job state, so one
+// runner serves every worker.
+//
+// # The report is the same for any N
+//
+// Each worker writes only its own slot, indexed by checkpoint position, and the
+// report is assembled from those slots in checkpoint order after the join.
+// Nothing is appended, so [Report.Checkpoints], [Report.OffsetsMS] and
+// [Report.Qualities] are byte-identical for any N, and aggregation ([classify])
+// runs once, single-threaded, after the join.
+//
+// # Errors and the memory ceiling are deterministic too
+//
+// A failing checkpoint cancels the shared context so the rest stop early, the
+// join waits for every worker, and the error returned is the lowest checkpoint
+// index that failed — never whichever goroutine lost the race. A failure that
+// is only the consequence of that cancellation is not a failure of its own
+// checkpoint and never outranks a genuine one. Errors stay wrapped exactly as
+// they were sequentially: "analyze: checkpoint %d%%: %w".
+//
+// Before dispatch the worker count is clamped (see [parallelWorkers]) and then
+// reduced until the modelled footprint of n workers fits in half of the
+// effective memory limit — the container's cgroup limit when there is one,
+// otherwise /proc/meminfo's MemAvailable (Linux only, ADR-0016). Reading the
+// cgroup limit matters because MemAvailable describes the host, not the
+// container: on the 4 GB container in a larger TrueNAS host the clamp yields 4
+// of the 8 workers (see [parallelWorkers] for the arithmetic). The reduction
+// never goes below one worker and never changes the report.
 //
 // Each checkpoint window is centred on the settled pct position, but its
 // length is searchWindowSec: the larger of checkpoint_window_sec and
@@ -221,9 +494,11 @@ type Report struct {
 // actual slice length, so the engine searches the whole analysed slice.
 //
 // Each checkpoint runs with its own deadline, [JobTimeout] (120 s for the
-// settled slice, or [Config.JobTimeout] when set). A sync.Runner built for the
-// production chain must use the same value through sync.WithTimeout: the
-// runner's own default is shorter than a 190 s correlation job.
+// settled slice, or [Config.JobTimeout] when set), derived from the shared
+// context so one failure or a caller cancel reaches every worker. A
+// sync.Runner built for the production chain must use the same value through
+// sync.WithTimeout: the runner's own default is shorter than a 190 s
+// correlation job.
 func Analyze(ctx context.Context, engine Engine, cfg Config, req Request) (Report, error) {
 	if engine == nil {
 		return Report{}, fmt.Errorf("analyze: nil engine")
@@ -258,39 +533,28 @@ func Analyze(ctx context.Context, engine Engine, cfg Config, req Request) (Repor
 	}
 
 	window := searchWindowSec(cfg)
+	workers := parallelWorkers(cfg)
+	pcts := cfg.CheckpointPositionsPct
+
 	report := Report{
 		SyncMethod:  method,
 		Reason:      resolved.Pairs[0].Reason,
-		Checkpoints: make([]Checkpoint, 0, len(cfg.CheckpointPositionsPct)),
-		OffsetsMS:   make([]float64, 0, len(cfg.CheckpointPositionsPct)),
-		Qualities:   make([]float64, 0, len(cfg.CheckpointPositionsPct)),
+		Checkpoints: make([]Checkpoint, len(pcts)),
+		OffsetsMS:   make([]float64, len(pcts)),
+		Qualities:   make([]float64, len(pcts)),
 	}
 
-	for _, pct := range cfg.CheckpointPositionsPct {
-		start, length := sliceWindow(duration, pct, window)
-		search := length
-		job := sync.Job{
-			TargetPath:    req.TargetPath,
-			DonorPath:     req.DonorPath,
-			SliceStartSec: start,
-			SliceLenSec:   length,
-			WindowSec:     &search,
-		}
-		jobCtx, cancel := context.WithTimeout(ctx, JobTimeout(cfg))
-		result, err := engine.Run(jobCtx, job)
-		cancel()
-		if err != nil {
-			return Report{}, fmt.Errorf("analyze: checkpoint %d%%: %w", pct, err)
-		}
-		report.Checkpoints = append(report.Checkpoints, Checkpoint{
-			PositionPct:   pct,
-			SliceStartSec: start,
-			SliceLenSec:   length,
-			OffsetMS:      result.OffsetMS,
-			Quality:       result.CorrelationQuality,
-		})
-		report.OffsetsMS = append(report.OffsetsMS, result.OffsetMS)
-		report.Qualities = append(report.Qualities, result.CorrelationQuality)
+	runs, err := runCheckpoints(ctx, engine, cfg, req, duration, window, workers)
+	if err != nil {
+		return Report{}, err
+	}
+
+	// Aggregation happens once, here, single-threaded, in checkpoint order:
+	// no part of the report is assembled inside a goroutine.
+	for i, run := range runs {
+		report.Checkpoints[i] = run.checkpoint
+		report.OffsetsMS[i] = run.checkpoint.OffsetMS
+		report.Qualities[i] = run.checkpoint.Quality
 	}
 
 	verdict, classification, drift := classify(report.OffsetsMS, report.Qualities, float64(cfg.MaxOffsetSec)*1000)
@@ -298,6 +562,115 @@ func Analyze(ctx context.Context, engine Engine, cfg Config, req Request) (Repor
 	report.Classification = classification
 	report.MaxDriftMS = drift
 	return report, nil
+}
+
+// checkpointRun is one checkpoint's slot in the dispatch. Exactly one worker
+// writes a given slot and nothing else does, so the slice needs no lock: the
+// join is the happens-before edge.
+type checkpointRun struct {
+	checkpoint Checkpoint
+	// cause is the worker's failure, already wrapped as
+	// "analyze: checkpoint %d%%: %w".
+	cause error
+	// casualty marks a cause that is only the consequence of the shared
+	// context being cancelled by a sibling's failure (or by the caller), not
+	// this checkpoint's own verdict.
+	casualty bool
+}
+
+// runCheckpoints analyses len(cfg.CheckpointPositionsPct) checkpoints with at
+// most workers of them in flight, and returns their slots. A non-nil error is
+// the deterministic pick described on [Analyze]: the lowest checkpoint index
+// that genuinely failed, else the lowest one a cancellation stopped.
+func runCheckpoints(ctx context.Context, engine Engine, cfg Config, req Request, duration, window float64, workers int) ([]checkpointRun, error) {
+	pcts := cfg.CheckpointPositionsPct
+	runs := make([]checkpointRun, len(pcts))
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// One buffered channel of checkpoint indices: the workers pull, so a
+	// worker never blocks another one and finishing early costs nothing.
+	queue := make(chan int, len(pcts))
+	for i := range pcts {
+		queue <- i
+	}
+	close(queue)
+
+	// The internal sync package owns the name `sync` in this file, so the
+	// join is a channel: every worker reports exactly once on its way out.
+	done := make(chan struct{}, workers)
+	for w := 0; w < workers; w++ {
+		go func() {
+			defer func() { done <- struct{}{} }()
+			for i := range queue {
+				pct := pcts[i]
+				start, length := sliceWindow(duration, pct, window)
+				search := length
+				job := sync.Job{
+					TargetPath:    req.TargetPath,
+					DonorPath:     req.DonorPath,
+					SliceStartSec: start,
+					SliceLenSec:   length,
+					WindowSec:     &search,
+				}
+				jobCtx, cancelJob := context.WithTimeout(runCtx, JobTimeout(cfg))
+				result, err := engine.Run(jobCtx, job)
+				cancelJob()
+				if err != nil {
+					// A checkpoint cancelled by a sibling's failure says
+					// nothing about its own audio, so it must never outrank
+					// a genuine failure recorded at a higher index. The
+					// dispatch deliberately continues in that case: the
+					// engine is contractually fast to give up on a cancelled
+					// context, and running it is what lets every checkpoint
+					// report its own failure.
+					casualty := errors.Is(err, context.Canceled) && runCtx.Err() != nil
+					runs[i] = checkpointRun{
+						cause:    fmt.Errorf("analyze: checkpoint %d%%: %w", pct, err),
+						casualty: casualty,
+					}
+					if !casualty {
+						// First failure stops the rest. The index is
+						// recorded, so *which* one stopped the job does not
+						// matter.
+						cancel()
+					}
+					return
+				}
+				runs[i] = checkpointRun{checkpoint: Checkpoint{
+					PositionPct:   pct,
+					SliceStartSec: start,
+					SliceLenSec:   length,
+					OffsetMS:      result.OffsetMS,
+					Quality:       result.CorrelationQuality,
+				}}
+			}
+		}()
+	}
+	for w := 0; w < workers; w++ {
+		<-done
+	}
+
+	// Two deterministic passes over the slots, both in checkpoint order: a
+	// genuine failure wins over a casualty of any index, and among each kind
+	// the lowest index wins. Neither depends on which goroutine finished when.
+	for _, run := range runs {
+		if run.cause != nil && !run.casualty {
+			return nil, run.cause
+		}
+	}
+	for _, run := range runs {
+		if run.cause != nil {
+			return nil, run.cause
+		}
+	}
+	// Nothing failed but the caller's context did: the analysis is not a
+	// result, so report it the way a cancelled checkpoint would have been.
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("analyze: checkpoint %d%%: %w", pcts[0], err)
+	}
+	return runs, nil
 }
 
 // searchWindowSec is the analysed slice length. It is at least the settled

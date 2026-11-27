@@ -282,7 +282,15 @@ search bound; the validator rejects a combination that cannot resolve.
 |---|---|
 | `balanced` (default) | `enabled: false` (D5) |
 | `fast` | `enabled: false` |
-| `maximum_accuracy` | `enabled: true`, everything else at the defaults above |
+| `maximum_accuracy` | `enabled: false`, everything else at the defaults above |
+
+**Ruling (orchestrator, after review): no preset enables piecewise.** The plan's
+earlier table had `maximum_accuracy` turning it on, but a saved `maximum_accuracy` row
+from 0.4.0/0.5.0 would then silently start re-encoding the dub copy and sampling the
+whole film on the next job — a behaviour change nobody asked for, and exactly the
+"hidden write" D11 forbids. Piecewise is opt-in by toggle, and its own tooltip says
+what it costs. The tests that asserted "maximum accuracy turns it on" are corrected
+with this ruling; every preset ships `enabled: false`.
 
 `PresetTechniques` becomes `Preset(preset) analyze.Strategy` returning the whole
 section (techniques + piecewise), so one function remains the single source of

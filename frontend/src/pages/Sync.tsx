@@ -80,6 +80,44 @@ function techniqueLabel(id?: string): string {
   return TECHNIQUE_LABELS[id] ?? id
 }
 
+/**
+ * At or above this, a reported precision is a grid rather than a sample period:
+ * the waveform matcher answers on the 0.125 ms sample while a hop-based matcher
+ * answers on its hop (MFCC: 10 ms). D3 forbids presenting a hop-quantised
+ * offset as sample-accurate, so from here up the badge names the grid and the
+ * technique that answered on it.
+ */
+const HOP_QUANTISED_PRECISION_MS = 5
+
+type ReportPrecision = {
+  /** The report's own precision, in milliseconds. */
+  ms: number
+  /** The technique that answered on the grid; empty for sample precision. */
+  technique: string
+}
+
+/**
+ * How the report's offset accuracy has to be stated. `precision_ms` is the
+ * coarsest precision among the checkpoints, so a coarse value means at least
+ * one answer sits on a hop grid, and the technique named is the one that set
+ * it. A waveform report keeps its plain number; a 0.4.0 report (no precision
+ * recorded) renders no badge at all.
+ */
+function reportPrecision(report: SyncReport): ReportPrecision | null {
+  const ms = report.precision_ms
+  if (ms == null || ms <= 0) return null
+  if (ms < HOP_QUANTISED_PRECISION_MS) return { ms, technique: '' }
+  const coarse = report.checkpoints.find((cp) => (cp.precision_ms ?? 0) >= HOP_QUANTISED_PRECISION_MS)
+  return { ms, technique: coarse?.technique ? techniqueLabel(coarse.technique) : '' }
+}
+
+/** The badge text: a sample period as itself, a hop grid named with its matcher. */
+function precisionLabel(precision: ReportPrecision): string {
+  return precision.technique
+    ? `±${precision.ms} ms · ${precision.technique}`
+    : `±${precision.ms} ms`
+}
+
 /** Why a strategy step runs, in the words the settings tooltip uses. */
 const WHEN_LABELS: Record<string, string> = {
   always: 'always',
@@ -402,6 +440,7 @@ function JobRow({
 
 function ReportView({ report, calculatedOffsetMs }: { report: SyncReport; calculatedOffsetMs: number }) {
   const verdict = verdictBadge(report.verdict)
+  const precision = reportPrecision(report)
   // A recorded method is new in 0.5.0. A report that records neither a
   // technique nor a second attempt anywhere keeps the five-column table it was
   // stored with: a column of dashes would change a 0.4.0 report's shape for no
@@ -419,9 +458,9 @@ function ReportView({ report, calculatedOffsetMs }: { report: SyncReport; calcul
         <Badge tone="neutral">classification: {report.classification}</Badge>
         <Badge tone="accent">method: {report.sync_method}</Badge>
         <Badge tone="neutral">applied offset: {formatMs(calculatedOffsetMs)}</Badge>
-        {report.precision_ms != null && report.precision_ms > 0 && (
+        {precision && (
           <span data-testid="sync-precision">
-            <Badge tone="neutral">±{report.precision_ms} ms</Badge>
+            <Badge tone="neutral">{precisionLabel(precision)}</Badge>
           </span>
         )}
       </div>

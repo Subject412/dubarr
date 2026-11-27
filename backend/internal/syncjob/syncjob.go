@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"github.com/Subject412/dubarr/backend/internal/analyze"
+	"github.com/Subject412/dubarr/backend/internal/dsp/mfcc"
 	"github.com/Subject412/dubarr/backend/internal/probe"
 	"github.com/Subject412/dubarr/backend/internal/reflang"
 	"github.com/Subject412/dubarr/backend/internal/settings"
@@ -581,11 +582,22 @@ func (s *Service) runAnalysis(ctx context.Context, rec store.SyncJobRecord) (ana
 	if engine == nil {
 		engine = sync.New(sync.WithTimeout(analyze.JobTimeout(cfg)), sync.WithLogger(s.logger))
 	}
-	// Every technique this build can run, by id. Slice #83 adds
-	// analyze.TechniqueMFCC here; until then a strategy naming it is skipped
-	// with a note in the report instead of failing every job.
+	// Every technique this build can actually run, by id: the waveform runner
+	// above (a test's injected engine wins, as it always has) and MFCC's, built
+	// only when the strategy names the technique. The map never carries a
+	// placeholder, so a configured `mfcc` entry it does not hold stays
+	// analyze.Analyze's own verdict — a loud "no enabled technique has an
+	// engine" when nothing else can answer, and a report note otherwise. The
+	// waveform answer is never substituted for it.
 	engines := map[analyze.TechniqueID]analyze.Engine{
 		analyze.TechniqueWaveform: engine,
+	}
+	if strategyUses(cfg.Strategy, analyze.TechniqueMFCC) {
+		engines[analyze.TechniqueMFCC] = sync.New(
+			sync.WithCorrelator(mfcc.Analyze),
+			sync.WithTimeout(analyze.JobTimeout(cfg)),
+			sync.WithLogger(s.logger),
+		)
 	}
 
 	jr := jobRun{
@@ -1277,6 +1289,24 @@ func (s *Service) analysisPolicy(ctx context.Context) (reflang.Languages, analyz
 		}
 	}
 	return policy, cfg
+}
+
+// strategyUses reports whether the strategy enables one technique. It is what
+// decides which engines the composition root builds: an entry the strategy
+// disables never runs, so its engine would never be called, and building one
+// anyway would put a technique in the map that this job does not use.
+//
+// The list read is [analyze.Strategy.Enabled]'s, the same one the pipeline
+// routes on, so "uses" means exactly "will be asked for". A zero strategy
+// enables nothing and therefore asks for nothing: analyze resolves that to the
+// shipped waveform-only strategy.
+func strategyUses(s analyze.Strategy, id analyze.TechniqueID) bool {
+	for _, entry := range s.Enabled() {
+		if entry.ID == id {
+			return true
+		}
+	}
+	return false
 }
 
 // sanitizeStrategy drops what this build cannot run and keeps the rest.

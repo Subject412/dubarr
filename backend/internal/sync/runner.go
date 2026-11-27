@@ -23,9 +23,15 @@ const (
 	DefaultWindowSec = 5.0
 )
 
-// correlator is the correlation seam: [correlate.Analyze]'s shape. Tests
-// substitute it to reach the deadline and panic paths without a slow job.
-type correlator func(ctx context.Context, target, donor []float32, sampleRate uint32, windowSec float64) (correlate.Analysis, error)
+// Correlator is the correlation seam: one answer for one pair of slices.
+//
+// [correlate.Analyze] is the waveform implementation; the mel-cepstral matcher
+// (internal/dsp/mfcc) is the other, and it fills the same [correlate.Analysis].
+// Sharing the seam is what makes a second matcher inherit everything the runner
+// does around the call — validation, WAV reading, the analysed-slice echo,
+// deadline classification, panic recovery — and the only thing that tells the
+// two apart downstream is the precision each one reports.
+type Correlator func(ctx context.Context, target, donor []float32, sampleRate uint32, windowSec float64) (correlate.Analysis, error)
 
 // Runner runs one job at a time in-process against the Go DSP engine.
 //
@@ -36,7 +42,7 @@ type correlator func(ctx context.Context, target, donor []float32, sampleRate ui
 type Runner struct {
 	timeout   time.Duration
 	log       *slog.Logger
-	correlate correlator
+	correlate Correlator
 }
 
 // Option customises [New].
@@ -58,6 +64,21 @@ func WithLogger(log *slog.Logger) Option {
 	return func(r *Runner) {
 		if log != nil {
 			r.log = log
+		}
+	}
+}
+
+// WithCorrelator replaces the waveform correlator, which is how a second
+// matcher runs behind the same runner: the mel-cepstral one is
+// WithCorrelator(mfcc.Analyze) and nothing else about the job changes. It
+// inherits the validation, the WAV reading, the analysed-slice echo, the
+// deadline classification and the panic recovery, and its precision, z and
+// sub-sample offset are reported as the engine scored them. A nil correlator
+// keeps the default ([correlate.Analyze]).
+func WithCorrelator(c Correlator) Option {
+	return func(r *Runner) {
+		if c != nil {
+			r.correlate = c
 		}
 	}
 }

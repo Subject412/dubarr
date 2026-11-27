@@ -11,6 +11,13 @@
 //
 //	cd backend && go run ./internal/dsp/testdata/capture/main.go
 //	cd backend && go run ./internal/dsp/testdata/capture/main.go -check
+//	cd backend && go run ./internal/dsp/testdata/capture/main.go -write-window-fixture /tmp/win
+//
+// `-write-window-fixture` is not a capture at all: it emits the synthetic
+// `start_time = 0.5 s` MKV and its full-decode reference WAV that U-WIN.3's seek
+// correction is proved against, and exits. Nothing is committed from it — the
+// window-decode test builds the same pair for itself — so it exists for
+// inspecting the fixture by hand.
 //
 // Two tiers are captured (see GOLDEN.md):
 //
@@ -240,7 +247,16 @@ func main() {
 	out := flag.String("out", "", "scratch directory (default: a fresh directory beside the module)")
 	excerpt := flag.Float64("excerpt", defaultExcerptSec, "Tier B excerpt length in seconds")
 	keep := flag.Bool("keep", false, "keep the scratch directory")
+	fixtureDir := flag.String("write-window-fixture", "", "write the synthetic start_time=0.5 s MKV and its full-decode reference WAV into this directory, then exit (needs ffmpeg and mkvmerge)")
 	flag.Parse()
+
+	if *fixtureDir != "" {
+		if err := writeWindowFixture(*ffmpeg, *fixtureDir); err != nil {
+			fmt.Fprintf(os.Stderr, "capture: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	if err := run(*root, *syncBin, *ffmpeg, *check, *out, *excerpt, *keep); err != nil {
 		fmt.Fprintf(os.Stderr, "capture: %v\n", err)
@@ -668,6 +684,8 @@ func decodeArgs(input string, stream int, filter, output string) []string {
 	}
 }
 
+// runFFmpeg runs one external command and folds its stderr into the error. The
+// name predates the fixture mode, which also uses it for mkvmerge.
 func runFFmpeg(bin string, args []string) error {
 	cmd := exec.Command(bin, args...)
 	var stderr bytes.Buffer
@@ -675,6 +693,69 @@ func runFFmpeg(bin string, args []string) error {
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("%s %s: %w: %s", bin, strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
 	}
+	return nil
+}
+
+// writeWindowFixture emits the material for U-WIN.3's start_time control: an
+// MKV whose video starts at container 0 and whose audio starts at 0.5 s
+// (`start_time = 0.5`), plus the full decode of that audio track, which is the
+// reference a correctly-corrected window must land on.
+//
+// The audio is PCM at the analysis rate, so a window decode differs from the
+// reference in nothing but where it started — a lossy codec's seek behaviour
+// would blur exactly the property the control measures. mkvmerge's
+// `--sync 0:500` shifts the *audio input's* only track (track IDs are numbered
+// per input file) to a 0.5 s first timestamp; a positive delay is what puts the
+// track's first sample later than the container's.
+//
+// Nothing here is committed: the two files exist only where this tool wrote
+// them, and `window_decode_test.go` builds the same pair for itself.
+func writeWindowFixture(ffmpegBin, dir string) error {
+	if _, err := exec.LookPath("mkvmerge"); err != nil {
+		return fmt.Errorf("mkvmerge not on PATH: %w", err)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	audio := filepath.Join(dir, "window-audio.wav")
+	video := filepath.Join(dir, "window-video.mkv")
+	fixture := filepath.Join(dir, "window-start-time-0.5.mkv")
+	reference := filepath.Join(dir, "window-reference.wav")
+
+	// syncjob's same-language band, verbatim: -ac 1 -ar 8000 -af <band>
+	// -c:a pcm_f32le is the production analysis decode.
+	const filter = "highpass=f=80,lowpass=f=3500"
+
+	steps := []struct {
+		bin  string
+		args []string
+	}{
+		{ffmpegBin, []string{
+			"-v", "error", "-y",
+			"-f", "lavfi", "-i", "anoisesrc=d=30:c=pink:r=8000:a=0.5",
+			"-ac", "1", "-c:a", "pcm_s16le", audio,
+		}},
+		{ffmpegBin, []string{
+			"-v", "error", "-y",
+			"-f", "lavfi", "-i", "color=c=black:s=160x120:r=8:d=30",
+			"-c:v", "mpeg4", video,
+		}},
+		{"mkvmerge", []string{"-o", fixture, "--quiet", video, "--sync", "0:500", audio}},
+		{ffmpegBin, []string{
+			"-v", "error", "-y",
+			"-i", fixture,
+			"-map", "0:1",
+			"-ac", "1", "-ar", "8000",
+			"-af", filter,
+			"-c:a", "pcm_f32le", reference,
+		}},
+	}
+	for _, step := range steps {
+		if err := runFFmpeg(step.bin, step.args); err != nil {
+			return err
+		}
+	}
+	fmt.Printf("window fixture: %s (audio start_time 0.5 s, stream 1)\nreference:      %s\n", fixture, reference)
 	return nil
 }
 

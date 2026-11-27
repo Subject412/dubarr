@@ -1,5 +1,15 @@
 import { useState } from 'react'
-import type { LibrarySearchItem, SyncFit, SyncJob, SyncJobStatus, SyncReport } from '../lib/api'
+import type {
+  LibrarySearchItem,
+  SyncAttempt,
+  SyncCheckpoint,
+  SyncFit,
+  SyncJob,
+  SyncJobStatus,
+  SyncReport,
+  SyncStrategy,
+  SyncTechnique,
+} from '../lib/api'
 import {
   useCreateSyncJob,
   useDebouncedValue,
@@ -47,11 +57,183 @@ function formatMs(value: number): string {
 
 /**
  * The slope reads in milliseconds of offset per second of film, the unit the
- * backend reports (`slope_ms_per_sec`): 42.7 is the 25.000 -> 23.976 fps
- * mismatch.
+ * backend reports (`slope_ms_per_sec`): 40.96 is the 25.000 -> 23.976 fps
+ * mismatch (1 − 23.976/25 = 0.04096 s of drift per second of film).
  */
 function formatSlope(value: number): string {
   return `${value < 0 ? '−' : '+'}${Math.abs(value).toFixed(1)} ms/s`
+}
+
+/**
+ * The plain word for a technique id (`analyze.TechniqueID`). An id this build
+ * does not know still renders as itself: the report is the record of what ran,
+ * so hiding an unknown method would be a lie.
+ */
+const TECHNIQUE_LABELS: Record<string, string> = {
+  waveform: 'Waveform',
+  mfcc: 'MFCC',
+}
+
+function techniqueLabel(id?: string): string {
+  if (!id) return '—'
+  return TECHNIQUE_LABELS[id] ?? id
+}
+
+/** Why a strategy step runs, in the words the settings tooltip uses. */
+const WHEN_LABELS: Record<string, string> = {
+  always: 'always',
+  below_confidence: 'when the previous step was unsure',
+  above_drift: 'on checkpoints that break the trend',
+}
+
+function whenLabel(when: string): string {
+  return WHEN_LABELS[when] ?? when
+}
+
+const PRESET_LABELS: Record<string, string> = {
+  fast: 'Fast',
+  balanced: 'Balanced',
+  maximum_accuracy: 'Maximum accuracy',
+  custom: 'Custom',
+}
+
+/**
+ * Why an attempt did not decide its checkpoint. The gates come from the
+ * strategy the report recorded, so the sentence is the one the operator's own
+ * thresholds produced; without a matching step the reason stays generic.
+ */
+function attemptOutcome(attempt: SyncAttempt, step?: SyncTechnique): string {
+  if (attempt.accepted) return 'accepted'
+  if (attempt.error) return `rejected: ${attempt.error}`
+  if (!step) return 'rejected'
+  const gates: string[] = []
+  if (attempt.quality < step.min_confidence) {
+    gates.push(`below the confidence gate (${step.min_confidence.toFixed(2)})`)
+  }
+  if (step.min_match_z > 0 && attempt.match_z > 0 && attempt.match_z < step.min_match_z) {
+    gates.push(`peak under the z gate (${step.min_match_z.toFixed(1)}σ)`)
+  }
+  return gates.length > 0 ? `rejected: ${gates.join(' · ')}` : 'rejected'
+}
+
+/**
+ * What the job ran (#82), above the checkpoint table: the starting point and
+ * the steps in list order, plus any note the report left about a technique it
+ * could not run. Both are 0.5.0-only, so a 0.4.0 report renders nothing here.
+ */
+function StrategySummary({ strategy, notes }: { strategy?: SyncStrategy; notes?: string[] }) {
+  const hasNotes = (notes?.length ?? 0) > 0
+  if (!strategy && !hasNotes) return null
+  const steps = strategy?.techniques ?? []
+  const preset = strategy ? (PRESET_LABELS[strategy.preset] ?? strategy.preset) : ''
+
+  return (
+    <div className="space-y-1">
+      {strategy && (
+        <p data-testid="sync-strategy-summary" className="text-xs text-zinc-400">
+          <span className="text-[11px] uppercase tracking-wider text-zinc-500">Strategy</span>{' '}
+          <span className="text-zinc-200">{preset}</span>
+          {steps.length > 0 && (
+            <span className="text-zinc-500">
+              {' · '}
+              {steps.map((step) => `${techniqueLabel(step.id)} ${whenLabel(step.when)}`).join(' → ')}
+            </span>
+          )}
+        </p>
+      )}
+      {hasNotes && (
+        <ul data-testid="sync-strategy-notes" className="space-y-0.5 text-[11px] text-zinc-500">
+          {(notes ?? []).map((note, index) => (
+            <li key={`${index}-${note}`}>{note}</li>
+          ))}
+        </ul>
+      )}
+    </div>
+  )
+}
+
+/**
+ * One checkpoint row, plus — when more than one technique ran here — a
+ * disclosure listing every attempt so the operator can see why a second method
+ * was tried. Collapsed by default: a single-method checkpoint, which is the
+ * whole of a 0.4.0 report and of the shipped strategy, stays one line.
+ */
+function CheckpointRow({
+  checkpoint,
+  index,
+  showMethod,
+  strategy,
+}: {
+  checkpoint: SyncCheckpoint
+  index: number
+  showMethod: boolean
+  strategy?: SyncStrategy
+}) {
+  const [open, setOpen] = useState(false)
+  const attempts = checkpoint.attempts ?? []
+  const expandable = attempts.length > 1
+
+  return (
+    <>
+      <tr
+        data-testid={`checkpoint-row-${index}`}
+        className="border-b border-ink-800/60 text-zinc-300 last:border-0"
+      >
+        <td className="py-1.5 pr-3">{checkpoint.position_pct}%</td>
+        <td className="py-1.5 pr-3 font-mono">{formatMs(checkpoint.offset_ms)}</td>
+        <td className="py-1.5 pr-3 font-mono">{checkpoint.correlation_quality.toFixed(2)}</td>
+        {showMethod && (
+          <td data-testid={`checkpoint-method-${index}`} className="py-1.5 pr-3">
+            {techniqueLabel(checkpoint.technique)}
+            {expandable && (
+              <button
+                type="button"
+                data-testid={`checkpoint-attempts-toggle-${index}`}
+                aria-expanded={open}
+                onClick={() => setOpen(!open)}
+                className="ml-2 text-[11px] text-accent-400 underline-offset-2 hover:underline"
+              >
+                {open ? 'hide' : `${attempts.length} methods`}
+              </button>
+            )}
+          </td>
+        )}
+        <td className="py-1.5 pr-3 font-mono">
+          {checkpoint.match_z ? checkpoint.match_z.toFixed(1) : '—'}
+        </td>
+        <td className="py-1.5 text-zinc-500">
+          {checkpoint.slice_start_sec.toFixed(1)}s + {checkpoint.slice_len_sec.toFixed(1)}s
+        </td>
+      </tr>
+      {expandable && open && (
+        <tr
+          data-testid={`checkpoint-attempts-${index}`}
+          className="border-b border-ink-800/60 last:border-0"
+        >
+          <td colSpan={showMethod ? 6 : 5} className="py-1.5">
+            <ul className="space-y-0.5 pl-3 text-[11px] text-zinc-500">
+              {attempts.map((attempt, attemptIndex) => (
+                <li
+                  key={`${attempt.technique}-${attemptIndex}`}
+                  data-testid={`checkpoint-attempt-${index}-${attemptIndex}`}
+                >
+                  <span className="text-zinc-300">{techniqueLabel(attempt.technique)}</span>{' '}
+                  <span className="font-mono">{formatMs(attempt.offset_ms)}</span>
+                  {' · '}confidence {attempt.quality.toFixed(2)}
+                  {' · '}z {attempt.match_z ? attempt.match_z.toFixed(1) : '—'}
+                  {' · '}
+                  {attemptOutcome(
+                    attempt,
+                    strategy?.techniques.find((step) => step.id === attempt.technique),
+                  )}
+                </li>
+              ))}
+            </ul>
+          </td>
+        </tr>
+      )}
+    </>
+  )
 }
 
 function libraryLabel(entry: LibrarySearchItem): string {
@@ -226,6 +408,13 @@ function JobRow({
 
 function ReportView({ report, calculatedOffsetMs }: { report: SyncReport; calculatedOffsetMs: number }) {
   const verdict = verdictBadge(report.verdict)
+  // A recorded method is new in 0.5.0. A report that records neither a
+  // technique nor a second attempt anywhere keeps the five-column table it was
+  // stored with: a column of dashes would change a 0.4.0 report's shape for no
+  // information. One checkpoint naming a method is enough to earn the column.
+  const showMethod = report.checkpoints.some(
+    (cp) => Boolean(cp.technique) || (cp.attempts?.length ?? 0) > 1,
+  )
 
   return (
     <div className="space-y-4">
@@ -272,6 +461,8 @@ function ReportView({ report, calculatedOffsetMs }: { report: SyncReport; calcul
 
       <CheckpointChart checkpoints={report.checkpoints} fit={report.fit} />
 
+      <StrategySummary strategy={report.strategy} notes={report.notes} />
+
       <div className="overflow-x-auto">
         <table className="w-full text-left text-xs">
           <thead>
@@ -279,25 +470,20 @@ function ReportView({ report, calculatedOffsetMs }: { report: SyncReport; calcul
               <th className="py-1.5 pr-3 font-medium">Position</th>
               <th className="py-1.5 pr-3 font-medium">Offset</th>
               <th className="py-1.5 pr-3 font-medium">Quality</th>
+              {showMethod && <th className="py-1.5 pr-3 font-medium">Method</th>}
               <th className="py-1.5 pr-3 font-medium">Match z</th>
               <th className="py-1.5 font-medium">Slice</th>
             </tr>
           </thead>
           <tbody>
             {report.checkpoints.map((cp, index) => (
-              <tr
+              <CheckpointRow
                 key={`${cp.position_pct}-${index}`}
-                data-testid={`checkpoint-row-${index}`}
-                className="border-b border-ink-800/60 text-zinc-300 last:border-0"
-              >
-                <td className="py-1.5 pr-3">{cp.position_pct}%</td>
-                <td className="py-1.5 pr-3 font-mono">{formatMs(cp.offset_ms)}</td>
-                <td className="py-1.5 pr-3 font-mono">{cp.correlation_quality.toFixed(2)}</td>
-                <td className="py-1.5 pr-3 font-mono">{cp.match_z ? cp.match_z.toFixed(1) : '—'}</td>
-                <td className="py-1.5 text-zinc-500">
-                  {cp.slice_start_sec.toFixed(1)}s + {cp.slice_len_sec.toFixed(1)}s
-                </td>
-              </tr>
+                checkpoint={cp}
+                index={index}
+                showMethod={showMethod}
+                strategy={report.strategy}
+              />
             ))}
           </tbody>
         </table>

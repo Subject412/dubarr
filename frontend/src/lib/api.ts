@@ -489,7 +489,7 @@ export type SyncFitShape = 'constant' | 'drift' | 'cut' | 'mixed' | 'insufficien
 /**
  * The trend through the checkpoint offsets (`analyze.LineFit`, #86). `slope_ms_per_sec`
  * is milliseconds of offset per second of film: a 25.000 -> 23.976 fps mismatch
- * reads +42.7. `tempo_factor` is the atempo factor that removes the slope and is
+ * reads +40.96. `tempo_factor` is the atempo factor that removes the slope and is
  * set only for a drift the encoder can represent; `tempo_applied` says whether
  * the worker folded it into the job's single encode.
  *
@@ -515,7 +515,7 @@ export type SyncFit = {
 export type SyncApplication = {
   /** `copy` | `re-encoded` */
   mode: string
-  /** e.g. `copied untouched`, `re-encoded (tempo 1.0427)` */
+  /** e.g. `copied untouched`, `re-encoded (tempo 0.95904)` */
   note: string
 }
 

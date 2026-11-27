@@ -83,6 +83,38 @@ const StableSpreadThresholdMS = 40.0
 // yields [VerdictUnreliable].
 const LowQualityThreshold = 0.10
 
+// Thresholds is the one table every verdict limit comes from. Re-tuning the
+// engine is an edit here, not a hunt through [classify].
+//
+// The two 0.4.0 limits keep their constants — [StableSpreadThresholdMS] and
+// [LowQualityThreshold] are referenced by the fallback policy and by the
+// acceptance tests — and the table takes its values from them, so there is
+// still exactly one definition of each number. The two z bands are new in 0.5.0
+// and live only here; they are engine policy, echoed in every report, and
+// deliberately not settings (a second source of truth for a number that must be
+// re-tuned from evidence is worse than a Go literal).
+type Thresholds struct {
+	// StableSpreadMS is the maximum checkpoint spread that still counts as a
+	// constant offset band.
+	StableSpreadMS float64 `json:"stable_spread_ms"`
+	// LowQuality is the correlation_quality floor below which a checkpoint is
+	// not trusted: the 0.4.0 gate.
+	LowQuality float64 `json:"low_quality"`
+	// MatchZMaybe is the z below which a weak checkpoint "needs a human look".
+	MatchZMaybe float64 `json:"match_z_maybe"`
+	// MatchZGood is the z at or above which a match is "likely correct".
+	MatchZGood float64 `json:"match_z_good"`
+}
+
+// DefaultThresholds is the table that judges every report, and the table a
+// report echoes so an operator reading an old job can see which limits applied.
+var DefaultThresholds = Thresholds{
+	StableSpreadMS: StableSpreadThresholdMS,
+	LowQuality:     LowQualityThreshold,
+	MatchZMaybe:    5.0,
+	MatchZGood:     10.0,
+}
+
 // Per-job engine timeout. One correlation job scans the whole widened slice
 // (190 s with the settled defaults), which is far longer than sync.Runner's
 // 30 s default: the engine must decode and correlate every lag at the source
@@ -455,17 +487,33 @@ type Request struct {
 }
 
 // Checkpoint is one correlation point in the report.
+//
+// OffsetSubMS, MatchZ and PrecisionMS are the 0.5.0 diagnostics and are never
+// omitempty: a new report always carries them, and 0 is the documented "not
+// recorded" sentinel a 0.4.0 row decodes to. MatchZ in particular is 0 both for
+// "scored no z" and for "written before 0.5.0", and both mean the same thing to
+// the verdict: no z evidence.
 type Checkpoint struct {
 	PositionPct   int     `json:"position_pct"`
 	SliceStartSec float64 `json:"slice_start_sec"`
 	SliceLenSec   float64 `json:"slice_len_sec"`
 	OffsetMS      float64 `json:"offset_ms"`
 	Quality       float64 `json:"correlation_quality"`
+	OffsetSubMS   float64 `json:"offset_sub_ms"`
+	MatchZ        float64 `json:"match_z"`
+	PrecisionMS   float64 `json:"precision_ms"`
 }
 
 // Report is the persisted multi-point analysis (sync_jobs.checkpoints_json).
 // OffsetsMS and Qualities are flat, checkpoint-ordered views for charting; the
 // Checkpoints slice carries the window details.
+//
+// MatchZ is the same flat view of the per-checkpoint z, and it is not
+// omitempty: `len(MatchZ) == len(OffsetsMS)` is how a consumer tells a 0.5.0
+// report with z = 0 from a 0.4.0 report with no z at all. PrecisionMS is the
+// coarsest precision among the checkpoints (the largest sample period, so a
+// report never claims more resolution than its worst checkpoint), and
+// Thresholds is the table that judged this report.
 type Report struct {
 	Verdict        string         `json:"verdict"`
 	OffsetsMS      []float64      `json:"offsets_ms"`
@@ -475,6 +523,9 @@ type Report struct {
 	Checkpoints    []Checkpoint   `json:"checkpoints"`
 	SyncMethod     reflang.Method `json:"sync_method"`
 	Reason         string         `json:"reason,omitempty"`
+	MatchZ         []float64      `json:"match_z"`
+	PrecisionMS    float64        `json:"precision_ms"`
+	Thresholds     Thresholds     `json:"thresholds"`
 }
 
 // Analyze resolves the reference strategy, runs one correlation per checkpoint,
@@ -628,6 +679,8 @@ func Analyze(ctx context.Context, engine Engine, cfg Config, req Request) (Repor
 		Checkpoints: make([]Checkpoint, len(pcts)),
 		OffsetsMS:   make([]float64, len(pcts)),
 		Qualities:   make([]float64, len(pcts)),
+		MatchZ:      make([]float64, len(pcts)),
+		Thresholds:  DefaultThresholds,
 	}
 
 	runs, err := runCheckpoints(ctx, engine, cfg, cfg.slicer(req), plan, workers)
@@ -641,9 +694,16 @@ func Analyze(ctx context.Context, engine Engine, cfg Config, req Request) (Repor
 		report.Checkpoints[i] = run.checkpoint
 		report.OffsetsMS[i] = run.checkpoint.OffsetMS
 		report.Qualities[i] = run.checkpoint.Quality
+		report.MatchZ[i] = run.checkpoint.MatchZ
+		// The coarsest precision wins: a report must never claim more
+		// resolution than its worst checkpoint.
+		if run.checkpoint.PrecisionMS > report.PrecisionMS {
+			report.PrecisionMS = run.checkpoint.PrecisionMS
+		}
 	}
 
-	verdict, classification, drift := classify(report.OffsetsMS, report.Qualities, float64(cfg.MaxOffsetSec)*1000)
+	verdict, classification, drift := classify(report.OffsetsMS, report.Qualities, report.MatchZ,
+		float64(cfg.MaxOffsetSec)*1000, DefaultThresholds)
 	report.Verdict = verdict
 	report.Classification = classification
 	report.MaxDriftMS = drift
@@ -734,6 +794,9 @@ func runCheckpoints(ctx context.Context, engine Engine, cfg Config, slicer Slice
 					SliceLenSec:   window.LenSec,
 					OffsetMS:      result.OffsetMS,
 					Quality:       result.CorrelationQuality,
+					OffsetSubMS:   result.OffsetSubMS,
+					MatchZ:        result.MatchZ,
+					PrecisionMS:   result.PrecisionMS,
 				}}
 			}
 		}()
@@ -815,10 +878,31 @@ func searchWindowSec(cfg Config) float64 {
 
 // classify implements the monotonic sanity check: a constant shift has a small
 // spread across checkpoints, drift has a large one, and any point beyond the
-// acceptance bound fails loudly. A checkpoint too weak to trust (quality below
-// [LowQualityThreshold]) outranks drift but not an out-of-range offset, giving
-// the precedence out_of_range > unreliable > drifting > ok.
-func classify(offsets, qualities []float64, maxOffsetMS float64) (verdict, classification string, maxDrift float64) {
+// acceptance bound fails loudly. A checkpoint too weak to trust outranks drift
+// but not an out-of-range offset, giving the precedence
+// out_of_range > unreliable > drifting > ok — unchanged from 0.4.0.
+//
+// Every limit comes from th (see [Thresholds]); no literal survives here, so
+// re-tuning is one edit to [DefaultThresholds].
+//
+// # The unreliable rule is a conjunction
+//
+// A checkpoint is unreliable when its quality is below th.LowQuality **and** its
+// match z dissents (or no z was recorded, which is every 0.4.0 row):
+//
+//	qualities[i] < th.LowQuality && (no z at i || matchZ[i] < th.MatchZMaybe)
+//
+// D2 requires both that the verdicts start using the new number and that an
+// item that was `ok` in 0.4.0 cannot silently reclassify. Under the conjunction
+// that second requirement holds by construction: a checkpoint 0.4.0 called fine
+// has quality >= th.LowQuality, so the old gate fails first and the new number
+// can only confirm distrust the old one already had. A pure-z rule would
+// reclassify 0.4.0 rows, which is exactly what D2 forbids.
+//
+// "no z recorded" means len(matchZ) <= i or matchZ[i] == 0: a zero z is the
+// documented sentinel for "not measured", so a legacy report behaves exactly as
+// it did in 0.4.0.
+func classify(offsets, qualities, matchZ []float64, maxOffsetMS float64, th Thresholds) (verdict, classification string, maxDrift float64) {
 	if len(offsets) == 0 {
 		return VerdictOutOfRange, ClassificationOutOfRange, 0
 	}
@@ -837,12 +921,15 @@ func classify(offsets, qualities []float64, maxOffsetMS float64) (verdict, class
 			return VerdictOutOfRange, ClassificationOutOfRange, maxDrift
 		}
 	}
-	for _, q := range qualities {
-		if q < LowQualityThreshold {
+	for i, q := range qualities {
+		if q >= th.LowQuality {
+			continue
+		}
+		if len(matchZ) <= i || matchZ[i] == 0 || matchZ[i] < th.MatchZMaybe {
 			return VerdictUnreliable, ClassificationUnreliable, maxDrift
 		}
 	}
-	if maxDrift >= StableSpreadThresholdMS {
+	if maxDrift >= th.StableSpreadMS {
 		return VerdictDrifting, ClassificationDrifting, maxDrift
 	}
 	return VerdictOK, ClassificationStable, maxDrift

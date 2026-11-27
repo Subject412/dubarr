@@ -28,11 +28,21 @@ type Analyzed struct {
 
 // Result is one correlation's answer. OffsetMS = target time - donor time, so a
 // positive value means the donor track must be delayed.
+//
+// OffsetSubMS, MatchZ and PrecisionMS are the 0.5.0 diagnostics: the
+// interpolated (never applied) offset, the peak's distance from the window's
+// own lag distribution in standard deviations, and one sample of the analysis
+// rate in milliseconds. They are appended after the 0.4.0 fields so the JSON
+// key order of an existing object is unchanged, and they are omitempty so a
+// zero value reads as "not recorded" rather than "measured zero".
 type Result struct {
 	OffsetMS           float64  `json:"offset_ms"`
 	CorrelationQuality float64  `json:"correlation_quality"`
 	SampleRate         uint32   `json:"sample_rate"`
 	Analyzed           Analyzed `json:"analyzed"`
+	OffsetSubMS        float64  `json:"offset_sub_ms,omitempty"`
+	MatchZ             float64  `json:"match_z,omitempty"`
+	PrecisionMS        float64  `json:"precision_ms,omitempty"`
 }
 
 // validate rejects a job the engine would reject, before any file is opened. It

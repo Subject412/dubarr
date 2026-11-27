@@ -194,6 +194,12 @@ func (r *Runner) Run(ctx context.Context, job Job) (out Result, err error) {
 		OffsetMS:           roundMillis(float64(analysis.OffsetSamples) * 1000 / float64(rate)),
 		CorrelationQuality: roundMillis(float64(analysis.Quality)),
 		SampleRate:         rate,
+		// The interpolated offset is converted like the applied one but never
+		// applied: it is the same measurement at sub-sample resolution, and z is
+		// O(10), so three decimals is plenty for both.
+		OffsetSubMS: roundMillis(analysis.OffsetSubSamples * 1000 / float64(rate)),
+		MatchZ:      roundMillis(float64(analysis.MatchZ)),
+		PrecisionMS: roundMillis(analysis.PrecisionMS),
 	}
 	result.Analyzed = Analyzed{
 		Start: float64(start) / float64(rate),

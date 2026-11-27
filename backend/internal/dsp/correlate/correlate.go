@@ -25,11 +25,31 @@ const scratchFree = 3
 type Analysis struct {
 	// OffsetSamples is `t_target - t_donor` in samples: a positive value means
 	// the target's audio runs late relative to the donor.
+	//
+	// It is the integer lag of the global maximum, unchanged from 0.4.0, and
+	// it is what the mux stage applies.
 	OffsetSamples int64
 
 	// Quality is the peak's prominence over the median lag response, in
-	// `0..=1`; see [peakProminence].
+	// `0..=1`; see [peakProminence]. It is the 0.4.0 confidence number and
+	// keeps its exact formula and meaning.
 	Quality float32
+
+	// OffsetSubSamples is OffsetSamples plus the parabolic interpolation of the
+	// three lag scores around the peak. It is diagnostics, never applied: at
+	// 8 kHz one sample is 0.125 ms and the consumer is `mkvmerge --sync 0:<ms>`.
+	// It lies within half a sample of OffsetSamples.
+	OffsetSubSamples float64
+
+	// MatchZ is the peak's distance from the window's own lag distribution, in
+	// standard deviations; see [matchZ]. It is scale-free, so it is comparable
+	// between a quiet dub and a loud one. 0 means "no z" (fewer than two scored
+	// lags, or a flat curve).
+	MatchZ float32
+
+	// PrecisionMS is one sample of the analysis rate, in milliseconds: the
+	// measurement precision of OffsetSamples and OffsetSubSamples.
+	PrecisionMS float64
 }
 
 // result is what one correlation produced, including the peak NCC that
@@ -39,6 +59,10 @@ type result struct {
 	offset  int64
 	peak    float64
 	quality float32
+	// subSamples is the interpolated peak position, in lag units.
+	subSamples float64
+	// matchZ is the peak scored against the lag curve, in std deviations.
+	matchZ float64
 }
 
 // InvalidJob reports an argument the correlator cannot use. It renders the
@@ -106,7 +130,13 @@ func (s *Scratch) Analyze(ctx context.Context, target, donor []float32, sampleRa
 	if err != nil {
 		return Analysis{}, err
 	}
-	return Analysis{OffsetSamples: r.offset, Quality: r.quality}, nil
+	return Analysis{
+		OffsetSamples:    r.offset,
+		Quality:          r.quality,
+		OffsetSubSamples: r.subSamples,
+		MatchZ:           float32(r.matchZ),
+		PrecisionMS:      1000 / float64(sampleRate),
+	}, nil
 }
 
 // Analyze correlates target against donor, both sampled at sampleRate, and
@@ -124,7 +154,13 @@ func Analyze(ctx context.Context, target, donor []float32, sampleRate uint32, wi
 	if err != nil {
 		return Analysis{}, err
 	}
-	return Analysis{OffsetSamples: r.offset, Quality: r.quality}, nil
+	return Analysis{
+		OffsetSamples:    r.offset,
+		Quality:          r.quality,
+		OffsetSubSamples: r.subSamples,
+		MatchZ:           float32(r.matchZ),
+		PrecisionMS:      1000 / float64(sampleRate),
+	}, nil
 }
 
 // correlate runs one correlation, taking and returning its padded inputs from
@@ -235,8 +271,24 @@ func correlate(ctx context.Context, s *Scratch, target, donor []float32, sampleR
 	// and a lag whose two energies do not multiply to something positive is
 	// skipped rather than scored (so no NaN and no Inf ever reaches scores).
 	// The comparison is strictly `>`, so a tie keeps the lowest lag.
+	//
+	// Two float64 accumulators ride along for matchZ and two locals capture the
+	// scores either side of the current best for the parabolic fit. Both are
+	// free: no second pass, no second allocation.
 	scores := make([]float64, 0, 2*maxLag+1)
 	best, peak, found := int64(0), 0.0, false
+	var sum, sumSq float64
+
+	// Neighbour capture. `scores` holds only the lags that survived the overlap
+	// and denom tests, so it is not index-aligned with lag and cannot be
+	// indexed by i-1/i+1 afterwards. When a new best is found at loop index i,
+	// the left neighbour is the previously scored lag's ncc if that lag was
+	// exactly i-1; when the scan later reaches i+1, that ncc becomes the right
+	// neighbour. NaN means "never seen", which parabolicPeak turns into 0.
+	left, right := math.NaN(), math.NaN()
+	var prevIdx, bestIdx = -1, -1
+	var prevNCC float64
+
 	for i := 0; i <= 2*maxLag; i++ {
 		if i%lagCheckInterval == 0 {
 			if err := ctx.Err(); err != nil {
@@ -275,17 +327,41 @@ func correlate(ctx context.Context, s *Scratch, target, donor []float32, sampleR
 			ncc = -1
 		}
 		scores = append(scores, ncc)
+		sum += ncc
+		sumSq += ncc * ncc
 		if !found || ncc > peak {
+			left, right = math.NaN(), math.NaN()
+			if prevIdx == i-1 {
+				left = prevNCC
+			}
 			best, peak, found = lag, ncc, true
+			bestIdx = i
+		} else if i == bestIdx+1 {
+			right = ncc
 		}
+		prevIdx, prevNCC = i, ncc
 	}
 
 	if !found {
 		return result{}, &NoValidLag{}
 	}
+
+	// The fractional offset is interpolated before peakProminence reorders
+	// `scores` in place. It does not read scores — the neighbours were captured
+	// during the scan — but keeping the order explicit stops a future reader
+	// from "optimising" it into a lookup.
+	delta := parabolicPeak(left, peak, right)
+	z := matchZ(peak, len(scores), sum, sumSq)
+
 	// The scan is over, so peakProminence may select the median in place; it
 	// would otherwise clone ~23 MB of scores at nfft = 2^22 for one value.
-	return result{offset: best, peak: peak, quality: peakProminence(peak, scores)}, nil
+	return result{
+		offset:     best,
+		peak:       peak,
+		quality:    peakProminence(peak, scores),
+		subSamples: float64(best) + delta,
+		matchZ:     z,
+	}, nil
 }
 
 // prepare removes DC, scales to unit RMS and rejects a silent slice, in the

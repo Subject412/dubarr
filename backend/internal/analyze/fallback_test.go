@@ -195,7 +195,7 @@ func TestFpsDriftIsNotASuspect(t *testing.T) {
 			}
 			// The shape really is drift: assert the verdict the policy is
 			// preserving, so a "fix" that flattened the ramp cannot pass here.
-			verdict, _, maxDrift := classify(tc.offsets, fillQualities(len(tc.offsets), testQuality), testAcceptBoundMS)
+			verdict, _, maxDrift := classify(tc.offsets, fillQualities(len(tc.offsets), testQuality), nil, testAcceptBoundMS, DefaultThresholds)
 			if verdict != VerdictDrifting {
 				t.Fatalf("classify(%v) = %q (max drift %v ms), want %q", tc.offsets, verdict, maxDrift, VerdictDrifting)
 			}
@@ -216,7 +216,7 @@ func TestMidMovieCutIsNotASuspect(t *testing.T) {
 	if got := Suspects(windows, offsets, qualities, testMaxLagMS); len(got) != 0 {
 		t.Fatalf("Suspects(cut %v) = %+v, want none: a cut is a verdict, not a decode failure", offsets, got)
 	}
-	verdict, _, maxDrift := classify(offsets, qualities, testAcceptBoundMS)
+	verdict, _, maxDrift := classify(offsets, qualities, nil, testAcceptBoundMS, DefaultThresholds)
 	if verdict != VerdictDrifting {
 		t.Fatalf("classify(cut %v) = %q (max drift %v ms), want %q", offsets, verdict, maxDrift, VerdictDrifting)
 	}
@@ -307,7 +307,7 @@ func TestFallbackBoundaryPeakIsNotMasked(t *testing.T) {
 
 	// And the full decode reproduces the peak: the report must still say
 	// out_of_range, not a drifting timeline that happens to include 190 s.
-	verdict, classification, _ := classify(offsets, qualities, testAcceptBoundMS)
+	verdict, classification, _ := classify(offsets, qualities, nil, testAcceptBoundMS, DefaultThresholds)
 	if verdict != VerdictOutOfRange || classification != ClassificationOutOfRange {
 		t.Fatalf("classify(boundary peak) = %q/%q, want %q/%q: the fallback must not mask it",
 			verdict, classification, VerdictOutOfRange, ClassificationOutOfRange)

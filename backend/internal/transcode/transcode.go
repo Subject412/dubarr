@@ -91,6 +91,11 @@ type Request struct {
 	// muxer ever stops writing them itself.
 	LangISO2 string
 	Title    string
+	// Segments, when non-empty, is the #84 piecewise render: the dub is cut per
+	// segment, each run placed at its absolute position, and the result
+	// concatenated in the same single encode ([BuildSegmentedArgs]). Empty means
+	// the ordinary single pass ([BuildArgs]).
+	Segments []Segment
 }
 
 // Result describes a successful encode.
@@ -130,8 +135,10 @@ func (t *Transcoder) EncoderAvailable(ctx context.Context, encoder string) (bool
 
 // Transcode runs exactly one ffmpeg encode (tempo + channel/rate conversion +
 // codec/bitrate all in one command, see [BuildArgs]) and then re-probes the
-// result. A codec/channel/duration mismatch is ErrVerify: the caller must fail
-// the job rather than mux an unexpected stream.
+// result. A piecewise render cuts, pads and concatenates the segments in that
+// same single command instead (see [BuildSegmentedArgs]). A codec/channel/
+// duration mismatch is ErrVerify: the caller must fail the job rather than mux
+// an unexpected stream.
 func (t *Transcoder) Transcode(ctx context.Context, req Request) (Result, error) {
 	if !req.Plan.Encode() {
 		return Result{}, fmt.Errorf("%w: plan requests no encode (%q)", ErrInvalidPlan, req.Plan.Codec)
@@ -177,7 +184,11 @@ func (t *Transcoder) Transcode(ctx context.Context, req Request) (Result, error)
 		outChannels = src.Channels
 	}
 
-	args, err := BuildArgs(req)
+	build := BuildArgs
+	if len(req.Segments) > 0 {
+		build = BuildSegmentedArgs
+	}
+	args, err := build(req)
 	if err != nil {
 		return Result{}, err
 	}
@@ -193,8 +204,16 @@ func (t *Transcoder) Transcode(ctx context.Context, req Request) (Result, error)
 		return Result{}, fmt.Errorf("%w: probe output: %v", ErrVerify, err)
 	}
 	expectedDuration := durationMS
-	if f := plan.TempoFactor; f > 0 && f != 1 {
-		expectedDuration = int64(float64(durationMS) / f)
+	switch {
+	case len(req.Segments) > 0:
+		// A segmented render's length is what the segments add up to, not the
+		// input's: cutting deliberately drops film and padding deliberately adds
+		// silence, so comparing against the dub's duration would both hide a
+		// wrong cut and reject a right one. The audio stream must be exactly the
+		// planned total or the job fails before any mux.
+		expectedDuration = SegmentsTotalMS(req.Segments)
+	case plan.TempoFactor > 0 && plan.TempoFactor != 1:
+		expectedDuration = int64(float64(durationMS) / plan.TempoFactor)
 	}
 	if err := Verify(got, Expect{
 		Codec:      plan.ExpectedCodec(),

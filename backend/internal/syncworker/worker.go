@@ -393,6 +393,38 @@ func (w *Worker) processJob(ctx context.Context, id int64) error {
 		return atStage("load", fmt.Errorf("syncworker: job %d not found", id))
 	}
 
+	// Claim-time re-check (#48): the selection (nextQueued) and this load are not
+	// one transaction, and a held row is only ever promoted by a projection that
+	// ran on some earlier snapshot. Before spending an analysis on it, prove the
+	// row is still queued and its target still passes the gate; a job that turned
+	// ineligible under us goes back to held instead of muxing into a file the
+	// upstream pipeline may still replace. A forced job is never re-held — the
+	// operator's override is persisted on the row and outranks the gate.
+	if rec.Status != statusQueued {
+		w.logf("syncworker: debug: job %d is %q, skipping", id, rec.Status)
+		return nil
+	}
+	reason, err := w.reholdReason(ctx, rec)
+	if err != nil {
+		return atStage("gate", err)
+	}
+	if reason != "" {
+		// HoldSyncJob only accepts a claimed row (analyzing or muxing), so claim
+		// it first and demote it in the same breath: the job never reaches
+		// Execute, and a projection that releases it later starts from held.
+		if err := w.store.SetSyncJobStatus(ctx, id, store.SyncJobAnalyzing, ""); err != nil {
+			return atStage("claim", err)
+		}
+		held, err := w.store.HoldSyncJob(ctx, id, reason)
+		if err != nil {
+			return atStage("hold", err)
+		}
+		if held {
+			w.logf("syncworker: job %d re-held (%s): its target is no longer eligible", id, reason)
+		}
+		return nil
+	}
+
 	// ADR-0010: Transcode Rules are matched against PRE-TEMPO vault-track
 	// metadata and the required encoder is verified BEFORE the job does any
 	// work, so a missing libopus fails with a clear error instead of midway
@@ -575,7 +607,7 @@ func (w *Worker) processJob(ctx context.Context, id int64) error {
 		OutputDir:      outputDir,
 		Gate:           rule,
 		Arr:            gate.ArrMetadata{Found: true, Tags: lib.ArrTagLabels, RootFolder: lib.RootFolderPath},
-		Force:          w.forceOverride(ctx),
+		Force:          rec.ForceIgnoreTagFilter || w.forceOverride(ctx),
 		Report:         report,
 		Candidates:     candidates,
 	})
@@ -870,9 +902,50 @@ func (w *Worker) gateRule(ctx context.Context) (gate.Rule, error) {
 	return gate.RuleFromTagFilter(tf), nil
 }
 
+// reholdReason answers "would the gate refuse this job's target right now?" and
+// returns the closed-vocabulary reason when it would, "" when the job may run.
+//
+// A forced job is never re-held: force_ignore_tag_filter is the operator's
+// persisted "start it now" and outranks the gate everywhere (birth, projection,
+// claim). A vanished target is missing_target rather than a tag verdict, so the
+// UI can say the file is gone instead of asking for tags that cannot help.
+func (w *Worker) reholdReason(ctx context.Context, rec store.SyncJobRecord) (string, error) {
+	if rec.ForceIgnoreTagFilter {
+		return "", nil
+	}
+	lib, hasLib, err := w.store.LibraryCacheJobTargetByID(ctx, rec.TargetLibraryCacheID)
+	if err != nil {
+		return "", err
+	}
+	target := strings.TrimSpace(rec.TargetVideoPath)
+	if target == "" && hasLib {
+		target = strings.TrimSpace(lib.TargetFilePath)
+	}
+	if target == "" {
+		return store.HeldReasonMissingTarget, nil
+	}
+	if info, err := os.Stat(target); err != nil || !info.Mode().IsRegular() {
+		return store.HeldReasonMissingTarget, nil
+	}
+	rule, err := w.gateRule(ctx)
+	if err != nil {
+		return "", err
+	}
+	if !rule.EligiblePath(target, gate.ArrMetadata{
+		Found:      hasLib,
+		Tags:       lib.ArrTagLabels,
+		RootFolder: lib.RootFolderPath,
+	}) {
+		return store.HeldReasonWaitingForTags, nil
+	}
+	return "", nil
+}
+
 // forceOverride maps the appliance-wide security switch onto mux.Force. The
-// job row does not persist a per-job force flag (M4-6 create only gates the
-// request), so the global opt-in is the only durable caller-owned switch.
+// per-job flag (migration 0008) is the operator's recorded override for one
+// approval; this is the appliance-wide opt-in that also covers manual Studio
+// jobs, which carry no approval to record it on. The mux is called with the OR
+// of the two.
 func (w *Worker) forceOverride(ctx context.Context) bool {
 	if w.settings == nil {
 		return false

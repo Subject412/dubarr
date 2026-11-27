@@ -293,7 +293,15 @@ explicit, audited path.
 | `backend/internal/store/sync_jobs_test.go` | unit tests for each new method and the guarded transitions |
 | `backend/internal/gate/rule.go` | `EligiblePath` thin wrapper over `Classify` |
 | `backend/internal/gate/rule_test.go` | table test: neutral rule, arr-only fail-closed, force bypass not implemented here |
-| `backend/internal/queue/queue.go` | `handleApprove` — record intent, four 409 codes, insert job with status, return `sync_job_id`; `handleReject` cancels by origin |
+| `backend/internal/queue/queue.go` | `handleApprove` — record intent (no gate consultation), keep the four 409 codes, hand `force_ignore_tag_filter` and the approving queue id forward; `handleReject` cancels by origin |
+
+**Ruling (orchestrator, after the storage pass hit a wall): the hold happens at sync-job creation, not at approve.**
+A `sync_mux_jobs` row cannot exist at approve time — `target_track_id` is `NOT NULL REFERENCES audio_tracks(id)` and the vault track is written by the extract worker *after* approve (that is the whole `pending_approval → extracting → vault → sync job` order the acceptance tests encode). So:
+
+- `approve` no longer asks the gate anything. It records intent on the queue row (`force_ignore_tag_filter` included) and lets extraction run — an ineligible target no longer blocks a dub from being extracted, which is also cheaper: the expensive part is extraction, and it is useful regardless of the film's current tags.
+- The gate is consulted exactly where a job row is born: the extract/sync-job step creates the job as `queued` when the pair is eligible and `held` (with a reason) when not. `held_reason` therefore always describes a real, existing target track.
+- `POST /api/queue/{id}/approve` therefore keeps its four 409s (identity, target file, folder, donor) and returns `{approved: true}`; `sync_job_id` and `sync_job_status` move to the job that extraction creates, which is what `GET /api/sync/jobs` reports anyway.
+- Everything else stands: release is a projection (each sync pass, after a rescan, at boot), `force_ignore_tag_filter` bypasses the hold, and a rejected intent cancels by origin while it is still `queued`/`held`.
 | `backend/internal/queue/queue_test.go` | approve/reject matrix |
 | `backend/internal/arrsync/poller.go` | `releaseHeld` after `syncPass` and at the end of `Trigger` |
 | `backend/internal/library/rescan.go` | release after a successful per-item rescan |

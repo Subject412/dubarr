@@ -440,6 +440,29 @@ func (s *Store) CancelSyncJobsByOrigin(ctx context.Context, queueID int64, reaso
 	return int(n), nil
 }
 
+// OriginHasLiveSyncJob reports whether an approval already owns a job that can
+// still run (queued, held, analyzing, ready_for_review or muxing). Approve uses
+// it to stay idempotent: a second POST for a row whose extraction already bred
+// the job must answer success, not breed another one.
+func (s *Store) OriginHasLiveSyncJob(ctx context.Context, queueID int64) (bool, error) {
+	if queueID <= 0 {
+		return false, errors.New("store: live sync job of queue row: queue id must be positive")
+	}
+	var one int
+	err := s.DB.QueryRowContext(ctx, `
+		SELECT 1 FROM sync_mux_jobs
+		WHERE origin_queue_id = ? AND status IN (?, ?, ?, ?, ?)
+		LIMIT 1`, queueID, SyncJobQueued, SyncJobHeld, SyncJobAnalyzing,
+		SyncJobReadyForReview, SyncJobMuxing).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("store: read live sync job of queue row %d: %w", queueID, err)
+	}
+	return true, nil
+}
+
 // FinishSyncJobAnalysis persists the terminal state of an analysis run.
 // checkpoints is marshalled as-is; a nil report stores an empty array.
 //

@@ -533,15 +533,14 @@ func TestQueueMatchStateReady(t *testing.T) {
 	}
 }
 
-func TestQueueMatchStateIneligibleTarget(t *testing.T) {
+// TestQueueMatchStateIneligibleTargetIsReady is the #48 widening: a matched row
+// with a target file and a donor is approvable whatever the gate says, because
+// approve records intent and the job born after the extraction is the thing that
+// holds. The card must therefore offer the button and still report the verdict
+// beside it, which is what Eligibility carries.
+func TestQueueMatchStateIneligibleTargetIsReady(t *testing.T) {
 	h := newHarness(t)
 	h.seedCandidate(t, "Shrek (2001) [Remux].mkv", "waiting_for_tags", `["en"]`)
-	// A donor exists, but the target is not gate-eligible. The card's `ready`
-	// is still the gate projection here, so the row must not claim it: the
-	// state is what the operator reads the tag verdict from, and donors are
-	// never tag-gated. Approving such a row no longer consults the gate at all
-	// (see TestApproveIneligibleTargetRecordsIntent) — widening `ready` to
-	// "no gate verdict blocks approval" is the follow-up this projection owes.
 	h.writeDonor(t)
 
 	item := onlyMatchItem(t, h.listMatchItems(t))
@@ -549,117 +548,89 @@ func TestQueueMatchStateIneligibleTarget(t *testing.T) {
 		t.Errorf("matched = false, want true")
 	}
 	if len(item.Donors) == 0 {
-		t.Fatalf("donor candidates = 0, want at least one so eligibility alone decides")
+		t.Fatalf("donor candidates = 0, want at least one so the target can be approved")
 	}
-	if item.MatchState == MatchStateReady {
-		t.Errorf("match_state = %q, want it not to be %q for an ineligible target", item.MatchState, MatchStateReady)
+	if item.MatchState != MatchStateReady {
+		t.Errorf("match_state = %q, want %q: an ineligible pair is approvable and simply held",
+			item.MatchState, MatchStateReady)
 	}
-	if item.MatchState != MatchStateMatchedNoDonor {
-		t.Errorf("match_state = %q, want %q", item.MatchState, MatchStateMatchedNoDonor)
+	if item.MatchBlocker != MatchBlockerNone {
+		t.Errorf("match_blocker = %q, want %q", item.MatchBlocker, MatchBlockerNone)
 	}
-	if !strings.Contains(item.MatchReason, "not eligible") {
-		t.Errorf("match_reason = %q, want it to explain the eligibility verdict", item.MatchReason)
-	}
-	// The seed records no missing tag, so a waiting verdict can only come from
-	// an exclusion: the reason must not invent a missing tag.
-	if strings.Contains(strings.ToLower(item.MatchReason), "missing") {
-		t.Errorf("match_reason = %q, want no missing-tag claim when the gate recorded none", item.MatchReason)
-	}
-	if !strings.Contains(strings.ToLower(item.MatchReason), "excluded") {
-		t.Errorf("match_reason = %q, want it to name the excluded tag that blocked the target", item.MatchReason)
-	}
-	if item.MatchBlocker != MatchBlockerGateExcluded {
-		t.Errorf("match_blocker = %q, want %q", item.MatchBlocker, MatchBlockerGateExcluded)
+	if item.MatchReason != "Ready to approve." {
+		t.Errorf("match_reason = %q, want %q", item.MatchReason, "Ready to approve.")
 	}
 }
 
-// TestQueueMatchStateExcludedTagReason classifies a target that carries an
-// excluded tag with the real gate rule, so the stored verdict has every
-// required tag matched and nothing missing: the queue must blame the exclusion.
-func TestQueueMatchStateExcludedTagReason(t *testing.T) {
-	h := newHarness(t)
-	target := "Shrek (2001) [ArcA310] [X].mkv"
-	id := h.seedCandidate(t, target, "waiting_for_tags", `["en"]`)
+// TestQueueMatchStateGateVerdictIsNotABlocker covers the three verdict shapes the
+// derivation used to blame — an excluded tag, a missing required tag and a
+// waiting verdict with no gate record — and pins that none of them is a blocker:
+// with a donor the row is ready, and without one the only blocker left is the
+// donor.
+func TestQueueMatchStateGateVerdictIsNotABlocker(t *testing.T) {
+	verdicts := []struct {
+		name      string
+		target    string
+		hasRecord bool
+		gate      gate.Result
+	}{
+		{
+			name:      "excluded tag",
+			target:    "Shrek (2001) [ArcA310] [X].mkv",
+			hasRecord: true,
+			gate: gate.Rule{Required: []string{"[ArcA310]"}, Excluded: []string{"[X]"}, Mode: gate.MatchAny, Enforce: true}.
+				Classify("Shrek (2001) [ArcA310] [X].mkv"),
+		},
+		{
+			name:      "missing required tag",
+			target:    "Shrek (2001) [Remux].mkv",
+			hasRecord: true,
+			gate: gate.Rule{Required: []string{"[ArcA310]"}, Mode: gate.MatchAny, Enforce: true}.
+				Classify("Shrek (2001) [Remux].mkv"),
+		},
+		{
+			name:   "no gate record at all",
+			target: "Shrek (2001) [Remux].mkv",
+		},
+	}
 
-	rule := gate.Rule{Required: []string{"[ArcA310]"}, Excluded: []string{"[X]"}, Mode: gate.MatchAny, Enforce: true}
-	res := rule.Classify(target)
-	if res.Status != gate.StatusWaitingForTags || len(res.Missing) != 0 {
-		t.Fatalf("gate verdict = %+v, want waiting_for_tags with no missing tag", res)
-	}
-	h.applyGate(t, id, filepath.Join(h.media, target), res)
+	for _, tc := range verdicts {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.hasRecord && tc.gate.Status != gate.StatusWaitingForTags {
+				t.Fatalf("gate verdict = %+v, want %q", tc.gate, gate.StatusWaitingForTags)
+			}
+			h := newHarness(t)
+			id := h.seedCandidate(t, tc.target, "waiting_for_tags", `["en"]`)
+			if tc.hasRecord {
+				h.applyGate(t, id, filepath.Join(h.media, tc.target), tc.gate)
+			} else {
+				h.clearGateVerdict(t, id)
+			}
 
-	item := onlyMatchItem(t, h.listMatchItems(t))
-	if item.MatchState != MatchStateMatchedNoDonor {
-		t.Errorf("match_state = %q, want %q", item.MatchState, MatchStateMatchedNoDonor)
-	}
-	lower := strings.ToLower(item.MatchReason)
-	if !strings.Contains(lower, "excluded") {
-		t.Errorf("match_reason = %q, want it to name the exclusion", item.MatchReason)
-	}
-	if strings.Contains(lower, "missing") {
-		t.Errorf("match_reason = %q, want no missing-tag claim for an excluded tag", item.MatchReason)
-	}
-	if item.MatchBlocker != MatchBlockerGateExcluded {
-		t.Errorf("match_blocker = %q, want %q", item.MatchBlocker, MatchBlockerGateExcluded)
-	}
-}
+			// Without a donor the row is matched but not actionable, and the
+			// only cause left to name is the missing donor.
+			blocked := onlyMatchItem(t, h.listMatchItems(t))
+			if blocked.MatchState != MatchStateMatchedNoDonor {
+				t.Errorf("no donor: match_state = %q, want %q", blocked.MatchState, MatchStateMatchedNoDonor)
+			}
+			if blocked.MatchBlocker != MatchBlockerNoDonor {
+				t.Errorf("no donor: match_blocker = %q, want %q", blocked.MatchBlocker, MatchBlockerNoDonor)
+			}
+			if strings.Contains(strings.ToLower(blocked.MatchReason), "not eligible") {
+				t.Errorf("no donor: match_reason = %q, want no eligibility claim", blocked.MatchReason)
+			}
 
-// TestQueueMatchStateMissingTagReason covers the other proven cause: the gate
-// recorded the required tags it could not find.
-func TestQueueMatchStateMissingTagReason(t *testing.T) {
-	h := newHarness(t)
-	target := "Shrek (2001) [Remux].mkv"
-	id := h.seedCandidate(t, target, "waiting_for_tags", `["en"]`)
-
-	rule := gate.Rule{Required: []string{"[ArcA310]"}, Mode: gate.MatchAny, Enforce: true}
-	res := rule.Classify(target)
-	if res.Status != gate.StatusWaitingForTags || len(res.Missing) != 1 {
-		t.Fatalf("gate verdict = %+v, want waiting_for_tags naming one missing tag", res)
-	}
-	h.applyGate(t, id, filepath.Join(h.media, target), res)
-
-	item := onlyMatchItem(t, h.listMatchItems(t))
-	lower := strings.ToLower(item.MatchReason)
-	if !strings.Contains(item.MatchReason, "[ArcA310]") {
-		t.Errorf("match_reason = %q, want it to name the missing tag", item.MatchReason)
-	}
-	if !strings.Contains(lower, "missing") {
-		t.Errorf("match_reason = %q, want it to say the required tag is missing", item.MatchReason)
-	}
-	if strings.Contains(lower, "excluded") {
-		t.Errorf("match_reason = %q, want no exclusion claim when the gate recorded a missing tag", item.MatchReason)
-	}
-	if item.MatchBlocker != MatchBlockerGateTags {
-		t.Errorf("match_blocker = %q, want %q", item.MatchBlocker, MatchBlockerGateTags)
-	}
-}
-
-// TestQueueMatchStateNoGateVerdictIsNeutral covers a row whose eligibility came
-// from the arr library row (arrsync writes waiting_for_tags for a missing arr
-// tag or a target outside the root-folder allowlist) with no gate record: the
-// queue cannot tell those causes apart and must not name one.
-func TestQueueMatchStateNoGateVerdictIsNeutral(t *testing.T) {
-	h := newHarness(t)
-	id := h.seedCandidate(t, "Shrek (2001) [Remux].mkv", "waiting_for_tags", `["en"]`)
-	h.clearGateVerdict(t, id)
-
-	item := onlyMatchItem(t, h.listMatchItems(t))
-	if item.MatchState != MatchStateMatchedNoDonor {
-		t.Errorf("match_state = %q, want %q", item.MatchState, MatchStateMatchedNoDonor)
-	}
-	lower := strings.ToLower(item.MatchReason)
-	if !strings.Contains(lower, "waiting for tags") {
-		t.Errorf("match_reason = %q, want the cause-neutral gate wording", item.MatchReason)
-	}
-	for _, forbidden := range []string{"missing", "excluded"} {
-		if strings.Contains(lower, forbidden) {
-			t.Errorf("match_reason = %q, want no %q claim without a gate record", item.MatchReason, forbidden)
-		}
-	}
-	// The cause is real but not provable from this row: the blocker must say
-	// so instead of picking one of the candidate causes.
-	if item.MatchBlocker != MatchBlockerUnknown {
-		t.Errorf("match_blocker = %q, want %q", item.MatchBlocker, MatchBlockerUnknown)
+			// With a donor the same row is approvable: the verdict moved into
+			// the hold the job will be born with, not into the button.
+			h.writeDonor(t)
+			ready := onlyMatchItem(t, h.listMatchItems(t))
+			if ready.MatchState != MatchStateReady {
+				t.Errorf("with donor: match_state = %q, want %q", ready.MatchState, MatchStateReady)
+			}
+			if ready.MatchBlocker != MatchBlockerNone {
+				t.Errorf("with donor: match_blocker = %q, want %q", ready.MatchBlocker, MatchBlockerNone)
+			}
+		})
 	}
 }
 
@@ -715,7 +686,7 @@ func TestQueueMatchStateBlankDonorPattern(t *testing.T) {
 	}
 
 	row := store.ImportCandidateSummary{Matched: true, TargetPath: target, Eligibility: "eligible"}
-	state, reason, blocker := deriveMatchState(row, donors, err, []string{""}, false)
+	state, reason, blocker := deriveMatchState(row, donors, err, []string{""})
 	if state != MatchStateMatchedNoDonor {
 		t.Errorf("match_state = %q, want %q", state, MatchStateMatchedNoDonor)
 	}
@@ -728,8 +699,10 @@ func TestQueueMatchStateBlankDonorPattern(t *testing.T) {
 }
 
 // TestQueueMatchStateNoTargetFileBlocker pins the machine-readable side of the
-// no-target case: a matched row without a target file reports no_target, and a
-// gate-recorded missing target file is the same operator-side blocker.
+// no-target case: a matched row without a target path reports no_target. A
+// missing_target verdict on its own is not the blocker any more (#48) — the pair
+// is approvable and the job is born held — so a row that does record a path
+// falls through to the donor branches.
 func TestQueueMatchStateNoTargetFileBlocker(t *testing.T) {
 	tests := []struct {
 		name string
@@ -742,14 +715,19 @@ func TestQueueMatchStateNoTargetFileBlocker(t *testing.T) {
 			want: MatchBlockerNoTarget,
 		},
 		{
-			name: "gate recorded a missing target file",
-			row:  store.ImportCandidateSummary{Matched: true, TargetPath: "/media/Target.mkv", Eligibility: "missing_target"},
+			name: "gate recorded a missing target file and there is no path",
+			row:  store.ImportCandidateSummary{Matched: true, Eligibility: "missing_target"},
 			want: MatchBlockerNoTarget,
+		},
+		{
+			name: "missing target file with a recorded path is a donor question",
+			row:  store.ImportCandidateSummary{Matched: true, TargetPath: "/media/Target.mkv", Eligibility: "missing_target"},
+			want: MatchBlockerNoDonor,
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			state, reason, blocker := deriveMatchState(tc.row, nil, nil, defaultDonorPatterns, false)
+			state, reason, blocker := deriveMatchState(tc.row, nil, nil, defaultDonorPatterns)
 			if state != MatchStateMatchedNoDonor {
 				t.Errorf("match_state = %q, want %q", state, MatchStateMatchedNoDonor)
 			}
@@ -790,9 +768,11 @@ func TestApproveUnreadableTargetFolderReportsMount(t *testing.T) {
 	}
 }
 
-// TestQueueMatchStateReadyRequiresEligibility pins that ready means approvable
-// now: it is produced only for a matched, gate-eligible target that has a donor.
-func TestQueueMatchStateReadyRequiresEligibility(t *testing.T) {
+// TestQueueMatchStateReadyIsApprovalReadiness pins that ready means approvable
+// now: a matched target with a donor, whatever the gate said. The verdict a
+// target carries decides whether the job born after the extraction waits, not
+// whether the operator may approve (see TestApproveIneligibleTargetRecordsIntent).
+func TestQueueMatchStateReadyIsApprovalReadiness(t *testing.T) {
 	tests := []struct {
 		name       string
 		target     string
@@ -822,20 +802,25 @@ func TestQueueMatchStateReadyRequiresEligibility(t *testing.T) {
 			wantReasonAny: []string{"no donor", "dubbing marker", "sibling"},
 		},
 		{
-			name:       "waiting for tags with donor",
-			target:     "Target [ArcA310].mkv",
-			seedElig:   "waiting_for_tags",
-			withDonor:  true,
-			wantReady:  false,
-			wantReason: "not eligible",
+			name:      "waiting for tags with donor is approvable",
+			target:    "Target [ArcA310].mkv",
+			seedElig:  "waiting_for_tags",
+			withDonor: true,
+			wantReady: true,
 		},
 		{
-			name:       "missing target with donor",
-			target:     "Target [ArcA310].mkv",
-			seedElig:   "missing_target",
-			withDonor:  true,
-			wantReady:  false,
-			wantReason: "not eligible",
+			name:      "missing target with donor is approvable",
+			target:    "Target [ArcA310].mkv",
+			seedElig:  "missing_target",
+			withDonor: true,
+			wantReady: true,
+		},
+		{
+			name:          "waiting for tags without donor",
+			target:        "Target [ArcA310].mkv",
+			seedElig:      "waiting_for_tags",
+			wantReady:     false,
+			wantReasonAny: []string{"no donor", "dubbing marker", "sibling"},
 		},
 	}
 	for _, tc := range tests {
@@ -1684,17 +1669,13 @@ func TestRejectLeavesCompletedJobAlone(t *testing.T) {
 	}
 }
 
-// TestQueueMatchStateReadyUnderForceOverride pins the card's force-override
-// projection: with security.options.allow_force_tag_override on, an
-// otherwise-ready row (a target file and a paired donor) whose only blocker is
-// the gate verdict reports ready, and the diagnostics report the flag; with it
-// off the same row keeps the gate verdict.
-//
-// Approve itself no longer consults the gate
-// (TestApproveIneligibleTargetRecordsIntent), so this projection now trails the
-// handler: widening `ready` to "no gate verdict blocks approval", and the card
-// that enables Approve on it, is the follow-up this slice does not take.
-func TestQueueMatchStateReadyUnderForceOverride(t *testing.T) {
+// TestQueueMatchStateReadyWhateverTheForceOverride pins the card's remaining use
+// of the escape hatch: security.options.allow_force_tag_override is reported in
+// the diagnostics (the card offers the "start it now" control on it), but it no
+// longer decides the match state — the row is ready either way, because an
+// ineligible pair is approvable and the override only chooses whether the job
+// born after the extraction starts immediately or waits.
+func TestQueueMatchStateReadyWhateverTheForceOverride(t *testing.T) {
 	h := newHarness(t)
 	target := "Shrek (2001) [ArcA310] [X].mkv"
 	id := h.seedCandidate(t, target, "waiting_for_tags", `["en"]`)
@@ -1702,13 +1683,14 @@ func TestQueueMatchStateReadyUnderForceOverride(t *testing.T) {
 	h.applyGate(t, id, filepath.Join(h.media, target), rule.Classify(target))
 	h.writeDonor(t)
 
-	// Override OFF: unchanged — an ineligible target with a donor is not ready.
+	// Override OFF: the row is approvable, and the override is simply not
+	// offered.
 	off := onlyMatchItem(t, h.listMatchItems(t))
-	if off.MatchState != MatchStateMatchedNoDonor {
-		t.Errorf("override off: match_state = %q, want %q", off.MatchState, MatchStateMatchedNoDonor)
+	if off.MatchState != MatchStateReady {
+		t.Errorf("override off: match_state = %q, want %q", off.MatchState, MatchStateReady)
 	}
-	if off.MatchBlocker != MatchBlockerGateExcluded {
-		t.Errorf("override off: match_blocker = %q, want %q", off.MatchBlocker, MatchBlockerGateExcluded)
+	if off.MatchBlocker != MatchBlockerNone {
+		t.Errorf("override off: match_blocker = %q, want %q", off.MatchBlocker, MatchBlockerNone)
 	}
 	if diag := h.listDiagnostics(t).Diagnostics; diag.ForceTagOverride == nil || *diag.ForceTagOverride {
 		t.Errorf("override off: force_tag_override = %v, want false", diag.ForceTagOverride)
@@ -1716,17 +1698,13 @@ func TestQueueMatchStateReadyUnderForceOverride(t *testing.T) {
 
 	h.enableForceTagOverride(t)
 
-	// Override ON: ready, with no blocker and a reason that says why.
+	// Override ON: same state, and now the diagnostics offer the control.
 	on := onlyMatchItem(t, h.listMatchItems(t))
 	if on.MatchState != MatchStateReady {
 		t.Errorf("override on: match_state = %q, want %q", on.MatchState, MatchStateReady)
 	}
 	if on.MatchBlocker != MatchBlockerNone {
 		t.Errorf("override on: match_blocker = %q, want %q", on.MatchBlocker, MatchBlockerNone)
-	}
-	lowerReason := strings.ToLower(on.MatchReason)
-	if !strings.Contains(lowerReason, "ready") || !strings.Contains(lowerReason, "force") {
-		t.Errorf("override on: match_reason = %q, want it to say ready under the force override", on.MatchReason)
 	}
 	if diag := h.listDiagnostics(t).Diagnostics; diag.ForceTagOverride == nil || !*diag.ForceTagOverride {
 		t.Errorf("override on: force_tag_override = %v, want true", diag.ForceTagOverride)

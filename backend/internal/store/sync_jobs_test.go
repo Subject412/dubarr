@@ -561,8 +561,11 @@ func TestReleaseHeldJobsOnlyPromotesEligible(t *testing.T) {
 		t.Errorf("forced job = status %q force %v, want queued/true", got.Status, got.ForceIgnoreTagFilter)
 	}
 
-	// Idempotent: nothing is held any more, so a second pass releases nothing.
-	again, err := st.ReleaseHeldJobs(ctx, func(HeldJob) bool { return true })
+	// Idempotent: the same projection finds nothing newly eligible — the row it
+	// released is queued now, and the ineligible one is still ineligible.
+	again, err := st.ReleaseHeldJobs(ctx, func(job HeldJob) bool {
+		return job.TargetVideoPath == eligiblePath
+	})
 	if err != nil {
 		t.Fatalf("ReleaseHeldJobs (second pass): %v", err)
 	}
@@ -877,7 +880,6 @@ func TestMigration0008RebuildsSyncMuxJobsPreservingRows(t *testing.T) {
 	}
 	defer db.Close()
 	db.SetMaxOpenConns(1)
-	ctx := context.Background()
 
 	if _, err := migrate(db, migrationsBefore(t, 8)); err != nil {
 		t.Fatalf("migrate up to 0007: %v", err)

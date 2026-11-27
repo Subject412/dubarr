@@ -9,12 +9,15 @@ import (
 	"testing"
 )
 
-// segmentedPair is the two-segment render the argv tests pin: a 20-minute cut at
-// 1500 s, the second run carrying the 2 s insert the cut removed.
+// segmentedPair is the two-segment render the argv tests pin: a 20-minute
+// opening run and a 15-minute run after it, the second carrying the 2 s insert
+// the cut removed. It tiles the target timeline from 0 — the only shape
+// [BuildSegmentedArgs] accepts, because concat places the first piece at the
+// track's start and stacks the rest behind it.
 func segmentedPair() []Segment {
 	return []Segment{
-		{StartSec: 300, EndSec: 1500, OffsetMS: 800},
-		{StartSec: 1500, EndSec: 2400, OffsetMS: 2800},
+		{StartSec: 0, EndSec: 1200, OffsetMS: 800},
+		{StartSec: 1200, EndSec: 2100, OffsetMS: 2800},
 	}
 }
 
@@ -33,14 +36,16 @@ func TestBuildSegmentedArgsRendersTrimDelayAndConcat(t *testing.T) {
 	}
 	joined := strings.Join(args, " ")
 	// Positions are target-timeline seconds shifted back by the segment's own
-	// offset: 300 - 0.8 = 299.2 in the dub, 1500 - 2.8 = 1497.2 for the run
-	// after the insert.
+	// offset: 0 - 0.8 = -0.8 in the dub, so the opening run needs 800 ms of lead
+	// silence and reads the dub from 0 to 1199.2; 1200 - 2.8 = 1197.2 for the
+	// run after the insert.
 	for _, want := range []string{
-		"atrim=start=299.200000:end=1499.200000",
-		"atrim=start=1497.200000:end=2397.200000",
+		"atrim=start=0.000000:end=1199.200000",
+		"atrim=start=1197.200000:end=2097.200000",
 		"asetpts=PTS-STARTPTS",
 		"aformat=sample_fmts=fltp:channel_layouts=stereo",
 		"aresample=48000",
+		"adelay=delays=800:all=1",
 		"adelay=delays=0:all=1",
 		"apad=whole_dur=1200.000000",
 		"apad=whole_dur=900.000000",
@@ -79,7 +84,9 @@ func TestBuildSegmentedArgsRendersTrimDelayAndConcat(t *testing.T) {
 
 // TestBuildSegmentedArgsClampsAtTheEdges: a segment the dub does not cover
 // becomes silence of exactly the right length — lead silence for a negative
-// source start, trailing silence for a window past the dub's end.
+// source start, trailing silence for a window past the dub's end. The plan
+// still tiles the target timeline (0 -> 60 -> 160 s); the dub is only 120 s
+// long, so the last run's second half is silence.
 func TestBuildSegmentedArgsClampsAtTheEdges(t *testing.T) {
 	plan := Plan{Codec: CodecFLAC, ChannelLayout: "stereo", SampleRate: 48000}
 	args, err := BuildSegmentedArgs(Request{
@@ -91,7 +98,7 @@ func TestBuildSegmentedArgsClampsAtTheEdges(t *testing.T) {
 			// 2.5 s of the dub does not exist yet: the film starts before it.
 			{StartSec: 0, EndSec: 60, OffsetMS: 2500},
 			// The dub ends at 120 s; this run needs 40 s past it.
-			{StartSec: 100, EndSec: 160, OffsetMS: 0},
+			{StartSec: 60, EndSec: 160, OffsetMS: 0},
 		},
 	})
 	if err != nil {
@@ -106,11 +113,77 @@ func TestBuildSegmentedArgsClampsAtTheEdges(t *testing.T) {
 	}
 	// The second run ends 40 s past the dub: the trim stops at the duration and
 	// apad produces the rest of the segment as silence.
-	if !strings.Contains(joined, "atrim=start=100.000000:end=120.000000") {
+	if !strings.Contains(joined, "atrim=start=60.000000:end=120.000000") {
 		t.Fatalf("window past the dub's end not clamped to the duration: %v", args)
 	}
-	if !strings.Contains(joined, "apad=whole_dur=60.000000") {
+	if !strings.Contains(joined, "apad=whole_dur=100.000000") {
 		t.Fatalf("window past the dub's end not padded to its segment length: %v", args)
+	}
+}
+
+// TestBuildSegmentedArgsRejectsAGap is the render's half of the tiling rule:
+// concat stacks the pieces back to back in plan order and knows nothing about
+// absolute time, so a plan with a hole would splice the film together and pull
+// everything after the hole earlier by the length of the hole. There is no
+// filtergraph that could notice, so the plan is refused instead.
+func TestBuildSegmentedArgsRejectsAGap(t *testing.T) {
+	req := Request{
+		Input:  "/work/dub.mka",
+		Output: "/work/out.mka",
+		Plan:   Plan{Codec: CodecFLAC},
+		Segments: []Segment{
+			{StartSec: 0, EndSec: 1200, OffsetMS: 800},
+			// 10 s of film are missing between the two runs.
+			{StartSec: 1210, EndSec: 2100, OffsetMS: 2800},
+		},
+	}
+	if _, err := BuildSegmentedArgs(req); !errors.Is(err, ErrInvalidPlan) {
+		t.Fatalf("BuildSegmentedArgs = %v, want ErrInvalidPlan for a plan with a gap", err)
+	}
+}
+
+// TestBuildSegmentedArgsRejectsANonZeroStart pins the case that used to shift a
+// whole published track: the opening checkpoints fell below the quality floor
+// (a quiet or fade-in opening is enough), so the plan began at the first kept
+// window — 45 s into the film. concat would place that run at time 0, the
+// published track would be 45 s early, and the worker would still record a sync
+// offset of 0 because nothing here disagreed. It disagrees now.
+func TestBuildSegmentedArgsRejectsANonZeroStart(t *testing.T) {
+	req := Request{
+		Input:  "/work/dub.mka",
+		Output: "/work/out.mka",
+		Plan:   Plan{Codec: CodecFLAC},
+		Segments: []Segment{
+			{StartSec: 45, EndSec: 1215, OffsetMS: 800},
+			{StartSec: 1215, EndSec: 2115, OffsetMS: 2800},
+		},
+	}
+	if _, err := BuildSegmentedArgs(req); !errors.Is(err, ErrInvalidPlan) {
+		t.Fatalf("BuildSegmentedArgs = %v, want ErrInvalidPlan for a plan that starts at 45 s", err)
+	}
+}
+
+// TestBuildSegmentedArgsRejectsAPlanShortOfTheTarget: when the caller knows how
+// long the target track is, the plan's last edge must reach it. A plan that
+// ends early renders a track that stops before the film, which is exactly the
+// truncation the verification would otherwise inherit from the plan itself.
+func TestBuildSegmentedArgsRejectsAPlanShortOfTheTarget(t *testing.T) {
+	req := Request{
+		Input:  "/work/dub.mka",
+		Output: "/work/out.mka",
+		Plan:   Plan{Codec: CodecFLAC},
+		// The segments stop at 2100 s; the film is 2400 s long.
+		TargetDurationMS: 2400000,
+		Segments:         segmentedPair(),
+	}
+	if _, err := BuildSegmentedArgs(req); !errors.Is(err, ErrInvalidPlan) {
+		t.Fatalf("BuildSegmentedArgs = %v, want ErrInvalidPlan for a plan short of the target", err)
+	}
+	// The same plan against its own total is accepted: without a known target
+	// length the segments are the only statement of how long the render is.
+	req.TargetDurationMS = 0
+	if _, err := BuildSegmentedArgs(req); err != nil {
+		t.Fatalf("BuildSegmentedArgs = %v, want the tiling plan accepted without a target length", err)
 	}
 }
 
@@ -252,6 +325,26 @@ func TestSegmentedEncodeVerifiesTheSegmentsTotal(t *testing.T) {
 	}
 }
 
+// TestSegmentedEncodeVerifiesAgainstTheTargetLength: when the caller knows how
+// long the target track is, that number — not the plan's own total — is what a
+// segmented render must match. The two agree on a tiled plan, which is the
+// point: the comparison now measures the render against the film instead of
+// against the plan that produced it, so a short render still fails.
+func TestSegmentedEncodeVerifiesAgainstTheTargetLength(t *testing.T) {
+	req := segmentedRequest()
+	req.Output = t.TempDir() + "/out.mka"
+	req.TargetDurationMS = 6000000
+	tool := &fakeTool{
+		probeMS: 4500000,
+		byPath:  map[string]int64{req.Input: 20000},
+	}
+	tr := New(Dependencies{FFmpegPath: "/fake/ffmpeg", FFprobePath: "/fake/ffprobe", Run: tool.run})
+
+	if _, err := tr.Transcode(context.Background(), req); !errors.Is(err, ErrVerify) {
+		t.Fatalf("Transcode = %v, want ErrVerify for a render short of the target track", err)
+	}
+}
+
 func TestSegmentedEncodeFailsWhenTheRenderIsShort(t *testing.T) {
 	req := segmentedRequest()
 	req.Output = t.TempDir() + "/out.mka"
@@ -282,7 +375,7 @@ func TestBuildSegmentedArgsRejectsUnusableRequests(t *testing.T) {
 		{"empty segment", func() Request {
 			r := base
 			r.Plan = Plan{Codec: CodecFLAC}
-			r.Segments = []Segment{{StartSec: 10, EndSec: 10}}
+			r.Segments = []Segment{{StartSec: 0, EndSec: 10}, {StartSec: 10, EndSec: 10}}
 			return r
 		}()},
 		{"tempo factor", func() Request {

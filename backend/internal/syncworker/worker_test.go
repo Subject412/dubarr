@@ -1367,10 +1367,12 @@ func TestProcessOnceTempoNeedsItsEncoder(t *testing.T) {
 }
 
 // twoSegments is the accepted cut the piecewise tests share: one boundary at
-// 1500 s where the dub jumps by 2 s, on a 2400 s timeline.
+// 1500 s where the dub jumps by 2 s, on a 2400 s timeline — tiled from the film's
+// first sample to its last, which is the only shape analyze stores (and the only
+// one the renderer accepts).
 func twoSegments() []analyze.Segment {
 	return []analyze.Segment{
-		{StartSec: 300, EndSec: 1500, OffsetMS: 800, Confidence: 0.91, Points: 60},
+		{StartSec: 0, EndSec: 1500, OffsetMS: 800, Confidence: 0.91, Points: 60},
 		{StartSec: 1500, EndSec: 2400, OffsetMS: 2800, Confidence: 0.86, Points: 40},
 	}
 }
@@ -1466,6 +1468,60 @@ func TestProcessOncePiecewiseReencodesOnceWithZeroSync(t *testing.T) {
 	}
 	if stored.Application.Segments[1].OffsetMS != 2800 {
 		t.Fatalf("stored second segment = %+v, want the plan's 2800 ms offset", stored.Application.Segments[1])
+	}
+}
+
+// TestProcessOncePiecewiseStartsTheTrackAtZero is the shift defect seen where it
+// would have been published. The analysis tiles an accepted plan from 0, so the
+// first segment the worker hands the encoder starts at 0 even when the first
+// checkpoint that could testify was the second one (a quiet or fade-in opening
+// falls below the quality floor and is dropped). The mux then runs at offset 0,
+// and the published track's implied start — the first run's position minus the
+// sync offset, which is where mkvmerge puts the track — is 0 rather than the
+// 45 s of the first kept window.
+func TestProcessOncePiecewiseStartsTheTrackAtZero(t *testing.T) {
+	r := newRig(t)
+	jobID := r.newJob(t)
+	r.stage(t, jobID)
+
+	report := piecewiseCutReport()
+	report.Piecewise.Segments = []analyze.Segment{
+		// What analyze stores when window 0 was dropped: the plan still runs from
+		// the film's first sample, so run 0 carries the offset measured from the
+		// first kept window onwards.
+		{StartSec: 0, EndSec: 1500, OffsetMS: 800, Confidence: 0.91, Points: 59},
+		{StartSec: 1500, EndSec: 2400, OffsetMS: 2800, Confidence: 0.86, Points: 40},
+	}
+
+	mx := &fakeMuxer{}
+	tr := &fakeTranscoder{}
+	w := newWorker(t, r, &fakeExecutor{report: report}, mx, &fakeRescanner{})
+	w.transcoder = tr
+
+	if processed, err := w.ProcessOnce(context.Background()); err != nil || !processed {
+		t.Fatalf("ProcessOnce = %v/%v, want true/nil", processed, err)
+	}
+	if len(tr.segments) != 1 || len(tr.segments[0]) != 2 {
+		t.Fatalf("recorded segments = %v, want the plan's 2", tr.segments)
+	}
+	segments := tr.segments[0]
+	if got := segments[0].StartSec; got != 0 {
+		t.Fatalf("first segment starts at %v s, want 0: the plan tiles the film", got)
+	}
+	if got := segments[len(segments)-1].EndSec; got != 2400 {
+		t.Fatalf("last segment ends at %v s, want the film's 2400 s", got)
+	}
+	if len(mx.jobs) != 1 {
+		t.Fatalf("Mux calls = %d, want 1", len(mx.jobs))
+	}
+	impliedStartMS := int64(math.Round(segments[0].StartSec*1000)) - mx.jobs[0].SyncOffsetMS
+	if impliedStartMS != 0 {
+		t.Fatalf("muxed track implies a start of %d ms, want 0 (offset %d ms, first segment %v s)",
+			impliedStartMS, mx.jobs[0].SyncOffsetMS, segments[0].StartSec)
+	}
+	rec, _, _ := r.store.SyncJobByID(context.Background(), jobID)
+	if rec.CalculatedOffsetMS != 0 {
+		t.Fatalf("stored offset = %d ms, want 0: the tiled track needs no shift", rec.CalculatedOffsetMS)
 	}
 }
 

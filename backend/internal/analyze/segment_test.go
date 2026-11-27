@@ -191,6 +191,115 @@ func TestBuildSegmentsFindsOneCut(t *testing.T) {
 	}
 }
 
+// TestBuildSegmentsTilesTheFilm is the first half of defect #84's render path:
+// an accepted plan must cover the whole film. The opening checkpoint of this
+// fixture is a quiet/fade-in window whose quality is below the floor, so it
+// cannot testify and the first *kept* point is index 1 — 45 s into the film.
+//
+// BuildSegments stops at the evidence it has (it is never handed the film's
+// length), so the tiling is the caller's finalisation step: analyze extends an
+// accepted plan to 0 and to the film's duration before the report is stored.
+// Without it the worker's concat would place the first kept window at time 0
+// (a 45 s shift) and the published track would stop at the last kept window's
+// end (a lost tail).
+func TestBuildSegmentsTilesTheFilm(t *testing.T) {
+	const (
+		points   = 40
+		step     = 45.0
+		window   = 60.0
+		duration = 1830.0 // the film, a little past the last planned window
+		cut      = 2500.0
+	)
+	windows := denseGrid(points, step, window)
+	offsets := make([]float64, points)
+	for i := points / 2; i < points; i++ {
+		offsets[i] = cut
+	}
+	qualities := flatQualities(points, 0.9)
+	// The opening cannot testify: below thresholds.LowQuality.
+	qualities[0] = 0.05
+
+	pw := BuildSegments(windows, offsets, qualities, DefaultPiecewisePolicy(), DefaultThresholds)
+	if pw.RejectedReason != "" {
+		t.Fatalf("rejected: %q (segments %+v)", pw.RejectedReason, pw.Segments)
+	}
+	if len(pw.Segments) != 2 {
+		t.Fatalf("segments = %d, want 2: %+v", len(pw.Segments), pw.Segments)
+	}
+	// The defect, pinned: the segmenter alone starts at the first kept window
+	// and ends at the last one, which is not the film.
+	if got := pw.Segments[0].StartSec; got != windows[1].FilmStartSec {
+		t.Fatalf("untiled first start = %v s, want the first kept window's %v s: "+
+			"the fixture must drop window 0 for the tiling to be what is tested",
+			got, windows[1].FilmStartSec)
+	}
+	lastKept := windows[len(windows)-1]
+	if got, want := pw.Segments[1].EndSec, lastKept.FilmStartSec+lastKept.LenSec; got != want {
+		t.Fatalf("untiled last end = %v s, want the last kept window's end %v s", got, want)
+	}
+
+	pw.tileToFilm(duration)
+
+	if got := pw.Segments[0].StartSec; got != 0 {
+		t.Fatalf("first start = %v s, want 0: concat places the first run at the track's start, "+
+			"so any other value shifts the whole published track", got)
+	}
+	if got := pw.Segments[len(pw.Segments)-1].EndSec; got != duration {
+		t.Fatalf("last end = %v s, want the film's %v s: a shorter plan loses the tail", got, duration)
+	}
+	for k := 1; k < len(pw.Segments); k++ {
+		if got, want := pw.Segments[k].StartSec, pw.Segments[k-1].EndSec; got != want {
+			t.Fatalf("segment %d starts at %v s but segment %d ends at %v s: the run would repeat or drop audio",
+				k, got, k-1, want)
+		}
+	}
+	// Tiling moves the outer edges only: the evidence behind each run (its
+	// offset, confidence and point count) is untouched.
+	if got, want := pw.Segments[0].Points, points/2-1; got != want {
+		t.Fatalf("first segment points = %d, want %d: the dropped opening must not be re-counted", got, want)
+	}
+	if got, want := pw.Segments[1].Points, points/2; got != want {
+		t.Fatalf("second segment points = %d, want %d", got, want)
+	}
+	if got := pw.Segments[1].OffsetMS; math.Abs(got-cut) > 1e-9 {
+		t.Fatalf("second segment offset = %v ms, want %v: tiling must not move an offset", got, cut)
+	}
+	if got, want := pw.Segments[0].EndSec, pw.Segments[1].StartSec; got != want {
+		t.Fatalf("the join moved: %v s vs %v s", got, want)
+	}
+}
+
+// TestBuildSegmentsRejectedPlanIsNotTiled: tiling is the finalisation of an
+// *accepted* plan. A rejected segmentation is never published — the job falls
+// back to the dominant offset and fails for review — so it must not grow edges
+// that claim film the analysis refused to stand behind.
+func TestBuildSegmentsRejectedPlanIsNotTiled(t *testing.T) {
+	const points = 160
+	offsets := make([]float64, points)
+	qualities := flatQualities(points, 0.9)
+	for i := points / 2; i < points; i++ {
+		offsets[i] = 2500
+	}
+	qualities[points/2-1] = 0.05
+	qualities[points/2] = 0.05
+
+	pw := BuildSegments(denseGrid(points, 45, 60), offsets, qualities, DefaultPiecewisePolicy(), DefaultThresholds)
+	if pw.accepted() {
+		t.Fatalf("fixture is not rejected: %+v", pw.Segments)
+	}
+	before := append([]Segment(nil), pw.Segments...)
+	pw.tileToFilm(8000)
+	if len(pw.Segments) != len(before) {
+		t.Fatalf("segments changed: %d -> %d", len(before), len(pw.Segments))
+	}
+	for k := range before {
+		if pw.Segments[k] != before[k] {
+			t.Fatalf("segment %d changed from %+v to %+v: a rejected plan must not be tiled",
+				k, before[k], pw.Segments[k])
+		}
+	}
+}
+
 // TestBuildSegmentsKeepsACleanTimelineAtOneSegment: ordinary jitter is not a
 // cut, and the one-segment answer is *accepted* — it is the ordinary
 // constant-offset job, not a rejected plan. An operator who switches

@@ -1790,6 +1790,16 @@ func TestPiecewiseSingleSegmentIsAnOrdinaryConstantOffset(t *testing.T) {
 		t.Fatalf("segments/boundaries = %d/%d, want 1/0: %+v",
 			len(rep.Piecewise.Segments), len(rep.Piecewise.Boundaries), rep.Piecewise.Segments)
 	}
+	// The plan tiles the film even when nothing was cut: it starts at 0 and runs
+	// to the film's own length, not to the last window the grid could place. A
+	// plan that stopped at the last kept window would publish a track short of
+	// the film by the grid's trailing margin.
+	if got := rep.Piecewise.Segments[0].StartSec; got != 0 {
+		t.Fatalf("first segment starts at %v s, want 0: the report must tile the film", got)
+	}
+	if got, want := rep.Piecewise.Segments[0].EndSec, req.DurationSec; got != want {
+		t.Fatalf("last segment ends at %v s, want the film's %v s", got, want)
+	}
 	if got := rep.Piecewise.DominantOffsetMS; math.Abs(got-400) > 1e-9 {
 		t.Fatalf("dominant offset = %v, want the single offset 400", got)
 	}

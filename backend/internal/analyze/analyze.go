@@ -412,8 +412,12 @@ type Request struct {
 	// TargetPath and DonorPath are WAV files staged by M4-3.
 	TargetPath string
 	DonorPath  string
-	// DurationSec is the shorter source's duration. Zero means "read the WAV
-	// headers of both staged files".
+	// DurationSec is the window plan's duration base: how long the shorter
+	// analysis input really is, in seconds. It is required when
+	// Config.AnalysisSource is windows; the whole-file path may leave it zero
+	// and have it derived from the headers of the two staged WAVs, which only
+	// exist after a full decode. Zero is never a valid duration for a window
+	// plan — it would clamp every checkpoint to the start of the file.
 	DurationSec float64
 	// Reference resolution inputs, forwarded to reflang.Resolve.
 	TargetTracks     []probe.AudioTrack

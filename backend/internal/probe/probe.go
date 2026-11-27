@@ -103,7 +103,22 @@ type AudioTrack struct {
 	// Duration is the stream's own duration (ffprobe `duration`, seconds). It
 	// differs from the container duration when donor tracks have unequal
 	// lengths, and extraction validates each output against this value.
+	//
+	// It stays the stream field only, by contract: a format-duration fallback
+	// here would let extraction validate a short track against the container's
+	// length. Callers that need the container-aware length use
+	// [MediaInfo.TrackDuration].
 	Duration time.Duration `json:"duration"`
+	// StartTime is the stream's own timeline origin (ffprobe `start_time`,
+	// seconds), which can be non-zero or even slightly negative in Matroska.
+	// StartTimeKnown reports whether the container stated it at all: a
+	// container that says 0 and one that says nothing are different facts,
+	// and N/A / absent / unparseable all mean "unknown", never 0.
+	//
+	// Its difference from [MediaInfo.StartTime] is the correction a seek into
+	// the container needs; on an audio-only file the two coincide.
+	StartTime      time.Duration `json:"-"`
+	StartTimeKnown bool          `json:"-"`
 }
 
 // IsCommentary reports whether the track is commentary: either the muxer set
@@ -116,12 +131,56 @@ func (t AudioTrack) IsCommentary() bool {
 
 // MediaInfo is the probe result for one file.
 type MediaInfo struct {
-	Path       string        `json:"path"`
-	Format     string        `json:"format"`
+	Path   string `json:"path"`
+	Format string `json:"format"`
+	// Duration is the container's duration (ffprobe `format.duration`): the
+	// length of the longest stream, not necessarily of any one track. It is 0
+	// when the container does not report one.
 	Duration   time.Duration `json:"-"`
 	DurationMS int64         `json:"duration_ms"`
 	Size       int64         `json:"size"`
-	Tracks     []AudioTrack  `json:"audio_tracks"`
+	// StartTime is the container's timeline origin (ffprobe
+	// `format.start_time`, seconds); StartTimeKnown reports whether the
+	// container stated it. N/A, absent and unparseable are unknown — a
+	// malformed value never becomes 0.
+	StartTime      time.Duration `json:"-"`
+	StartTimeKnown bool          `json:"-"`
+	Tracks         []AudioTrack  `json:"audio_tracks"`
+}
+
+// TrackDuration returns the duration of the audio track whose container-wide
+// stream index is index, and whether the container reported any duration at
+// all. Precedence, in this exact order:
+//
+//  1. the track's own `duration` (the stream describes the audio itself);
+//  2. the container's `format` duration (the only number some containers give,
+//     e.g. Matroska reports `duration: N/A` on every stream);
+//  3. ok=false — nothing is known.
+//
+// The order is not cosmetic: a short track inside a long container must not
+// inherit the container's length, so the stream always wins when present, and
+// there is no averaging or interpolation. ok=false is a first-class answer:
+// callers must not turn it into 0, because 0 and "unknown" drive opposite
+// decisions (percentages clamp to nothing versus plan from real data).
+//
+// This is deliberately separate from [AudioTrack.Duration], which stays the
+// stream field only: extraction validates its output against that value at a
+// 2% tolerance, and a container fallback could overstate a short track and
+// fail a good extraction.
+func (m MediaInfo) TrackDuration(index int) (time.Duration, bool) {
+	for _, t := range m.Tracks {
+		if t.Index != index {
+			continue
+		}
+		if t.Duration > 0 {
+			return t.Duration, true
+		}
+		break
+	}
+	if m.Duration > 0 {
+		return m.Duration, true
+	}
+	return 0, false
 }
 
 // cacheKey identifies a file version. Path+size+mtime is the settled cache
@@ -305,12 +364,14 @@ type ffprobeDoc struct {
 		BitRate     ffprobeNumber     `json:"bit_rate"`
 		SampleRate  ffprobeNumber     `json:"sample_rate"`
 		Duration    string            `json:"duration"`
+		StartTime   ffprobeNumber     `json:"start_time"`
 		Tags        map[string]string `json:"tags"`
 		Disposition map[string]int    `json:"disposition"`
 	} `json:"streams"`
 	Format struct {
-		FormatName string `json:"format_name"`
-		Duration   string `json:"duration"`
+		FormatName string        `json:"format_name"`
+		Duration   string        `json:"duration"`
+		StartTime  ffprobeNumber `json:"start_time"`
 	} `json:"format"`
 }
 
@@ -329,6 +390,7 @@ func parseFFprobe(path string, raw []byte) (*MediaInfo, error) {
 		info.Duration = time.Duration(math.Round(d * float64(time.Second)))
 		info.DurationMS = info.Duration.Milliseconds()
 	}
+	info.StartTime, info.StartTimeKnown = parseSeconds(doc.Format.StartTime)
 
 	for _, s := range doc.Streams {
 		if !strings.EqualFold(s.CodecType, "audio") {
@@ -340,22 +402,43 @@ func parseFFprobe(path string, raw []byte) (*MediaInfo, error) {
 		if d, err := strconv.ParseFloat(strings.TrimSpace(s.Duration), 64); err == nil && d > 0 {
 			trackDuration = time.Duration(math.Round(d * float64(time.Second)))
 		}
+		trackStart, trackStartKnown := parseSeconds(s.StartTime)
 		info.Tracks = append(info.Tracks, AudioTrack{
-			Index:         s.Index,
-			Codec:         s.CodecName,
-			Channels:      s.Channels,
-			ChannelLayout: s.ChannelLayout,
-			Language:      lang,
-			LanguageISO1:  ISO639_1(lang),
-			LanguageISO2B: ISO639_2B(lang),
-			Title:         tags["title"],
-			Disposition:   dispositionFrom(s.Disposition),
-			BitrateBPS:    parsePositiveInt(string(s.BitRate)),
-			SampleRate:    parsePositiveInt(string(s.SampleRate)),
-			Duration:      trackDuration,
+			Index:          s.Index,
+			Codec:          s.CodecName,
+			Channels:       s.Channels,
+			ChannelLayout:  s.ChannelLayout,
+			Language:       lang,
+			LanguageISO1:   ISO639_1(lang),
+			LanguageISO2B:  ISO639_2B(lang),
+			Title:          tags["title"],
+			Disposition:    dispositionFrom(s.Disposition),
+			BitrateBPS:     parsePositiveInt(string(s.BitRate)),
+			SampleRate:     parsePositiveInt(string(s.SampleRate)),
+			Duration:       trackDuration,
+			StartTime:      trackStart,
+			StartTimeKnown: trackStartKnown,
 		})
 	}
 	return info, nil
+}
+
+// parseSeconds parses an ffprobe seconds field (a quoted string or a bare
+// number). ok=false means the container said nothing usable: absent, "N/A",
+// "null" and unparseable all count, so a malformed value can never masquerade
+// as the real answer 0. Zero and negative values are legitimate answers
+// (start_time 0.000000 is a fact; Matroska can even report a small negative
+// origin), which is exactly what the bool is for.
+func parseSeconds(raw ffprobeNumber) (time.Duration, bool) {
+	text := strings.TrimSpace(string(raw))
+	if text == "" || strings.EqualFold(text, "N/A") || strings.EqualFold(text, "null") {
+		return 0, false
+	}
+	sec, err := strconv.ParseFloat(text, 64)
+	if err != nil || math.IsNaN(sec) || math.IsInf(sec, 0) {
+		return 0, false
+	}
+	return time.Duration(math.Round(sec * float64(time.Second))), true
 }
 
 // parsePositiveInt parses an optional numeric field ("" or "N/A" -> 0). A

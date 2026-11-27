@@ -30,6 +30,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Subject412/dubarr/backend/internal/analyze"
 	"github.com/Subject412/dubarr/backend/internal/probe"
@@ -57,6 +58,43 @@ const (
 	StatusDone    = "done"
 	StatusFailed  = "failed"
 )
+
+// SourceTiming is what the container says about one analysis input before it
+// is decoded: how long the audio really is and where its timeline starts.
+//
+// All three values come from the file the job will decode, not from the WAV
+// that a windowed decode never produces, which is the whole point: a
+// percentage of a duration that only exists after a full decode is useless to
+// a job that intends to skip the full decode.
+type SourceTiming struct {
+	// Duration is the length of the track the job analyses, from
+	// probe.MediaInfo.TrackDuration: the stream's own duration when the
+	// container provides one, else the container's, else unknown. It is 0
+	// when unknown; Known is what says which case that is.
+	Duration time.Duration
+	// ContainerStart is the container's timeline origin
+	// (ffprobe `format.start_time`) and TrackStart the analysed stream's own
+	// origin. Their difference is the correction an input seek into the
+	// container needs; on an audio-only file the two coincide. Both are 0
+	// when their field is unknown, so read Known before trusting them.
+	ContainerStart time.Duration
+	TrackStart     time.Duration
+	// Known reports that the container stated everything the window planner
+	// needs: a duration and both timeline origins. It is false when any of
+	// them was absent, "N/A" or unparseable — never silently 0. Callers can
+	// still tell the two failure shapes apart: Duration == 0 && !Known is
+	// "no duration", while Duration > 0 && !Known is "unknown origin". Both
+	// mean whole-file analysis, for different reasons.
+	Known bool
+}
+
+// SourceTimings are the timing facts of the two analysis inputs, probed once
+// per job before any mode decision and before any decode. Nothing re-probes
+// per checkpoint.
+type SourceTimings struct {
+	Target SourceTiming
+	Donor  SourceTiming
+}
 
 // Dependencies are the collaborators the sync job API needs.
 type Dependencies struct {
@@ -88,6 +126,10 @@ type Service struct {
 	ffmpegPath   string
 	prober       *probe.Prober
 	logger       *slog.Logger
+	// probeTimings is the probe seam for source timing: one call per analysis
+	// input, returning the container's MediaInfo. Nil resolves the service's
+	// prober, so tests supply ffprobe output instead of shelling out.
+	probeTimings func(ctx context.Context, path string) (probe.MediaInfo, error)
 }
 
 // RegisterRoutes mounts:
@@ -461,6 +503,26 @@ func (s *Service) runAnalysis(ctx context.Context, rec store.SyncJobRecord) (ana
 		return analyze.Report{}, fmt.Errorf("syncjob: staged copy of track %d is missing", donorID)
 	}
 
+	// The two analysis inputs' real timings, probed once, here, before
+	// anything is decoded and before any mode is chosen: a window plan needs
+	// the length and origin of the files it will seek, not of the WAVs a full
+	// decode produces. Nothing re-probes per checkpoint.
+	//
+	// A failed probe is not a failed job. This step did not exist before
+	// windowed analysis, so letting it abort would turn a job that worked into
+	// one that does not, for a reason the operator cannot act on. Unknown
+	// timings simply mean the window plan cannot be built, and the job takes
+	// the whole-file path - which is exactly the behaviour that predates it.
+	timings, err := s.sourceTimings(ctx, prober, lib.TargetFilePath, pair.Target.Index, donorPath)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Warn("syncjob: source timing unknown; analysing the whole file",
+				"job", rec.ID, "error", err)
+		}
+		timings = SourceTimings{}
+	}
+	s.logSourceTimings(rec.ID, timings)
+
 	ffmpeg, err := s.resolveFFmpeg()
 	if err != nil {
 		return analyze.Report{}, err
@@ -480,9 +542,12 @@ func (s *Service) runAnalysis(ctx context.Context, rec store.SyncJobRecord) (ana
 		engine = sync.New(sync.WithTimeout(analyze.JobTimeout(cfg)), sync.WithLogger(s.logger))
 	}
 	req := analyze.Request{
-		TargetPath:       targetWAV,
-		DonorPath:        donorWAV,
-		DurationSec:      0, // derive from the decoded WAVs
+		TargetPath: targetWAV,
+		DonorPath:  donorWAV,
+		// The whole-file path: analyze derives the duration base from the
+		// headers of these two WAVs. The container-side numbers probed above
+		// are not consumed by this path.
+		DurationSec:      0,
 		TargetTracks:     targetTracks,
 		VaultTracks:      vaultTracks,
 		Policy:           policy,
@@ -494,6 +559,84 @@ func (s *Service) runAnalysis(ctx context.Context, rec store.SyncJobRecord) (ana
 	}
 	succeeded = true
 	return report, nil
+}
+
+// sourceTimings probes the two files the job will decode and projects what the
+// container says about them: the analysed track's length and both timeline
+// origins. It is the only timing probe a job performs, and it runs before any
+// decode.
+//
+// The target is lib.TargetFilePath read at the reference pair's container
+// stream index, so the number describes the stream the decoder will map, not
+// the longest stream in the remux. The donor is the staged audio-only .mka,
+// whose single stream is the whole file; its format duration is exact there.
+func (s *Service) sourceTimings(ctx context.Context, prober *probe.Prober, targetPath string, targetIndex int, donorPath string) (SourceTimings, error) {
+	probeFn := s.probeTimings
+	if probeFn == nil {
+		probeFn = func(ctx context.Context, path string) (probe.MediaInfo, error) {
+			info, err := prober.Probe(ctx, path)
+			if err != nil {
+				return probe.MediaInfo{}, err
+			}
+			return *info, nil
+		}
+	}
+	targetInfo, err := probeFn(ctx, targetPath)
+	if err != nil {
+		return SourceTimings{}, fmt.Errorf("syncjob: probe target timings: %w", err)
+	}
+	donorInfo, err := probeFn(ctx, donorPath)
+	if err != nil {
+		return SourceTimings{}, fmt.Errorf("syncjob: probe donor timings: %w", err)
+	}
+	donorIndex := 0
+	if len(donorInfo.Tracks) > 0 {
+		donorIndex = donorInfo.Tracks[0].Index
+	}
+	return SourceTimings{
+		Target: sourceTiming(targetInfo, targetIndex),
+		Donor:  sourceTiming(donorInfo, donorIndex),
+	}, nil
+}
+
+// sourceTiming projects one probe result onto the numbers the window planner
+// consumes. Known stays false unless the container stated all three, so an
+// absent duration or origin can never pass for a real 0.
+func sourceTiming(info probe.MediaInfo, index int) SourceTiming {
+	duration, durationKnown := info.TrackDuration(index)
+	timing := SourceTiming{
+		Duration:       duration,
+		ContainerStart: info.StartTime,
+	}
+	for _, track := range info.Tracks {
+		if track.Index != index {
+			continue
+		}
+		timing.TrackStart = track.StartTime
+		timing.Known = durationKnown && info.StartTimeKnown && track.StartTimeKnown
+		return timing
+	}
+	return timing
+}
+
+// logSourceTimings records the probed timings once per job. Nothing acts on
+// them yet; the line is what makes a later mode decision auditable ("why did
+// this job run full?").
+func (s *Service) logSourceTimings(jobID int64, timings SourceTimings) {
+	if s.logger == nil {
+		return
+	}
+	s.logger.Info("syncjob: source timing",
+		"job", jobID,
+		"target_duration_s", timings.Target.Duration.Seconds(),
+		"target_container_start_s", timings.Target.ContainerStart.Seconds(),
+		"target_track_start_s", timings.Target.TrackStart.Seconds(),
+		"target_known", timings.Target.Known,
+		"donor_duration_s", timings.Donor.Duration.Seconds(),
+		"donor_container_start_s", timings.Donor.ContainerStart.Seconds(),
+		"donor_track_start_s", timings.Donor.TrackStart.Seconds(),
+		"donor_known", timings.Donor.Known,
+	)
 }
 
 // trackAudioTrack adapts a persisted vault track to the probe shape reflang

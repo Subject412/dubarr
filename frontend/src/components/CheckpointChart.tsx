@@ -107,7 +107,9 @@ export function CheckpointChart({ checkpoints }: { checkpoints: SyncCheckpoint[]
                 strokeWidth={1.5}
               >
                 <title>
-                  {`position ${cp.position_pct}% · offset ${Math.round(cp.offset_ms)}ms · quality ${cp.correlation_quality.toFixed(2)}`}
+                  {`position ${cp.position_pct}% · offset ${Math.round(cp.offset_ms)}ms · quality ${cp.correlation_quality.toFixed(2)}${
+                    cp.match_z ? ` · z ${cp.match_z.toFixed(1)}` : ''
+                  }`}
                 </title>
               </circle>
               <rect

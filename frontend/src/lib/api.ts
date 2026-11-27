@@ -400,9 +400,29 @@ export type SyncCheckpoint = {
   slice_len_sec: number
   offset_ms: number
   correlation_quality: number
+  /**
+   * Parabolic peak interpolation, diagnostics only — the applied offset stays
+   * `offset_ms`. Absent on a report written before 0.5.0.
+   */
+  offset_sub_ms?: number
+  /**
+   * Peak distance from the window's lag distribution in standard deviations.
+   * `0` is the "not recorded" sentinel, so a 0.4.0 row renders as unknown.
+   */
+  match_z?: number
+  /** One sample of the analysis rate (0.125 at 8 kHz). Absent before 0.5.0. */
+  precision_ms?: number
 }
 
 export type SyncVerdict = 'ok' | 'drifting' | 'unreliable' | 'out_of_range'
+
+/** The verdict table that judged a report; absent on reports stored before 0.5.0. */
+export type SyncThresholds = {
+  stable_spread_ms: number
+  low_quality: number
+  match_z_maybe: number
+  match_z_good: number
+}
 
 export type SyncReport = {
   verdict: SyncVerdict | string
@@ -412,6 +432,11 @@ export type SyncReport = {
   classification: string
   checkpoints: SyncCheckpoint[]
   sync_method: string
+  /** Checkpoint-ordered, like `offsets_ms`; absent on a 0.4.0 report. */
+  match_z?: number[]
+  /** Coarsest precision among the checkpoints; absent on a 0.4.0 report. */
+  precision_ms?: number
+  thresholds?: SyncThresholds
   reason?: string
 }
 

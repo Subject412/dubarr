@@ -91,6 +91,19 @@ type Request struct {
 	// muxer ever stops writing them itself.
 	LangISO2 string
 	Title    string
+	// Segments, when non-empty, is the #84 piecewise render: the dub is cut per
+	// segment, each run given exactly its length and the pieces concatenated in
+	// the same single encode ([BuildSegmentedArgs]). Empty means the ordinary
+	// single pass ([BuildArgs]).
+	Segments []Segment
+	// TargetDurationMS is the target track's own length when the caller knows
+	// it: the timeline the segments are stated on. A segmented render is
+	// verified against it, and a plan whose last edge does not reach it is
+	// refused as a non-tiling plan. 0 means unknown — the plan's own total
+	// ([SegmentsTotalMS]) stands in, which is the best available statement of
+	// how long the render should be but cannot catch a plan that truncates the
+	// film, because the truncation is baked into the plan.
+	TargetDurationMS int64
 }
 
 // Result describes a successful encode.
@@ -130,8 +143,10 @@ func (t *Transcoder) EncoderAvailable(ctx context.Context, encoder string) (bool
 
 // Transcode runs exactly one ffmpeg encode (tempo + channel/rate conversion +
 // codec/bitrate all in one command, see [BuildArgs]) and then re-probes the
-// result. A codec/channel/duration mismatch is ErrVerify: the caller must fail
-// the job rather than mux an unexpected stream.
+// result. A piecewise render cuts, pads and concatenates the segments in that
+// same single command instead (see [BuildSegmentedArgs]). A codec/channel/
+// duration mismatch is ErrVerify: the caller must fail the job rather than mux
+// an unexpected stream.
 func (t *Transcoder) Transcode(ctx context.Context, req Request) (Result, error) {
 	if !req.Plan.Encode() {
 		return Result{}, fmt.Errorf("%w: plan requests no encode (%q)", ErrInvalidPlan, req.Plan.Codec)
@@ -177,7 +192,11 @@ func (t *Transcoder) Transcode(ctx context.Context, req Request) (Result, error)
 		outChannels = src.Channels
 	}
 
-	args, err := BuildArgs(req)
+	build := BuildArgs
+	if len(req.Segments) > 0 {
+		build = BuildSegmentedArgs
+	}
+	args, err := build(req)
 	if err != nil {
 		return Result{}, err
 	}
@@ -193,8 +212,19 @@ func (t *Transcoder) Transcode(ctx context.Context, req Request) (Result, error)
 		return Result{}, fmt.Errorf("%w: probe output: %v", ErrVerify, err)
 	}
 	expectedDuration := durationMS
-	if f := plan.TempoFactor; f > 0 && f != 1 {
-		expectedDuration = int64(float64(durationMS) / f)
+	switch {
+	case len(req.Segments) > 0:
+		// A segmented render's length is not the input's: cutting deliberately
+		// drops film and padding deliberately adds silence, so comparing
+		// against the dub's duration would both hide a wrong cut and reject a
+		// right one. The track must match the length of the timeline it is
+		// stated on — the target track's when the caller knows it, otherwise
+		// what the segments themselves add up to. The audio stream must match
+		// exactly or the job fails before any mux, which is what keeps a short
+		// render (a lost tail) from ever being published.
+		expectedDuration = expectedSegmentTotalMS(req)
+	case plan.TempoFactor > 0 && plan.TempoFactor != 1:
+		expectedDuration = int64(float64(durationMS) / plan.TempoFactor)
 	}
 	if err := Verify(got, Expect{
 		Codec:      plan.ExpectedCodec(),

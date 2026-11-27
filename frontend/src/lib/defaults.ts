@@ -56,9 +56,9 @@ export const DEFAULT_SETTINGS: DubarrSettings = {
     allow_force_tag_override: false,
   },
   // The shipped strategy (#82, D4): one waveform step on every checkpoint,
-  // which is settings.PresetTechniques("balanced") — the same value the server
-  // stores on a fresh install. Fast shares this list and differs only in how
-  // many checkpoints it measures (D4a).
+  // which is settings.Preset("balanced") — the same value the server stores on
+  // a fresh install. Fast shares this list and differs only in how many
+  // checkpoints it measures (D4a).
   //
   // This literal stays written out on purpose. TestDefaultStrategyMatchesTheSPADefault
   // (backend/internal/settings) brace-scans *this file* and decodes the literal
@@ -76,6 +76,18 @@ export const DEFAULT_SETTINGS: DubarrSettings = {
         z_gate: true,
       },
     ],
+    // The segmentation block (#84) at analyze.DefaultPiecewisePolicy(): off, so
+    // a fresh install samples six points and produces the 0.4.0 report (D5).
+    // The Go SPA-parity test decodes this literal, so every number here is
+    // pinned against the server default and no preset turns it on.
+    piecewise: {
+      enabled: false,
+      step_sec: 45,
+      window_sec: 60,
+      split_penalty_ms: 250,
+      min_segment_sec: 120,
+      max_segments: 12,
+    },
   } as SyncStrategy,
   'mux.options': {
     track_title_in_mkv: 'Polski Dubbing',

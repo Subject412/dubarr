@@ -1,8 +1,18 @@
-import { useState } from 'react'
-import type { SyncPreset, SyncStrategy, SyncTechnique, SyncTechniqueID, SyncWhen } from '../lib/api'
+import { useEffect, useState } from 'react'
+import type {
+  SyncPiecewisePolicy,
+  SyncPreset,
+  SyncStrategy,
+  SyncTechnique,
+  SyncTechniqueID,
+  SyncWhen,
+} from '../lib/api'
+import { helpIdFor } from '../lib/help-id'
 import { settingsHelp } from '../lib/settings-help'
 import {
+  DEFAULT_PIECEWISE,
   PRESET_NAMES,
+  PRESET_PIECEWISE,
   PRESET_POSITIONS_PCT,
   PRESET_TECHNIQUES,
   isZGated,
@@ -79,12 +89,87 @@ function newStep(id: SyncTechniqueID): SyncTechnique {
 }
 
 /**
- * A threshold keystroke. An unparseable (or cleared) box keeps the previous
- * number rather than silently saving a zero the operator never typed.
+ * A numeric keystroke as the number it stands for, or `null` while it does not
+ * stand for one yet — empty, just a minus sign, or a fraction mid-integer.
  */
-function thresholdFrom(raw: string, previous: number): number {
-  const next = Number.parseFloat(raw)
-  return Number.isFinite(next) ? next : previous
+function knobNumber(raw: string, integer: boolean): number | null {
+  const parsed = Number.parseFloat(raw)
+  if (!Number.isFinite(parsed)) return null
+  return integer ? Math.round(parsed) : parsed
+}
+
+/**
+ * A numeric knob the operator can clear before retyping it.
+ *
+ * The box holds the keystrokes as a string — empty and half-typed are legal
+ * intermediate states — so `clear()` followed by the new number lands as that
+ * number, not as the old digits with the new ones appended. A keystroke inside
+ * [min, max] reaches the draft at once (a save that never leaves the box still
+ * stores what was typed); a number outside the range waits, and leaving the box
+ * clamps it into the range and shows the clamped value. Blur is also what a
+ * press on Save does, so a save never stores a value the field could not show.
+ */
+function NumericKnob({
+  label,
+  value,
+  min,
+  max,
+  step,
+  integer = false,
+  onCommit,
+}: {
+  label: string
+  value: number
+  min: number
+  max: number
+  step: number
+  /** The knob counts things: a typed fraction commits as the nearest whole. */
+  integer?: boolean
+  onCommit: (next: number) => void
+}) {
+  const [draft, setDraft] = useState<string | null>(null)
+
+  // A preset press (or any edit from elsewhere) replaces the number: keystrokes
+  // typed against the old value must give way, or the box would keep showing a
+  // number the draft no longer holds.
+  // oxlint-disable react/set-state-in-effect
+  useEffect(() => {
+    setDraft((current) => {
+      if (current === null) return null
+      return knobNumber(current, integer) === value ? current : null
+    })
+  }, [value, integer])
+  // oxlint-enable react/set-state-in-effect
+
+  const commit = (raw: string) => {
+    const next = knobNumber(raw, integer)
+    if (next === null || next < min || next > max) return
+    if (next !== value) onCommit(next)
+  }
+
+  const clampOnBlur = () => {
+    const typed = draft === null ? value : knobNumber(draft, integer)
+    const next = typed === null ? value : Math.min(max, Math.max(min, typed))
+    setDraft(null)
+    if (next !== value) onCommit(next)
+  }
+
+  return (
+    <Input
+      type="number"
+      step={step}
+      min={min}
+      max={max}
+      aria-label={label}
+      value={draft ?? value}
+      onChange={(event) => {
+        const raw = event.target.value
+        setDraft(raw)
+        commit(raw)
+      }}
+      onBlur={clampOnBlur}
+    />
+  )
 }
 
 export function StrategyEditor({
@@ -115,6 +200,20 @@ export function StrategyEditor({
   // list or a fifth step would only come back as a 400 after a save.
   const [notice, setNotice] = useState('')
   const [openAdvanced, setOpenAdvanced] = useState<Record<number, boolean>>({})
+  const [openPiecewise, setOpenPiecewise] = useState(false)
+
+  // A section written before 0.5.0 has no block, which means the documented
+  // default: off at 45/60/250/120/12 (analyze.DefaultPiecewisePolicy).
+  const piecewise: SyncPiecewisePolicy = draft.piecewise ?? DEFAULT_PIECEWISE
+
+  /**
+   * A number the block does not carry reads as its documented default, so the
+   * card never shows a zero the operator did not choose.
+   */
+  const knob = (key: keyof SyncPiecewisePolicy): number => {
+    const value = piecewise[key] ?? DEFAULT_PIECEWISE[key]
+    return typeof value === 'number' && Number.isFinite(value) ? value : 0
+  }
 
   const preset: SyncPreset = (PRESET_NAMES as readonly string[]).includes(draft.preset)
     ? draft.preset
@@ -132,6 +231,19 @@ export function StrategyEditor({
 
   const updateStep = (index: number, patch: Partial<SyncTechnique>) =>
     writeSteps(techniques.map((entry, i) => (i === index ? { ...entry, ...patch } : entry)))
+
+  /**
+   * The segmentation block is part of the same section, so an edit there makes
+   * the starting point `custom` exactly as a technique edit does — the server
+   * derives the preset from the whole section, and every preset keeps the block
+   * off. It also withdraws a staged preset pair: that pair describes the preset
+   * this draft no longer is.
+   */
+  const writePiecewise = (patch: Partial<SyncPiecewisePolicy>) => {
+    setNotice('')
+    update({ preset: 'custom', piecewise: { ...piecewise, ...patch } })
+    onPreset?.(null)
+  }
 
   const moveStep = (index: number, delta: -1 | 1) => {
     const target = index + delta
@@ -168,13 +280,88 @@ export function StrategyEditor({
   const applyPreset = (name: PresetName) => {
     setNotice('')
     setOpenAdvanced({})
-    const next: SyncStrategy = { preset: name, techniques: PRESET_TECHNIQUES[name]() }
+    setOpenPiecewise(false)
+    // The preset's whole section: its list and its segmentation block, both of
+    // which the server compares when it decides the stored name. Every preset
+    // ships the block off, so a press that left it on would be stored as
+    // `custom` while the button claimed a starting point.
+    const next: SyncStrategy = {
+      preset: name,
+      techniques: PRESET_TECHNIQUES[name](),
+      piecewise: PRESET_PIECEWISE[name](),
+    }
     update(next)
     // Fast and Balanced move the checkpoint positions as well, so the press is
     // two sections; Maximum accuracy leaves them alone and needs no pair.
     const positions = PRESET_POSITIONS_PCT[name]
     onPreset?.(positions ? { strategy: next, positions: [...positions] } : null)
   }
+
+  /**
+   * The five knobs as a read-out: the numbers the switch would use, each with
+   * the one tip that explains it. Collapsed — and, while the feature is off,
+   * always — this is all the operator sees. Advanced moves the same tips onto
+   * the inputs that edit those numbers, so a key never has two help buttons.
+   */
+  const piecewiseSummary = (
+    <div
+      data-testid="strategy-piecewise-summary"
+      className="flex flex-wrap items-center gap-3 text-xs text-zinc-500"
+    >
+      <span className="inline-flex items-center gap-1">
+        <span>
+          Check every <span className="font-medium text-zinc-300">{knob('step_sec')} s</span>
+        </span>
+        <InfoTip
+          id={helpIdFor('Check every (seconds)')}
+          label="Check every (seconds)"
+          text={settingsHelp('sync.strategy', 'piecewise_step_sec') ?? ''}
+        />
+      </span>
+      <span className="inline-flex items-center gap-1">
+        <span>
+          Sample length <span className="font-medium text-zinc-300">{knob('window_sec')} s</span>
+        </span>
+        <InfoTip
+          id={helpIdFor('Sample length (seconds)')}
+          label="Sample length (seconds)"
+          text={settingsHelp('sync.strategy', 'piecewise_window_sec') ?? ''}
+        />
+      </span>
+      <span className="inline-flex items-center gap-1">
+        <span>
+          Evidence for another segment{' '}
+          <span className="font-medium text-zinc-300">{knob('split_penalty_ms')} ms</span>
+        </span>
+        <InfoTip
+          id={helpIdFor('Evidence needed for another segment')}
+          label="Evidence needed for another segment"
+          text={settingsHelp('sync.strategy', 'piecewise_split_penalty_ms') ?? ''}
+        />
+      </span>
+      <span className="inline-flex items-center gap-1">
+        <span>
+          Shortest segment{' '}
+          <span className="font-medium text-zinc-300">{knob('min_segment_sec')} s</span>
+        </span>
+        <InfoTip
+          id={helpIdFor('Shortest segment (seconds)')}
+          label="Shortest segment (seconds)"
+          text={settingsHelp('sync.strategy', 'piecewise_min_segment_sec') ?? ''}
+        />
+      </span>
+      <span className="inline-flex items-center gap-1">
+        <span>
+          At most <span className="font-medium text-zinc-300">{knob('max_segments')}</span> segments
+        </span>
+        <InfoTip
+          id={helpIdFor('At most how many segments')}
+          label="At most how many segments"
+          text={settingsHelp('sync.strategy', 'piecewise_max_segments') ?? ''}
+        />
+      </span>
+    </div>
+  )
 
   return (
     <div className="space-y-5">
@@ -391,21 +578,13 @@ export function StrategyEditor({
                         hint="0.10 is the shipped floor."
                         help={settingsHelp('sync.strategy', 'min_confidence')}
                       >
-                        <Input
-                          type="number"
-                          step="0.01"
+                        <NumericKnob
+                          label={`Step ${step} confidence needed`}
+                          step={0.01}
                           min={0}
                           max={1}
-                          aria-label={`Step ${step} confidence needed`}
                           value={entry.min_confidence}
-                          onChange={(event) =>
-                            updateStep(index, {
-                              min_confidence: thresholdFrom(
-                                event.target.value,
-                                entry.min_confidence,
-                              ),
-                            })
-                          }
+                          onCommit={(min_confidence) => updateStep(index, { min_confidence })}
                         />
                       </Field>
                       {gated && (
@@ -414,18 +593,13 @@ export function StrategyEditor({
                           hint="5 means a human should check the result."
                           help={settingsHelp('sync.strategy', 'min_match_z')}
                         >
-                          <Input
-                            type="number"
-                            step="0.5"
+                          <NumericKnob
+                            label={`Step ${step} peak must stand out by (σ)`}
+                            step={0.5}
                             min={0}
                             max={100}
-                            aria-label={`Step ${step} peak must stand out by (σ)`}
                             value={entry.min_match_z}
-                            onChange={(event) =>
-                              updateStep(index, {
-                                min_match_z: thresholdFrom(event.target.value, entry.min_match_z),
-                              })
-                            }
+                            onCommit={(min_match_z) => updateStep(index, { min_match_z })}
                           />
                         </Field>
                       )}
@@ -464,6 +638,122 @@ export function StrategyEditor({
             </p>
           )}
         </div>
+      </div>
+
+      {/*
+        Segmentation (#84) is a block of its own, not another step: it is
+        switched on as one thing, and the five numbers behind it are correct for
+        everybody (D11). Off, the knobs are absent from the form entirely — but
+        each one is still described, so the switch can be understood before it
+        is turned on and its cost is never hidden behind a click.
+      */}
+      <div
+        data-testid="strategy-piecewise"
+        className="space-y-3 rounded-lg border border-ink-700 bg-ink-950/40 p-3"
+      >
+        <Toggle
+          label="Handle films with a cut or an inserted scene"
+          help={settingsHelp('sync.strategy', 'piecewise_enabled')}
+          checked={Boolean(piecewise.enabled)}
+          onChange={(enabled) => writePiecewise({ enabled })}
+        />
+        <p className="text-xs text-zinc-500">
+          Off, one offset is applied to the whole track. On, Dubarr looks for the point where the dub
+          stops lining up and shifts each part of the film separately; the dub copy is then cut and
+          rejoined in one lossless pass, and your video is never touched.
+        </p>
+        {piecewise.enabled ? (
+          <div className="flex flex-wrap items-center gap-3">
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              data-testid="strategy-piecewise-advanced"
+              aria-expanded={openPiecewise}
+              onClick={() => setOpenPiecewise((current) => !current)}
+            >
+              {openPiecewise ? 'Hide advanced' : 'Advanced'}
+            </Button>
+            {!openPiecewise && piecewiseSummary}
+          </div>
+        ) : (
+          piecewiseSummary
+        )}
+        {piecewise.enabled && openPiecewise && (
+          <div className="grid gap-4 md:grid-cols-2">
+            <Field
+              label="Check every (seconds)"
+              hint="15–300 s; the sample length may be at most twice this."
+              help={settingsHelp('sync.strategy', 'piecewise_step_sec')}
+            >
+              <NumericKnob
+                label="Check every (seconds)"
+                step={1}
+                min={15}
+                max={300}
+                value={knob('step_sec')}
+                onCommit={(step_sec) => writePiecewise({ step_sec })}
+              />
+            </Field>
+            <Field
+              label="Sample length (seconds)"
+              hint="20–190 s, and at most twice the interval above."
+              help={settingsHelp('sync.strategy', 'piecewise_window_sec')}
+            >
+              <NumericKnob
+                label="Sample length (seconds)"
+                step={1}
+                min={20}
+                max={190}
+                value={knob('window_sec')}
+                onCommit={(window_sec) => writePiecewise({ window_sec })}
+              />
+            </Field>
+            <Field
+              label="Evidence needed for another segment"
+              hint="50–5000 ms; 250 ms is the shipped value."
+              help={settingsHelp('sync.strategy', 'piecewise_split_penalty_ms')}
+            >
+              <NumericKnob
+                label="Evidence needed for another segment"
+                step={10}
+                min={50}
+                max={5000}
+                value={knob('split_penalty_ms')}
+                onCommit={(split_penalty_ms) => writePiecewise({ split_penalty_ms })}
+              />
+            </Field>
+            <Field
+              label="Shortest segment (seconds)"
+              hint="30–3600 s; shorter runs are merged into their neighbour."
+              help={settingsHelp('sync.strategy', 'piecewise_min_segment_sec')}
+            >
+              <NumericKnob
+                label="Shortest segment (seconds)"
+                step={10}
+                min={30}
+                max={3600}
+                value={knob('min_segment_sec')}
+                onCommit={(min_segment_sec) => writePiecewise({ min_segment_sec })}
+              />
+            </Field>
+            <Field
+              label="At most how many segments"
+              hint="2–40; a real re-cut has a handful of joins."
+              help={settingsHelp('sync.strategy', 'piecewise_max_segments')}
+            >
+              <NumericKnob
+                label="At most how many segments"
+                step={1}
+                min={2}
+                max={40}
+                integer
+                value={knob('max_segments')}
+                onCommit={(max_segments) => writePiecewise({ max_segments })}
+              />
+            </Field>
+          </div>
+        )}
       </div>
 
       {error && (

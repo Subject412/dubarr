@@ -10,6 +10,7 @@ import type {
   SyncStrategy,
   SyncTechnique,
 } from '../lib/api'
+import { piecewiseCut } from '../lib/api'
 import {
   useCreateSyncJob,
   useDebouncedValue,
@@ -54,6 +55,11 @@ function createdAtLabel(created?: string): string {
 
 function formatMs(value: number): string {
   return `${Math.round(value)} ms`
+}
+
+/** Film seconds, for a segment edge or a join: one decimal, like the trend block. */
+function formatSec(value: number): string {
+  return `${value.toFixed(1)} s`
 }
 
 /**
@@ -375,6 +381,138 @@ function TrendBlock({ fit }: { fit?: SyncFit }) {
   )
 }
 
+/**
+ * D11: what a piecewise job did, why it was done and what it cost. The block
+ * appears on a report whose plan was accepted and found a join, but the copy
+ * below is only the render's own account of itself: it is printed when the
+ * report records a render (see [piecewiseRendered]) and never for a plan the
+ * worker was refused before it cut anything.
+ */
+const PIECEWISE_HELP =
+  'The dub needed a different offset before and after a scene the two releases do ' +
+  'not share. Dubarr cut the dub copy at the join, shifted each part on its own ' +
+  'and rejoined it in one lossless pass, so the mux needed no further offset. ' +
+  'Your video file was not touched, and a join is only listed when the analysis ' +
+  'was confident enough to place it.'
+
+/**
+ * The same block for a job that was analysed but never rendered: the plan was
+ * accepted and its verdict then failed the gate, so the segments are what the
+ * analysis proposed, not what was published.
+ */
+const PIECEWISE_ANALYSIS_HELP =
+  'The analysis found places where the dub needs a different offset before and ' +
+  'after a scene the two releases do not share. This job was not rendered ' +
+  'piecewise: the segments below are what the analysis proposed, and the dub ' +
+  'copy was not cut.'
+
+/**
+ * Whether the worker recorded that it rendered this plan piecewise. The plan
+ * alone is not proof: `syncworker` cuts and rejoins only when the verdict is
+ * muxable, so a job its gate refused keeps the segmentation and reports no
+ * `application` block at all — that field is written on the render path only.
+ * Without that record there is nothing to claim.
+ */
+function piecewiseRendered(report: SyncReport): boolean {
+  return report.application?.mode === 'piecewise'
+}
+
+/**
+ * The segmentation a piecewise job applied (#84): one row per run of the film,
+ * and the joins between them with the uncertainty the sampling step implies.
+ *
+ * `piecewiseCut` decides whether there is a table at all — a rejected plan or a
+ * single segment has none. Whether the table describes a render is a separate
+ * question, answered by `application.mode`: an accepted plan the verdict gate
+ * refused is still worth listing, but it is labelled analysis-only and the
+ * joins are withheld, because the step across a join is a claim about a render.
+ */
+function PiecewiseBlock({ report }: { report: SyncReport }) {
+  if (!piecewiseCut(report.piecewise)) return null
+
+  const rendered = piecewiseRendered(report)
+  const segments = report.piecewise?.segments ?? []
+  const boundaries = report.piecewise?.boundaries ?? []
+  // The application block is the worker's own count; the list is the evidence.
+  const count = report.application?.segment_count ?? segments.length
+  const review = report.review_reason?.trim()
+
+  return (
+    <section data-testid="sync-piecewise" className="space-y-2">
+      <div className="flex items-center gap-1.5">
+        <h3 className="text-[11px] uppercase tracking-wider text-zinc-500">Segments</h3>
+        <InfoTip
+          id={helpIdFor('Segments')}
+          label="Segments"
+          text={rendered ? PIECEWISE_HELP : PIECEWISE_ANALYSIS_HELP}
+        />
+      </div>
+      {rendered ? (
+        <p data-testid="piecewise-count" className="text-xs text-zinc-400">
+          The dub was cut into {count} segments and rejoined in one pass; each segment carries its
+          own offset.
+        </p>
+      ) : (
+        <p data-testid="piecewise-analysis-only" className="text-xs text-zinc-400">
+          Analysed only — the plan splits the film into {segments.length} segments, but this job was
+          not rendered piecewise, so the dub copy was not cut and no join was applied.
+          {review ? ` ${review}` : ''}
+        </p>
+      )}
+
+      <div className="overflow-x-auto">
+        <table className="w-full text-left text-xs">
+          <thead>
+            <tr className="border-b border-ink-800 text-[11px] uppercase tracking-wider text-zinc-500">
+              <th className="py-1.5 pr-3 font-medium">Start</th>
+              <th className="py-1.5 pr-3 font-medium">End</th>
+              <th className="py-1.5 pr-3 font-medium">Offset</th>
+              <th className="py-1.5 pr-3 font-medium">Confidence</th>
+              <th className="py-1.5 font-medium">Points</th>
+            </tr>
+          </thead>
+          <tbody>
+            {segments.map((segment, index) => (
+              <tr
+                key={`${segment.start_sec}-${index}`}
+                data-testid={`piecewise-row-${index}`}
+                className="border-b border-ink-800/60 text-zinc-300 last:border-0"
+              >
+                <td className="py-1.5 pr-3 font-mono">{formatSec(segment.start_sec)}</td>
+                <td className="py-1.5 pr-3 font-mono">{formatSec(segment.end_sec)}</td>
+                <td className="py-1.5 pr-3 font-mono">{formatMs(segment.offset_ms)}</td>
+                <td className="py-1.5 pr-3 font-mono">{segment.confidence.toFixed(2)}</td>
+                <td className="py-1.5 font-mono">{segment.points}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {rendered && boundaries.length > 0 && (
+        <div className="space-y-1">
+          <h4 className="text-[11px] uppercase tracking-wider text-zinc-500">Joins</h4>
+          <ul
+            data-testid="sync-piecewise-boundaries"
+            className="space-y-0.5 text-xs text-zinc-400"
+          >
+            {boundaries.map((boundary, index) => (
+              <li
+                key={`${boundary.at_sec}-${index}`}
+                data-testid={`piecewise-boundary-${index}`}
+                className="font-mono"
+              >
+                {formatSec(boundary.at_sec)} ± {boundary.uncertainty_sec.toFixed(1)} s ·{' '}
+                {boundary.step_ms < 0 ? '−' : '+'}
+                {Math.abs(Math.round(boundary.step_ms))} ms
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </section>
+  )
+}
+
 function JobRow({
   job,
   selected,
@@ -472,6 +610,16 @@ function ReportView({ report, calculatedOffsetMs }: { report: SyncReport; calcul
             <Badge tone="neutral">{precisionLabel(precision)}</Badge>
           </span>
         )}
+        {/*
+          D5: a job the verdict alone would not have flagged still needs a human
+          when the segmentation was refused. The reason is the server's own
+          sentence, printed as given — never re-worded into a claim of ours.
+        */}
+        {report.review_reason && (
+          <span data-testid="sync-review-reason">
+            <Badge tone="warning">review: {report.review_reason}</Badge>
+          </span>
+        )}
       </div>
 
       <dl className="grid gap-3 sm:grid-cols-4">
@@ -501,7 +649,16 @@ function ReportView({ report, calculatedOffsetMs }: { report: SyncReport; calcul
 
       {report.reason && <Alert tone="warning">{report.reason}</Alert>}
 
-      <CheckpointChart checkpoints={report.checkpoints} fit={report.fit} />
+      <PiecewiseBlock report={report} />
+
+      <CheckpointChart
+        checkpoints={report.checkpoints}
+        fit={report.fit}
+        // Only a join the worker recorded that it rendered is evidence: a
+        // rejected plan keeps the dominant offset and a plan the verdict gate
+        // refused was never cut, so neither draws a marker.
+        boundaries={piecewiseRendered(report) ? report.piecewise?.boundaries : undefined}
+      />
 
       <StrategySummary strategy={report.strategy} notes={report.notes} />
 

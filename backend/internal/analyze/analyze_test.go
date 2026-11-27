@@ -449,12 +449,12 @@ func TestVerdictUnreliableNeedsBothScores(t *testing.T) {
 	offsets := []float64{1200, 1210, 1195}
 	qualities := []float64{0.9, 0.05, 0.9}
 
-	verdict, classification, _ := classify(offsets, qualities, []float64{30, 3, 30}, testAcceptBoundMS, DefaultThresholds)
+	verdict, classification, _ := classify(offsets, qualities, []float64{30, 3, 30}, nil, testAcceptBoundMS, DefaultThresholds)
 	if verdict != VerdictUnreliable || classification != ClassificationUnreliable {
 		t.Fatalf("weak quality with a dissenting z = %q/%q, want unreliable/unreliable", verdict, classification)
 	}
 
-	verdict, classification, _ = classify(offsets, qualities, []float64{30, 12, 30}, testAcceptBoundMS, DefaultThresholds)
+	verdict, classification, _ = classify(offsets, qualities, []float64{30, 12, 30}, nil, testAcceptBoundMS, DefaultThresholds)
 	if verdict != VerdictOK || classification != ClassificationStable {
 		t.Fatalf("weak quality with an agreeing z = %q/%q, want ok/stable (the conjunction must not invent distrust)", verdict, classification)
 	}
@@ -467,6 +467,7 @@ func TestVerdictUnreliableOnALegacyReport(t *testing.T) {
 	verdict, classification, drift := classify(
 		[]float64{1200, 1210, 1195},
 		[]float64{0.9, 0.05, 0.9},
+		nil,
 		nil,
 		testAcceptBoundMS,
 		DefaultThresholds,
@@ -509,7 +510,7 @@ func TestVerdictCannotReclassifyA04OKCheckpoint(t *testing.T) {
 				qualities[i] = tc.quality
 				matchZ[i] = tc.z
 			}
-			verdict, _, _ := classify(tc.offsets, qualities, matchZ, testAcceptBoundMS, DefaultThresholds)
+			verdict, _, _ := classify(tc.offsets, qualities, matchZ, nil, testAcceptBoundMS, DefaultThresholds)
 			if verdict == VerdictUnreliable {
 				t.Fatalf("verdict = %q for quality %v, z %v: a 0.4.0 ok checkpoint reclassified (want %q)",
 					verdict, tc.quality, tc.z, tc.want)
@@ -544,10 +545,10 @@ func TestThresholdsTableIsTheOnlySource(t *testing.T) {
 	qualities := []float64{0.9, 0.9, 0.9}
 	wide := DefaultThresholds
 	wide.StableSpreadMS = 1e9
-	if verdict, _, _ := classify(spread, qualities, nil, testAcceptBoundMS, wide); verdict != VerdictOK {
+	if verdict, _, _ := classify(spread, qualities, nil, nil, testAcceptBoundMS, wide); verdict != VerdictOK {
 		t.Fatalf("verdict = %q with a 1e9 ms band, want ok", verdict)
 	}
-	if verdict, _, _ := classify(spread, qualities, nil, testAcceptBoundMS, DefaultThresholds); verdict != VerdictDrifting {
+	if verdict, _, _ := classify(spread, qualities, nil, nil, testAcceptBoundMS, DefaultThresholds); verdict != VerdictDrifting {
 		t.Fatalf("verdict = %q with the default band, want drifting", verdict)
 	}
 
@@ -555,7 +556,7 @@ func TestThresholdsTableIsTheOnlySource(t *testing.T) {
 	// the correlation and however absent the z.
 	weak := DefaultThresholds
 	weak.LowQuality = 0
-	if verdict, _, _ := classify(spread, []float64{0.01, 0.01, 0.01}, nil, testAcceptBoundMS, weak); verdict == VerdictUnreliable {
+	if verdict, _, _ := classify(spread, []float64{0.01, 0.01, 0.01}, nil, nil, testAcceptBoundMS, weak); verdict == VerdictUnreliable {
 		t.Fatalf("verdict = %q with LowQuality 0, want anything but unreliable", verdict)
 	}
 }
@@ -1570,5 +1571,352 @@ func TestContainerBytesForFourWorkers(t *testing.T) {
 	withMemAvailable(t, need-1, true)
 	if got := parallelWorkers(cfg); got != 3 {
 		t.Fatalf("container 3600 MiB - 1: parallelWorkers = %d, want 3", got)
+	}
+}
+
+// --- piecewise (#84) -------------------------------------------------------
+
+// TestPiecewiseDisabledReportIsUnchanged is invariant 1 of slice 05, pinned
+// rather than argued: with the shipped strategy the report carries no piecewise
+// key, no review reason, the same six checkpoints at the same percentages and
+// the same verdict numbers it did before the feature existed.
+//
+// "Byte-identical to main" is checked as "no new key and the same values": a
+// golden file of main's bytes would rot the moment an unrelated field is added,
+// which is not what this guard is about.
+func TestPiecewiseDisabledReportIsUnchanged(t *testing.T) {
+	offsets := []float64{1200, 1210, 1195, 1205, 1198, 1202}
+	qualities := []float64{0.91, 0.92, 0.90, 0.93, 0.94, 0.95}
+	cfg := DefaultConfig()
+	cfg.ParallelCheckpoints = 1
+	rep, err := Analyze(context.Background(), &scriptedEngine{offsets: offsets, qualities: qualities},
+		cfg, request(t.TempDir()))
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+	raw, err := json.Marshal(rep)
+	if err != nil {
+		t.Fatalf("marshal report: %v", err)
+	}
+	for _, key := range []string{`"piecewise"`, `"review_reason"`} {
+		if bytes.Contains(raw, []byte(key)) {
+			t.Fatalf("report contains %s with the shipped strategy; the feature is off (D5) and must not "+
+				"change one byte of a report it never ran for:\n%s", key, raw)
+		}
+	}
+	if len(rep.Checkpoints) != len(DefaultCheckpointPositionsPct) {
+		t.Fatalf("checkpoints = %d, want the shipped %d: the dense plan was selected while piecewise is off",
+			len(rep.Checkpoints), len(DefaultCheckpointPositionsPct))
+	}
+	for i, pct := range DefaultCheckpointPositionsPct {
+		if got := rep.Checkpoints[i].PositionPct; got != pct {
+			t.Fatalf("checkpoint %d position = %d%%, want the shipped %d%%", i, got, pct)
+		}
+		if got := rep.Checkpoints[i].OffsetMS; math.Abs(got-offsets[i]) > 1e-9 {
+			t.Fatalf("checkpoint %d offset = %v, want %v", i, got, offsets[i])
+		}
+	}
+	if rep.Verdict != VerdictOK || rep.Classification != ClassificationStable {
+		t.Fatalf("verdict = %q/%q, want ok/stable", rep.Verdict, rep.Classification)
+	}
+	if math.Abs(rep.MaxDriftMS-15) > 1e-9 {
+		t.Fatalf("max_drift_ms = %v, want 15 (the raw spread, as before)", rep.MaxDriftMS)
+	}
+	if rep.Piecewise != nil {
+		t.Fatalf("report.Piecewise = %+v, want nil", *rep.Piecewise)
+	}
+	if rep.ReviewReason != "" {
+		t.Fatalf("review_reason = %q, want empty", rep.ReviewReason)
+	}
+}
+
+// TestReportJSONShapeCarriesPiecewise pins the wire shape the SPA reads: the
+// segment fields D2b fixed, the boundary fields, and a review reason that is
+// absent unless it says something.
+func TestReportJSONShapeCarriesPiecewise(t *testing.T) {
+	rep := Report{
+		Verdict:        VerdictOK,
+		Classification: ClassificationPiecewise,
+		Piecewise: &Piecewise{
+			Segments: []Segment{
+				{StartSec: 0, EndSec: 600, OffsetMS: 500, Confidence: 0.9, Points: 12},
+				{StartSec: 600, EndSec: 1200, OffsetMS: 2500, Confidence: 0.8, Points: 11},
+			},
+			Boundaries:       []Boundary{{AtSec: 600, UncertaintySec: 22.5, StepMS: 2000}},
+			DominantOffsetMS: 1480,
+			StepSec:          45,
+		},
+	}
+	raw, err := json.Marshal(rep)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, ok := fields["piecewise"]; !ok {
+		t.Fatalf("no piecewise key: %s", raw)
+	}
+	if _, ok := fields["review_reason"]; ok {
+		t.Fatalf("review_reason present while empty: %s", raw)
+	}
+	var pw map[string]json.RawMessage
+	if err := json.Unmarshal(fields["piecewise"], &pw); err != nil {
+		t.Fatalf("piecewise is not an object: %s", fields["piecewise"])
+	}
+	for _, key := range []string{"segments", "boundaries", "dominant_offset_ms", "step_sec"} {
+		if _, ok := pw[key]; !ok {
+			t.Fatalf("piecewise.%s missing: %s", key, fields["piecewise"])
+		}
+	}
+	if _, ok := pw["rejected_reason"]; ok {
+		t.Fatalf("rejected_reason present on an accepted plan: %s", fields["piecewise"])
+	}
+	var segments []map[string]float64
+	if err := json.Unmarshal(pw["segments"], &segments); err != nil {
+		t.Fatalf("segments: %v", err)
+	}
+	for _, key := range []string{"start_sec", "end_sec", "offset_ms", "confidence", "points"} {
+		if _, ok := segments[0][key]; !ok {
+			t.Fatalf("segment.%s missing: %s", key, pw["segments"])
+		}
+	}
+}
+
+// TestPiecewiseOutOfRangeStillWins pins the one precedence the new rule had to
+// respect: an out-of-range checkpoint fails the job whatever the segmentation
+// says about the rest of the timeline.
+func TestPiecewiseOutOfRangeStillWins(t *testing.T) {
+	offsets := []float64{500, 500, 500, 500, 2500, 2500, 2500, 200100}
+	accepted := &Piecewise{
+		Segments: []Segment{
+			{StartSec: 0, EndSec: 300, OffsetMS: 500, Confidence: 0.9, Points: 4},
+			{StartSec: 300, EndSec: 700, OffsetMS: 2500, Confidence: 0.9, Points: 4},
+		},
+		Boundaries:       []Boundary{{AtSec: 300, UncertaintySec: 22.5, StepMS: 2000}},
+		DominantOffsetMS: 1500,
+	}
+	verdict, classification, _ := classify(offsets, fillQualities(len(offsets), 0.9), nil, accepted,
+		testAcceptBoundMS, DefaultThresholds)
+	if verdict != VerdictOutOfRange || classification != ClassificationOutOfRange {
+		t.Fatalf("verdict = %q/%q, want %q/%q: an out-of-range checkpoint outranks an accepted segmentation",
+			verdict, classification, VerdictOutOfRange, ClassificationOutOfRange)
+	}
+}
+
+// TestClassifyPiecewiseOutranksUnreliable pins the other side of the same
+// ordering, which the plan states explicitly:
+//
+//	out_of_range > piecewise-ok > unreliable > drifting > ok
+func TestClassifyPiecewiseOutranksUnreliable(t *testing.T) {
+	offsets := []float64{1200, 1210, 1195, 2500}
+	qualities := []float64{0.9, 0.9, 0.02, 0.9}
+	accepted := &Piecewise{
+		Segments: []Segment{
+			{StartSec: 0, EndSec: 300, OffsetMS: 1200, Confidence: 0.9, Points: 3},
+			{StartSec: 300, EndSec: 600, OffsetMS: 2500, Confidence: 0.9, Points: 1},
+		},
+		Boundaries:       []Boundary{{AtSec: 300, UncertaintySec: 22.5, StepMS: 1300}},
+		DominantOffsetMS: 1805,
+		maxResidualMS:    7,
+	}
+	verdict, classification, drift := classify(offsets, qualities, nil, accepted, testAcceptBoundMS, DefaultThresholds)
+	if verdict != VerdictOK || classification != ClassificationPiecewise {
+		t.Fatalf("verdict = %q/%q, want ok/piecewise", verdict, classification)
+	}
+	if drift != accepted.maxResidualMS {
+		t.Fatalf("max_drift_ms = %v, want the segmentation's residual %v, not the %v ms step it removed",
+			drift, accepted.maxResidualMS, 1300.0)
+	}
+
+	// Without an accepted plan the same evidence is unreliable: the piecewise
+	// rule is what changed the answer, nothing else.
+	if verdict, _, _ := classify(offsets, qualities, nil, nil, testAcceptBoundMS, DefaultThresholds); verdict != VerdictUnreliable {
+		t.Fatalf("verdict without segmentation = %q, want %q", verdict, VerdictUnreliable)
+	}
+}
+
+// TestPiecewiseSingleSegmentIsAnOrdinaryConstantOffset: the dense plan found one
+// plateau, which is the answer on a clean film. That is not a rejection — the
+// job is the ordinary constant-offset job, judged exactly as it is with the
+// feature off and applied as a copy — so the fixture asserts acceptance rather
+// than the D5 fallback (that path is TestBuildSegmentsRejectsAnUnconfidentBoundary).
+//
+// The engine is scripted from the plan the analysis actually requests, not from
+// a fixed list: a fixture that guesses the grid goes stale the moment the
+// policy, the duration or MaxDenseSamples changes, and a scripted engine that
+// runs out of answers fails "unexpected extra job" instead of testing the
+// aggregation.
+func TestPiecewiseSingleSegmentIsAnOrdinaryConstantOffset(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.ParallelCheckpoints = 1
+	cfg.Piecewise.Enabled = true
+	cfg.Piecewise.StepSec = 45
+	cfg.Piecewise.WindowSec = 45
+
+	req := request(t.TempDir())
+	timing := Timing{
+		Target: SourceTiming{DurationSec: req.DurationSec, OriginKnown: true},
+		Donor:  SourceTiming{DurationSec: req.DurationSec, OriginKnown: true},
+	}
+	plan, err := PlanWindowsEvery(timing, cfg.Piecewise.StepSec, cfg.Piecewise.WindowSec)
+	if err != nil {
+		t.Fatalf("PlanWindowsEvery: %v", err)
+	}
+	if len(plan) < piecewiseMinPoints {
+		t.Fatalf("dense plan = %d checkpoints, want at least %d: fewer cannot be segmented",
+			len(plan), piecewiseMinPoints)
+	}
+	// Every checkpoint answers the same offset: nothing to segment.
+	offsets := make([]float64, len(plan))
+	for i := range offsets {
+		offsets[i] = 400
+	}
+	eng := &scriptedEngine{offsets: offsets, qualities: fillQualities(len(offsets), 0.9)}
+
+	rep, err := Analyze(context.Background(), eng, cfg, req)
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+	if rep.Piecewise == nil {
+		t.Fatal("report.Piecewise is nil: a job that ran the dense plan must say so")
+	}
+	if rep.Piecewise.RejectedReason != "" {
+		t.Fatalf("rejected_reason = %q, want empty: one plateau is not a rejected plan",
+			rep.Piecewise.RejectedReason)
+	}
+	if len(rep.Piecewise.Segments) != 1 || len(rep.Piecewise.Boundaries) != 0 {
+		t.Fatalf("segments/boundaries = %d/%d, want 1/0: %+v",
+			len(rep.Piecewise.Segments), len(rep.Piecewise.Boundaries), rep.Piecewise.Segments)
+	}
+	// The plan tiles the film even when nothing was cut: it starts at 0 and runs
+	// to the film's own length, not to the last window the grid could place. A
+	// plan that stopped at the last kept window would publish a track short of
+	// the film by the grid's trailing margin.
+	if got := rep.Piecewise.Segments[0].StartSec; got != 0 {
+		t.Fatalf("first segment starts at %v s, want 0: the report must tile the film", got)
+	}
+	if got, want := rep.Piecewise.Segments[0].EndSec, req.DurationSec; got != want {
+		t.Fatalf("last segment ends at %v s, want the film's %v s", got, want)
+	}
+	if got := rep.Piecewise.DominantOffsetMS; math.Abs(got-400) > 1e-9 {
+		t.Fatalf("dominant offset = %v, want the single offset 400", got)
+	}
+	// The verdict is the one the job would get without the feature: one offset
+	// is `ok`/`stable` and the drift is the raw spread, not a residual.
+	if rep.Verdict != VerdictOK || rep.Classification != ClassificationStable {
+		t.Fatalf("verdict/classification = %q/%q, want %q/%q: a single-offset plan is judged as before",
+			rep.Verdict, rep.Classification, VerdictOK, ClassificationStable)
+	}
+	if rep.MaxDriftMS != 0 {
+		t.Fatalf("max_drift_ms = %v, want 0: the offsets are one number", rep.MaxDriftMS)
+	}
+	if rep.ReviewReason != "" {
+		t.Fatalf("review_reason = %q, want empty: a clean single-offset film needs no human look", rep.ReviewReason)
+	}
+	// A single offset needs no re-encode: the report records the copy it will be.
+	if rep.Application == nil {
+		t.Fatal("application is nil, want the single-offset copy application")
+	}
+	if rep.Application.Mode != "copy" || rep.Application.SegmentCount != 0 || rep.Application.Segments != nil {
+		t.Fatalf("application = %+v, want a plain copy with no segments", *rep.Application)
+	}
+	if want := len(plan); len(rep.Checkpoints) != want {
+		t.Fatalf("checkpoints = %d, want the dense plan's %d", len(rep.Checkpoints), want)
+	}
+}
+
+// TestPiecewiseDisabledIgnoresAScriptedDensePlan is the other half of the off
+// switch: a caller with a piecewise policy that is off plans six checkpoints
+// even though the policy object exists.
+func TestPiecewiseDisabledIgnoresAScriptedDensePlan(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.ParallelCheckpoints = 1
+	cfg.Piecewise = DefaultPiecewisePolicy() // off, but present
+	eng := &scriptedEngine{offsets: []float64{500, 500, 500, 500, 500, 500}, qualities: fillQualities(6, 0.9)}
+	rep, err := Analyze(context.Background(), eng, cfg, request(t.TempDir()))
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+	if len(rep.Checkpoints) != len(DefaultCheckpointPositionsPct) {
+		t.Fatalf("checkpoints = %d, want the shipped %d", len(rep.Checkpoints), len(DefaultCheckpointPositionsPct))
+	}
+	if rep.Piecewise != nil {
+		t.Fatal("report.Piecewise is set for a policy that is off")
+	}
+}
+
+// TestIntegrationPiecewiseAcceptedIsOK is the acceptance-criteria end-to-end
+// case, on real audio: a 25-minute timeline the donor re-cuts by 1.5 s at
+// 675 s. With segmentation on, the job is `ok`/`piecewise`, one boundary is
+// reported where the edit is, and the drift the report states is the residual
+// the segmentation left — a few milliseconds — instead of the 1.5 s step.
+//
+// The same traffic with piecewise off is TestIntegrationPiecewiseDrift, which
+// must keep saying `drifting`: that is the whole point of the feature.
+func TestIntegrationPiecewiseAcceptedIsOK(t *testing.T) {
+	dir := t.TempDir()
+	const (
+		dur      = 1500
+		splitSec = 675
+		leadA    = 500
+		leadB    = 2000
+	)
+	n := dur * sampleRate
+	target := noiseSignal(n, 13)
+	donor := piecewiseDonor(target, leadA, leadB, splitSec*sampleRate)
+	writeWAV(t, filepath.Join(dir, "target.wav"), target)
+	writeWAV(t, filepath.Join(dir, "donor.wav"), donor)
+
+	cfg := DefaultConfig()
+	cfg.ParallelCheckpoints = 1
+	cfg.Piecewise.Enabled = true
+	cfg.Piecewise.StepSec = 45
+	cfg.Piecewise.WindowSec = 45
+	// The dense grid is planned from the timeline length, so the request must
+	// carry it: the shipped `request` helper describes a 600 s film, and a plan
+	// that stops at 585 s never samples the cut at 675 s.
+	req := request(dir)
+	req.DurationSec = dur
+	rep, err := Analyze(context.Background(), requireEngine(t), cfg, req)
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+	if rep.Piecewise == nil {
+		t.Fatal("report.Piecewise is nil: the dense plan ran and must be reported")
+	}
+	if rep.Piecewise.RejectedReason != "" {
+		t.Fatalf("rejected: %q (segments %+v, boundaries %+v)",
+			rep.Piecewise.RejectedReason, rep.Piecewise.Segments, rep.Piecewise.Boundaries)
+	}
+	if len(rep.Piecewise.Segments) != 2 || len(rep.Piecewise.Boundaries) != 1 {
+		t.Fatalf("segments/boundaries = %d/%d, want 2/1: %+v",
+			len(rep.Piecewise.Segments), len(rep.Piecewise.Boundaries), rep.Piecewise.Segments)
+	}
+	if got := math.Abs(rep.Piecewise.Boundaries[0].AtSec - splitSec); got > 45 {
+		t.Fatalf("boundary at %v s, want ~%v s (±one 45 s step)", rep.Piecewise.Boundaries[0].AtSec, splitSec)
+	}
+	if got, want := rep.Piecewise.Boundaries[0].StepMS, float64(leadB-leadA); math.Abs(got-want) > 20 {
+		t.Fatalf("boundary step = %v ms, want ~%v", got, want)
+	}
+	if rep.Verdict != VerdictOK || rep.Classification != ClassificationPiecewise {
+		t.Fatalf("verdict = %q/%q, want %q/%q", rep.Verdict, rep.Classification, VerdictOK, ClassificationPiecewise)
+	}
+	if rep.MaxDriftMS >= 40 {
+		t.Fatalf("max_drift_ms = %v, want the residual (< the 40 ms stable band), not the 1.5 s step it removed",
+			rep.MaxDriftMS)
+	}
+	// The raw timeline still shows the cut: the fit describes the evidence, the
+	// segmentation describes what the job did about it.
+	if rep.Fit == nil || rep.Fit.Shape != ShapeCut {
+		t.Fatalf("fit = %+v, want shape %q: the report must still say the timeline was cut", rep.Fit, ShapeCut)
+	}
+	if rep.Piecewise.Segments[0].OffsetMS >= rep.Piecewise.Segments[1].OffsetMS {
+		t.Fatalf("segment offsets = %v then %v, want the first half closer: the donor gains lead at the cut",
+			rep.Piecewise.Segments[0].OffsetMS, rep.Piecewise.Segments[1].OffsetMS)
+	}
+	if got, want := rep.Piecewise.StepSec, 45.0; math.Abs(got-want) > 1e-9 {
+		t.Fatalf("piecewise.step_sec = %v, want %v", got, want)
 	}
 }

@@ -418,7 +418,42 @@ func (w *Worker) processJob(ctx context.Context, id int64) error {
 	// gate must see whether the drift was actually compensated — and only the
 	// worker knows whether an encode path exists; analyze never sets
 	// TempoApplied itself.
-	if tempoEligible(report) {
+	//
+	// #84 sits first and is mutually exclusive with it by construction: a
+	// piecewise render requires an accepted segmentation, the tempo path requires
+	// a drifting verdict, and analyze never emits both for the same report. If
+	// they ever did, the cut wins and Application records only that.
+	//
+	// A *rejected* segmentation is never guessed at (D5): no cut, no tempo — a
+	// drift that came from a re-cut is not a frame-rate drift — just the dominant
+	// single offset, with report.review_reason surfaced on the failure below.
+	var segments []transcode.Segment
+	switch {
+	case piecewiseRender(report):
+		segments = toTranscodeSegments(report.Piecewise.Segments)
+		// A cut track is always an encode: the matched rule's codec when there
+		// is one, FLAC otherwise. Lossless, because the operator switched this
+		// on for timing, not to spend quality (ADR-0010's boundary).
+		if !plan.Encode() {
+			plan = transcode.Plan{RuleIndex: transcode.NoRule, Codec: transcode.CodecFLAC}
+			// The rule path's encoder check ran before Execute. This one could
+			// not: the FLAC plan did not exist until the report did.
+			if available, detail := w.transcoder.EncoderAvailable(ctx, plan.Encoder()); !available {
+				return atStage("encoder", fmt.Errorf("%w: piecewise render needs %s for audio track %d: %s",
+					ErrEncoderUnavailable, plan.Encoder(), rec.TargetTrackID, detail))
+			}
+		}
+		report.Application = &analyze.Application{
+			Mode:         "piecewise",
+			Note:         fmt.Sprintf("re-encoded (piecewise, %d segments)", len(segments)),
+			SegmentCount: len(segments),
+			Segments:     report.Piecewise.Segments,
+		}
+	case piecewiseRejected(report):
+		// Deliberately no cut and no tempo: the offset chosen below becomes the
+		// plan's dominant single offset, and the gate refuses the job so the
+		// operator sees report.review_reason (D5).
+	case tempoEligible(report):
 		report.Fit.TempoApplied = true
 		plan = plan.WithTempo(report.Fit.TempoFactor)
 		if !plan.Encode() {
@@ -444,7 +479,11 @@ func (w *Worker) processJob(ctx context.Context, id int64) error {
 		}
 	}
 	if !muxableReport(report) {
-		return atStage("verdict", fmt.Errorf("%w: verdict %q (%s)", ErrUnmuxableVerdict, report.Verdict, strings.TrimSpace(report.Reason)))
+		reason := strings.TrimSpace(report.Reason)
+		if review := strings.TrimSpace(report.ReviewReason); review != "" {
+			reason = strings.TrimSpace(reason + " — " + review)
+		}
+		return atStage("verdict", fmt.Errorf("%w: verdict %q (%s)", ErrUnmuxableVerdict, report.Verdict, reason))
 	}
 
 	// Execute persisted the report and offset; re-read for the canonical row.
@@ -471,7 +510,7 @@ func (w *Worker) processJob(ctx context.Context, id int64) error {
 		return atStage("staging", err)
 	}
 	if plan.Encode() {
-		if audio, err = w.transcodeStaged(ctx, id, audio, plan, track); err != nil {
+		if audio, err = w.transcodeStaged(ctx, id, audio, plan, segments, track); err != nil {
 			return atStage("transcode", err)
 		}
 	}
@@ -485,9 +524,26 @@ func (w *Worker) processJob(ctx context.Context, id int64) error {
 	// band). The median is only the right constant for a timeline with no
 	// trend: on a linear ramp it leaves half the drift in place. A report
 	// without a fit (a 0.4.0 row) keeps the median.
+	//
+	// #84: a piecewise render needs no shift at all, and that is a claim about
+	// the plan rather than about mkvmerge. concat stacks the runs in plan order,
+	// so the track is aligned only because analyze tiles an accepted plan from 0
+	// to the film's end: the first run really does land at time 0 and the last
+	// one on the film's last frame. transcode refuses any other shape, which is
+	// what keeps this 0 honest — with a plan that started at the first kept
+	// window, concat would still place it at 0 and the published track would be
+	// early by that much. The stored 0 plus application.mode is the signature of
+	// that mechanism. A rejected segmentation keeps the median, and uses the
+	// plan's dominant offset when analyze reported one: that is the 0.4.0
+	// fallback D5 promises.
 	offset := medianOffsetMS(report.OffsetsMS)
-	if report.Fit != nil && report.Fit.TempoApplied && report.Fit.TempoFactor > 0 {
+	switch {
+	case len(segments) > 0:
+		offset = 0
+	case report.Fit != nil && report.Fit.TempoApplied && report.Fit.TempoFactor > 0:
 		offset = int64(math.Round(report.Fit.InterceptMS / report.Fit.TempoFactor))
+	case piecewiseRejected(report):
+		offset = int64(math.Round(report.Piecewise.DominantOffsetMS))
 	}
 	rule, err := w.gateRule(ctx)
 	if err != nil {
@@ -598,10 +654,21 @@ func muxableVerdict(verdict string) bool {
 // can represent and this worker has folded the correction into the job's single
 // encode (Fit.TempoApplied). The mux then runs at intercept/TempoFactor and the
 // row says so in report.application. Everything else keeps today's behaviour:
-// a cut needs per-segment work (slice 05), an unreliable or out-of-range report
-// needs a human, and a drift whose factor the worker refused to apply must not
-// be published with half the correction missing.
+// a cut needs per-segment work, an unreliable or out-of-range report needs a
+// human, and a drift whose factor the worker refused to apply must not be
+// published with half the correction missing.
+//
+// #84 adds one refusal and no acceptance. An accepted segmentation whose cut
+// was rendered is already muxable through muxableVerdict(ok) — the classification
+// is `piecewise`, the verdict is `ok` — so nothing here needs to wave it
+// through. A *rejected* one is refused even when the verdict looks acceptable:
+// the analysis found a boundary it could not stand behind, and publishing the
+// dominant offset as if the timeline were flat is exactly the guess D5 says
+// must not happen. The operator sees review_reason instead.
 func muxableReport(report analyze.Report) bool {
+	if piecewiseRejected(report) {
+		return false
+	}
 	if muxableVerdict(report.Verdict) {
 		return true
 	}
@@ -609,6 +676,44 @@ func muxableReport(report analyze.Report) bool {
 		return false
 	}
 	return report.Fit != nil && report.Fit.Shape == analyze.ShapeDrift && report.Fit.TempoApplied
+}
+
+// piecewiseCut reports whether the report carries a segmentation the job could
+// cut on: the feature ran, nothing was rejected, and more than one run survived.
+//
+// A one-segment plan is an accepted plan and not a cut — the dense plan looked
+// and found nothing to re-cut, which is the ordinary constant-offset job, and
+// re-encoding it would cost the operator a lossless generation for no reason.
+func piecewiseCut(report analyze.Report) bool {
+	p := report.Piecewise
+	return p != nil && p.RejectedReason == "" && len(p.Segments) > 1
+}
+
+// piecewiseRejected reports whether the segmenter refused a boundary it was not
+// confident about. Such a report is never cut, never tempo-corrected and never
+// published; it falls back to the dominant single offset, for review.
+func piecewiseRejected(report analyze.Report) bool {
+	p := report.Piecewise
+	return p != nil && strings.TrimSpace(p.RejectedReason) != ""
+}
+
+// piecewiseRender is the one case this worker cuts and renders: an accepted
+// segmentation with a real boundary, on the ok verdict the segmenter produced
+// for it. Any other verdict means the report needs a human, so no encode is
+// spent on it.
+func piecewiseRender(report analyze.Report) bool {
+	return piecewiseCut(report) && strings.EqualFold(strings.TrimSpace(report.Verdict), analyze.VerdictOK)
+}
+
+// toTranscodeSegments maps the report's segments onto the encoder's: the report
+// keeps the evidence (confidence, points), the encoder needs only the window and
+// the offset that places it.
+func toTranscodeSegments(segs []analyze.Segment) []transcode.Segment {
+	out := make([]transcode.Segment, len(segs))
+	for i, s := range segs {
+		out[i] = transcode.Segment{StartSec: s.StartSec, EndSec: s.EndSec, OffsetMS: s.OffsetMS}
+	}
+	return out
 }
 
 // tempoEligible reports whether the report describes a drift this worker can
@@ -868,20 +973,29 @@ func (w *Worker) transcodePlan(ctx context.Context, rec store.SyncJobRecord) (tr
 // into this same plan (Plan.WithTempo) rather than applied as a second pass.
 // Language and title survive because mux writes them onto the appended track
 // (mux.options.track_title_in_mkv), and the encode carries the language tag.
-func (w *Worker) transcodeStaged(ctx context.Context, jobID int64, audio string, plan transcode.Plan, track store.VaultTrackRecord) (string, error) {
+//
+// segs, when non-empty, is the #84 piecewise render: the same one pass cuts,
+// pads and concatenates the segments, which is why a piecewise job's log line
+// names the segments instead of a rule the operator may not have written.
+func (w *Worker) transcodeStaged(ctx context.Context, jobID int64, audio string, plan transcode.Plan, segs []transcode.Segment, track store.VaultTrackRecord) (string, error) {
 	out := filepath.Join(w.workDir, "jobs", strconv.FormatInt(jobID, 10), "audio.transcoded.mka")
+	label := encodeLabel(plan)
+	if len(segs) > 0 {
+		label = fmt.Sprintf("piecewise, %d segments", len(segs))
+	}
 	res, err := w.transcoder.Transcode(ctx, transcode.Request{
 		Input:            audio,
 		Output:           out,
 		Plan:             plan,
+		Segments:         segs,
 		SourceChannels:   track.ChannelCount,
 		SourceDurationMS: track.DurationMS,
 		LangISO2:         track.LangISO2,
 	})
 	if err != nil {
-		return "", fmt.Errorf("syncworker: job %d transcode (%s): %w", jobID, encodeLabel(plan), err)
+		return "", fmt.Errorf("syncworker: job %d transcode (%s): %w", jobID, label, err)
 	}
-	w.logf("syncworker: job %d transcoded %s to %s (%d ch, %d bps)", jobID, encodeLabel(plan), res.Codec, res.Channels, res.BitrateBPS)
+	w.logf("syncworker: job %d transcoded %s to %s (%d ch, %d bps)", jobID, label, res.Codec, res.Channels, res.BitrateBPS)
 	return res.Path, nil
 }
 

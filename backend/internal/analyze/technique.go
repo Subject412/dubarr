@@ -63,9 +63,10 @@ func (w When) Known() bool {
 }
 
 // Strategy presets. A preset is a label on the list, never a second source of
-// truth: the server stores whichever name matches the list it was given and
-// calls anything else `custom` (see settings.PresetTechniques). The checkpoint
-// count a preset implies is a sync.defaults concern and lives there, not here.
+// truth: the server stores whichever name matches the section it was given and
+// calls anything else `custom` (see settings.Preset, which is the one place a
+// preset's contents exist). The checkpoint count a preset implies is a
+// sync.defaults concern and lives there, not here.
 const (
 	PresetFast            = "fast"
 	PresetBalanced        = "balanced"
@@ -98,9 +99,15 @@ type Technique struct {
 
 // Strategy is the whole pipeline policy: an ordered list of techniques plus the
 // name of the starting point it came from.
+//
+// Piecewise is the segmentation block (#84). It travels inside the section —
+// one stored document, one validation, one preset — rather than as a second
+// settings row, and it is omitzero so a report's strategy block is unchanged
+// byte for byte while the feature is off at the shipped numbers (D5).
 type Strategy struct {
-	Preset     string      `json:"preset"`
-	Techniques []Technique `json:"techniques"`
+	Preset     string          `json:"preset"`
+	Techniques []Technique     `json:"techniques"`
+	Piecewise  PiecewisePolicy `json:"piecewise,omitzero"`
 }
 
 // DefaultStrategy is the D4 guarantee: exactly one enabled entry, the waveform
@@ -108,6 +115,10 @@ type Strategy struct {
 // (quality 0.10) and the shipped "needs a human look" z (5.0). A change here
 // changes every offset the analyser produces, so it is a release-note event and
 // is asserted by name in TestDefaultStrategyIsOneWaveformEntry.
+//
+// Its piecewise block is the documented default at `enabled: false` (D5):
+// segmentation is an opt-in that re-encodes the operator's dub copy, so a fresh
+// install samples six points and produces 0.4.0's report.
 func DefaultStrategy() Strategy {
 	return Strategy{
 		Preset: PresetBalanced,
@@ -119,6 +130,7 @@ func DefaultStrategy() Strategy {
 			MinMatchZ:     DefaultThresholds.MatchZMaybe,
 			ZGate:         true,
 		}},
+		Piecewise: DefaultPiecewisePolicy(),
 	}
 }
 
@@ -207,7 +219,11 @@ func (s Strategy) Validate() error {
 	default:
 		return errors.New("preset must be fast, balanced, maximum_accuracy or custom")
 	}
-	return nil
+	// The piecewise block travels in this section, so its ranges are this
+	// method's too: one validation for the whole document, whichever caller
+	// (settings on save, the analyser before a job) asks. An absent block is
+	// legal and means the documented defaults.
+	return s.Piecewise.Normalised().validate()
 }
 
 // accepts reports whether one technique's answer is good enough under its own

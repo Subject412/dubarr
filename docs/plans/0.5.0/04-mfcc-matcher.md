@@ -262,7 +262,21 @@ the test.
 - `TestFramesCoverTheSliceAtTenMillisecondHops` — a 10 s slice at 8 kHz yields 998 frames (`(80000−200)/80 + 1`), each 200 samples.
 - `TestMFCCRecoversAKnownShift` — the synthetic pair delayed by 250 ms ⇒ `OffsetSamples == 2000` exactly (a whole number of hops), `OffsetSubSamples == 2000`, `PrecisionMS == 10`.
 - `TestMFCCQuantisesToTheHop` — a pair delayed by 255 ms ⇒ `OffsetSamples == 2000` (nearest hop, 10 ms), never 2040; the test asserts the answer is a multiple of the hop by construction.
-- `TestMFCCMatchZUsesTheSameScaleAsWaveform` — the clean pair yields `MatchZ > th.MatchZGood` (10) and the unrelated-noise pair `MatchZ < th.MatchZMaybe` (5), using the *same* `DefaultThresholds`.
+- `TestMFCCIsGatedByQualityNotZ` — **replaces `TestMFCCMatchZUsesTheSameScaleAsWaveform`, which was empirically false on real material** (see the ruling below): a correct committed excerpt is accepted under the *shipped* `maximum_accuracy` step, the unrelated-noise pair is refused by `MinConfidence`, and `MatchZ` is still reported as a diagnostic.
+
+### Ruling (orchestrator, after review): the σ gate is per-technique, and MFCC is not gated by it
+
+The two matchers do not produce the same `match_z` scale on real audio — measured on the committed
+excerpts, a correct MFCC answer scores 5.3–9.2 while the waveform matcher scores 21–28 on the same pair,
+because MFCC scores ~2 000 heavily overlapping hop lags against the waveform matcher's ~8·10⁴ near-independent
+samples, so the lag curve's spread is larger relative to its peak. A shared 5/10 band would therefore mark the
+only answers MFCC exists for as *not accepted* — the degraded fixture that is #83's whole point scores 5.8.
+
+So: `analyze.Technique` gains `ZGate bool` (waveform true, mfcc false). For a technique with `ZGate == false`
+acceptance is decided by `MinConfidence` alone, `MatchZ` is recorded and reported as a diagnostic, and the
+settings editor hides the σ field for that row with a tooltip saying why. The `maximum_accuracy` preset's mfcc
+step therefore carries `min_match_z: 0`. The synthetic clean pair that hits z 13 is not evidence that the scales
+match; it is a fixture that happens to agree, and it must not be cited as parity.
 - `TestMFCCSurvivesClippingAndLowPass` — the degraded fixture: `Quality >= th.LowQuality`, `|OffsetSamples·1000/rate − 250| <= 30`, and the **waveform** matcher on the same input reports `Quality < th.LowQuality`. This is #83's acceptance in one test.
 - `TestMFCCRejectsSilence` — a zero slice returns `*correlate.SilentSlice` with `Which == "target"`.
 - `TestMFCCRejectsAShortSlice` — 63 samples returns `*correlate.SliceTooShort` with `Min == correlate.MinSliceSamples`.

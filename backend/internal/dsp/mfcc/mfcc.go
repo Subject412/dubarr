@@ -37,11 +37,6 @@ const (
 
 	// FMaxHz is the top of the analysed band, clamped to Nyquist at low rates.
 	FMaxHz = 4000
-
-	// MinOverlapPt is the fraction of the shorter slice a lag must overlap to be
-	// scored: the same 1/20 rule as correlate (which also keeps its floor of 16
-	// frames, in [analyze]).
-	MinOverlapPt = 1.0 / 20
 )
 
 const (
@@ -55,15 +50,11 @@ const (
 
 	// lagCheckInterval is how often the lag scan looks at ctx, in hops.
 	lagCheckInterval = 64
-
-	// scratchFree is how many nfft-sized buffers a [Scratch] keeps: the two
-	// coefficient columns being correlated plus one spare.
-	scratchFree = 3
 )
 
 // Analysis contract, mirrored from correlate: [Analyze] returns a
 // [correlate.Analysis] whose fields mean what the waveform matcher's mean,
-// except that the offset is quantised to the hop.
+// except that the offset is quantised to the hop and that MatchZ is not a gate.
 //
 // Analyze correlates the mel-cepstral representation of two slices and returns
 // the answer in the shared shape.
@@ -76,7 +67,13 @@ const (
 //
 // MatchZ and Quality are computed exactly as the waveform matcher computes them
 // — (peak−mean)/std and (peak−median)/(1−median) over the matcher's own lag
-// curve — so the strategy pipeline's thresholds mean the same thing for both.
+// curve — but the formulas agreeing does not make the numbers comparable. This
+// matcher scores a few thousand heavily overlapping hop lags where the sample
+// correlator scores ~8·10⁴ near-independent ones, so the spread is larger
+// relative to the peak: a correct answer here scores z 5.3 where the waveform
+// scores 21-28 on the same committed pair. Quality is therefore what decides
+// this matcher's answers (analyze.Technique.ZGate is false for it) and MatchZ is
+// reported as a diagnostic.
 //
 // The errors are correlate's, value for value: *correlate.InvalidJob,
 // *correlate.SilentSlice, *correlate.SliceTooShort and *correlate.NoValidLag,
@@ -86,28 +83,7 @@ const (
 // A cancelled ctx returns an error wrapping ctx.Err() and never a partial
 // Analysis.
 func Analyze(ctx context.Context, target, donor []float32, sampleRate uint32, windowSec float64) (correlate.Analysis, error) {
-	return analyze(ctx, nil, target, donor, sampleRate, windowSec)
-}
-
-// Scratch recycles the nfft-sized complex buffers of repeated correlations of
-// one coefficient length. A job that walks six checkpoints of the same window
-// reuses them instead of allocating two fresh buffers per checkpoint.
-//
-// It is not safe for concurrent use: give each worker its own. Buffers are
-// dropped when a correlation of a different nfft asks for the pool, because a
-// shorter or longer transform cannot use them.
-type Scratch struct {
-	nfft int
-	free [][]complex64
-}
-
-// NewScratch returns an empty buffer pool.
-func NewScratch() *Scratch { return &Scratch{} }
-
-// Analyze correlates on the package-level [Analyze], using this pool's buffers
-// for the coefficient columns.
-func (s *Scratch) Analyze(ctx context.Context, target, donor []float32, sampleRate uint32, windowSec float64) (correlate.Analysis, error) {
-	return analyze(ctx, s, target, donor, sampleRate, windowSec)
+	return analyze(ctx, target, donor, sampleRate, windowSec)
 }
 
 // frames converts one slice into a [frames][Cepstra] matrix plus its per-frame
@@ -255,9 +231,10 @@ func hopSamples(sampleRate uint32) int {
 	return hop
 }
 
-// analyze runs one correlation, taking and returning its transform buffers from
-// s when s is not nil.
-func analyze(ctx context.Context, s *Scratch, target, donor []float32, sampleRate uint32, windowSec float64) (correlate.Analysis, error) {
+// analyze runs one correlation. The two transform buffers it needs are
+// allocated here: nothing outside this package analysed the same coefficient
+// length twice in a row, so a pool had no reuse site to justify it.
+func analyze(ctx context.Context, target, donor []float32, sampleRate uint32, windowSec float64) (correlate.Analysis, error) {
 	// Validation, in correlate's order and wording. The order is part of the
 	// contract: a caller with two problems gets the error the waveform matcher
 	// would have reported for the same input.
@@ -323,10 +300,8 @@ func analyze(ctx context.Context, s *Scratch, target, donor []float32, sampleRat
 	opts := fft.Options{NoFMA: true}
 	sum := make([]float64, nfft)
 
-	xb := s.take(nfft)
-	yb := s.take(nfft)
-	defer s.give(xb)
-	defer s.give(yb)
+	xb := make([]complex64, nfft)
+	yb := make([]complex64, nfft)
 
 	width := len(x[0])
 	for c := 0; c < width; c++ {
@@ -517,31 +492,4 @@ func nextPow2(n int) int {
 		p <<= 1
 	}
 	return p
-}
-
-// take returns a complex buffer of n points, from the pool when one of that
-// length is waiting. Its contents are left over from the previous use;
-// [fillCoefficient] overwrites every element it needs.
-func (s *Scratch) take(n int) []complex64 {
-	if s == nil {
-		return make([]complex64, n)
-	}
-	if s.nfft != n {
-		s.nfft, s.free = n, nil
-	}
-	if last := len(s.free) - 1; last >= 0 {
-		buf := s.free[last]
-		s.free = s.free[:last]
-		return buf
-	}
-	return make([]complex64, n)
-}
-
-// give returns a buffer to the pool. Buffers of another length, and a pool that
-// is already holding its working set, are dropped.
-func (s *Scratch) give(buf []complex64) {
-	if s == nil || len(buf) != s.nfft || len(s.free) >= scratchFree {
-		return
-	}
-	s.free = append(s.free, buf)
 }

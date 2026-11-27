@@ -19,9 +19,17 @@
 // is deliberate. The engine seam (#83's WithCorrelator) swaps one implementation
 // for the other, and `analyze` must not be able to tell them apart except by the
 // precision they report. OffsetSamples means the same thing (`t_target −
-// t_donor`), Quality is the same peak prominence over the matcher's own lag
-// curve, and MatchZ is the same (peak−mean)/std, so the threshold table in
-// `analyze` judges both answers with the same numbers.
+// t_donor`) and Quality is the same peak prominence over the matcher's own lag
+// curve.
+//
+// MatchZ has the same formula as the waveform matcher's (peak−mean)/std, but it
+// is not on the same scale and is not a gate here. This matcher scores a few
+// thousand heavily overlapping hop lags where the sample correlator scores
+// ~8·10⁴ near-independent ones, so its peak stands out by ~3x less for the same
+// correct answer (5.3 against 21-28 on committed audio). `analyze` therefore
+// judges this matcher on quality (its Technique entry carries ZGate false) and
+// records the z as a diagnostic — a shared σ band would refuse the very answers
+// MFCC exists for.
 //
 // # The precision is the hop, and that is the whole story
 //

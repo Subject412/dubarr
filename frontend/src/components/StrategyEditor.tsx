@@ -296,22 +296,62 @@ export function StrategyEditor({
               {/*
                 A switched-off step never runs, so its acceptance gates cannot
                 apply: both thresholds stay out of the card entirely until the
-                step is on. They never show by default — a correct installation
+                step is on. Even then they are only read out, never editable,
+                unless the operator opens Advanced — a correct installation
                 costs the operator no decisions (D11).
               */}
               {entry.enabled && (
                 <div className="space-y-3">
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    aria-expanded={advanced}
-                    onClick={() =>
-                      setOpenAdvanced((current) => ({ ...current, [index]: !advanced }))
-                    }
-                  >
-                    {advanced ? 'Hide advanced' : 'Advanced'}
-                  </Button>
+                  <div className="flex flex-wrap items-center gap-3">
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      aria-expanded={advanced}
+                      onClick={() =>
+                        setOpenAdvanced((current) => ({ ...current, [index]: !advanced }))
+                      }
+                    >
+                      {advanced ? 'Hide advanced' : 'Advanced'}
+                    </Button>
+                    {/*
+                      Both gates keep their help in either state: collapsed, the
+                      row reads out the values the step is judged by and each
+                      value carries its own tip; expanded, the tips move onto the
+                      inputs that edit those same values. One tip per gate, never
+                      both at once.
+                    */}
+                    {!advanced && (
+                      <div className="flex flex-wrap items-center gap-3 text-xs text-zinc-500">
+                        <span className="inline-flex items-center gap-1">
+                          <span>
+                            Confidence ≥{' '}
+                            <span className="font-medium text-zinc-300">
+                              {entry.min_confidence}
+                            </span>
+                          </span>
+                          <InfoTip
+                            id={`sync-strategy-min-confidence-${index}`}
+                            label={`Step ${step} confidence needed`}
+                            text={settingsHelp('sync.strategy', 'min_confidence') ?? ''}
+                          />
+                        </span>
+                        <span className="inline-flex items-center gap-1">
+                          <span>
+                            Peak σ ≥{' '}
+                            <span className="font-medium text-zinc-300">
+                              {entry.min_match_z}
+                            </span>
+                          </span>
+                          <InfoTip
+                            id={`sync-strategy-min-match-z-${index}`}
+                            label={`Step ${step} peak must stand out by (σ)`}
+                            text={settingsHelp('sync.strategy', 'min_match_z') ?? ''}
+                          />
+                        </span>
+                      </div>
+                    )}
+                  </div>
                   {advanced && (
                     <div className="grid gap-4 md:grid-cols-2">
                       <Field

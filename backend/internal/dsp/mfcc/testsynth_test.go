@@ -157,7 +157,9 @@ func chirp(seconds float64) []float32 {
 // 250 ms instead would answer −2000 samples.
 func synthPair() (target, donor, degraded []float32) {
 	donor = programme()
-	delay := int(math.Round(synthDelayMS / 1000 * float64(synthRate)))
+	// The constant must be made a float before dividing: 250/1000 in untyped
+	// integer arithmetic is 0, which silently builds a zero-delay pair.
+	delay := int(math.Round(float64(synthDelayMS) / 1000 * float64(synthRate)))
 	target = delaySamples(donor, delay)
 	return target, donor, degrade(donor)
 }

@@ -201,7 +201,7 @@ func main() {
 	// sign convention (offset = t_target − t_donor); a delayed donor would
 	// answer the same magnitude, negated.
 	donor := programme()
-	shift := int(math.Round(delayMS / 1000 * float64(rate)))
+	shift := int(math.Round(float64(delayMS) / 1000 * float64(rate)))
 	target := delay(donor, shift)
 	degraded := degrade(donor)
 

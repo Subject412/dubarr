@@ -348,8 +348,12 @@ func analyze(ctx context.Context, s *Scratch, target, donor []float32, sampleRat
 		}
 	}
 
-	px := prefixSquares(ex)
-	py := prefixSquares(ey)
+	// ex and ey already hold Σ_c X[n][c]², one energy per frame, so the
+	// prefix of them is a prefix of sums — squaring here a second time would
+	// weight every frame by its own energy and leave the NCC measuring the
+	// loudness contour's fourth moment instead of the coefficient agreement.
+	px := prefixSums(ex)
+	py := prefixSums(ey)
 	// The overlap rule and its floor: 5 % of the shorter slice, never fewer than
 	// 16 frames, as correlate keeps 16 samples.
 	minOverlap := max(16, min(len(x), len(y))/20)
@@ -387,7 +391,7 @@ func analyze(ctx context.Context, s *Scratch, target, donor []float32, sampleRat
 		if k < 0 {
 			index = nfft + k
 		}
-		denom := math.Sqrt(energy(px, xStart, count) * energy(py, yStart, count))
+		denom := math.Sqrt(segmentSum(px, xStart, count) * segmentSum(py, yStart, count))
 		if denom <= energyFloor {
 			continue
 		}
@@ -448,20 +452,21 @@ func fillCoefficient(buf []complex64, coeffs [][]float32, c int) {
 	clear(buf[len(coeffs):])
 }
 
-// prefixSquares returns the running sum of squares, so the energy of any
-// `[start, start+length)` range is one subtraction.
-func prefixSquares(values []float64) []float64 {
+// prefixSums returns the running sum, so the total of any
+// `[start, start+length)` range is one subtraction. Its input is a per-frame
+// energy (already a sum of squares), not the coefficients themselves.
+func prefixSums(values []float64) []float64 {
 	prefix := make([]float64, len(values)+1)
 	var acc float64
 	for i, v := range values {
-		acc += v * v
+		acc += v
 		prefix[i+1] = acc
 	}
 	return prefix
 }
 
-// energy is the sum of squares over values[start:start+length].
-func energy(prefix []float64, start, length int) float64 {
+// segmentSum is the total over values[start:start+length].
+func segmentSum(prefix []float64, start, length int) float64 {
 	return prefix[start+length] - prefix[start]
 }
 

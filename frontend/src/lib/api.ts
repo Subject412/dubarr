@@ -120,6 +120,8 @@ export type SyncDefaults = {
   preview_window_sec: number
   /** Absent in a row stored before U-DSP.8; the form falls back to 1. */
   parallel_checkpoints?: number
+  /** Absent in a row stored before U-WIN.6; the form falls back to 'full'. */
+  analysis_source?: 'windows' | 'full'
 }
 
 export type SecurityOptions = {

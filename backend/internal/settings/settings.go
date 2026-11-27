@@ -40,6 +40,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Subject412/dubarr/backend/internal/analyze"
 	"github.com/Subject412/dubarr/backend/internal/langtoken"
 	"github.com/Subject412/dubarr/backend/internal/secrets"
 	"github.com/Subject412/dubarr/backend/internal/transcode"
@@ -196,7 +197,19 @@ type SyncDefaults struct {
 	// hard bound). Absent in a row written before the key existed, which
 	// [SyncDefaults.UnmarshalJSON] resolves to [DefaultParallelCheckpoints].
 	ParallelCheckpoints int `json:"parallel_checkpoints"`
+	// AnalysisSource is where a checkpoint's engine job gets its audio from:
+	// [analyze.AnalysisSourceWindows] or [analyze.AnalysisSourceFull]. Absent
+	// in a row written before the key existed, which
+	// [SyncDefaults.UnmarshalJSON] resolves to [DefaultAnalysisSource].
+	AnalysisSource string `json:"analysis_source"`
 }
+
+// DefaultAnalysisSource is the shipped analysis mode: both tracks decoded
+// whole, i.e. exactly the behaviour every install had before the setting
+// existed. It is the only place in the backend the default is written down, so
+// flipping it (U-WIN.9) is one constant; the SPA mirrors it in
+// DEFAULTS['sync.defaults'] and its select fallback.
+const DefaultAnalysisSource = analyze.AnalysisSourceFull
 
 // DefaultParallelCheckpoints is the shipped worker count: one checkpoint at a
 // time, i.e. exactly the behaviour every install had before the setting
@@ -204,15 +217,21 @@ type SyncDefaults struct {
 const DefaultParallelCheckpoints = 1
 
 // UnmarshalJSON makes an absent parallel_checkpoints mean
-// [DefaultParallelCheckpoints]. Legacy rows written before the key existed must
-// keep analysing one checkpoint at a time; a plain decode would read them as 0
-// and fail validation. A *present* 0 is kept as 0 so validateSync rejects it:
-// treating it as "absent" would make an operator's explicit 0 silently mean 1.
+// [DefaultParallelCheckpoints] and an absent analysis_source mean
+// [DefaultAnalysisSource]. Legacy rows written before the keys existed must
+// keep analysing one checkpoint at a time and both tracks whole; a plain decode
+// would read them as 0 and "", and fail validation. A *present* 0 is kept as 0
+// so validateSync rejects it: treating it as "absent" would make an operator's
+// explicit 0 silently mean 1. A present-but-empty analysis_source is kept empty
+// for the same reason, so "" and absent stay distinguishable at the boundary
+// (validateSync accepts "" as the compiled default and normalize materialises
+// it before storing).
 func (s *SyncDefaults) UnmarshalJSON(data []byte) error {
 	type plain SyncDefaults
 	aux := struct {
 		*plain
-		ParallelCheckpoints *int `json:"parallel_checkpoints"`
+		ParallelCheckpoints *int    `json:"parallel_checkpoints"`
+		AnalysisSource      *string `json:"analysis_source"`
 	}{plain: (*plain)(s)}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
@@ -223,6 +242,11 @@ func (s *SyncDefaults) UnmarshalJSON(data []byte) error {
 		s.ParallelCheckpoints = DefaultParallelCheckpoints
 	} else {
 		s.ParallelCheckpoints = *aux.ParallelCheckpoints
+	}
+	if aux.AnalysisSource == nil {
+		s.AnalysisSource = DefaultAnalysisSource
+	} else {
+		s.AnalysisSource = *aux.AnalysisSource
 	}
 	return nil
 }
@@ -393,6 +417,7 @@ func Defaults(dataDir string) map[string]any {
 			PreviewPositionsPct:    []int{10, 25, 50, 75, 90},
 			PreviewWindowSec:       60,
 			ParallelCheckpoints:    DefaultParallelCheckpoints,
+			AnalysisSource:         DefaultAnalysisSource,
 		},
 		KeySecurityOptions: SecurityOptions{
 			AllowForceTagOverride: false,
@@ -464,9 +489,10 @@ func (s *Store) Get(ctx context.Context, key string) (json.RawMessage, bool, err
 }
 
 // serveable applies load-time defaults to a stored section before it reaches a
-// caller. It exists for languages.policy, mux.options and target.tag_filter:
-// legacy rows predate prefer_original_language / output_mode / source_mode, and
-// the UI/API/export all decode the served JSON directly, so absence has to be
+// caller. It exists for languages.policy, mux.options, sync.defaults and
+// target.tag_filter: legacy rows predate prefer_original_language /
+// output_mode / parallel_checkpoints / analysis_source / source_mode, and the
+// UI/API/export all decode the served JSON directly, so absence has to be
 // materialized as the agreed default here too.
 //
 // It also canonicalises sections that lost a field: security.options and
@@ -521,6 +547,22 @@ func serveable(key, value string) json.RawMessage {
 		var p TargetTagFilter
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return raw
+		}
+		blob, err := json.Marshal(p)
+		if err != nil {
+			return raw
+		}
+		return blob
+	case KeySyncDefaults:
+		// A row written before analysis_source (and parallel_checkpoints)
+		// existed carries neither key. Decoding into the current schema
+		// resolves them to the compiled defaults and re-marshalling serves
+		// the complete section, so the API never hands the UI a section whose
+		// missing key it would then persist back as "". The stored row is
+		// left untouched.
+		var p SyncDefaults
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return raw // a malformed legacy row keeps its raw bytes
 		}
 		blob, err := json.Marshal(p)
 		if err != nil {
@@ -786,6 +828,13 @@ func normalize(key string, raw json.RawMessage) (string, error) {
 		err = strict(raw, &p)
 		if err == nil {
 			err = validateSync(&p)
+		}
+		// "" is accepted by validateSync as "the compiled default", but it is
+		// materialised here so the stored row never carries an empty mode: a
+		// client that omits the field (or sends "") must not leave the DB with
+		// a row every reader then has to interpret.
+		if err == nil && p.AnalysisSource == "" {
+			p.AnalysisSource = DefaultAnalysisSource
 		}
 		v = p
 	case KeySecurityOptions:
@@ -1094,7 +1143,17 @@ func validateSync(p *SyncDefaults) error {
 	if p.ParallelCheckpoints < 1 || p.ParallelCheckpoints > 8 {
 		return errors.New("parallel_checkpoints must be 1..8")
 	}
-	return nil
+	// "" is the compiled default, not an error: a legacy row that reaches here
+	// without the key (absent resolves in UnmarshalJSON) or a client that sends
+	// an empty mode keeps working. Everything else must be one of the two
+	// values, and case is NOT normalised: "Windows" is a typo the operator has
+	// to fix, because silently lowercasing it would hide a broken client.
+	switch p.AnalysisSource {
+	case "", analyze.AnalysisSourceWindows, analyze.AnalysisSourceFull:
+		return nil
+	default:
+		return errors.New("analysis_source must be windows or full")
+	}
 }
 
 // maskFields walks a JSON value and replaces the value of any

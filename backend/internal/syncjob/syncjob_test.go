@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Subject412/dubarr/backend/internal/analyze"
 	"github.com/Subject412/dubarr/backend/internal/probe"
 	"github.com/Subject412/dubarr/backend/internal/reflang"
 	"github.com/Subject412/dubarr/backend/internal/settings"
@@ -469,5 +470,43 @@ func TestAnalysisPolicyParallelCheckpoints(t *testing.T) {
 	_, cfg = f.svc.analysisPolicy(ctx)
 	if cfg.ParallelCheckpoints != 5 {
 		t.Errorf("stored parallel_checkpoints = %d, want 5", cfg.ParallelCheckpoints)
+	}
+}
+
+// analysis_source must reach analyze.Config through the same block that copies
+// the windows, and every shape a row can have must resolve to a real mode: ""
+// (and an absent key) is the compiled default, never "no mode at all". The
+// switch is defence in depth for a row that skipped serveable - a direct
+// Store.Get or an imported backup - which is exactly what these inserts are.
+func TestAnalysisPolicyAnalysisSource(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+
+	if _, cfg := f.svc.analysisPolicy(ctx); cfg.AnalysisSource != settings.DefaultAnalysisSource {
+		t.Fatalf("seeded analysis_source = %q, want %q", cfg.AnalysisSource, settings.DefaultAnalysisSource)
+	}
+
+	cases := []struct {
+		name string
+		row  string
+		want string
+	}{
+		{"absent", `{}`, settings.DefaultAnalysisSource},
+		{"empty", `{"analysis_source":""}`, settings.DefaultAnalysisSource},
+		{"windows", `{"analysis_source":"windows"}`, analyze.AnalysisSourceWindows},
+		{"full", `{"analysis_source":"full"}`, analyze.AnalysisSourceFull},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := f.db.DB.ExecContext(ctx,
+				`INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`,
+				settings.KeySyncDefaults, tc.row); err != nil {
+				t.Fatalf("insert sync.defaults %s: %v", tc.row, err)
+			}
+			_, cfg := f.svc.analysisPolicy(ctx)
+			if cfg.AnalysisSource != tc.want {
+				t.Errorf("cfg.AnalysisSource = %q, want %q for row %s", cfg.AnalysisSource, tc.want, tc.row)
+			}
+		})
 	}
 }

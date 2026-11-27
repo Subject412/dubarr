@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import type {
   ArrOptions,
@@ -292,6 +292,19 @@ function NumberField({
   )
 }
 
+/**
+ * Seeds the analysis mode a `sync.defaults` row written before U-WIN.6 does not
+ * carry, and repairs an empty one. 'full' is the compiled default
+ * (settings.DefaultAnalysisSource) and changes with it in U-WIN.9, together
+ * with DEFAULTS['sync.defaults'] and the select's own fallback. Anything that
+ * is not a real mode renders as the default, so the control is never blank —
+ * the finding-4 symptom.
+ */
+function withAnalysisSource(section: SyncDefaults): SyncDefaults {
+  const mode = section.analysis_source
+  return { ...section, analysis_source: mode === 'windows' || mode === 'full' ? mode : 'full' }
+}
+
 export function SettingsPage() {
   const settings = useSettings()
   const saveSettings = useSaveSettings()
@@ -302,6 +315,21 @@ export function SettingsPage() {
   const flagWatchRestart = () => setWatchRestartNotice(true)
 
   const data = settings.data?.settings
+
+  // The analysis mode is a `sync.defaults` field, and a row stored before
+  // U-WIN.6 carries no analysis_source. The card is seeded with the compiled
+  // default (the same 'full' the select falls back to, and the same value as
+  // DEFAULTS['sync.defaults'] / settings.DefaultAnalysisSource) so the control
+  // is never blank and an untouched save sends the mode it displays instead of
+  // leaving the key out of the section. The memo keeps the object identity
+  // stable: Section re-seeds its draft whenever the value prop changes.
+  const syncDefaults = useMemo(
+    () =>
+      withAnalysisSource(
+        (data?.['sync.defaults'] as SyncDefaults | undefined) ?? DEFAULTS['sync.defaults'],
+      ),
+    [data],
+  )
 
   // The Mux output folder is a `storage.paths` setting, so its control stays in
   // the Storage card, but it only applies when the SAVED mux options write to a
@@ -613,7 +641,7 @@ export function SettingsPage() {
 
           <Section<SyncDefaults>
             sectionKey="sync.defaults"
-            value={(data['sync.defaults'] as SyncDefaults) ?? DEFAULTS['sync.defaults']}
+            value={syncDefaults}
             save={save}
           >
             {(draft, update) => (
@@ -631,6 +659,28 @@ export function SettingsPage() {
                     onChange={(checkpoint_window_sec) => update({ checkpoint_window_sec })}
                     help={settingsHelp('sync.defaults', 'checkpoint_window_sec')}
                   />
+                  {/* A row stored before U-WIN.6 has no analysis_source; the
+                      card is seeded with the compiled default, and the select
+                      falls back to it too, so a blank control (the
+                      finding-4 symptom) cannot happen. */}
+                  <Field
+                    label="Analysis source"
+                    htmlFor="sync-analysis-source"
+                    help={settingsHelp('sync.defaults', 'analysis_source')}
+                  >
+                    <Select
+                      id="sync-analysis-source"
+                      value={draft.analysis_source ?? 'full'}
+                      onChange={(event) =>
+                        update({
+                          analysis_source: event.target.value === 'windows' ? 'windows' : 'full',
+                        })
+                      }
+                    >
+                      <option value="windows">Windows</option>
+                      <option value="full">Full</option>
+                    </Select>
+                  </Field>
                   {/* A row stored before U-DSP.8 has no parallel_checkpoints
                       key, so the control falls back to the shipped default
                       instead of rendering an empty worker count. */}

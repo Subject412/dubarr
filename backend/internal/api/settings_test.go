@@ -746,3 +746,79 @@ func TestSettingsServesParallelCheckpoints(t *testing.T) {
 		t.Errorf("a rejected write changed parallel_checkpoints to %d", got)
 	}
 }
+
+// A settings row can hold bytes that are not JSON at all (issue #67):
+// serveable keeps a row it cannot decode verbatim, so the raw bytes used to
+// reach the JSON encoder and GET /api/settings answered 200 with an empty body.
+// The corrupt section must instead be absent and the rest of the payload intact.
+func TestSettingsNamesCorruptSectionInsteadOfBlankingTheBody(t *testing.T) {
+	h := newHarness(t)
+	h.setupAdmin()
+	if _, err := h.db.Exec(
+		`INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`,
+		settings.KeySecurityOptions, `{"allow_force_tag_override":`,
+	); err != nil {
+		t.Fatalf("seed corrupt security.options: %v", err)
+	}
+
+	// The section is what the operator has to repair, so the response names it.
+	// It must not be reported as absent (absence means "never configured") and
+	// it must not be served, which would hand the client an unparseable body.
+	code, body := h.do(http.MethodGet, "/api/settings", nil)
+	if code != http.StatusInternalServerError {
+		t.Fatalf("GET /api/settings = %d, want 500: %s", code, body)
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		t.Fatal("GET /api/settings returned an empty body")
+	}
+	if !json.Valid(body) {
+		t.Fatalf("GET /api/settings body is not valid JSON: %s", body)
+	}
+	if !bytes.Contains(body, []byte(settings.KeySecurityOptions)) {
+		t.Errorf("error body does not name the corrupt section %q: %s", settings.KeySecurityOptions, body)
+	}
+
+	// Serving is not repairing: the corrupt bytes are still in the row.
+	var stored string
+	if err := h.db.QueryRow(`SELECT value FROM settings WHERE key = ?`, settings.KeySecurityOptions).Scan(&stored); err != nil {
+		t.Fatalf("read stored security.options: %v", err)
+	}
+	if stored != `{"allow_force_tag_override":` {
+		t.Errorf("stored row was rewritten: %s", stored)
+	}
+}
+
+// writeJSON must never emit the intended status for a payload it cannot encode;
+// it answers 500 with a JSON error body instead of 200 with no body.
+func TestWriteJSONEncodeFailureIs500(t *testing.T) {
+	cases := map[string]any{
+		"channel": make(chan int),
+		"func":    func() {},
+	}
+	for name, value := range cases {
+		t.Run(name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			writeJSON(rec, http.StatusOK, map[string]any{"bad": value})
+
+			res := rec.Result()
+			defer res.Body.Close()
+			if res.StatusCode != http.StatusInternalServerError {
+				t.Fatalf("writeJSON = %d, want 500", res.StatusCode)
+			}
+			body, err := io.ReadAll(res.Body)
+			if err != nil {
+				t.Fatalf("read body: %v", err)
+			}
+			if !json.Valid(body) {
+				t.Fatalf("500 body is not valid JSON: %q", body)
+			}
+			var payload map[string]string
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Fatalf("decode error body: %v (%s)", err, body)
+			}
+			if payload["error"] != "could not encode response" {
+				t.Errorf("error body = %q, want the encode failure message", body)
+			}
+		})
+	}
+}

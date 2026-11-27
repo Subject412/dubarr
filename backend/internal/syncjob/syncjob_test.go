@@ -357,11 +357,26 @@ func TestExecuteEndToEnd(t *testing.T) {
 	}
 
 	f.svc.engine = sync.New()
+	// The job path must probe each analysis input exactly once, before any
+	// decode, and never per checkpoint (six checkpoints here).
+	prober := probe.New(probe.Dependencies{})
+	timingProbes := 0
+	f.svc.probeTimings = func(ctx context.Context, path string) (probe.MediaInfo, error) {
+		timingProbes++
+		info, err := prober.Probe(ctx, path)
+		if err != nil {
+			return probe.MediaInfo{}, err
+		}
+		return *info, nil
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	report, err := f.svc.Execute(ctx, job.ID)
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
+	}
+	if timingProbes != 2 {
+		t.Errorf("source timing probes = %d, want 2 (one per analysis input)", timingProbes)
 	}
 	if report.Verdict != "ok" || report.SyncMethod == "" {
 		t.Fatalf("report verdict/method = %q/%q", report.Verdict, report.SyncMethod)

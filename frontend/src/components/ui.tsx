@@ -413,7 +413,7 @@ export function StringListEditor({
   /** Long-form definition rendered in an info popover. */
   help?: string
   /** One-click special entries (e.g. reserved language tokens). */
-  presets?: StringListPreset[]
+  presets?: readonly StringListPreset[]
 }) {
   const [text, setText] = useState('')
 

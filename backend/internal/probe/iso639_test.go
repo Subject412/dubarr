@@ -128,6 +128,20 @@ func TestLanguageName(t *testing.T) {
 	}
 }
 
+// TestEveryTableEntryRoundTrips is the guarantee the settings validator leans
+// on: every spelling the table offers for a language resolves back to that
+// language's ISO 639-1 code. If a row ever gains a spelling that does not, a
+// configured "pol" would be refused instead of stored as "pl".
+func TestEveryTableEntryRoundTrips(t *testing.T) {
+	for iso1, entry := range iso639Table {
+		for _, spelling := range append([]string{iso1, entry.iso2B, entry.name}, entry.aliases...) {
+			if got := ISO639_1(spelling); got != iso1 {
+				t.Errorf("ISO639_1(%q) = %q, want %q (table row %q)", spelling, got, iso1, iso1)
+			}
+		}
+	}
+}
+
 func TestISO639TableIntegrity(t *testing.T) {
 	for iso1, entry := range iso639Table {
 		if len(iso1) != 2 {

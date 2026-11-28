@@ -45,6 +45,7 @@ import (
 	"github.com/Subject412/dubarr/backend/internal/analyze"
 	"github.com/Subject412/dubarr/backend/internal/langtoken"
 	"github.com/Subject412/dubarr/backend/internal/naming"
+	"github.com/Subject412/dubarr/backend/internal/probe"
 	"github.com/Subject412/dubarr/backend/internal/secrets"
 	"github.com/Subject412/dubarr/backend/internal/transcode"
 )
@@ -922,7 +923,24 @@ func isKnownKey(key string) bool {
 	return false
 }
 
-var iso1or3 = regexp.MustCompile(`^[a-z]{2,3}$`)
+// normaliseLanguage returns the canonical ISO 639-1 code for a configured
+// language, accepting 639-1, 639-2/B, 639-2/T and the table's names, because an
+// operator who types "pol" means pl and a bare "zzz" means nothing. Rejecting an
+// unresolvable code is the only way that typo ever surfaces: it used to pass a
+// shape check and then match no track.
+func normaliseLanguage(raw string) (string, bool) {
+	code := probe.ISO639_1(raw)
+	if code == "" {
+		return "", false
+	}
+	return code, true
+}
+
+// unknownLanguageError names the offending value and the accepted forms: a bare
+// "not a language code" leaves the operator guessing which spellings work.
+func unknownLanguageError(raw string) error {
+	return fmt.Errorf("language %q is not recognised: use a code (pl, pol) or a language name (Polish)", raw)
+}
 
 // normalize validates a section payload and returns its canonical JSON.
 func normalize(key string, raw json.RawMessage) (string, error) {
@@ -1139,26 +1157,53 @@ func validateLanguages(p *LanguagesPolicy) error {
 	if p.ExtraReferenceLanguages == nil {
 		p.ExtraReferenceLanguages = []string{}
 	}
-	for _, code := range p.TargetImportLanguages {
-		if langtoken.IsReserved(code) {
-			return fmt.Errorf("target import language %q is a reserved reference token, not a language code", code)
+
+	// Both lists are rewritten to canonical ISO 639-1 codes and de-duplicated in
+	// place: the stored value is what every consumer compares against, so a
+	// "pol" that survives a save would never match a "pl" track.
+	targets := make([]string, 0, len(p.TargetImportLanguages))
+	seenTargets := make(map[string]bool, len(p.TargetImportLanguages))
+	for _, raw := range p.TargetImportLanguages {
+		if langtoken.IsReserved(raw) {
+			return fmt.Errorf("target import language %q is a reserved reference token, not a language code", raw)
 		}
-		if !iso1or3.MatchString(code) {
-			return fmt.Errorf("language code %q must be a lowercase ISO 639-1/2 code", code)
+		code, ok := normaliseLanguage(raw)
+		if !ok {
+			return unknownLanguageError(raw)
 		}
-	}
-	for i, raw := range p.ExtraReferenceLanguages {
-		// Reserved tokens are canonicalized to lowercase and never validated as
-		// ISO codes; anything else must be a lowercase ISO 639-1/2 code.
-		if tok, ok := langtoken.Token(raw); ok {
-			p.ExtraReferenceLanguages[i] = tok
+		if seenTargets[code] {
 			continue
 		}
-		if !iso1or3.MatchString(raw) {
-			return fmt.Errorf("language code %q must be a lowercase ISO 639-1/2 code or a reserved token (%s, %s)",
-				raw, langtoken.Org, langtoken.All)
-		}
+		seenTargets[code] = true
+		targets = append(targets, code)
 	}
+	p.TargetImportLanguages = targets
+
+	refs := make([]string, 0, len(p.ExtraReferenceLanguages))
+	seenRefs := make(map[string]bool, len(p.ExtraReferenceLanguages))
+	for _, raw := range p.ExtraReferenceLanguages {
+		// Reserved tokens are canonicalized to lowercase and never validated as
+		// ISO codes; everything else is a language and is normalised.
+		if tok, ok := langtoken.Token(raw); ok {
+			if seenRefs[tok] {
+				continue
+			}
+			seenRefs[tok] = true
+			refs = append(refs, tok)
+			continue
+		}
+		code, ok := normaliseLanguage(raw)
+		if !ok {
+			return unknownLanguageError(raw)
+		}
+		if seenRefs[code] {
+			continue
+		}
+		seenRefs[code] = true
+		refs = append(refs, code)
+	}
+	p.ExtraReferenceLanguages = refs
+
 	switch p.ExportMode {
 	case "rule_based", "all":
 	default:

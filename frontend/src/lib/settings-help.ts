@@ -33,9 +33,9 @@ export const SETTINGS_HELP: Record<SettingsSectionKey, Record<string, string>> =
   },
   'languages.policy': {
     target_import_languages:
-      'Target Language codes (two-letter ISO-639-1, e.g. pl): the dub/lektor tracks the Export Policy pre-selects from a donor.',
+      'Target Languages: the dub/lektor tracks the Export Policy pre-selects from a donor. Two-letter ISO 639-1 codes (pl), three-letter 639-2 codes (pol) and language names (Polish) are all accepted and stored as the two-letter code.',
     extra_reference_languages:
-      'Reference Language candidates tried after the Original Language. Use org for the arr-reported original or all for every shared language.',
+      'Reference Language candidates tried after the Original Language. Two-letter ISO 639-1 codes (pl), three-letter 639-2 codes (pol) and language names (Polish) are all accepted and stored as the two-letter code. Use org for the arr-reported original or all for every shared language.',
     export_mode:
       'Rule based keeps the tracks the Export Policy selects; All tracks keeps every donor track, with beyond-policy tracks still needing explicit approval.',
     original_language_from_arr:

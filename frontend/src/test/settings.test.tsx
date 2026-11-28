@@ -1361,3 +1361,119 @@ describe('watch options defaults', () => {
     expect(screen.getByLabelText('Scan interval (s)')).toHaveValue(60)
   })
 })
+
+// Settings offered presets and help. Both pages now read one shared help table
+// and one shared preset list, so the wizard explains the accepted forms too.
+describe('setup wizard language help', () => {
+  const VIRGIN = { initialized: false, authenticated: false, keyring_available: true }
+  const CLAIMED = { initialized: true, authenticated: true, keyring_available: true }
+
+  /** The `settings` object of a PUT /api/settings body, or {} when unparseable. */
+  function putSettingsBody(init?: RequestInit): Record<string, unknown> {
+    if (typeof init?.body !== 'string') return {}
+    try {
+      const parsed = JSON.parse(init.body) as { settings?: Record<string, unknown> }
+      return parsed.settings ?? {}
+    } catch {
+      return {}
+    }
+  }
+
+  // The wizard PUTs /api/settings twice before the language fields exist:
+  // once for storage paths, once for the language policy. The save hook is
+  // therefore only consulted for the language payload — answering 400 to the
+  // storage save would stall the wizard on step 1 and never reach the fields
+  // under test.
+  function mockWizardFetch(
+    onSave: (settings: Record<string, unknown>) => Response = () => jsonResponse({ settings: {} }),
+  ): ReturnType<typeof vi.fn> {
+    let statusCalls = 0
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/api/auth/setup') && isMethod(init, 'POST')) {
+        return jsonResponse({ id: 1, username: 'admin', is_admin: true }, 201)
+      }
+      if (url.includes('/api/auth/status')) {
+        statusCalls += 1
+        return jsonResponse(statusCalls === 1 ? VIRGIN : CLAIMED)
+      }
+      if (url.includes('/api/auth/login') && isMethod(init, 'POST')) {
+        return jsonResponse({ id: 1, username: 'admin', is_admin: true })
+      }
+      if (url.includes('/api/settings') && isMethod(init, 'PUT')) {
+        const settings = putSettingsBody(init)
+        // Only the language-policy payload is under test; every other wizard
+        // save (storage paths) succeeds so the wizard can advance.
+        if (!('languages.policy' in settings)) return jsonResponse({ settings })
+        return onSave(settings)
+      }
+      if (url.includes('/api/settings')) return jsonResponse({ settings: {} })
+      return jsonResponse({ error: `unexpected ${url}` }, 404)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    return fetchMock
+  }
+
+  async function reachLanguagesStep() {
+    const user = userEvent.setup()
+    await user.type(screen.getByLabelText('Username'), 'admin')
+    await user.type(screen.getByLabelText('Password'), 'longenough')
+    await user.type(screen.getByLabelText('Confirm password'), 'longenough')
+    await user.click(screen.getByRole('button', { name: /create administrator/i }))
+    expect(await screen.findByRole('heading', { name: 'Storage paths' })).toBeInTheDocument()
+    await user.type(screen.getByLabelText('Watch folder'), '/media/watch')
+    await user.type(screen.getByLabelText('Audio Vault'), '/media/vault')
+    await user.click(screen.getByRole('button', { name: /save & continue/i }))
+    expect(await screen.findByRole('heading', { name: 'Languages & tags' })).toBeInTheDocument()
+    return user
+  }
+
+  it('shows the reference presets and the same help as Settings on both lists', async () => {
+    mockWizardFetch()
+    renderWithProviders(<SetupPage />, { route: '/setup' })
+    const user = await reachLanguagesStep()
+
+    // Presets: the two reserved tokens, with Settings' friendly labels.
+    expect(screen.getByRole('button', { name: 'org — original language from *arr' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'all — any shared language' })).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'About Target import languages' }))
+    expect(await screen.findByRole('tooltip')).toHaveTextContent(
+      SETTINGS_HELP['languages.policy'].target_import_languages,
+    )
+    await user.keyboard('{Escape}')
+    expect(screen.queryByRole('tooltip')).toBeNull()
+
+    await user.click(screen.getByRole('button', { name: 'About Extra reference languages' }))
+    expect(await screen.findByRole('tooltip')).toHaveTextContent(
+      SETTINGS_HELP['languages.policy'].extra_reference_languages,
+    )
+  })
+
+  it('shows the server error naming the rejected language next to the fields', async () => {
+    // The store's rejection NAMES the offending value, so the copy cannot be
+    // faked client-side; the 400 applies to the language save only.
+    const rejected: Record<string, unknown>[] = []
+    mockWizardFetch((settings) => {
+      rejected.push(settings)
+      return jsonResponse(
+        {
+          error:
+            'settings: invalid value: languages.policy: language "zzz" is not recognised: use a code (pl, pol) or a language name (Polish)',
+        },
+        400,
+      )
+    })
+    renderWithProviders(<SetupPage />, { route: '/setup' })
+    const user = await reachLanguagesStep()
+
+    await user.type(screen.getByLabelText('Add reference language'), 'zzz{Enter}')
+    await user.click(screen.getByRole('button', { name: /save & continue/i }))
+
+    // The message is the server's, not a client-side guess: it names the value.
+    expect(await screen.findByText(/language "zzz" is not recognised/)).toBeInTheDocument()
+    // And the rejection hit the language payload, never the storage-step save.
+    expect(rejected.length).toBeGreaterThan(0)
+    for (const payload of rejected) expect(payload).toHaveProperty('languages.policy')
+  })
+})

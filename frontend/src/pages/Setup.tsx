@@ -3,6 +3,8 @@ import { Link, Navigate, useNavigate } from 'react-router-dom'
 import { ApiError, api, type LanguagesPolicy, type StoragePaths, type TargetTagFilter } from '../lib/api'
 import { DEFAULT_SETTINGS } from '../lib/defaults'
 import { useAuthStatus, useSaveSettings, useSettings, useSetup } from '../lib/hooks'
+import { REFERENCE_TOKEN_PRESETS } from '../lib/language-presets'
+import { settingsHelp } from '../lib/settings-help'
 import { ArrConnectionsPanel } from '../components/ArrConnections'
 import { PathField, PathListEditor } from '../components/PathPicker'
 import { cn } from '../lib/cn'
@@ -324,6 +326,7 @@ export function SetupPage() {
                 values={languages.target_import_languages}
                 onChange={(target_import_languages) => setLanguages({ ...languages, target_import_languages })}
                 placeholder="pl"
+                help={settingsHelp('languages.policy', 'target_import_languages')}
               />
               <StringListEditor
                 label="Extra reference languages"
@@ -333,6 +336,8 @@ export function SetupPage() {
                   setLanguages({ ...languages, extra_reference_languages })
                 }
                 placeholder="en"
+                help={settingsHelp('languages.policy', 'extra_reference_languages')}
+                presets={REFERENCE_TOKEN_PRESETS}
               />
               <div className="grid gap-3 md:grid-cols-2">
                 <Toggle

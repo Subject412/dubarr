@@ -1,5 +1,5 @@
 import { Route, Routes } from 'react-router-dom'
-import { screen } from '@testing-library/react'
+import { screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 import { SetupPage } from '../pages/Setup'
@@ -72,9 +72,9 @@ async function reachFinishStep(user: ReturnType<typeof userEvent.setup>) {
   await user.click(screen.getByRole('button', { name: /save & continue/i }))
   expect(await screen.findByRole('heading', { name: 'Radarr & Sonarr' })).toBeInTheDocument()
   await user.click(screen.getByRole('button', { name: 'Skip for now' }))
-  expect(await screen.findByRole('heading', { name: 'Security' })).toBeInTheDocument()
-  await user.click(screen.getByRole('button', { name: /save & continue/i }))
+  // The *arr step is the last one before Finish: its Next lands there directly.
   expect(await screen.findByRole('heading', { name: 'Ready to go' })).toBeInTheDocument()
+  expect(screen.queryByRole('heading', { name: 'Security' })).toBeNull()
 }
 
 function mutationCalls(fetchMock: ReturnType<typeof vi.fn>) {
@@ -157,5 +157,80 @@ describe('first-run wizard escape hatch', () => {
 
     expect(screen.getByRole('button', { name: 'Open Library' })).not.toBeNull()
     expect(skipButton()).toBeNull()
+  })
+
+  it('lists five steps and never announces a Security step', () => {
+    mockFirstRun()
+    renderWizard()
+
+    const progress = screen.getByRole('list', { name: 'Setup progress' })
+    const labels = within(progress)
+      .getAllByRole('listitem')
+      .map((item) => item.lastElementChild?.textContent)
+    expect(labels).toEqual([
+      'Administrator',
+      'Storage',
+      'Languages & tags',
+      '*arr connections',
+      'Finish',
+    ])
+    expect(screen.queryByRole('heading', { name: 'Security' })).toBeNull()
+  })
+
+  it('advances from the *arr step straight to Finish', async () => {
+    const fetchMock = mockFirstRun()
+    renderWizard()
+    const user = await createAdminAndReachStorage()
+
+    await user.type(screen.getByLabelText('Watch folder'), '/media/watch')
+    await user.type(screen.getByLabelText('Audio Vault'), '/media/vault')
+    await user.click(screen.getByRole('button', { name: /save & continue/i }))
+    expect(await screen.findByRole('heading', { name: 'Languages & tags' })).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: /save & continue/i }))
+    expect(await screen.findByRole('heading', { name: 'Radarr & Sonarr' })).toBeInTheDocument()
+
+    const before = mutationCalls(fetchMock).length
+    await user.click(screen.getByRole('button', { name: 'Continue' }))
+
+    expect(await screen.findByRole('heading', { name: 'Ready to go' })).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'Security' })).toBeNull()
+    // Advancing is a pure view change: the arr step does not write the security
+    // section, so no additional mutation may appear.
+    expect(mutationCalls(fetchMock).length).toBe(before)
+  })
+
+  it('reviews the saved answers on Finish and opens the library without writing', async () => {
+    const fetchMock = mockFirstRun()
+    renderWizard()
+    const user = await createAdminAndReachStorage()
+    await reachFinishStep(user)
+
+    expect(screen.getByText('/media/watch · /media/vault')).toBeInTheDocument()
+    const before = mutationCalls(fetchMock).length
+    // POST /api/auth/setup plus the storage and languages PUTs; nothing else.
+    expect(before).toBe(3)
+
+    await user.click(screen.getByRole('button', { name: 'Open Library' }))
+
+    expect(await screen.findByText('library-page')).toBeInTheDocument()
+    expect(mutationCalls(fetchMock).length).toBe(before)
+  })
+
+  it('leaves from the *arr step without a Security step or any write', async () => {
+    const fetchMock = mockFirstRun()
+    renderWizard()
+    const user = await createAdminAndReachStorage()
+    await reachFinishStep(user)
+    // Walk back to the *arr step: Finish is the last step, so Back must land on
+    // the arr connections, not on a removed Security form.
+    await user.click(screen.getByRole('button', { name: 'Back' }))
+    expect(await screen.findByRole('heading', { name: 'Radarr & Sonarr' })).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'Security' })).toBeNull()
+
+    const before = mutationCalls(fetchMock).length
+    await user.click(screen.getByRole('button', { name: 'Set up later' }))
+
+    expect(await screen.findByText('library-page')).toBeInTheDocument()
+    expect(mutationCalls(fetchMock).length).toBe(before)
   })
 })

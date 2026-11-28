@@ -1,6 +1,6 @@
 import { useEffect, useState, type FormEvent } from 'react'
 import { Link, Navigate, useNavigate } from 'react-router-dom'
-import { ApiError, api, type LanguagesPolicy, type SecurityOptions, type StoragePaths, type TargetTagFilter } from '../lib/api'
+import { ApiError, api, type LanguagesPolicy, type StoragePaths, type TargetTagFilter } from '../lib/api'
 import { DEFAULT_SETTINGS } from '../lib/defaults'
 import { useAuthStatus, useSaveSettings, useSettings, useSetup } from '../lib/hooks'
 import { ArrConnectionsPanel } from '../components/ArrConnections'
@@ -8,7 +8,6 @@ import { PathField, PathListEditor } from '../components/PathPicker'
 import { cn } from '../lib/cn'
 import {
   Alert,
-  Badge,
   Button,
   Field,
   Input,
@@ -17,7 +16,7 @@ import {
   Toggle,
 } from '../components/ui'
 
-const STEPS = ['Administrator', 'Storage', 'Languages & tags', '*arr connections', 'Security', 'Finish'] as const
+const STEPS = ['Administrator', 'Storage', 'Languages & tags', '*arr connections', 'Finish'] as const
 
 export function SetupPage() {
   const navigate = useNavigate()
@@ -40,8 +39,6 @@ export function SetupPage() {
   const [tagFilter, setTagFilter] = useState<TargetTagFilter>(DEFAULT_SETTINGS['target.tag_filter'])
   const [languageError, setLanguageError] = useState('')
 
-  const [security, setSecurity] = useState<SecurityOptions>(DEFAULT_SETTINGS['security.options'])
-  const [stepError, setStepError] = useState('')
   const [adminCreated, setAdminCreated] = useState(false)
   const [requiresLogin, setRequiresLogin] = useState(false)
 
@@ -53,7 +50,6 @@ export function SetupPage() {
     if (data['storage.paths']) setStorage(data['storage.paths'])
     if (data['languages.policy']) setLanguages(data['languages.policy'])
     if (data['target.tag_filter']) setTagFilter(data['target.tag_filter'])
-    if (data['security.options']) setSecurity(data['security.options'])
   }, [settings.data])
   // oxlint-enable react/set-state-in-effect
 
@@ -80,7 +76,6 @@ export function SetupPage() {
   }
 
   const saveStep = async (key: string, value: object) => {
-    setStepError('')
     await saveSettings.mutateAsync({ [key]: value })
   }
 
@@ -171,16 +166,6 @@ export function SetupPage() {
       setStep(3)
     } catch (error) {
       setLanguageError(error instanceof Error ? error.message : 'Could not save language policy.')
-    }
-  }
-
-  const submitSecurity = async (event: FormEvent) => {
-    event.preventDefault()
-    try {
-      await saveStep('security.options', security)
-      setStep(5)
-    } catch (error) {
-      setStepError(error instanceof Error ? error.message : 'Could not save security options.')
     }
   }
 
@@ -441,39 +426,6 @@ export function SetupPage() {
           )}
 
           {step === 4 && (
-            <form onSubmit={(event) => void submitSecurity(event)} className="space-y-5">
-              <div>
-                <h2 className="text-lg font-semibold text-zinc-100">Security</h2>
-                <p className="text-sm text-zinc-400">Appliance-wide safety switches.</p>
-              </div>
-              {stepError && <Alert>{stepError}</Alert>}
-              <div className="flex flex-wrap items-center gap-2 rounded-lg border border-ink-800 bg-ink-950/50 px-3 py-2">
-                <span className="text-sm text-zinc-400">OS keyring</span>
-                <Badge tone={status.data?.keyring_available ? 'success' : 'warning'}>
-                  {status.data?.keyring_available ? 'available' : 'unavailable'}
-                </Badge>
-                <span className="text-xs text-zinc-500">
-                  Master-key mode is chosen at boot; this page cannot change it.
-                </span>
-              </div>
-              <Toggle
-                label="Allow force tag override"
-                description="Permit per-item bypass of the processing filter."
-                checked={security.allow_force_tag_override}
-                onChange={(allow_force_tag_override) => setSecurity({ ...security, allow_force_tag_override })}
-              />
-              <div className="flex justify-between">
-                <Button type="button" variant="ghost" onClick={() => setStep(3)}>
-                  Back
-                </Button>
-                <Button type="submit" disabled={saveSettings.isPending}>
-                  {saveSettings.isPending ? 'Saving…' : 'Save & continue'}
-                </Button>
-              </div>
-            </form>
-          )}
-
-          {step === 5 && (
             <div className="space-y-5">
               <div>
                 <h2 className="text-lg font-semibold text-zinc-100">Ready to go</h2>
@@ -501,8 +453,11 @@ export function SetupPage() {
                   </dd>
                 </div>
               </dl>
+              <p className="text-xs text-zinc-500">
+                Security is configured from Settings → Security once the appliance is running.
+              </p>
               <div className="flex justify-between">
-                <Button type="button" variant="ghost" onClick={() => setStep(4)}>
+                <Button type="button" variant="ghost" onClick={() => setStep(3)}>
                   Back
                 </Button>
                 <Button type="button" onClick={() => navigate('/library', { replace: true })}>
@@ -516,7 +471,7 @@ export function SetupPage() {
         {/* Secondary escape route. Rendered only once the administrator exists
             (step 0 is mandatory) and before the Finish step, where 'Open Library'
             is the same action. It never writes: it just leaves. */}
-        {step >= 1 && step < 5 && (
+        {step >= 1 && step < STEPS.length - 1 && (
           <div className="mt-6 flex flex-col items-center gap-2 text-center text-xs">
             <p className="text-zinc-600">
               Settings can be changed later under Settings → each section saves independently.

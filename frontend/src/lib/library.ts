@@ -74,12 +74,6 @@ export type LibraryItemsQuery = {
   offset?: number
 }
 
-export const libraryKindOptions: { value: LibraryKind | ''; label: string }[] = [
-  { value: '', label: 'All' },
-  { value: 'radarr', label: 'Radarr' },
-  { value: 'sonarr', label: 'Sonarr' },
-]
-
 export const libraryEligibilityOptions: { value: LibraryEligibility | ''; label: string }[] = [
   { value: '', label: 'All' },
   { value: 'eligible', label: 'Eligible' },
@@ -102,16 +96,6 @@ export function eligibilityTone(status: string): BadgeTone {
     default:
       return 'neutral'
   }
-}
-
-/** `S02E05` for an episode row, `Movie` otherwise. */
-export function libraryTypeLabel(item: Pick<LibraryItem, 'media_type' | 'season' | 'episode'>): string {
-  const { season, episode } = item
-  if (season != null && episode != null) {
-    const pad = (n: number) => String(n).padStart(2, '0')
-    return `S${pad(season)}E${pad(episode)}`
-  }
-  return item.media_type === 'movie' ? 'Movie' : 'Series'
 }
 
 /** Last path segment of an arr file path (either separator). */
@@ -164,14 +148,6 @@ export function healthState(instance: LibraryHealthInstance): { label: string; t
   return { label: 'Sync failed', tone: 'danger' }
 }
 
-/** Instances in the active kind scope; `''` keeps the whole list. */
-export function scopedInstances(
-  instances: LibraryHealthInstance[],
-  kind: LibraryKind | '' = '',
-): LibraryHealthInstance[] {
-  return kind === '' ? instances : instances.filter((instance) => instance.kind === kind)
-}
-
 /** First non-empty sync error, used by the `sync_failed` empty state. */
 export function firstSyncError(instances: LibraryHealthInstance[]): string {
   return instances.find((instance) => instance.last_ok === false && instance.last_error)?.last_error ?? ''
@@ -181,40 +157,32 @@ export type LibraryEmptyState = 'never_synced' | 'sync_failed' | 'empty_library'
 
 /**
  * Decides which of the four mutually exclusive empty states applies. Only
- * called once the item page is empty. A filter hit that hides existing rows is
+ * called once the list page is empty. A search that hides existing rows is
  * `filtered_nothing`; otherwise the instance sync state decides, in the order
  * never-attempted -> failed -> succeeded-empty.
  *
- * Both signals are scoped to the active `kind`: a `kind=radarr` view must not
- * claim "drop a filter" because Sonarr rows exist, nor let a healthy Sonarr
- * hide a failed Radarr. With no kind selected the whole cache/instance list is
- * in play.
+ * `cacheItems` is the count the caller's tab is about — the Movies tab passes
+ * `cache_movies`, so 12 400 Sonarr episodes cannot make an empty Radarr list
+ * look like a filter problem.
  */
 export function libraryEmptyState({
   instances,
   cacheItems,
-  kind = '',
   filtersActive,
   total,
 }: {
   instances: LibraryHealthInstance[]
   cacheItems: number
-  kind?: LibraryKind | ''
   filtersActive: boolean
   total: number
 }): LibraryEmptyState | null {
   if (total > 0) return null
 
-  const scoped = scopedInstances(instances, kind)
-  const existingItems =
-    kind === ''
-      ? cacheItems
-      : scoped.reduce((sum, instance) => sum + instance.items_seen, 0)
-  if (filtersActive && existingItems > 0) return 'filtered_nothing'
+  if (filtersActive && cacheItems > 0) return 'filtered_nothing'
 
   // Only rows that were actually attempted can say anything about the sync.
   // A never-attempted instance (`last_ok === null`) must not veto a failure.
-  const attempted = scoped.filter((instance) => instance.last_ok !== null)
+  const attempted = instances.filter((instance) => instance.last_ok !== null)
   if (attempted.length === 0) return 'never_synced'
   if (attempted.every((instance) => instance.last_ok === false)) return 'sync_failed'
   // Mixed list (some failed, some succeeded): a success proves the pipeline
@@ -222,7 +190,14 @@ export function libraryEmptyState({
   return 'empty_library'
 }
 
-/** Query string for the items endpoint; limit/offset are always explicit. */
+/**
+ * Query string for the items endpoint; limit/offset are always explicit.
+ *
+ * `/api/library/items` is the legacy flat list #56 left in place: it returns
+ * movies and episode rows alike and carries no language fields, so the Movies
+ * tab reads `/api/library/movies` instead. The route and this helper stay for
+ * the queue's type and its own tests.
+ */
 export function libraryItemsPath(query: LibraryItemsQuery = {}): string {
   const params = new URLSearchParams()
   if (query.q) params.set('q', query.q)

@@ -5,6 +5,7 @@ import { EligibilityBadge } from '../components/library/EligibilityBadge'
 import { LibraryPage } from '../pages/Library'
 import type {
   LibraryEpisodeResource,
+  LibraryMovieResource,
   LibrarySeasonResource,
   LibrarySeriesResource,
 } from '../lib/api'
@@ -27,22 +28,22 @@ function instance(overrides: Partial<LibraryHealthInstance> = {}): LibraryHealth
   }
 }
 
-function movie(overrides: Partial<LibraryItem> = {}): LibraryItem {
+function movieResource(overrides: Partial<LibraryMovieResource> = {}): LibraryMovieResource {
   return {
     id: 1,
-    media_type: 'movie',
+    arr_id: 318,
+    instance_id: 1,
+    instance: 'Radarr',
     title: 'Arrival',
     year: 2016,
-    season: null,
-    episode: null,
-    kind: 'radarr',
-    instance_id: 1,
-    instance_name: 'Radarr',
-    eligibility_status: 'eligible',
-    matches_target_tags: true,
-    root_folder_path: '/media/movies',
+    original_language: 'en',
+    audio_languages: ['en'],
+    monitored: true,
+    available: true,
+    path: '/media/movies/Arrival (2016)',
     target_file_path: '/media/movies/Arrival (2016)/Arrival.2016.mkv',
-    last_seen_at: '2026-11-25 10:00:00',
+    has_file: true,
+    eligibility: 'eligible',
     updated_at: '2026-11-25 09:30:00',
     ...overrides,
   }
@@ -107,14 +108,23 @@ type EpisodePage = {
   items: LibraryEpisodeResource[]
 }
 
+type MoviePage = {
+  page: number
+  pageSize: number
+  total: number
+  items: LibraryMovieResource[]
+}
+
 type Fixtures = {
   instances?: LibraryHealthInstance[]
   cacheItems?: number
   /** Films and shows in the health payload's header counts. */
   cacheMovies?: number
   cacheSeries?: number
-  /** The flat Films list (GET /api/library/items). */
-  movies?: LibraryItem[]
+  /** The Radarr list the Movies tab reads (GET /api/library/movies). */
+  movies?: (url: URL) => MoviePage
+  /** The legacy flat list (#56's GET /api/library/items): still served, never read by the tab. */
+  flatItems?: LibraryItem[]
   series?: (url: URL) => SeriesPage
   /** Seasons keyed by series id. */
   seasons?: Record<string, LibrarySeasonResource[]>
@@ -123,9 +133,10 @@ type Fixtures = {
 
 const SERIES_SEASONS = /^\/api\/library\/series\/(\d+)\/seasons$/
 const SEASON_EPISODES = /^\/api\/library\/series\/(\d+)\/seasons\/(\d+)\/episodes$/
+const ITEM_RESCAN = /^\/api\/library\/items\/(\d+)\/rescan$/
 
 function mockLibrary(fixtures: Fixtures) {
-  const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+  const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input), 'http://localhost')
     if (url.pathname === '/api/library/health') {
       return jsonResponse({
@@ -135,9 +146,18 @@ function mockLibrary(fixtures: Fixtures) {
         cache_series: fixtures.cacheSeries ?? 0,
       })
     }
+    // The Movies tab reads this route; `/items` below stays for the legacy
+    // flat list, so a regression that points the tab back at it fails loudly.
+    if (url.pathname === '/api/library/movies') {
+      return jsonResponse(fixtures.movies?.(url) ?? { page: 1, pageSize: 50, total: 0, items: [] })
+    }
     if (url.pathname === '/api/library/items') {
-      const items = fixtures.movies ?? []
+      const items = fixtures.flatItems ?? []
       return jsonResponse({ items, total: items.length, limit: 50, offset: 0 })
+    }
+    const rescanMatch = ITEM_RESCAN.exec(url.pathname)
+    if (rescanMatch && (init?.method ?? 'GET').toUpperCase() === 'POST') {
+      return jsonResponse({ accepted: true, reread: 'ok' }, 202)
     }
     if (url.pathname === '/api/library/series') {
       return jsonResponse(
@@ -190,17 +210,18 @@ async function openTvShows(user: ReturnType<typeof userEvent.setup>) {
 }
 
 describe('library tabs (#56)', () => {
-  it('keeps the flat Films list when switching to TV shows and back', async () => {
+  it('reads the Radarr movie list and keeps it when switching to TV shows and back', async () => {
     const user = userEvent.setup()
     mockLibrary({
       instances: [instance({ last_ok: true, items_seen: 1 })],
       cacheItems: 1,
-      movies: [movie()],
+      cacheMovies: 1,
+      movies: () => ({ page: 1, pageSize: 50, total: 1, items: [movieResource()] }),
       series: () => ({ page: 1, pageSize: 50, total: 1, items: [series()] }),
     })
     renderWithProviders(<LibraryPage />, { route: '/library' })
 
-    // The flat library is the Films tab, unchanged.
+    // The Movies tab is the Radarr list, unchanged by the tab switch.
     expect(await screen.findByRole('table', { name: 'Library titles' })).toBeInTheDocument()
     expect(screen.getByText('Arrival')).toBeInTheDocument()
     expect(screen.getByRole('tab', { name: 'Movies' })).toHaveAttribute('aria-selected', 'true')
@@ -212,6 +233,142 @@ describe('library tabs (#56)', () => {
     await user.click(screen.getByRole('tab', { name: 'Movies' }))
     expect(await screen.findByRole('table', { name: 'Library titles' })).toBeInTheDocument()
     expect(screen.getByText('Arrival')).toBeInTheDocument()
+  })
+})
+
+/**
+ * The Movies tab's own contract (#128): it reads the Radarr movie endpoint —
+ * the only list that carries languages and never a series row.
+ */
+describe('library movies tab (#128)', () => {
+  it('TestMoviesTabReadsTheMovieEndpoint', async () => {
+    const fetchMock = mockLibrary({
+      instances: [instance({ last_ok: true, items_seen: 1 })],
+      cacheMovies: 1,
+      movies: () => ({ page: 1, pageSize: 50, total: 1, items: [movieResource()] }),
+    })
+    renderWithProviders(<LibraryPage />, { route: '/library' })
+
+    expect(await screen.findByText('Arrival')).toBeInTheDocument()
+
+    const reads = callsTo(fetchMock, '/api/library/movies')
+    expect(reads).toHaveLength(1)
+    expect(reads[0].searchParams.get('page')).toBe('1')
+    expect(reads[0].searchParams.get('pageSize')).toBe('50')
+    // The flat route also returns episode rows, which is why the tab left it.
+    expect(callsTo(fetchMock, '/api/library/items')).toHaveLength(0)
+  })
+
+  it('TestMoviesTabHasNoKindFilter', async () => {
+    mockLibrary({
+      instances: [instance({ last_ok: true, items_seen: 1 })],
+      cacheMovies: 1,
+      movies: () => ({ page: 1, pageSize: 50, total: 1, items: [movieResource()] }),
+    })
+    renderWithProviders(<LibraryPage />, { route: '/library' })
+
+    await screen.findByRole('table', { name: 'Library titles' })
+    // The tab is the filter; a Kind control could only offer the other tab.
+    expect(screen.queryByLabelText('Kind')).toBeNull()
+    expect(document.querySelector('#library-kind')).toBeNull()
+  })
+
+  it('TestMoviesTabRendersOnlyMovies', async () => {
+    mockLibrary({
+      instances: [instance({ last_ok: true, items_seen: 2 })],
+      cacheMovies: 2,
+      movies: () => ({
+        page: 1,
+        pageSize: 50,
+        total: 2,
+        items: [
+          movieResource(),
+          movieResource({
+            id: 2,
+            title: 'Dune',
+            year: 2021,
+            target_file_path: '/media/movies/Dune (2021)/Dune.2021.mkv',
+          }),
+        ],
+      }),
+    })
+    renderWithProviders(<LibraryPage />, { route: '/library' })
+
+    const table = await screen.findByRole('table', { name: 'Library titles' })
+    // One header row plus one row per movie — no episode rows can appear.
+    expect(within(table).getAllByRole('row')).toHaveLength(3)
+    expect(within(table).getByText('Arrival')).toBeInTheDocument()
+    expect(within(table).getByText('Dune')).toBeInTheDocument()
+    // No Type column: a movie list cannot contain a series or an episode.
+    expect(within(table).queryByRole('columnheader', { name: 'Type' })).toBeNull()
+    expect(within(table).queryByText('Movie')).toBeNull()
+    expect(within(table).queryByText('S02E05')).toBeNull()
+  })
+
+  it('TestMoviesTabShowsLanguages', async () => {
+    mockLibrary({
+      instances: [instance({ last_ok: true, items_seen: 2 })],
+      cacheMovies: 2,
+      movies: () => ({
+        page: 1,
+        pageSize: 50,
+        total: 2,
+        items: [
+          movieResource({
+            id: 1,
+            title: 'Spirited Away',
+            original_language: 'ja',
+            audio_languages: ['ja', 'en'],
+          }),
+          movieResource({
+            id: 2,
+            title: 'Unreported Language',
+            original_language: '',
+            audio_languages: [],
+          }),
+        ],
+      }),
+    })
+    renderWithProviders(<LibraryPage />, { route: '/library' })
+
+    const japanese = (await screen.findByText('Spirited Away')).closest('tr') as HTMLElement
+    expect(within(japanese).getByText('ja')).toBeInTheDocument()
+    expect(within(japanese).getByText('ja, en')).toBeInTheDocument()
+
+    const unknown = screen.getByText('Unreported Language').closest('tr') as HTMLElement
+    // Both language cells say "not reported" rather than inventing a code.
+    expect(within(unknown).getAllByText('—')).toHaveLength(2)
+  })
+
+  it('TestMoviesTabRescanUsesTheCacheID', async () => {
+    const user = userEvent.setup()
+    const fetchMock = mockLibrary({
+      instances: [instance({ last_ok: true, items_seen: 1 })],
+      cacheMovies: 1,
+      movies: () => ({
+        page: 1,
+        pageSize: 50,
+        total: 1,
+        items: [movieResource({ id: 41, title: 'Dune' })],
+      }),
+    })
+    renderWithProviders(<LibraryPage />, { route: '/library' })
+
+    const row = (await screen.findByText('Dune')).closest('tr') as HTMLElement
+    await user.click(within(row).getByRole('button', { name: 'Rescan' }))
+
+    await waitFor(() =>
+      expect(callsTo(fetchMock, '/api/library/items/41/rescan')).toHaveLength(1),
+    )
+    const posts = (
+      fetchMock.mock.calls as unknown as Array<[RequestInfo | URL, RequestInit | undefined]>
+    ).filter(
+      ([input, init]) =>
+        new URL(String(input), 'http://localhost').pathname === '/api/library/items/41/rescan' &&
+        (init?.method ?? 'GET').toUpperCase() === 'POST',
+    )
+    // 41 is arr_library_cache.id, the id the rescan route takes — not Radarr's movieId.
+    expect(posts).toHaveLength(1)
   })
 })
 

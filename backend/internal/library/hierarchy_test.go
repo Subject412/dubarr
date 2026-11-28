@@ -109,6 +109,84 @@ func decodeError(t *testing.T, body []byte) (string, string) {
 	return payload.Error, payload.Code
 }
 
+// movieLanguagesItem is the subset of the movie resource this test reads.
+type movieLanguagesItem struct {
+	ID               int64    `json:"id"`
+	OriginalLanguage string   `json:"original_language"`
+	AudioLanguages   []string `json:"audio_languages"`
+	Monitored        bool     `json:"monitored"`
+	Available        bool     `json:"available"`
+}
+
+// TestMovieResourceSerialisesLanguages pins the wire shape of U02's fields: a
+// movie with an original language and two audio codes ships them, and a movie
+// with none ships an empty array rather than null.
+func TestMovieResourceSerialisesLanguages(t *testing.T) {
+	h := newHarness(t)
+	radarr := h.insertInstance(t, "Radarr", "radarr", true)
+	withLanguages := h.insertHierarchyMovie(t, radarr, 21, "Spirited Away", "千と千尋の神隠し", 2001)
+	without := h.insertHierarchyMovie(t, radarr, 22, "Minions", "", 2015)
+	for id, language := range map[int64]string{withLanguages: "ja", without: ""} {
+		var original any
+		audio := "[]"
+		if language != "" {
+			original = language
+			audio = `["ja","en"]`
+		}
+		if _, err := h.db.DB.ExecContext(context.Background(),
+			`UPDATE arr_library_cache
+			    SET original_language_iso2 = ?, audio_languages_json = ?, monitored = 1
+			  WHERE id = ?`, original, audio, id); err != nil {
+			t.Fatalf("set languages of row %d: %v", id, err)
+		}
+	}
+
+	rec := h.get("/api/library/movies")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/library/movies = %d, body %s", rec.Code, rec.Body.String())
+	}
+	var page struct {
+		Items []movieLanguagesItem `json:"items"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &page); err != nil {
+		t.Fatalf("decode movies page %s: %v", rec.Body.String(), err)
+	}
+	byID := map[int64]movieLanguagesItem{}
+	for _, item := range page.Items {
+		byID[item.ID] = item
+	}
+	got := byID[withLanguages]
+	if got.OriginalLanguage != "ja" {
+		t.Errorf("original_language = %q, want ja", got.OriginalLanguage)
+	}
+	if len(got.AudioLanguages) != 2 || got.AudioLanguages[0] != "ja" || got.AudioLanguages[1] != "en" {
+		t.Errorf("audio_languages = %v, want [ja en]", got.AudioLanguages)
+	}
+	if !got.Monitored || !got.Available {
+		t.Errorf("monitored/available = %v/%v, want both true", got.Monitored, got.Available)
+	}
+
+	// A movie with no languages must serialise [] — never null.
+	rec = h.get("/api/library/movies?q=minions")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET movies?q=minions = %d, body %s", rec.Code, rec.Body.String())
+	}
+	top := decodeObject(t, rec.Body.Bytes())
+	var items []map[string]json.RawMessage
+	if err := json.Unmarshal(top["items"], &items); err != nil {
+		t.Fatalf("decode minions items: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("minions items = %d, want 1", len(items))
+	}
+	if got := string(items[0]["audio_languages"]); got != "[]" {
+		t.Errorf("audio_languages = %s, want [] (never null)", got)
+	}
+	if got := string(items[0]["original_language"]); got != `""` {
+		t.Errorf("original_language = %s, want an empty string", got)
+	}
+}
+
 // TestMoviesRouteValidatesPaging pins the documented 400 codes: a page or page
 // size below 1, a non-numeric value, and an unknown sort/dir.
 // rawJSON re-encodes a decoded resource map so a test can decode it into a
@@ -206,9 +284,9 @@ func TestMoviesRouteReturnsPagedResource(t *testing.T) {
 		t.Fatalf("items = %d, want 1", len(items))
 	}
 	assertKeys(t, "movie resource", items[0], []string{
-		"arr_id", "eligibility", "has_file", "id", "instance", "instance_id",
-		"original_title", "path", "size_on_disk", "target_file_path", "title",
-		"updated_at", "video_codec", "year",
+		"arr_id", "audio_languages", "available", "eligibility", "has_file", "id", "instance",
+		"instance_id", "monitored", "original_language", "original_title", "path", "size_on_disk",
+		"target_file_path", "title", "updated_at", "video_codec", "year",
 	})
 
 	var movie struct {
@@ -274,8 +352,9 @@ func TestSeriesRouteReturnsNestedStatistics(t *testing.T) {
 		t.Fatalf("series items = %d, want 1", len(seriesItems))
 	}
 	assertKeys(t, "series resource", seriesItems[0], []string{
-		"eligibility", "episode_count", "episode_file_count", "id", "instance",
-		"instance_id", "path", "season_count", "title", "updated_at", "year",
+		"available", "eligibility", "episode_count", "episode_file_count", "id", "instance",
+		"instance_id", "monitored", "original_language", "path", "season_count", "title",
+		"updated_at", "year",
 	})
 
 	var series struct {
@@ -315,8 +394,9 @@ func TestSeriesRouteReturnsNestedStatistics(t *testing.T) {
 		t.Fatalf("GET /api/library/series/7 = %d, body %s", headerRec.Code, headerRec.Body.String())
 	}
 	assertKeys(t, "series header", decodeObject(t, headerRec.Body.Bytes()), []string{
-		"eligibility", "episode_count", "episode_file_count", "id", "instance",
-		"instance_id", "path", "season_count", "title", "updated_at", "year",
+		"available", "eligibility", "episode_count", "episode_file_count", "id", "instance",
+		"instance_id", "monitored", "original_language", "path", "season_count", "title",
+		"updated_at", "year",
 	})
 
 	// Seasons route: {items: SeasonResource[]} with nested statistics.

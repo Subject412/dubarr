@@ -58,6 +58,14 @@ type LibraryCacheItem struct {
 	SeasonNumber         *int
 	EpisodeNumber        *int
 	EpisodeTitle         string
+	// AudioLanguages are the ISO 639-1 codes of the target file's audio
+	// tracks, in stream order as arr reported them. Empty when arr has no
+	// file or named no language Dubarr can resolve; never a raw language
+	// name, because the column is documented as ISO-2.
+	AudioLanguages []string
+	// Monitored is arr's monitored flag for the item (for an episode row:
+	// for its series, which is the level Sonarr's library list shows).
+	Monitored bool
 	// MediaFolderPath is the arr folder (movie.path / series.path).
 	MediaFolderPath string
 	// RootFolderPath is the canonical arr root folder containing
@@ -446,7 +454,8 @@ const libraryCacheRowColumns = `SELECT id, media_type, external_item_id, COALESC
 	        COALESCE(episode_title, ''), COALESCE(media_folder_path, ''),
 	        COALESCE(target_file_path, ''), matches_target_tags, eligibility_status,
 	        COALESCE(arr_tag_ids_json, '[]'), COALESCE(arr_tag_labels_json, '[]'),
-	        COALESCE(root_folder_path, '')
+	        COALESCE(root_folder_path, ''), COALESCE(audio_languages_json, '[]'),
+	        COALESCE(monitored, 0)
 	 FROM arr_library_cache`
 
 // rowScanner is what *sql.Rows and *sql.Row both implement.
@@ -464,17 +473,23 @@ func scanLibraryCacheRow(row rowScanner) (libraryCacheRow, error) {
 		external int64
 		idsJSON  string
 		lblJSON  string
+		langJSON string
 	)
 	if err := row.Scan(&out.ID, &media, &external, &out.SeriesID, &out.TMDBID, &out.TVDBID,
 		&out.Title, &out.OriginalTitle, &out.OriginalLanguageISO2, &out.Year,
 		&season, &episode, &out.EpisodeTitle, &out.MediaFolderPath, &out.TargetFilePath,
 		&out.MatchesTargetTags, &out.EligibilityStatus, &idsJSON, &lblJSON,
-		&out.RootFolderPath); err != nil {
+		&out.RootFolderPath, &langJSON, &out.Monitored); err != nil {
 		return libraryCacheRow{}, fmt.Errorf("store: scan library cache row: %w", err)
 	}
 	if err := decodeArrTagSnapshot(idsJSON, lblJSON, &out.LibraryCacheItem); err != nil {
 		return libraryCacheRow{}, err
 	}
+	langs, err := decodeAudioLanguages(langJSON)
+	if err != nil {
+		return libraryCacheRow{}, err
+	}
+	out.AudioLanguages = langs
 	out.MediaType = media
 	out.ExternalItemID = external
 	if season.Valid {
@@ -505,7 +520,7 @@ func scanLibraryCacheRow(row rowScanner) (libraryCacheRow, error) {
 // The conflict target covers the key columns, which are never rewritten; every
 // other synced column plus updated_at/last_seen_at is overwritten exactly like
 // updateLibraryCacheRow does. Columns the sync does not own (imdb_id,
-// audio_languages_json, video_codec, raw_metadata_json) keep their values.
+// video_codec, raw_metadata_json) keep their values.
 func insertLibraryCacheRow(ctx context.Context, tx *sql.Tx, instanceID int64, item LibraryCacheItem, now string) error {
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO arr_library_cache
@@ -513,8 +528,8 @@ func insertLibraryCacheRow(ctx context.Context, tx *sql.Tx, instanceID int64, it
 		  title, original_title, original_language_iso2, year, season_number, episode_number,
 		  episode_title, media_folder_path, root_folder_path, target_file_path,
 		  arr_tag_ids_json, arr_tag_labels_json, matches_target_tags,
-		  eligibility_status, updated_at, last_seen_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		  eligibility_status, audio_languages_json, monitored, updated_at, last_seen_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(arr_instance_id, media_type, external_item_id) DO UPDATE SET
 		     series_id = excluded.series_id,
 		     tmdb_id = excluded.tmdb_id,
@@ -533,6 +548,8 @@ func insertLibraryCacheRow(ctx context.Context, tx *sql.Tx, instanceID int64, it
 		     arr_tag_labels_json = excluded.arr_tag_labels_json,
 		     matches_target_tags = excluded.matches_target_tags,
 		     eligibility_status = excluded.eligibility_status,
+		     audio_languages_json = excluded.audio_languages_json,
+		     monitored = excluded.monitored,
 		     updated_at = excluded.updated_at,
 		     last_seen_at = excluded.last_seen_at`,
 		instanceID, item.MediaType, item.ExternalItemID, nullInt(item.SeriesID),
@@ -542,7 +559,8 @@ func insertLibraryCacheRow(ctx context.Context, tx *sql.Tx, instanceID int64, it
 		nullStr(item.EpisodeTitle), nullStr(item.MediaFolderPath), nullStr(item.RootFolderPath),
 		nullStr(item.TargetFilePath), encodeArrTagIDs(item.ArrTagIDs),
 		encodeArrTagLabels(item.ArrTagLabels),
-		item.MatchesTargetTags, item.EligibilityStatus, now, now); err != nil {
+		item.MatchesTargetTags, item.EligibilityStatus,
+		encodeAudioLanguages(item.AudioLanguages), item.Monitored, now, now); err != nil {
 		return fmt.Errorf("store: insert library row %s %d: %w", item.MediaType, item.ExternalItemID, err)
 	}
 	return nil
@@ -563,7 +581,8 @@ func updateLibraryCacheRow(ctx context.Context, tx *sql.Tx, instanceID, id int64
 		     original_language_iso2 = ?, year = ?, season_number = ?, episode_number = ?,
 		     episode_title = ?, media_folder_path = ?, root_folder_path = ?, target_file_path = ?,
 		     arr_tag_ids_json = ?, arr_tag_labels_json = ?,
-		     matches_target_tags = ?, eligibility_status = ?, updated_at = ?, last_seen_at = ?
+		     matches_target_tags = ?, eligibility_status = ?,
+		     audio_languages_json = ?, monitored = ?, updated_at = ?, last_seen_at = ?
 		 WHERE id = ?`,
 		nullInt(item.SeriesID), nullInt(item.TMDBID), nullInt(item.TVDBID), item.Title,
 		nullStr(item.OriginalTitle), nullStr(item.OriginalLanguageISO2), nullInt(int64(item.Year)),
@@ -571,7 +590,8 @@ func updateLibraryCacheRow(ctx context.Context, tx *sql.Tx, instanceID, id int64
 		nullStr(item.EpisodeTitle), nullStr(item.MediaFolderPath), nullStr(item.RootFolderPath),
 		nullStr(item.TargetFilePath), encodeArrTagIDs(item.ArrTagIDs),
 		encodeArrTagLabels(item.ArrTagLabels),
-		item.MatchesTargetTags, item.EligibilityStatus, now, now, id)
+		item.MatchesTargetTags, item.EligibilityStatus,
+		encodeAudioLanguages(item.AudioLanguages), item.Monitored, now, now, id)
 	if err != nil {
 		return fmt.Errorf("store: update library row %d: %w", id, err)
 	}
@@ -710,8 +730,44 @@ func decodeArrTagSnapshot(idsJSON, labelsJSON string, out *LibraryCacheItem) err
 	return nil
 }
 
-// libraryItemEqual compares every synced field. updated_at, audio_languages_json
-// and video_codec are deliberately not compared: the sync does not own them.
+// encodeAudioLanguages renders the audio-language codes as JSON for
+// audio_languages_json. The column is NOT NULL DEFAULT '[]' and the API
+// promises an array, never null, so an empty set is written as "[]" — which is
+// also what "the file has no language Dubarr can resolve" honestly looks like.
+func encodeAudioLanguages(codes []string) string {
+	if len(codes) == 0 {
+		return "[]"
+	}
+	b, err := json.Marshal(codes)
+	if err != nil {
+		// Marshalling a []string cannot fail; the empty array is the safe
+		// fallback if a future type change ever makes it possible.
+		return "[]"
+	}
+	return string(b)
+}
+
+// decodeAudioLanguages reads audio_languages_json back into a non-nil slice, so
+// every read path hands the API an array and never a nil slice (which would
+// marshal as null). Legacy rows carry '[]' from the column default; malformed
+// JSON is reported rather than silently reported as "no languages".
+func decodeAudioLanguages(raw string) ([]string, error) {
+	out := []string{}
+	if raw == "" {
+		return out, nil
+	}
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil, fmt.Errorf("store: decode audio languages %q: %w", raw, err)
+	}
+	if out == nil {
+		out = []string{}
+	}
+	return out, nil
+}
+
+// libraryItemEqual compares every synced field. updated_at, imdb_id,
+// video_codec and raw_metadata_json are deliberately not compared: the sync does
+// not own them.
 func libraryItemEqual(row libraryCacheRow, item LibraryCacheItem) bool {
 	return row.MediaType == item.MediaType &&
 		row.ExternalItemID == item.ExternalItemID &&
@@ -725,6 +781,8 @@ func libraryItemEqual(row libraryCacheRow, item LibraryCacheItem) bool {
 		intPtrEqual(row.SeasonNumber, item.SeasonNumber) &&
 		intPtrEqual(row.EpisodeNumber, item.EpisodeNumber) &&
 		row.EpisodeTitle == item.EpisodeTitle &&
+		slices.Equal(row.AudioLanguages, item.AudioLanguages) &&
+		row.Monitored == item.Monitored &&
 		row.MediaFolderPath == item.MediaFolderPath &&
 		row.RootFolderPath == item.RootFolderPath &&
 		slices.Equal(row.ArrTagIDs, item.ArrTagIDs) &&

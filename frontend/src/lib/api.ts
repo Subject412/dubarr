@@ -447,6 +447,14 @@ export type LibraryMovieResource = {
   title: string
   original_title?: string
   year?: number
+  /** The movie's original language, as the arr reports it (ISO 639-1 code). */
+  original_language?: string
+  /** The file's audio languages, arr-reported, in stream order. Never null. */
+  audio_languages?: string[]
+  /** arr's monitored flag. */
+  monitored?: boolean
+  /** True when the mirror holds a target path for the movie. */
+  available?: boolean
   /** The movie folder. */
   path?: string
   target_file_path?: string
@@ -465,6 +473,17 @@ export type LibrarySeriesResource = {
   instance?: string
   title: string
   year?: number
+  /** The series' own language, as Sonarr reports it (ISO 639-1 code). */
+  original_language?: string
+  /** arr's monitored flag for the series. */
+  monitored?: boolean
+  /**
+   * True when at least one episode of the series has a file in the mirror.
+   * No `audio_languages` is served on this resource: audio tracks belong to one
+   * file, and a series row aggregates its episodes, so the server omits the
+   * field rather than invent one for the whole show.
+   */
+  available?: boolean
   path?: string
   season_count?: number
   episode_count?: number

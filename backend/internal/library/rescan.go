@@ -240,8 +240,10 @@ func (s *Service) rereadMovie(ctx context.Context, client *arr.RadarrClient, ite
 		return err
 	}
 	target := ""
+	languages := []string{}
 	if movie.HasFile && movie.MovieFile != nil {
 		target = movie.MovieFile.Path
+		languages = movie.MovieFile.MediaInfo.AudioLanguageCodes()
 	}
 	tagIDs, tagLabels := resolveArrTags(movie.Tags, labels)
 	root := rootFolderFor(movie.Path, roots)
@@ -258,6 +260,8 @@ func (s *Service) rereadMovie(ctx context.Context, client *arr.RadarrClient, ite
 		OriginalTitle:        movie.OriginalTitle,
 		OriginalLanguageISO2: probe.ISO639_1(movie.OriginalLanguage.Name),
 		Year:                 movie.Year,
+		AudioLanguages:       languages,
+		Monitored:            movie.Monitored,
 		MediaFolderPath:      movie.Path,
 		RootFolderPath:       root,
 		ArrTagIDs:            tagIDs,
@@ -296,8 +300,10 @@ func (s *Service) rereadEpisode(ctx context.Context, client *arr.SonarrClient, i
 		return err
 	}
 	target := ""
+	languages := []string{}
 	if episode.HasFile && episode.EpisodeFile != nil {
 		target = episode.EpisodeFile.Path
+		languages = episode.EpisodeFile.MediaInfo.AudioLanguageCodes()
 	}
 	tagIDs, tagLabels := resolveArrTags(show.Tags, labels)
 	root := rootFolderFor(show.Path, roots)
@@ -316,16 +322,21 @@ func (s *Service) rereadEpisode(ctx context.Context, client *arr.SonarrClient, i
 		OriginalTitle:        show.OriginalTitle,
 		OriginalLanguageISO2: probe.ISO639_1(show.OriginalLanguage.Name),
 		Year:                 show.Year,
-		SeasonNumber:         &season,
-		EpisodeNumber:        &number,
-		EpisodeTitle:         episode.Title,
-		MediaFolderPath:      show.Path,
-		RootFolderPath:       root,
-		ArrTagIDs:            tagIDs,
-		ArrTagLabels:         tagLabels,
-		TargetFilePath:       target,
-		MatchesTargetTags:    matches,
-		EligibilityStatus:    status,
+		AudioLanguages:       languages,
+		// The series' monitored flag, like the poller writes on every
+		// episode row: the aggregate must not depend on which episode the
+		// operator rescanned.
+		Monitored:         show.Monitored,
+		SeasonNumber:      &season,
+		EpisodeNumber:     &number,
+		EpisodeTitle:      episode.Title,
+		MediaFolderPath:   show.Path,
+		RootFolderPath:    root,
+		ArrTagIDs:         tagIDs,
+		ArrTagLabels:      tagLabels,
+		TargetFilePath:    target,
+		MatchesTargetTags: matches,
+		EligibilityStatus: status,
 	})
 }
 

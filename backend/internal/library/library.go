@@ -158,13 +158,22 @@ var (
 // Radarr's resource where they overlap and the legacy item shape where it
 // already had a name, so the UI's types do not fork.
 type movieResource struct {
-	ID             int64  `json:"id"`
-	ArrID          int64  `json:"arr_id"`
-	InstanceID     int64  `json:"instance_id"`
-	Instance       string `json:"instance"`
-	Title          string `json:"title"`
-	OriginalTitle  string `json:"original_title"`
-	Year           int    `json:"year"`
+	ID            int64  `json:"id"`
+	ArrID         int64  `json:"arr_id"`
+	InstanceID    int64  `json:"instance_id"`
+	Instance      string `json:"instance"`
+	Title         string `json:"title"`
+	OriginalTitle string `json:"original_title"`
+	Year          int    `json:"year"`
+	// OriginalLanguage is the movie's language as an ISO 639-1 code;
+	// AudioLanguages are the codes of the file's audio tracks in arr's
+	// order. Both are never null: an absent value ships as "" / [].
+	OriginalLanguage string   `json:"original_language"`
+	AudioLanguages   []string `json:"audio_languages"`
+	// Monitored is arr's monitored flag; Available means the mirror holds a
+	// target path for the movie (the same fact has_file reports).
+	Monitored      bool   `json:"monitored"`
+	Available      bool   `json:"available"`
 	Path           string `json:"path"`
 	TargetFilePath string `json:"target_file_path"`
 	HasFile        bool   `json:"has_file"`
@@ -174,13 +183,19 @@ type movieResource struct {
 	UpdatedAt      string `json:"updated_at"`
 }
 
-// seriesResource is one aggregated Sonarr series.
+// seriesResource is one aggregated Sonarr series. AudioLanguages are absent on
+// purpose: they are per file, and a series row must not invent one.
 type seriesResource struct {
 	ID               int64  `json:"id"`
 	InstanceID       int64  `json:"instance_id"`
 	Instance         string `json:"instance"`
 	Title            string `json:"title"`
 	Year             int    `json:"year"`
+	OriginalLanguage string `json:"original_language"`
+	// Monitored is arr's monitored flag for the series; Available means at
+	// least one episode of it has a file in the mirror.
+	Monitored        bool   `json:"monitored"`
+	Available        bool   `json:"available"`
 	Path             string `json:"path"`
 	SeasonCount      int    `json:"season_count"`
 	EpisodeCount     int    `json:"episode_count"`
@@ -267,20 +282,24 @@ func (s *Service) handleMovies(w http.ResponseWriter, r *http.Request) {
 	items := make([]movieResource, 0, len(rows))
 	for _, row := range rows {
 		items = append(items, movieResource{
-			ID:             row.ID,
-			ArrID:          row.ExternalItemID,
-			InstanceID:     row.ArrInstanceID,
-			Instance:       row.InstanceName,
-			Title:          row.Title,
-			OriginalTitle:  row.OriginalTitle,
-			Year:           row.Year,
-			Path:           row.MediaFolderPath,
-			TargetFilePath: row.TargetFilePath,
-			HasFile:        row.HasFile,
-			SizeOnDisk:     row.SizeOnDisk,
-			Eligibility:    row.Eligibility,
-			VideoCodec:     row.VideoCodec,
-			UpdatedAt:      row.UpdatedAt,
+			ID:               row.ID,
+			ArrID:            row.ExternalItemID,
+			InstanceID:       row.ArrInstanceID,
+			Instance:         row.InstanceName,
+			Title:            row.Title,
+			OriginalTitle:    row.OriginalTitle,
+			Year:             row.Year,
+			OriginalLanguage: row.OriginalLanguageISO2,
+			AudioLanguages:   nonNilLanguages(row.AudioLanguages),
+			Monitored:        row.Monitored,
+			Available:        row.Available,
+			Path:             row.MediaFolderPath,
+			TargetFilePath:   row.TargetFilePath,
+			HasFile:          row.HasFile,
+			SizeOnDisk:       row.SizeOnDisk,
+			Eligibility:      row.Eligibility,
+			VideoCodec:       row.VideoCodec,
+			UpdatedAt:        row.UpdatedAt,
 		})
 	}
 	writeJSON(w, http.StatusOK, moviesResponse{
@@ -530,6 +549,9 @@ func seriesResourceOf(row store.SeriesRow) seriesResource {
 		Instance:         row.InstanceName,
 		Title:            row.Title,
 		Year:             row.Year,
+		OriginalLanguage: row.OriginalLanguageISO2,
+		Monitored:        row.Monitored,
+		Available:        row.Available,
 		Path:             row.MediaFolderPath,
 		SeasonCount:      row.SeasonCount,
 		EpisodeCount:     row.EpisodeCount,
@@ -537,6 +559,16 @@ func seriesResourceOf(row store.SeriesRow) seriesResource {
 		Eligibility:      row.Eligibility,
 		UpdatedAt:        row.UpdatedAt,
 	}
+}
+
+// nonNilLanguages guarantees the wire shape of a language list: the API
+// promises an array, and a nil slice would marshal as null (which the UI would
+// have to special-case).
+func nonNilLanguages(codes []string) []string {
+	if codes == nil {
+		return []string{}
+	}
+	return codes
 }
 
 // writeHierarchyError maps a query-parse failure onto the documented 400 code.

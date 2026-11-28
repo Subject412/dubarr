@@ -411,7 +411,8 @@ func readCache(t *testing.T, st *store.Store) map[string]cacheRow {
 		        COALESCE(media_folder_path,''), COALESCE(target_file_path,''),
 		        matches_target_tags, eligibility_status,
 		        COALESCE(arr_tag_ids_json,'[]'), COALESCE(arr_tag_labels_json,'[]'),
-		        COALESCE(root_folder_path,'')
+		        COALESCE(root_folder_path,''), COALESCE(audio_languages_json,'[]'),
+		        COALESCE(monitored,0)
 		 FROM arr_library_cache`)
 	if err != nil {
 		t.Fatalf("query cache: %v", err)
@@ -421,19 +422,20 @@ func readCache(t *testing.T, st *store.Store) map[string]cacheRow {
 	out := map[string]cacheRow{}
 	for rows.Next() {
 		var (
-			row     cacheRow
-			season  *int64
-			episode *int64
-			media   string
-			ext     int64
-			idsJSON string
-			lblJSON string
+			row      cacheRow
+			season   *int64
+			episode  *int64
+			media    string
+			ext      int64
+			idsJSON  string
+			lblJSON  string
+			langJSON string
 		)
 		if err := rows.Scan(&row.ID, &row.InstanceID, &media, &ext, &row.SeriesID,
 			&row.TMDBID, &row.TVDBID, &row.Title, &row.OriginalLanguageISO2, &row.Year,
 			&season, &episode, &row.EpisodeTitle, &row.MediaFolderPath, &row.TargetFilePath,
 			&row.MatchesTargetTags, &row.EligibilityStatus, &idsJSON, &lblJSON,
-			&row.RootFolderPath); err != nil {
+			&row.RootFolderPath, &langJSON, &row.Monitored); err != nil {
 			t.Fatalf("scan cache row: %v", err)
 		}
 		if err := json.Unmarshal([]byte(idsJSON), &row.ArrTagIDs); err != nil {
@@ -441,6 +443,9 @@ func readCache(t *testing.T, st *store.Store) map[string]cacheRow {
 		}
 		if err := json.Unmarshal([]byte(lblJSON), &row.ArrTagLabels); err != nil {
 			t.Fatalf("decode arr tag labels %q: %v", lblJSON, err)
+		}
+		if err := json.Unmarshal([]byte(langJSON), &row.AudioLanguages); err != nil {
+			t.Fatalf("decode audio languages %q: %v", langJSON, err)
 		}
 		if season != nil {
 			v := int(*season)
@@ -481,6 +486,10 @@ type cacheRow struct {
 	ArrTagIDs            []int64
 	ArrTagLabels         []string
 	RootFolderPath       string
+	// AudioLanguages is the decoded audio_languages_json; Monitored the
+	// arr-reported flag.
+	AudioLanguages []string
+	Monitored      bool
 }
 
 func cacheIDs(t *testing.T, st *store.Store) map[string]int64 {

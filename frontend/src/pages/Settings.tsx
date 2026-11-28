@@ -28,7 +28,12 @@ import {
   settingsSectionKeyFromId,
   type SettingsSectionKey,
 } from '../lib/settings-sections'
-import type { PresetPress } from '../lib/strategy'
+import {
+  PRESET_LABELS,
+  PRESET_NAMES,
+  PRESET_POSITIONS_PCT,
+  type PresetPress,
+} from '../lib/strategy'
 import { ArrConnectionsSection } from '../components/ArrConnections'
 import { PathField, PathListEditor } from '../components/PathPicker'
 import { StrategyEditor } from '../components/StrategyEditor'
@@ -42,7 +47,6 @@ import {
   Card,
   Field,
   Input,
-  ListEditor,
   PageHeader,
   Select,
   Spinner,
@@ -352,6 +356,83 @@ function NumberField({
 function withAnalysisSource(section: SyncDefaults): SyncDefaults {
   const mode = section.analysis_source
   return { ...section, analysis_source: mode === 'windows' || mode === 'full' ? mode : 'windows' }
+}
+
+/**
+ * The stored checkpoint positions, read back (U09, D-CKPT shape B).
+ *
+ * Both percent lists used to be free-text editors here. A typed list could
+ * silently disagree with the starting point shown in Matching techniques — the
+ * card's draft stayed dirty across a preset press, so the label and the list
+ * drifted apart and the next save wrote the typed list back over the preset.
+ * The preset is now the only way to move the list, and this card reads it out:
+ * how many checkpoints, where they sit, whether they are the list a preset
+ * writes, and — for a stored list that matches no preset — exactly that, rather
+ * than an empty card or a control the operator cannot reconcile.
+ *
+ * `preview_positions_pct` is deliberately not shown: nothing reads it, and the
+ * removal leaves it stored and unchanged.
+ */
+function CheckpointPositionsSummary({ positions }: { positions: number[] }) {
+  const preset = PRESET_NAMES.find((name) => {
+    const candidate = PRESET_POSITIONS_PCT[name]
+    return (
+      candidate !== undefined &&
+      candidate.length === positions.length &&
+      candidate.every((value, index) => value === positions[index])
+    )
+  })
+  const pointWord = positions.length === 1 ? 'checkpoint' : 'checkpoints'
+  // Only Fast and Balanced write the positions — PRESET_POSITIONS_PCT has no
+  // entry for Maximum accuracy, whose press changes the method list alone. The
+  // note offers exactly those two, and says what the third does instead: naming
+  // Maximum accuracy as a way to set the list sent the operator to a press that
+  // left it where it was. This is the same split the strategy card's own note
+  // draws, so the two cards never disagree.
+  const presetsPath = 'press Fast or Balanced in Matching techniques to set them'
+  const maximumAccuracyNote =
+    'Maximum accuracy leaves them alone — it only changes the methods'
+
+  if (positions.length === 0) {
+    return (
+      <div
+        data-testid="checkpoint-positions"
+        className="rounded-lg border border-ink-700 bg-ink-800/50 px-3 py-2 text-sm text-zinc-400"
+      >
+        <p role="note" data-testid="checkpoint-positions-custom">
+          No checkpoint positions are stored — {presetsPath}; a press there writes the
+          positions in one go with the methods. {maximumAccuracyNote}.
+        </p>
+      </div>
+    )
+  }
+
+  return (
+    <div
+      data-testid="checkpoint-positions"
+      className="space-y-1 rounded-lg border border-ink-700 bg-ink-800/50 px-3 py-2 text-sm"
+    >
+      <p className="text-zinc-200">
+        <span data-testid="checkpoint-positions-count" className="font-medium">
+          {positions.length}
+        </span>{' '}
+        {pointWord} measured at{' '}
+        <span data-testid="checkpoint-positions-value">{positions.join(', ')} %</span>
+        {preset ? ` — the ${PRESET_LABELS[preset]} positions.` : ' — a stored list.'}
+      </p>
+      {!preset && (
+        <p role="note" data-testid="checkpoint-positions-custom" className="text-zinc-400">
+          This list matches no preset, so the starting point in Matching techniques does not
+          describe it. Checkpoints are measured along the film at fixed percentages and a
+          starting point sets them — {presetsPath}. {maximumAccuracyNote}.
+        </p>
+      )}
+      <p className="text-xs text-zinc-500">
+        Checkpoints are measured along the film at fixed percentages — six for Balanced, three
+        for Fast. The preset sets them; they are no longer edited here.
+      </p>
+    </div>
+  )
 }
 
 export function SettingsPage() {
@@ -811,18 +892,10 @@ export function SettingsPage() {
                     help={settingsHelp('sync.defaults', 'preview_window_sec')}
                   />
                 </div>
-                <ListEditor
-                  label="Checkpoint positions (%)"
-                  values={draft.checkpoint_positions_pct ?? []}
-                  onChange={(checkpoint_positions_pct) => update({ checkpoint_positions_pct })}
-                  help={settingsHelp('sync.defaults', 'checkpoint_positions_pct')}
-                />
-                <ListEditor
-                  label="Preview positions (%)"
-                  values={draft.preview_positions_pct ?? []}
-                  onChange={(preview_positions_pct) => update({ preview_positions_pct })}
-                  help={settingsHelp('sync.defaults', 'preview_positions_pct')}
-                />
+                {/* U09 (D-CKPT, shape B): the two percent lists are read back,
+                    never edited. The stored values and their defaults are
+                    untouched — a preset is the only way to move them. */}
+                <CheckpointPositionsSummary positions={draft.checkpoint_positions_pct ?? []} />
               </>
             )}
           </Section>

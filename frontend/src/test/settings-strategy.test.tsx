@@ -3,6 +3,7 @@ import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 import { DEFAULT_SETTINGS } from '../lib/defaults'
 import { settingsSectionId, type SettingsSectionKey } from '../lib/settings-sections'
+import { PRESET_LABELS, PRESET_NAMES, PRESET_POSITIONS_PCT } from '../lib/strategy'
 import { SettingsPage } from '../pages/Settings'
 import { isMethod, jsonResponse, renderWithProviders } from '../test/helpers'
 
@@ -239,8 +240,13 @@ describe('matching techniques settings (#82)', () => {
     // D4a: Fast measures fewer checkpoints with the same waveform matcher.
     expect(within(strategyCard()).getByLabelText('Step 1 method')).toHaveValue('waveform')
     expect(within(strategyCard()).getByTestId('strategy-preset')).toHaveTextContent('Fast')
-    const positions = within(syncCard()).getByLabelText('Checkpoint positions (%)')
-    await waitFor(() => expect(positions).toHaveValue('15, 50, 85'))
+    // U09: the positions are read back, never edited — the card shows what the
+    // press staged, before it is saved.
+    await waitFor(() =>
+      expect(within(syncCard()).getByTestId('checkpoint-positions-value')).toHaveTextContent(
+        '15, 50, 85',
+      ),
+    )
 
     await user.click(screen.getByLabelText('Save Matching techniques'))
     await user.click(screen.getByLabelText('Save Sync defaults'))
@@ -268,7 +274,7 @@ describe('matching techniques settings (#82)', () => {
 
     await user.click(within(strategyCard()).getByRole('button', { name: 'Balanced (default)' }))
     await waitFor(() =>
-      expect(within(syncCard()).getByLabelText('Checkpoint positions (%)')).toHaveValue(
+      expect(within(syncCard()).getByTestId('checkpoint-positions-value')).toHaveTextContent(
         '10, 25, 40, 55, 70, 85',
       ),
     )
@@ -379,7 +385,7 @@ describe('matching techniques settings (#82)', () => {
     expect(within(strategyCard()).getByTestId('strategy-preset')).toHaveTextContent(/^Custom$/)
     expect(within(strategyCard()).queryByTestId('strategy-preset-pending')).toBeNull()
     await waitFor(() =>
-      expect(within(syncCard()).getByLabelText('Checkpoint positions (%)')).toHaveValue(
+      expect(within(syncCard()).getByTestId('checkpoint-positions-value')).toHaveTextContent(
         '10, 25, 40, 55, 70, 85',
       ),
     )
@@ -626,5 +632,201 @@ describe('piecewise settings (#84)', () => {
     )
     expect(strategy.preset).toBe('maximum_accuracy')
     expect(strategy.piecewise).toEqual(PIECEWISE_DEFAULTS)
+  })
+})
+
+/**
+ * The presets whose press writes `sync.defaults.checkpoint_positions_pct`, and
+ * the ones whose press leaves it alone, derived from `PRESET_POSITIONS_PCT`
+ * rather than restated: adding a preset there without updating the read-only
+ * card's note — or offering a preset that writes nothing — fails these tests
+ * instead of silently making the note lie.
+ */
+const SETS_CHECKPOINT_POSITIONS = PRESET_NAMES.filter(
+  (name) => PRESET_POSITIONS_PCT[name] !== undefined,
+)
+const LEAVES_CHECKPOINT_POSITIONS = PRESET_NAMES.filter(
+  (name) => PRESET_POSITIONS_PCT[name] === undefined,
+)
+
+/**
+ * The half of the card's note that offers a control — "press … in Matching
+ * techniques to set them" — separated from the half that says what a preset
+ * leaving the list alone does. Only the first half may name a preset as a way
+ * to set the positions; the second half is where Maximum accuracy is explained.
+ */
+function presetPathClause(note: HTMLElement): string {
+  const text = note.textContent ?? ''
+  const match = text.match(/press (.*?) in Matching techniques to set them/)
+  expect(match).not.toBeNull()
+  if (match === null) throw new Error(`the note offers no preset press: "${text}"`)
+  return match[1]
+}
+
+/**
+ * The copy is the defect this pins: the note under the read-only summary used
+ * to send the operator to "Fast, Balanced or Maximum accuracy", and a Maximum
+ * accuracy press does not move the list (`applyPreset` stages positions only
+ * for a preset `PRESET_POSITIONS_PCT` has). Both notes — the stored-list one and
+ * the empty one — must name exactly the presets that set the positions.
+ */
+describe('the checkpoint note names only the presets that set the positions (U09)', () => {
+  it('TestANonPresetListNoteOffersOnlyThePresetsThatSetThePositions', async () => {
+    mockFetch({ positions: [5, 20, 65, 92] })
+    await openPage()
+
+    const note = within(syncCard()).getByTestId('checkpoint-positions-custom')
+    const clause = presetPathClause(note)
+
+    for (const name of SETS_CHECKPOINT_POSITIONS) {
+      expect(clause).toContain(PRESET_LABELS[name])
+    }
+    for (const name of LEAVES_CHECKPOINT_POSITIONS) {
+      expect(clause).not.toContain(PRESET_LABELS[name])
+    }
+
+    // And each preset that leaves them is described as leaving them, rather
+    // than left out with nothing said about it.
+    for (const name of LEAVES_CHECKPOINT_POSITIONS) {
+      expect(note).toHaveTextContent(`${PRESET_LABELS[name]} leaves them alone`)
+    }
+  })
+
+  it('TestTheEmptyListNoteOffersOnlyThePresetsThatSetThePositions', async () => {
+    mockFetch({ positions: [] })
+    await openPage()
+
+    const note = within(syncCard()).getByTestId('checkpoint-positions-custom')
+    const clause = presetPathClause(note)
+
+    for (const name of SETS_CHECKPOINT_POSITIONS) {
+      expect(clause).toContain(PRESET_LABELS[name])
+    }
+    for (const name of LEAVES_CHECKPOINT_POSITIONS) {
+      expect(clause).not.toContain(PRESET_LABELS[name])
+    }
+  })
+})
+
+/**
+ * U09, D-CKPT shape B: the two percent lists stop being operator inputs.
+ *
+ * The wedge this removes: a typed list left `sync.defaults` dirty, so the card
+ * kept the typed value across a preset press while the server already held the
+ * preset's — the label said one thing and the list said another, and the next
+ * save wrote the typed list back over the preset. The stored values and their
+ * defaults are unchanged (a preset is still the only way to move checkpoints),
+ * `preview_positions_pct` is left exactly as stored, and a stored list that
+ * matches no preset is described rather than hidden.
+ */
+describe('checkpoint positions are set by presets, not typed (U09)', () => {
+  it('TestCheckpointPercentListsAreNotOperatorInputs', async () => {
+    mockFetch()
+    await openPage()
+
+    const card = syncCard()
+    // Neither list is a form control any more, and neither label exists.
+    expect(within(card).queryByLabelText('Checkpoint positions (%)')).toBeNull()
+    expect(within(card).queryByLabelText('Preview positions (%)')).toBeNull()
+    // No add/delete affordance of the removed list editor is left behind.
+    expect(within(card).queryByRole('button', { name: /add|remove|delete/i })).toBeNull()
+
+    const summary = within(card).getByTestId('checkpoint-positions')
+    expect(summary.querySelectorAll('input, textarea, select')).toHaveLength(0)
+
+    // What is left is a read-out: the six shipped points, named as the Balanced
+    // ones, and the line pointing the operator at the presets.
+    expect(within(summary).getByTestId('checkpoint-positions-count')).toHaveTextContent('6')
+    expect(within(summary).getByTestId('checkpoint-positions-value')).toHaveTextContent(
+      '10, 25, 40, 55, 70, 85',
+    )
+    expect(summary).toHaveTextContent(/the Balanced positions/)
+    expect(summary).toHaveTextContent(/no longer edited here/i)
+    // A list a preset writes is not announced as a custom one.
+    expect(within(summary).queryByTestId('checkpoint-positions-custom')).toBeNull()
+  })
+
+  it('TestANonPresetStoredListIsDescribedInsteadOfBlank', async () => {
+    const user = userEvent.setup()
+    const stored = [5, 20, 65, 92]
+    const fetchMock = mockFetch({ positions: stored })
+    await openPage()
+
+    const summary = within(syncCard()).getByTestId('checkpoint-positions')
+    // The card reads the stored list back — never a blank.
+    expect(within(summary).getByTestId('checkpoint-positions-count')).toHaveTextContent('4')
+    expect(within(summary).getByTestId('checkpoint-positions-value')).toHaveTextContent(
+      '5, 20, 65, 92',
+    )
+
+    // Described honestly: it matches no preset, and where to change it.
+    const note = within(summary).getByTestId('checkpoint-positions-custom')
+    expect(note).toHaveTextContent(/matches no preset/i)
+    expect(note).toHaveTextContent(/Matching techniques/i)
+
+    // And it is still what gets saved: removal neither zeroes nor defaults it.
+    await user.click(screen.getByLabelText('Save Sync defaults'))
+    await waitFor(() => expect(putPayloads(fetchMock)).toHaveLength(1))
+    const defaults = savedSection<{ checkpoint_positions_pct: number[] }>(
+      fetchMock,
+      'sync.defaults',
+    )
+    expect(defaults.checkpoint_positions_pct).toEqual(stored)
+  })
+
+  it('TestPresetStillSetsTheCheckpointPositions', async () => {
+    const user = userEvent.setup()
+    const fetchMock = mockFetch()
+    await openPage()
+
+    await user.click(within(strategyCard()).getByRole('button', { name: 'Fast' }))
+    await waitFor(() =>
+      expect(within(syncCard()).getByTestId('checkpoint-positions-value')).toHaveTextContent(
+        '15, 50, 85',
+      ),
+    )
+    await user.click(screen.getByLabelText('Save Matching techniques'))
+    await waitFor(() => expect(putPayloads(fetchMock)).toHaveLength(1))
+    expect(
+      savedSection<{ checkpoint_positions_pct: number[] }>(fetchMock, 'sync.defaults')
+        .checkpoint_positions_pct,
+    ).toEqual(FAST_POSITIONS)
+
+    await user.click(within(strategyCard()).getByRole('button', { name: 'Balanced (default)' }))
+    await waitFor(() =>
+      expect(within(syncCard()).getByTestId('checkpoint-positions-value')).toHaveTextContent(
+        '10, 25, 40, 55, 70, 85',
+      ),
+    )
+    await user.click(screen.getByLabelText('Save Matching techniques'))
+    await waitFor(() => expect(putPayloads(fetchMock)).toHaveLength(2))
+    expect(
+      (
+        putPayloads(fetchMock)[1]['sync.defaults'] as { checkpoint_positions_pct: number[] }
+      ).checkpoint_positions_pct,
+    ).toEqual(BALANCED_POSITIONS)
+  })
+
+  it('TestTheRemovedFieldsStillRoundTrip', async () => {
+    const user = userEvent.setup()
+    const stored = [5, 20, 65, 92]
+    const fetchMock = mockFetch({ positions: stored })
+    await openPage()
+
+    // An edit that has nothing to do with the checkpoint positions.
+    await user.selectOptions(within(syncCard()).getByLabelText('Analysis source'), 'full')
+    await user.click(screen.getByLabelText('Save Sync defaults'))
+    await waitFor(() => expect(putPayloads(fetchMock)).toHaveLength(1))
+
+    const defaults = savedSection<{
+      analysis_source: string
+      checkpoint_positions_pct: number[]
+      preview_positions_pct: number[]
+    }>(fetchMock, 'sync.defaults')
+    expect(defaults.analysis_source).toBe('full')
+    // Removing the editors does not zero the lists: the stored values travel
+    // back untouched, and the dead preview list is left exactly as it was.
+    expect(defaults.checkpoint_positions_pct).toEqual(stored)
+    expect(defaults.preview_positions_pct).toEqual([10, 25, 50, 75, 90])
   })
 })

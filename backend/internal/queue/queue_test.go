@@ -174,8 +174,24 @@ func (h *harness) applyGate(t *testing.T, id int64, targetPath string, res gate.
 		TargetPath:  targetPath,
 		MatchedTags: res.Matched,
 		MissingTags: res.Missing,
+		Reason:      res.Reason,
 	}); err != nil {
 		t.Fatalf("SetImportCandidateGate: %v", err)
+	}
+}
+
+// writeTagFilterRow writes target.tag_filter straight into the settings table,
+// bypassing save validation. A pattern the regex engine refuses can only reach
+// the store as a hand-written/legacy row now — saving one is refused (#155) —
+// and that row is exactly what a queue card has to explain, so a test that needs
+// one writes it the way it can still exist.
+func (h *harness) writeTagFilterRow(t *testing.T, section string) {
+	t.Helper()
+	if _, err := h.db.Exec(
+		`INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+		settings.KeyTargetTagFilter, section, "2026-01-01 00:00:00"); err != nil {
+		t.Fatalf("write target.tag_filter row: %v", err)
 	}
 }
 
@@ -265,6 +281,122 @@ func TestListQueueShowsWaitingForTags(t *testing.T) {
 	}
 	if len(body.Items) != 1 || body.Items[0].Eligibility != "waiting_for_tags" {
 		t.Fatalf("items = %+v", body.Items)
+	}
+}
+
+// TestQueueExposesGateReason pins #155 end to end for the API: a target the
+// gate classified as waiting on a pattern that does not compile carries the
+// reason on its row, next to the missing tags, so the card can say why the
+// wait cannot end. The status is unchanged — the target still waits.
+func TestQueueExposesGateReason(t *testing.T) {
+	h := newHarness(t)
+	const targetName = "Shrek (2001) [ArcA310].mkv"
+	id := h.seedCandidate(t, targetName, "waiting_for_tags", `["en"]`)
+
+	targetPath := filepath.Join(h.media, targetName)
+	// A pattern the engine refuses can only be in the store as a hand-written or
+	// legacy row: saving one is refused now (#155). The card still has to explain
+	// that row, so it is written the way it can exist — and the listing must keep
+	// reporting it, because re-proving a still-broken pattern changes nothing.
+	h.writeTagFilterRow(t, `{"required_filename_tags":["\\d+\\1"],"tag_match_mode":"REGEX","enforce_tag_filter":true}`)
+	rule := gate.Rule{Required: []string{`\d+\1`}, Mode: gate.MatchRegex, Enforce: true}
+	res := rule.Classify(targetPath)
+	if res.Status != gate.StatusWaitingForTags || res.Reason == "" {
+		t.Fatalf("classification = %+v, want waiting_for_tags carrying a reason", res)
+	}
+	h.applyGate(t, id, targetPath, res)
+
+	rec := h.request(http.MethodGet, "/api/queue")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/queue = %d, body %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Items []struct {
+			Eligibility string   `json:"eligibility"`
+			MissingTags []string `json:"missing_tags"`
+			GateReason  string   `json:"gate_reason"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(body.Items) != 1 {
+		t.Fatalf("items = %+v", body.Items)
+	}
+	item := body.Items[0]
+	if item.Eligibility != "waiting_for_tags" {
+		t.Errorf("eligibility = %q, want waiting_for_tags", item.Eligibility)
+	}
+	if !strings.Contains(item.GateReason, "filename tag pattern") {
+		t.Errorf("gate_reason = %q, want it to name the pattern", item.GateReason)
+	}
+	if len(item.MissingTags) != 1 || item.MissingTags[0] != `\d+\1` {
+		t.Errorf("missing_tags = %v, want the offending pattern", item.MissingTags)
+	}
+}
+
+// TestQueueReclassifiesAStaleGateReason pins #155's other half: the gate verdict
+// and its reason are written once, at discovery, and nothing reclassified an
+// existing row — so an operator who fixed the pattern kept reading "Cannot
+// become eligible" for a target that is fine now. Listing the queue re-proves
+// the verdict with the rule as it stands, so the reason is gone and the status
+// is the fixed pattern's verdict, not the typo's.
+func TestQueueReclassifiesAStaleGateReason(t *testing.T) {
+	h := newHarness(t)
+	const targetName = "Shrek (2001) [ArcA310].mkv"
+	id := h.seedCandidate(t, targetName, "waiting_for_tags", `["en"]`)
+	targetPath := filepath.Join(h.media, targetName)
+
+	// What discovery stored: the configured pattern did not compile, so the row
+	// waits with a reason no tag can answer.
+	broken := gate.Rule{Required: []string{`\d+\1`}, Mode: gate.MatchRegex, Enforce: true}
+	stale := broken.Classify(targetPath)
+	if stale.Status != gate.StatusWaitingForTags || stale.Reason == "" {
+		t.Fatalf("stale classification = %+v, want waiting_for_tags carrying a reason", stale)
+	}
+	h.applyGate(t, id, targetPath, stale)
+
+	// The operator fixes the typo and saves: the section now carries a pattern
+	// that compiles and matches the target's tag, which the settings form
+	// accepts. The stored row is not touched by the save.
+	raw, err := json.Marshal(settings.TargetTagFilter{
+		RequiredFilenameTags: []string{`\[ArcA310\]`},
+		TagMatchMode:         "REGEX",
+		EnforceTagFilter:     true,
+	})
+	if err != nil {
+		t.Fatalf("marshal target.tag_filter: %v", err)
+	}
+	if err := h.settings.Set(context.Background(), settings.KeyTargetTagFilter, raw); err != nil {
+		t.Fatalf("save target.tag_filter: %v", err)
+	}
+
+	rec := h.request(http.MethodGet, "/api/queue")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/queue = %d, body %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Items []struct {
+			Eligibility string   `json:"eligibility"`
+			MissingTags []string `json:"missing_tags"`
+			GateReason  string   `json:"gate_reason"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(body.Items) != 1 {
+		t.Fatalf("items = %+v", body.Items)
+	}
+	item := body.Items[0]
+	if item.GateReason != "" {
+		t.Errorf("gate_reason = %q, want it gone after the pattern was fixed", item.GateReason)
+	}
+	if item.Eligibility != "eligible" {
+		t.Errorf("eligibility = %q, want eligible: the target carries the tag", item.Eligibility)
+	}
+	if len(item.MissingTags) != 0 {
+		t.Errorf("missing_tags = %v, want none: the pattern that produced them is fixed", item.MissingTags)
 	}
 }
 

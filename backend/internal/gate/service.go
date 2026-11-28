@@ -101,6 +101,7 @@ func (s *Service) ClassifyCandidate(ctx context.Context, sourcePath, targetPath 
 		TargetPath:  res.TargetPath,
 		MatchedTags: res.Matched,
 		MissingTags: res.Missing,
+		Reason:      res.Reason,
 		CheckedAt:   time.Now().UTC(),
 	}); err != nil {
 		return Result{}, err

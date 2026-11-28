@@ -20,6 +20,6 @@ export function tagListHint(mode: TargetTagFilter['tag_match_mode']): {
   if (mode !== 'REGEX') return { placeholder: '[TAG]', note: '' }
   return {
     placeholder: TAG_FILTER_REGEX_EXAMPLE,
-    note: "Each entry is a regular expression in Go's RE2 syntax, matched against the filename (not its folder). Two PCRE features do not compile here: no backreferences (\\1) and no lookaround ((?=…), (?<=…)). Case sensitivity follows the case-sensitive switch.",
+    note: "Each entry is a regular expression in Go's RE2 syntax, matched against the filename (not its folder). Two PCRE features do not compile here: no backreferences (\\1) and no lookaround ((?=…), (?<=…)). A pattern that does not compile is refused when you save, because it could never match.",
   }
 }

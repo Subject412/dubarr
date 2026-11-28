@@ -2,6 +2,8 @@ package gate
 
 import (
 	"encoding/json"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/Subject412/dubarr/backend/internal/settings"
@@ -61,6 +63,73 @@ func TestRuleClassifyRegex(t *testing.T) {
 	// An invalid pattern must never make an untagged file eligible.
 	if got := (Rule{Required: []string{`[`}, Mode: MatchRegex, Enforce: true}).Classify("f.mkv"); got.Status != StatusWaitingForTags {
 		t.Errorf("invalid regex: status = %q, want waiting_for_tags", got.Status)
+	}
+}
+
+// TestGateReportsWhyAPatternDoesNotCompile pins #155's second half: a target
+// waiting on a pattern the engine refuses must be distinguishable from one
+// whose file simply lacks the tag. The status stays waiting_for_tags (the
+// target is still waiting for a correct tag); Reason says why the wait cannot
+// end, in the same words the settings form refuses the save with.
+func TestGateReportsWhyAPatternDoesNotCompile(t *testing.T) {
+	const pattern = `\d+\1`
+	broken := Rule{Required: []string{pattern}, Mode: MatchRegex, Enforce: true}
+	got := broken.Classify("Shrek (2001) [ArcA310].mkv")
+	if got.Status != StatusWaitingForTags {
+		t.Fatalf("status = %q, want waiting_for_tags", got.Status)
+	}
+	if !strings.Contains(got.Reason, "filename tag pattern "+fmt.Sprintf("%q", pattern)) {
+		t.Errorf("reason = %q, want it to name the filename pattern %q", got.Reason, pattern)
+	}
+	if !strings.Contains(got.Reason, "invalid escape sequence") {
+		t.Errorf("reason = %q, want the engine's own message", got.Reason)
+	}
+	// The pattern still appears in Missing: the card lists what it is short of
+	// either way, and the reason is additive.
+	if len(got.Missing) != 1 || got.Missing[0] != pattern {
+		t.Errorf("missing = %v, want [%q]", got.Missing, pattern)
+	}
+
+	// A pattern that compiles leaves the reason empty, so a card has nothing to
+	// add to its missing-tag line.
+	fine := Rule{Required: []string{`\[ArcA310\]`}, Mode: MatchRegex, Enforce: true}
+	if ok := fine.Classify("Shrek (2001) [ArcA310].mkv"); ok.Status != StatusEligible || ok.Reason != "" {
+		t.Errorf("compiling pattern: status = %q reason = %q, want eligible with no reason", ok.Status, ok.Reason)
+	}
+
+	// REGEX treats every entry the same way, so one good and one broken pattern
+	// can still be satisfied: the target is eligible and must not carry a
+	// reason, because it is not stuck.
+	mixed := Rule{Required: []string{`\[ArcA310\]`, pattern}, Mode: MatchRegex, Enforce: true}
+	if mixedRes := mixed.Classify("Shrek (2001) [ArcA310].mkv"); mixedRes.Status != StatusEligible || mixedRes.Reason != "" {
+		t.Errorf("satisfiable REGEX: status = %q reason = %q, want eligible with no reason", mixedRes.Status, mixedRes.Reason)
+	}
+
+	// ANY has no patterns at all: every entry is a literal substring, so a
+	// regex-shaped entry such as `(?=x)` is an ordinary filename fragment that
+	// compiles nothing and is accepted when the name carries it literally. There
+	// is nothing for this mode to refuse, hence nothing to explain.
+	literal := Rule{Required: []string{`(?=x)`}, Mode: MatchAny, Enforce: true}
+	if got := literal.Classify("Shrek (2001) (?=x).mkv"); got.Status != StatusEligible || got.Reason != "" {
+		t.Errorf("literal ANY: status = %q reason = %q, want eligible with no reason", got.Status, got.Reason)
+	}
+	if got := literal.Classify("Shrek (2001).mkv"); got.Status != StatusWaitingForTags || got.Reason != "" {
+		t.Errorf("literal ANY miss: status = %q reason = %q, want waiting_for_tags with no reason", got.Status, got.Reason)
+	}
+
+	// The arr criterion uses the same compile and the same wording.
+	arrBroken := Rule{
+		RequiredArrTags: []string{pattern},
+		Mode:            MatchRegex,
+		SourceMode:      SourceArr,
+		Enforce:         true,
+	}
+	arrRes := arrBroken.Classify("Shrek.mkv", ArrMetadata{Found: true, Tags: []string{"dub"}})
+	if arrRes.Status != StatusWaitingForTags {
+		t.Fatalf("arr status = %q, want waiting_for_tags", arrRes.Status)
+	}
+	if !strings.Contains(arrRes.Reason, "arr tag pattern") {
+		t.Errorf("arr reason = %q, want it to name the arr pattern", arrRes.Reason)
 	}
 }
 

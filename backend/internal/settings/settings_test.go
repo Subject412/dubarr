@@ -1165,6 +1165,63 @@ func TestTargetTagFilterValidation(t *testing.T) {
 	}
 }
 
+// TestSettingsRefusesAPatternThatDoesNotCompile pins #155: in REGEX mode the
+// entries are patterns to the gate, so a pattern the engine refuses can never
+// match anything. Accepting it would store a filter whose targets wait forever
+// with no explanation, so the write is refused and the message names the
+// section, the pattern and Go's own reason.
+func TestSettingsRefusesAPatternThatDoesNotCompile(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+
+	// A backreference: PCRE, not RE2 — the typo an operator actually makes.
+	const pattern = `\d+\1`
+	body := `{"tag_match_mode":"REGEX","tag_case_sensitive":false,"enforce_tag_filter":true,"required_filename_tags":["` + `\\d+\\1` + `"]}`
+	err := s.Set(ctx, KeyTargetTagFilter, json.RawMessage(body))
+	if err == nil {
+		t.Fatalf("Set stored the uncompilable pattern %q", pattern)
+	}
+	if !errors.Is(err, ErrInvalidValue) {
+		t.Errorf("error %v is not ErrInvalidValue", err)
+	}
+	for _, want := range []string{"target.tag_filter", "filename tag pattern", fmt.Sprintf("%q", pattern), "invalid escape sequence"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+
+	// Nothing was stored: the refusal is not a partial write.
+	if _, ok, getErr := s.Get(ctx, KeyTargetTagFilter); getErr != nil || ok {
+		t.Errorf("Get after a refused write = ok=%v err=%v, want no row", ok, getErr)
+	}
+
+	// The same string is a plain substring in ANY and ALL mode, where it is
+	// never compiled; refusing it there would reject a legitimate filename.
+	for _, mode := range []string{"ANY", "ALL"} {
+		literal := `{"tag_match_mode":"` + mode + `","enforce_tag_filter":true,"required_filename_tags":["` + `\\d+\\1` + `"]}`
+		if err := s.Set(ctx, KeyTargetTagFilter, json.RawMessage(literal)); err != nil {
+			t.Errorf("Set(%s mode, literal %q) = %v, want accepted", mode, pattern, err)
+		}
+	}
+}
+
+// TestSettingsAcceptsLookaroundInLiteralMode pins the other half of #155: a
+// lookahead is not a Go pattern, but in ALL mode the entry is a filename
+// substring, so it must be stored exactly as typed.
+func TestSettingsAcceptsLookaroundInLiteralMode(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+
+	body := `{"tag_match_mode":"ALL","enforce_tag_filter":true,"required_filename_tags":["(?=x)"]}`
+	if err := s.Set(ctx, KeyTargetTagFilter, json.RawMessage(body)); err != nil {
+		t.Fatalf("Set(ALL mode, literal (?=x)) = %v, want accepted", err)
+	}
+	tf := decode[TargetTagFilter](t, mustGet(t, s, ctx, KeyTargetTagFilter))
+	if len(tf.RequiredFilenameTags) != 1 || tf.RequiredFilenameTags[0] != "(?=x)" {
+		t.Errorf("required filename tags = %v, want [(?=x)] stored verbatim", tf.RequiredFilenameTags)
+	}
+}
+
 func TestSeedAudioOptionsIsEmpty(t *testing.T) {
 	ctx := context.Background()
 	s := openStore(t)

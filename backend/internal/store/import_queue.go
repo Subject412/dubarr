@@ -79,6 +79,10 @@ type ImportGateStatus struct {
 	MatchedTags []string `json:"matched_tags"`
 	// MissingTags lists the required tags not found (waiting_for_tags).
 	MissingTags []string `json:"missing_tags"`
+	// Reason names a required pattern the engine could not compile, so a row
+	// stuck on a typo reads differently from one waiting for a tag (#155).
+	// Empty when every pattern compiled; additive, the status is unchanged.
+	Reason string `json:"reason,omitempty"`
 	// CheckedAt is when the classification was made (UTC).
 	CheckedAt time.Time `json:"checked_at"`
 }

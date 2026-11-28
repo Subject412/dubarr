@@ -323,6 +323,54 @@ describe('approval queue page', () => {
     expect(within(blocked).getByText(/Missing filename tags/)).toBeInTheDocument()
   })
 
+  it('names a pattern the regex engine refused instead of only a missing tag', async () => {
+    // #155: no filename tag can satisfy a pattern that does not compile, so the
+    // card says why the wait cannot end — next to, not instead of, the
+    // missing-tag line, because the pattern is also a tag that was not found.
+    const broken = {
+      ...items[3],
+      gate_reason:
+        'filename tag pattern "\\d+\\1" is not a valid regular expression: invalid escape sequence: `\\1`',
+    }
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => jsonResponse({ items: [broken] })),
+    )
+    renderWithProviders(<QueuePage />, { route: '/queue' })
+
+    const card = await screen.findByTestId('queue-item-4')
+    const reason = within(card).getByTestId('queue-gate-reason')
+    expect(reason).toHaveTextContent('Cannot become eligible: filename tag pattern')
+    expect(reason).toHaveTextContent(/invalid escape sequence/)
+    expect(within(card).getByText(/Missing filename tags/)).toBeInTheDocument()
+  })
+
+  it('adds no gate reason when every pattern compiled', async () => {
+    vi.stubGlobal('fetch', queueFetch())
+    renderWithProviders(<QueuePage />, { route: '/queue' })
+
+    const card = await screen.findByTestId('queue-item-4')
+    expect(within(card).queryByTestId('queue-gate-reason')).not.toBeInTheDocument()
+  })
+
+  it('renders no gate reason on a row that is already eligible', async () => {
+    // The reason describes a wait: it is shown only where there is one. A stale
+    // field on an eligible card would claim a target cannot become eligible
+    // when it already is, so the card keeps it out of reach.
+    const stale = {
+      ...items[0],
+      gate_reason: 'filename tag pattern "\\\\d+\\\\1" is not a valid regular expression',
+    }
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => jsonResponse({ items: [stale] })),
+    )
+    renderWithProviders(<QueuePage />, { route: '/queue' })
+
+    const card = await screen.findByTestId('queue-item-1')
+    expect(within(card).queryByTestId('queue-gate-reason')).not.toBeInTheDocument()
+  })
+
   it('badges a ready release', async () => {
     vi.stubGlobal('fetch', queueFetch())
     renderWithProviders(<QueuePage />, { route: '/queue' })

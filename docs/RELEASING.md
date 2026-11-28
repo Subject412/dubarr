@@ -14,7 +14,7 @@ Dubarr is pre-1.0, so the usual SemVer rules are read as:
 - `1.0.0` is reserved for the point at which the HTTP API, settings schema and
   on-disk data layout are considered stable.
 
-`0.5.0` is released. The next version is chosen from what the vault model still
+`0.6.0` is released. The next version is chosen from what the pairing model still
 needs rather than from a schedule; there is no 1.0 target, because being
 prepared for release is not the same as leaving beta. The version number
 describes how stable the API is, not how ready the software is to run.

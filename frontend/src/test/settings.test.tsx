@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { DEFAULT_SETTINGS } from '../lib/defaults'
 import { settingsSectionId } from '../lib/settings-sections'
 import { SETTINGS_HELP } from '../lib/settings-help'
+import { TAG_FILTER_REGEX_EXAMPLE, tagListHint } from '../lib/tag-filter-hint'
 import { SettingsPage } from '../pages/Settings'
 import { QueuePage } from '../pages/Queue'
 import { SetupPage } from '../pages/Setup'
@@ -519,6 +520,41 @@ describe('tag match mode (ADR-0005)', () => {
     expect(saved.tag_match_mode).toBe('REGEX')
     expect(saved.required_filename_tags).toEqual(['[ArcA310]'])
   })
+
+  // U15: REGEX mode must show a pattern the gate's engine accepts, and say
+  // which dialect it is — an operator who copies a shell glob or a PCRE
+  // pattern otherwise gets a filter that compiles to nothing.
+  it('TestRegexModeShowsARegexExample', async () => {
+    const user = userEvent.setup()
+    mockSettingsFetch('REGEX')
+    renderWithProviders(<SettingsPage />, { route: '/settings' })
+    expect(
+      await screen.findByRole('heading', { name: 'Process only files tagged as …' }),
+    ).toBeInTheDocument()
+
+    // The rendered placeholder is the shared example itself, not a copy of it.
+    expect(screen.getByLabelText('Add required tag')).toHaveAttribute(
+      'placeholder',
+      TAG_FILTER_REGEX_EXAMPLE,
+    )
+    expect(TAG_FILTER_REGEX_EXAMPLE).not.toBe('[TAG]')
+    // An escaped dot is what makes it a pattern rather than the old tag stub.
+    expect(TAG_FILTER_REGEX_EXAMPLE).toContain('\\.')
+
+    const note = tagListHint('REGEX').note
+    expect(note).toMatch(/regular expression/i)
+    expect(note).toMatch(/filename/i)
+    expect(note).toMatch(/RE2/)
+    expect(note).toMatch(/backreference/i)
+    expect(note).toMatch(/lookaround/i)
+    expect(screen.getByText(note)).toBeInTheDocument()
+
+    // Switching back to ANY restores the literal-tag placeholder and drops the
+    // regex explanation, so the two modes cannot be confused.
+    await user.selectOptions(screen.getByLabelText('Tag match mode'), 'ANY')
+    expect(screen.getByLabelText('Add required tag')).toHaveAttribute('placeholder', '[TAG]')
+    expect(screen.queryByText(note)).toBeNull()
+  })
 })
 
 describe('setup wizard tag filter step', () => {
@@ -560,6 +596,34 @@ describe('setup wizard tag filter step', () => {
       settings: Record<string, { tag_match_mode?: string }>
     }
     expect(body.settings['target.tag_filter'].tag_match_mode).toBe('REGEX')
+  })
+
+  // U15: the wizard must teach the same pattern and the same dialect as the
+  // Settings card — both read tagListHint, so the two pages cannot drift.
+  it('TestWizardRegexModeShowsTheSameExample', async () => {
+    const user = userEvent.setup()
+    mockFetch()
+    renderWithProviders(<SetupPage />, { route: '/setup' })
+
+    await user.type(screen.getByLabelText('Username'), 'admin')
+    await user.type(screen.getByLabelText('Password'), 'longenough')
+    await user.type(screen.getByLabelText('Confirm password'), 'longenough')
+    await user.click(screen.getByRole('button', { name: /create administrator/i }))
+    expect(await screen.findByRole('heading', { name: 'Storage paths' })).toBeInTheDocument()
+
+    await user.type(screen.getByLabelText('Watch folder'), '/watch')
+    await user.type(screen.getByLabelText('Audio Vault'), '/vault')
+    await user.click(screen.getByRole('button', { name: /save & continue/i }))
+    expect(await screen.findByRole('heading', { name: 'Languages & tags' })).toBeInTheDocument()
+    expect(screen.getByLabelText('Add required tag')).toHaveAttribute('placeholder', '[TAG]')
+
+    await user.selectOptions(screen.getByLabelText('Tag match mode'), 'REGEX')
+    expect(tagListHint('REGEX').placeholder).toBe(TAG_FILTER_REGEX_EXAMPLE)
+    expect(screen.getByLabelText('Add required tag')).toHaveAttribute(
+      'placeholder',
+      TAG_FILTER_REGEX_EXAMPLE,
+    )
+    expect(screen.getByText(tagListHint('REGEX').note)).toBeInTheDocument()
   })
 })
 

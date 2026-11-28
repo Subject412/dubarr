@@ -20,6 +20,7 @@ import { api } from '../lib/api'
 import { DEFAULT_SETTINGS as DEFAULTS } from '../lib/defaults'
 import { useSaveSettings, useSettings } from '../lib/hooks'
 import { settingsHelp } from '../lib/settings-help'
+import { tagListHint } from '../lib/tag-filter-hint'
 import {
   isSettingsSectionKey,
   SETTINGS_SECTIONS,
@@ -764,7 +765,7 @@ export function SettingsPage() {
                   inputLabel="Add required tag"
                   values={draft.required_filename_tags ?? []}
                   onChange={(required_filename_tags) => update({ required_filename_tags })}
-                  placeholder="[TAG]"
+                  placeholder={tagListHint(draft.tag_match_mode).placeholder}
                   help={settingsHelp('target.tag_filter', 'required_filename_tags')}
                 />
                 <StringListEditor
@@ -778,6 +779,7 @@ export function SettingsPage() {
                   <Field
                     label="Tag match mode"
                     htmlFor="tag-match-mode"
+                    hint={tagListHint(draft.tag_match_mode).note}
                     help={settingsHelp('target.tag_filter', 'tag_match_mode')}
                   >
                     <Select

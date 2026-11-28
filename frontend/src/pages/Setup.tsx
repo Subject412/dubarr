@@ -6,6 +6,8 @@ import { useAuthStatus, useSaveSettings, useSettings, useSetup } from '../lib/ho
 import { ArrConnectionsPanel } from '../components/ArrConnections'
 import { PathField, PathListEditor } from '../components/PathPicker'
 import { cn } from '../lib/cn'
+import { settingsHelp } from '../lib/settings-help'
+import { tagListHint } from '../lib/tag-filter-hint'
 import {
   Alert,
   Button,
@@ -355,11 +357,17 @@ export function SetupPage() {
                   inputLabel="Add required tag"
                   values={tagFilter.required_filename_tags}
                   onChange={(required_filename_tags) => setTagFilter({ ...tagFilter, required_filename_tags })}
-                  placeholder="[TAG]"
+                  placeholder={tagListHint(tagFilter.tag_match_mode).placeholder}
+                  help={settingsHelp('target.tag_filter', 'required_filename_tags')}
                 />
               </div>
               <div className="grid gap-4 md:grid-cols-2">
-                <Field label="Tag match mode" htmlFor="setup-tag-mode">
+                <Field
+                  label="Tag match mode"
+                  htmlFor="setup-tag-mode"
+                  hint={tagListHint(tagFilter.tag_match_mode).note}
+                  help={settingsHelp('target.tag_filter', 'tag_match_mode')}
+                >
                   <Select
                     id="setup-tag-mode"
                     value={tagFilter.tag_match_mode}

@@ -4,7 +4,6 @@ import { ApiError, api, type LanguagesPolicy, type StoragePaths, type TargetTagF
 import { DEFAULT_SETTINGS } from '../lib/defaults'
 import { useAuthStatus, useSaveSettings, useSettings, useSetup } from '../lib/hooks'
 import { REFERENCE_TOKEN_PRESETS } from '../lib/language-presets'
-import { settingsHelp } from '../lib/settings-help'
 import { ArrConnectionsPanel } from '../components/ArrConnections'
 import { PathField, PathListEditor } from '../components/PathPicker'
 import { cn } from '../lib/cn'

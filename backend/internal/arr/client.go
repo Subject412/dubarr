@@ -78,7 +78,7 @@ type Radarr interface {
 	// single movie.
 	RescanMovie(ctx context.Context, movieID int) error
 	// Parse asks Radarr's own parser to identify one release name
-	// (POST /api/v3/parse), normalised onto ParseResult.
+	// (GET /api/v3/parse?title=...), normalised onto ParseResult.
 	Parse(ctx context.Context, title string) (ParseResult, error)
 }
 
@@ -93,7 +93,7 @@ type Sonarr interface {
 	// RescanSeries asks Sonarr to rescan one series (command RescanSeries).
 	RescanSeries(ctx context.Context, seriesID int) error
 	// Parse asks Sonarr's own parser to identify one release name
-	// (POST /api/v5/parse), normalised onto ParseResult.
+	// (GET /api/v5/parse?title=...), normalised onto ParseResult.
 	Parse(ctx context.Context, title string) (ParseResult, error)
 }
 
@@ -301,26 +301,26 @@ func (c *SonarrClient) RescanSeries(ctx context.Context, seriesID int) error {
 func (c *core) get(ctx context.Context, path string, out any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
 	if err != nil {
-		return fmt.Errorf("arr: build request %s: %w", path, err)
+		return fmt.Errorf("arr: build request %s: %w", errorPath(path), err)
 	}
 	req.Header.Set("X-Api-Key", c.apiKey)
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("%w: GET %s: %w", ErrNetwork, path, scrub(err, c.apiKey))
+		return fmt.Errorf("%w: GET %s: %w", ErrNetwork, errorPath(path), scrub(redactQuery(err), c.apiKey))
 	}
 	defer resp.Body.Close()
 
 	switch {
 	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
-		return &AuthError{Code: resp.StatusCode, Method: http.MethodGet, Path: path}
+		return &AuthError{Code: resp.StatusCode, Method: http.MethodGet, Path: errorPath(path)}
 	case resp.StatusCode < 200 || resp.StatusCode > 299:
-		return &StatusError{Code: resp.StatusCode, Method: http.MethodGet, Path: path}
+		return &StatusError{Code: resp.StatusCode, Method: http.MethodGet, Path: errorPath(path)}
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
-		return fmt.Errorf("%w: GET %s: %w", ErrDecode, path, err)
+		return fmt.Errorf("%w: GET %s: %w", ErrDecode, errorPath(path), err)
 	}
 	return nil
 }
@@ -332,8 +332,8 @@ func (c *core) post(ctx context.Context, path string, payload any) error {
 }
 
 // postJSON is post plus an optional 2xx response body decoded into out (nil
-// discards it). Both products answer {apiBase}/parse with a payload, so the
-// decode shares this one request/error path instead of copying it.
+// discards it). The command routes that use it answer no body, but a caller that
+// needs one shares this single request/error path instead of copying it.
 func (c *core) postJSON(ctx context.Context, path string, payload any, out any) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -366,6 +366,29 @@ func (c *core) postJSON(ctx context.Context, path string, payload any, out any) 
 		return fmt.Errorf("arr: decode POST %s response: %w", path, err)
 	}
 	return nil
+}
+
+// errorPath renders a request path for an error message without its query
+// string. The parse route carries the release name as ?title=…, and a diagnostic
+// must never quote a release name back at the operator or into a log; the path
+// alone still names the route that failed.
+func errorPath(path string) string {
+	if i := strings.IndexByte(path, '?'); i >= 0 {
+		return path[:i]
+	}
+	return path
+}
+
+// redactQuery drops the request URL a transport error echoes. Go's *url.Error
+// carries the whole URL, query string included, so a failed parse would quote
+// the release name even when the formatted path is clean. The inner error is
+// returned unchanged, so errors.Is still classifies the failure.
+func redactQuery(err error) error {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) && urlErr.Err != nil {
+		return urlErr.Err
+	}
+	return err
 }
 
 // scrub removes the API key from error text should a transport error echo the

@@ -56,6 +56,10 @@ type Service struct {
 	secrets         Decrypter
 	identifyTimeout time.Duration
 	requireAdmin    func(http.Handler) http.Handler
+	// identifyPool overrides the store lookup identify searches the library
+	// with. Nil means the store; a test injects a counter to observe the
+	// mirror ladder's bound.
+	identifyPool identifyPoolFunc
 }
 
 // RegisterRoutes mounts:

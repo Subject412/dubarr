@@ -120,8 +120,8 @@ type Fixtures struct {
 	QualityProfiles []QualityProfile
 	RootFolders     []RootFolder
 	Tags            []Tag
-	// Parse is the verdict POST {base}/parse answers with. A zero value is
-	// an instance that parsed nothing.
+	// Parse is the verdict GET {base}/parse?title=... answers with. A zero
+	// value is an instance that parsed nothing.
 	Parse ParseResponse
 }
 

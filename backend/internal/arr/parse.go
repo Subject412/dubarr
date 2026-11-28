@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"strings"
 )
 
@@ -72,29 +73,31 @@ type parseWire struct {
 	} `json:"series"`
 }
 
-// Parse asks the instance to parse one release name (POST {apiBase}/parse with
-// {"title": ...}). Errors go through the shared error model, so an operator
-// diagnostic can classify them: ErrAuth, ErrNetwork or a *StatusError. The API
-// key is sent as X-Api-Key and never appears in an error.
+// Parse asks the instance to parse one release name — GET {apiBase}/parse with
+// the name as the title query parameter. Both products expose the route as
+// [HttpGet] Parse(string title) and answer 405 to a POST, so the verb is not a
+// choice. The title is escaped as one query value, so a name carrying "&", "#"
+// or "+" reaches arr intact.
+//
+// Errors go through the shared error model, so an operator diagnostic can
+// classify them: ErrAuth, ErrNetwork or a *StatusError. The API key is sent as
+// X-Api-Key and never appears in an error.
 func (c *core) Parse(ctx context.Context, title string) (ParseResult, error) {
 	trimmed := strings.TrimSpace(title)
 	if trimmed == "" {
 		return ParseResult{}, fmt.Errorf("arr: parse: title is empty")
 	}
-	body := struct {
-		Title string `json:"title"`
-	}{Title: trimmed}
-	path := c.apiBase + parsePath
+	path := c.apiBase + parsePath + "?" + url.Values{"title": {trimmed}}.Encode()
 
 	// Decoding into a RawMessage keeps the payload verbatim: the normalised
 	// view is derived from these bytes, so Raw and the result cannot disagree.
 	var raw json.RawMessage
-	if err := c.postJSON(ctx, path, body, &raw); err != nil {
+	if err := c.get(ctx, path, &raw); err != nil {
 		return ParseResult{}, err
 	}
 	var wire parseWire
 	if err := json.Unmarshal(raw, &wire); err != nil {
-		return ParseResult{}, fmt.Errorf("arr: decode POST %s response: %w", path, err)
+		return ParseResult{}, fmt.Errorf("arr: decode GET %s response: %w", errorPath(path), err)
 	}
 	return normaliseParse(c.kind, wire, raw), nil
 }
@@ -102,7 +105,7 @@ func (c *core) Parse(ctx context.Context, title string) (ParseResult, error) {
 // normaliseParse maps either product's payload onto ParseResult.
 //
 // The media title comes from the product's parsed-info block, never from the
-// top-level "title": a real instance echoes the release name Dubarr just posted
+// top-level "title": a real instance echoes the release name Dubarr just sent
 // there, which is not an identification. A payload the instance could not parse
 // therefore normalises to an empty title (confidence 0), and the operator sees
 // that instead of their own input bounced back as a match.

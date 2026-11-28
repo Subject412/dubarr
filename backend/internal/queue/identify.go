@@ -35,6 +35,11 @@ const identifyTimeout = 30 * time.Second
 // returns. The pool it ranks is larger (store.IdentifyPoolLimit).
 const identifyCandidateLimit = 20
 
+// mirrorCandidateCeiling caps a mirror hit. A LIKE hit on the release's own
+// words is a substring match, not a parse, so it must never outrank a candidate
+// arr's parser named.
+const mirrorCandidateCeiling = 0.5
+
 // Decrypter is the subset of secrets.Service the identify route uses: it opens
 // the API key the sync pass stored in arr_instances. A nil Decrypter (no secret
 // store wired) makes the route answer 409 "not_configured".
@@ -47,6 +52,22 @@ type Decrypter interface {
 // never a third construction path.
 type parser interface {
 	Parse(ctx context.Context, title string) (arr.ParseResult, error)
+}
+
+// identifyPoolFunc is the one store read identify searches the synced library
+// with. It is a field on Service rather than a direct store call because the
+// route promises a bound — at most four mirror searches per identify — and an
+// injected counter is the only way a test can observe that bound. Nil means the
+// real store.
+type identifyPoolFunc func(ctx context.Context, instanceID int64, mediaType, term string) ([]store.LibraryCandidate, error)
+
+// candidatePool reads the synced library through the injected lookup, falling
+// back to the store itself.
+func (s *Service) candidatePool(ctx context.Context, instanceID int64, mediaType, term string) ([]store.LibraryCandidate, error) {
+	if s.identifyPool != nil {
+		return s.identifyPool(ctx, instanceID, mediaType, term)
+	}
+	return s.store.IdentifyCandidatePool(ctx, instanceID, mediaType, term)
 }
 
 // identifyRequest is the optional identify body: an operator-supplied release
@@ -74,19 +95,23 @@ type identifyCandidate struct {
 	MediaType      string  `json:"media_type"`
 	ExternalItemID int64   `json:"external_item_id"`
 	Confidence     float64 `json:"confidence"`
-	// MatchedBy names how the candidate was found; the parse route only ever
-	// reports "parse".
+	// MatchedBy names how the candidate was found: "parse" when arr's own
+	// parser named the title, "mirror" when the synced library was searched
+	// on the release's words alone.
 	MatchedBy string `json:"matched_by"`
 }
 
 // identifyParse is what arr thought of the release name. Parsed is false when
 // the instance recognised no title: an unparsable release, not a cold cache.
+// Error carries the human arr failure class when the parse call itself failed;
+// a name arr simply could not read is parsed=false with no error.
 type identifyParse struct {
 	Parsed     bool    `json:"parsed"`
 	Title      string  `json:"title"`
 	Year       int     `json:"year"`
 	Quality    string  `json:"quality"`
 	Confidence float64 `json:"confidence"`
+	Error      string  `json:"error,omitempty"`
 }
 
 type identifyResponse struct {
@@ -136,12 +161,15 @@ func writeAPIKindsError(w http.ResponseWriter, status int, message, code string,
 //	409 code "not_configured" no secret store, no enabled instance at all, or the
 //	    chosen kind has no enabled instance or key
 //	500 the arr configuration could not be read
-//	502 code "identify_failed" arr refused or could not answer; class says why
+//	502 code "identify_failed" arr refused or could not answer AND the mirror
+//	    library held nothing to offer; class says why
 //
 // An empty library cache is not an error: the parse verdict is still worth
 // showing, and candidates come back as an empty array. A release arr could not
-// parse is reported as parse.parsed=false with an empty candidate array and no
-// library read at all, so "unparsable" is never mistaken for "nothing matched".
+// parse is reported as parse.parsed=false, and the synced library is searched
+// anyway — an unparsable name is the case identify exists for, so an empty
+// candidate array there means "nothing in your library fits", never "no search
+// was run".
 // An ambiguous appliance is reported as a choice, never as absence: the route
 // asks which library before it parses anything, and resolves nothing from the
 // filename.
@@ -222,12 +250,7 @@ func (s *Service) handleIdentify(w http.ResponseWriter, r *http.Request) {
 	// hung instance must fail the request with a class the operator can read.
 	parseCtx, cancel := context.WithTimeout(ctx, s.identifyDeadline())
 	defer cancel()
-	parsed, err := client.Parse(parseCtx, title)
-	if err != nil {
-		class, message := classifyIdentifyError(err)
-		writeAPIError(w, http.StatusBadGateway, message, "identify_failed", class)
-		return
-	}
+	parsed, parseErr := client.Parse(parseCtx, title)
 
 	parseView := identifyParse{
 		Parsed:     parsed.Parsed,
@@ -236,26 +259,47 @@ func (s *Service) handleIdentify(w http.ResponseWriter, r *http.Request) {
 		Quality:    parsed.Quality,
 		Confidence: parsed.Confidence,
 	}
-	// An unparsable release short-circuits before the library read: scoring an
-	// empty title against the pool would scan every row and return nothing,
-	// which looks identical to a healthy cold cache. Reporting parsed=false with
-	// no candidates keeps the two apart without inventing a title.
-	if !parsed.Parsed {
-		writeJSON(w, http.StatusOK, identifyResponse{Parse: parseView, Candidates: []identifyCandidate{}})
-		return
+	var (
+		parseClass   string
+		parseMessage string
+	)
+	if parseErr != nil {
+		parseClass, parseMessage = classifyIdentifyError(parseErr)
+		// The verdict is unknown, not empty: parsed stays false and the class
+		// message rides along, so a refused key reads differently from a name
+		// arr simply could not parse.
+		parseView = identifyParse{Error: parseMessage}
 	}
 
+	// The mirror is searched whether or not arr could parse the release, because
+	// the unparsable names are the ones the operator needs help with. Parse wins
+	// a tie: it matched the release, the mirror matched a substring.
 	mediaType := s.identifyMediaType(row, kind)
-	pool, err := s.store.IdentifyCandidatePool(ctx, row.InstanceID, mediaType, poolTerm(parsed.Title))
+	parseCandidates := []identifyCandidate{}
+	if parsed.Parsed {
+		pool, err := s.candidatePool(ctx, row.InstanceID, mediaType, poolTerm(parsed.Title))
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "could not search the library")
+			return
+		}
+		parseCandidates = rankCandidates(parsed.Title, parsed.Year, pool)
+	}
+	mirrorCandidates, err := s.rankMirrorCandidates(ctx, row.InstanceID, mediaType, mirrorTerm(title))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "could not search the library")
 		return
 	}
+	candidates := mergeIdentifyCandidates(parseCandidates, mirrorCandidates)
 
-	writeJSON(w, http.StatusOK, identifyResponse{
-		Parse:      parseView,
-		Candidates: rankCandidates(parsed.Title, parsed.Year, pool),
-	})
+	// An arr failure is the answer only when the mirror had nothing to offer: a
+	// response that carries a usable match is never a 502, and an empty one is
+	// never dressed up as success.
+	if parseErr != nil && len(candidates) == 0 {
+		writeAPIError(w, http.StatusBadGateway, parseMessage, "identify_failed", parseClass)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, identifyResponse{Parse: parseView, Candidates: candidates})
 }
 
 // handleMatch persists the operator's pick and reports the match state the queue
@@ -639,4 +683,166 @@ func poolTerm(parsedTitle string) string {
 		return strings.Trim(fields[0], `.,:;!?()[]{}'"-_`)
 	}
 	return ""
+}
+
+// rankMirrorCandidates searches the synced library for the release's own words
+// and ranks what it finds as a mirror hit.
+//
+// The ladder stops at the first rung whose LIKE found anything, so one identify
+// costs at most four pool reads however unhelpful the name is. Every hit is
+// capped at mirrorCandidateCeiling: it matched a substring, not the release, so
+// it must never outrank a candidate the parser named.
+func (s *Service) rankMirrorCandidates(ctx context.Context, instanceID int64, mediaType, term string) ([]identifyCandidate, error) {
+	for _, rung := range mirrorLadder(term) {
+		pool, err := s.candidatePool(ctx, instanceID, mediaType, rung)
+		if err != nil {
+			return nil, err
+		}
+		if len(pool) == 0 {
+			continue
+		}
+		ranked := rankCandidates(term, 0, pool)
+		for i := range ranked {
+			ranked[i].MatchedBy = "mirror"
+			if ranked[i].Confidence > mirrorCandidateCeiling {
+				ranked[i].Confidence = mirrorCandidateCeiling
+			}
+		}
+		return ranked, nil
+	}
+	return []identifyCandidate{}, nil
+}
+
+// mergeIdentifyCandidates puts the parse hits first, in their ranked order, then
+// the mirror hits the parse did not already offer, and caps the total.
+//
+// The limit is the first thing the loop body checks, not the last: a check after
+// the append only leaves the call that filled the list, so a parse that already
+// returned the whole cap would still receive one mirror row on top of it.
+func mergeIdentifyCandidates(parse, mirror []identifyCandidate) []identifyCandidate {
+	out := make([]identifyCandidate, 0, len(parse)+len(mirror))
+	seen := make(map[int64]struct{}, len(parse))
+	appendAll := func(items []identifyCandidate) {
+		for _, item := range items {
+			if len(out) >= identifyCandidateLimit {
+				return
+			}
+			if _, ok := seen[item.LibraryCacheID]; ok {
+				continue
+			}
+			seen[item.LibraryCacheID] = struct{}{}
+			out = append(out, item)
+		}
+	}
+	appendAll(parse)
+	appendAll(mirror)
+	return out
+}
+
+// mirrorTerm reduces a release name to the words a synced-library title is
+// likely to share with it: separators become spaces, bracketed groups go, and
+// so does everything from the first four-digit year on. A trailing scene group
+// marker ("-GRP") goes last.
+//
+// An empty result — a name that starts with its year, say — falls back to the
+// first four dot-separated components rather than searching with no term at all.
+func mirrorTerm(stem string) string {
+	cleaned := strings.NewReplacer(".", " ", "_", " ").Replace(stem)
+	cleaned = dropBracketedGroups(cleaned)
+	words := strings.Fields(cleaned)
+	for i, word := range words {
+		if isYearToken(word) {
+			words = words[:i]
+			break
+		}
+	}
+	for len(words) > 0 && strings.HasPrefix(words[len(words)-1], "-") {
+		words = words[:len(words)-1]
+	}
+	if term := strings.Join(words, " "); term != "" {
+		return term
+	}
+	parts := make([]string, 0, 4)
+	for _, part := range strings.Split(stem, ".") {
+		if part = strings.TrimSpace(part); part == "" {
+			continue
+		}
+		parts = append(parts, part)
+		if len(parts) == 4 {
+			break
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+// mirrorLadder is the query ladder for one mirror search: the whole term, then
+// its first three, two and one words, deduplicated — at most four queries.
+//
+// The shorter rungs stop at three characters, because a one- or two-character
+// LIKE would scan the whole library and offer noise. The full term is always
+// tried, even a short one: a two-letter film title is still the operator's name.
+func mirrorLadder(term string) []string {
+	words := strings.Fields(term)
+	rungs := make([]string, 0, 4)
+	add := func(part []string) {
+		if len(part) == 0 {
+			return
+		}
+		candidate := strings.Join(part, " ")
+		for _, existing := range rungs {
+			if existing == candidate {
+				return
+			}
+		}
+		rungs = append(rungs, candidate)
+	}
+	add(words)
+	for _, n := range []int{3, 2, 1} {
+		if len(words) <= n {
+			continue
+		}
+		if len([]rune(strings.Join(words[:n], " "))) < 3 {
+			continue
+		}
+		add(words[:n])
+	}
+	return rungs
+}
+
+// dropBracketedGroups removes [...] and (...) groups from a release name,
+// keeping an unbalanced closer as the literal character it is.
+func dropBracketedGroups(name string) string {
+	var b strings.Builder
+	depth := 0
+	for _, r := range name {
+		switch r {
+		case '[', '(':
+			depth++
+		case ']', ')':
+			if depth > 0 {
+				depth--
+				continue
+			}
+			b.WriteRune(r)
+		default:
+			if depth == 0 {
+				b.WriteRune(r)
+			}
+		}
+	}
+	return b.String()
+}
+
+// isYearToken reports whether one release-name token is exactly a four-digit
+// year, which is where the title stops and the release metadata starts.
+func isYearToken(word string) bool {
+	if len(word) != 4 {
+		return false
+	}
+	for _, r := range word {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }

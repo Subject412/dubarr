@@ -398,13 +398,15 @@ export type QueueIdentifyCandidate = {
 
 /** What arr's own parser made of the release name. `parsed` is false when the
  * instance recognised no title at all — an unparsable release, which is not the
- * same thing as a library with no matching rows. */
+ * same thing as a library with no matching rows. `error` is set only when the
+ * call itself failed, and candidates may still follow it. */
 export type QueueIdentifyParse = {
   parsed: boolean
   title: string
   year: number
   quality: string
   confidence: number
+  error?: string
 }
 
 export type QueueIdentifyResponse = {

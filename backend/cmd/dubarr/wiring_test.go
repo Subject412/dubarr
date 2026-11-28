@@ -63,7 +63,7 @@ func TestWireScannerClassifiesTaggedMKV(t *testing.T) {
 	if err := settingsStore.Set(ctx, settings.KeyStoragePaths, storageRaw); err != nil {
 		t.Fatalf("set storage: %v", err)
 	}
-	// A 1 s cadence keeps the test fast; the default is 10 s.
+	// A 1 s cadence keeps the test fast; the default is 60 s.
 	watchRaw, err := json.Marshal(settings.WatchOptions{ScanIntervalSec: 1, StabilityCheckIntervalSec: 4})
 	if err != nil {
 		t.Fatalf("marshal watch options: %v", err)

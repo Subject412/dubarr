@@ -1351,3 +1351,13 @@ describe('analysis source (U-WIN.6)', () => {
     expect(savedSync(fetchMock)).toEqual({ ...legacySync, analysis_source: 'windows' })
   })
 })
+
+describe('watch options defaults', () => {
+  it('shows the 60 s scan interval before the section has ever been saved', async () => {
+    mockFetch()
+    renderWithProviders(<SettingsPage />, { route: '/settings' })
+
+    expect(await screen.findByRole('heading', { name: 'Watch options' })).toBeInTheDocument()
+    expect(screen.getByLabelText('Scan interval (s)')).toHaveValue(60)
+  })
+})

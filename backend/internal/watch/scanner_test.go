@@ -226,13 +226,20 @@ func TestNewRejectsInvalidRoots(t *testing.T) {
 	}
 }
 
-func TestNewDefaultsIntervalToTenSeconds(t *testing.T) {
+// TestNewFallsBackToDefaultInterval covers a provider that reports 0 (a stored
+// scan_interval_sec <= 0, which settings validation rejects but a hand-written
+// row can hold): New must use DefaultInterval, which is the same number the
+// seeded settings default carries — see TestDefaultIntervalMatchesSettingsDefault.
+func TestNewFallsBackToDefaultInterval(t *testing.T) {
 	sc, err := New(newFakeStore(), []string{t.TempDir()}, testProvider(0))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	if sc.Interval() != 10*time.Second {
-		t.Errorf("Interval() = %v, want 10s", sc.Interval())
+	if DefaultInterval != 60*time.Second {
+		t.Errorf("DefaultInterval = %v, want 60s", DefaultInterval)
+	}
+	if sc.Interval() != DefaultInterval {
+		t.Errorf("Interval() = %v, want DefaultInterval (%v)", sc.Interval(), DefaultInterval)
 	}
 }
 

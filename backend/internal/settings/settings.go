@@ -539,7 +539,7 @@ func Defaults(dataDir string) map[string]any {
 			OutputMode: MuxOutputReplace,
 		},
 		KeyWatchOptions: WatchOptions{
-			ScanIntervalSec:           10,
+			ScanIntervalSec:           60,
 			StabilityCheckIntervalSec: 4,
 		},
 		KeyArrOptions: ArrOptions{

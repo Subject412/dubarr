@@ -1,6 +1,7 @@
 import type { VaultNaming } from '../lib/api'
 import { settingsHelp } from '../lib/settings-help'
 import {
+  VAULT_NAMING_PRESET_KEYS,
   VAULT_NAMING_PRESETS,
   namingPresetFor,
   previewEpisodeFile,
@@ -23,10 +24,10 @@ import { Alert, Field, Input, Select } from './ui'
  * validates with, so it costs no request.
  */
 
-const PRESET_LABELS: Record<VaultNamingPreset, string> = {
+/** Labels for the presets only: `custom` is a status, never a choice. */
+const PRESET_LABELS: Record<keyof typeof VAULT_NAMING_PRESETS, string> = {
   arr: 'Arr style (recommended)',
   title_year: 'Title and year only',
-  custom: 'Custom',
 }
 
 const FIELD_NAMES = ['movie_template', 'episode_template', 'season_folder'] as const
@@ -73,7 +74,9 @@ export function VaultNamingSettings({
 
   const pickPreset = (next: VaultNamingPreset) => {
     // "Custom" is a state, not a choice: it describes patterns that match no
-    // preset, so selecting it must not overwrite what the operator wrote.
+    // preset, which is why the select renders it as a disabled status option.
+    // The guard stays anyway, so a value the control cannot produce is ignored
+    // instead of overwriting what the operator wrote.
     if (next === 'custom') return
     onChange({ ...VAULT_NAMING_PRESETS[next] })
   }
@@ -91,7 +94,19 @@ export function VaultNamingSettings({
           value={preset}
           onChange={(event) => pickPreset(event.target.value as VaultNamingPreset)}
         >
-          {(Object.keys(PRESET_LABELS) as VaultNamingPreset[]).map((name) => (
+          {/*
+            Edited patterns match no preset, and a <select> whose value matches
+            no option silently displays the first one — which would claim "Arr
+            style". This disabled status option comes first so the control shows
+            the state without offering it: a disabled option is announced as
+            unavailable and skipped by the keyboard.
+          */}
+          {preset === 'custom' && (
+            <option value="custom" disabled>
+              Custom (edited)
+            </option>
+          )}
+          {VAULT_NAMING_PRESET_KEYS.map((name) => (
             <option key={name} value={name}>
               {PRESET_LABELS[name]}
             </option>

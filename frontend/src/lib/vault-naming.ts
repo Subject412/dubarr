@@ -361,6 +361,11 @@ export const VAULT_NAMING_PRESETS: Record<'arr' | 'title_year', VaultNaming> = {
   },
 }
 
+/** The preset keys, i.e. the choices — `custom` is a state and is never offered. */
+export const VAULT_NAMING_PRESET_KEYS = Object.keys(VAULT_NAMING_PRESETS) as Array<
+  keyof typeof VAULT_NAMING_PRESETS
+>
+
 export type VaultNamingPreset = keyof typeof VAULT_NAMING_PRESETS | 'custom'
 
 /** Which preset the stored patterns are, or `custom` once they were edited. */

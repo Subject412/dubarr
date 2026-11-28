@@ -116,4 +116,47 @@ describe('vault naming settings (#47)', () => {
       'single folder name',
     )
   })
+
+  it('TestCustomIsNotASelectablePreset: the default patterns offer exactly the two presets', async () => {
+    await renderSettings()
+
+    const select = screen.getByLabelText('Naming style') as HTMLSelectElement
+    const options = Array.from(select.options)
+
+    expect(options.map((option) => option.textContent)).toEqual([
+      'Arr style (recommended)',
+      'Title and year only',
+    ])
+    expect(options.map((option) => option.value)).toEqual(['arr', 'title_year'])
+    expect(options.some((option) => option.value === 'custom')).toBe(false)
+    expect(select).toHaveValue('arr')
+  })
+
+  it('TestEditedPatternsShowCustomAsAStatus: an edited pattern shows a disabled Custom (edited)', async () => {
+    const user = userEvent.setup()
+    await renderSettings()
+
+    fireEvent.change(screen.getByLabelText('Movie file name'), {
+      target: { value: '{Title} ({Year}) [{Variant}]' },
+    })
+
+    const select = screen.getByLabelText('Naming style') as HTMLSelectElement
+    // The state is displayed, and it is what the control reports as its value.
+    expect(select).toHaveValue('custom')
+    const status = within(select).getByRole('option', { name: 'Custom (edited)' })
+    expect(status).toBeDisabled()
+    expect(select.options[select.selectedIndex]).toBe(status)
+    // Both real presets are still on offer next to it.
+    expect(select.options).toHaveLength(3)
+
+    // A real preset still replaces all three patterns and re-selects itself.
+    await user.selectOptions(select, 'title_year')
+    expect(screen.getByLabelText('Movie file name')).toHaveValue('{Title} ({Year})')
+    expect(screen.getByLabelText('Episode file name')).toHaveValue(
+      '{Title} - S{Season:00}E{Episode:00}',
+    )
+    expect(screen.getByLabelText('Season folder')).toHaveValue('Season {Season:00}')
+    expect(select).toHaveValue('title_year')
+    expect(within(select).queryByRole('option', { name: 'Custom (edited)' })).toBeNull()
+  })
 })

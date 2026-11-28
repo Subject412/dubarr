@@ -230,6 +230,151 @@ func TestLanguagesPolicyNormalizesReferenceTokens(t *testing.T) {
 	}
 }
 
+// A configured language is validated through the ISO 639 table, not by shape:
+// "pol" and "Polish" both mean pl, and a stored value must come back as the
+// canonical two-letter code consumers compare against.
+func TestLanguageCodesAreNormalised(t *testing.T) {
+	ctx := context.Background()
+	tests := []struct {
+		name string
+		in   []string
+		want []string
+	}{
+		{"iso639-2/B", []string{"pol"}, []string{"pl"}},
+		{"lowercase name", []string{"polish"}, []string{"pl"}},
+		{"capitalised name", []string{"Polish"}, []string{"pl"}},
+		{"bcp-47 region", []string{"pt-BR"}, []string{"pt"}},
+		{"ISO 639-2/T", []string{"deu"}, []string{"de"}},
+		{"ISO 639-2/B german", []string{"ger"}, []string{"de"}},
+		{"duplicate after normalisation", []string{"pl", "pol"}, []string{"pl"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := openStore(t)
+			body, err := json.Marshal(LanguagesPolicy{
+				TargetImportLanguages:   tt.in,
+				ExtraReferenceLanguages: tt.in,
+				ExportMode:              "rule_based",
+			})
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if err := s.Set(ctx, KeyLanguagesPolicy, body); err != nil {
+				t.Fatalf("Set(%v): %v", tt.in, err)
+			}
+			got := decode[LanguagesPolicy](t, mustGet(t, s, ctx, KeyLanguagesPolicy))
+			if !reflect.DeepEqual(got.TargetImportLanguages, tt.want) {
+				t.Errorf("target languages = %v, want %v", got.TargetImportLanguages, tt.want)
+			}
+			if !reflect.DeepEqual(got.ExtraReferenceLanguages, tt.want) {
+				t.Errorf("reference languages = %v, want %v", got.ExtraReferenceLanguages, tt.want)
+			}
+		})
+	}
+}
+
+// Existing rows already carry ISO 639-1 codes; a save must leave them byte-for-
+// byte equivalent instead of rewriting or dropping them.
+func TestExistingISO639_1LanguagesAreUntouched(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	in := LanguagesPolicy{
+		TargetImportLanguages:   []string{"pl", "cs"},
+		ExtraReferenceLanguages: []string{"en", "org", "de"},
+		ExportMode:              "rule_based",
+	}
+	body, err := json.Marshal(in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := s.Set(ctx, KeyLanguagesPolicy, body); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	got := decode[LanguagesPolicy](t, mustGet(t, s, ctx, KeyLanguagesPolicy))
+	if !reflect.DeepEqual(got.TargetImportLanguages, in.TargetImportLanguages) {
+		t.Errorf("target languages = %v, want %v untouched", got.TargetImportLanguages, in.TargetImportLanguages)
+	}
+	if !reflect.DeepEqual(got.ExtraReferenceLanguages, in.ExtraReferenceLanguages) {
+		t.Errorf("reference languages = %v, want %v untouched", got.ExtraReferenceLanguages, in.ExtraReferenceLanguages)
+	}
+}
+
+// A value that resolves to nothing must be refused with the offending value and
+// the accepted forms named, because "zzz" silently matched no track before.
+func TestUnknownLanguageIsRejectedWithTheForms(t *testing.T) {
+	ctx := context.Background()
+	for _, raw := range []string{"zzz", "engl", "12", ""} {
+		t.Run(fmt.Sprintf("%q", raw), func(t *testing.T) {
+			s := openStore(t)
+			body, err := json.Marshal(LanguagesPolicy{
+				TargetImportLanguages:   []string{raw},
+				ExtraReferenceLanguages: []string{},
+				ExportMode:              "rule_based",
+			})
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			err = s.Set(ctx, KeyLanguagesPolicy, body)
+			if err == nil {
+				t.Fatalf("Set accepted %q as a target import language", raw)
+			}
+			msg := err.Error()
+			for _, want := range []string{fmt.Sprintf("%q", raw), "not recognised", "pl, pol", "Polish"} {
+				if !strings.Contains(msg, want) {
+					t.Errorf("error %q does not mention %q", msg, want)
+				}
+			}
+			if !errors.Is(err, ErrInvalidValue) {
+				t.Errorf("error %v is not ErrInvalidValue", err)
+			}
+		})
+	}
+}
+
+// pl-PL is a BCP-47 tag whose primary subtag is a real language: the region is
+// dropped rather than refused.
+func TestRegionalTagSavesAsItsPrimarySubtag(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	body, err := json.Marshal(LanguagesPolicy{
+		TargetImportLanguages:   []string{"pl-PL"},
+		ExtraReferenceLanguages: []string{},
+		ExportMode:              "rule_based",
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := s.Set(ctx, KeyLanguagesPolicy, body); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	got := decode[LanguagesPolicy](t, mustGet(t, s, ctx, KeyLanguagesPolicy))
+	if !reflect.DeepEqual(got.TargetImportLanguages, []string{"pl"}) {
+		t.Errorf("target languages = %v, want [pl]", got.TargetImportLanguages)
+	}
+}
+
+// Reserved tokens are not languages: they must survive normalisation untouched.
+func TestReservedReferenceTokensSurvive(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	body, err := json.Marshal(LanguagesPolicy{
+		TargetImportLanguages:   []string{"pl"},
+		ExtraReferenceLanguages: []string{"org", "all", "pol"},
+		ExportMode:              "rule_based",
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := s.Set(ctx, KeyLanguagesPolicy, body); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	got := decode[LanguagesPolicy](t, mustGet(t, s, ctx, KeyLanguagesPolicy))
+	want := []string{"org", "all", "pl"}
+	if !reflect.DeepEqual(got.ExtraReferenceLanguages, want) {
+		t.Errorf("reference languages = %v, want %v", got.ExtraReferenceLanguages, want)
+	}
+}
+
 func TestLanguagesPolicyRejectsReferenceTokensAsTargets(t *testing.T) {
 	ctx := context.Background()
 	s := openStore(t)

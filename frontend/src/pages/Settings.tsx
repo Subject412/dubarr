@@ -18,6 +18,7 @@ import type {
 import { api } from '../lib/api'
 import { DEFAULT_SETTINGS as DEFAULTS } from '../lib/defaults'
 import { useSaveSettings, useSettings } from '../lib/hooks'
+import { REFERENCE_TOKEN_PRESETS } from '../lib/language-presets'
 import { settingsHelp } from '../lib/settings-help'
 import {
   isSettingsSectionKey,
@@ -52,12 +53,6 @@ import {
   StringListEditor,
   Toggle,
 } from '../components/ui'
-
-/** Friendly labels for the reserved Reference Language tokens (GLOSSARY). */
-const REFERENCE_TOKEN_PRESETS = [
-  { value: 'org', label: 'org — original language from *arr' },
-  { value: 'all', label: 'all — any shared language' },
-]
 
 /**
  * The three tag sources the Processing Gate reads, all of them live. The sync

@@ -1,55 +1,115 @@
 import { useEffect, useRef, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { Alert, Button, Card, Input, Select, Spinner } from '../ui'
+import { Alert, Badge, Button, Card, Input, Select, Spinner } from '../ui'
 import { useDebouncedValue } from '../../lib/hooks'
+import { api, type LibraryMovieResource } from '../../lib/api'
 import { EligibilityBadge } from './EligibilityBadge'
 import {
   basename,
-  fetchLibraryItems,
   firstSyncError,
   libraryEligibilityOptions,
   libraryEmptyState,
-  libraryItemsPath,
-  libraryKindOptions,
-  libraryTypeLabel,
   LIBRARY_PAGE_SIZE,
   LibraryRescanError,
   rescanLibraryItem,
-  scopedInstances,
   type LibraryEligibility,
   type LibraryEmptyState,
   type LibraryHealthInstance,
   type LibraryHealthResponse,
-  type LibraryItem,
-  type LibraryItemsResponse,
-  type LibraryKind,
 } from '../../lib/library'
 
-/** Page sizes the Films tab offers; the flat route clamps to the same maximum. */
+/** Page sizes the Movies tab offers; the route clamps to the same maximum. */
 const PAGE_SIZES = [25, 50, 100, 200]
 
 /**
- * Copy for the four mutually exclusive empty states of the flat list. `state`
- * comes from [libraryEmptyState], so a search that hides existing rows reads
- * differently from a library that has never been synced.
+ * One Radarr movie as the table renders it. `id` is `arr_library_cache.id` —
+ * the id the rescan route takes, never Radarr's own movieId.
+ */
+type MovieRow = {
+  id: number
+  title: string
+  year: number
+  originalLanguage: string
+  audioLanguages: string[]
+  monitored: boolean
+  available: boolean
+  eligibility: string
+  targetFilePath: string
+  instance: string
+}
+
+function movieRow(movie: LibraryMovieResource): MovieRow {
+  return {
+    id: movie.id,
+    title: movie.title,
+    year: movie.year ?? 0,
+    originalLanguage: movie.original_language ?? '',
+    audioLanguages: movie.audio_languages ?? [],
+    monitored: movie.monitored ?? false,
+    available: movie.available ?? false,
+    eligibility: movie.eligibility ?? '',
+    targetFilePath: movie.target_file_path ?? '',
+    instance: movie.instance ?? '',
+  }
+}
+
+/** `ja` / `da, en`, and a dash when arr reported nothing. */
+function languagesText(codes: string[]): string {
+  if (codes.length === 0) return '—'
+  // A file with many tracks keeps the cell narrow: `ja, en, da +2`.
+  if (codes.length <= 3) return codes.join(', ')
+  return `${codes.slice(0, 3).join(', ')} +${codes.length - 3}`
+}
+
+/**
+ * Empty states the list can show. `filtered_page` is local to this tab: the
+ * Eligibility control narrows the page the server already returned, so an
+ * empty page says nothing about the rest of the library.
+ */
+type MovieEmptyState = LibraryEmptyState | 'filtered_page'
+
+/**
+ * Copy for the mutually exclusive empty states of the movie list. `state`
+ * comes from [libraryEmptyState] plus the page-local `filtered_page`, so a
+ * search that hides existing rows reads differently from a library that has
+ * never been synced — and a page emptied by Eligibility never claims the
+ * library has no matches.
  */
 function EmptyState({
   state,
   instances,
-  kind,
   onClearFilters,
 }: {
-  state: LibraryEmptyState
+  state: MovieEmptyState
   instances: LibraryHealthInstance[]
-  kind: LibraryKind | ''
   onClearFilters: () => void
 }) {
+  if (state === 'filtered_page') {
+    return (
+      <div className="py-8 text-center">
+        <p className="text-sm font-medium text-zinc-200">
+          No titles on this page match these filters
+        </p>
+        <p className="mt-1 text-sm text-zinc-500">
+          Eligibility narrows the titles loaded on this page only, so matches can sit on another
+          page. Try the next page or clear the filter.
+        </p>
+        <div className="mt-4 flex justify-center">
+          <Button variant="secondary" size="sm" onClick={onClearFilters}>
+            Clear filters
+          </Button>
+        </div>
+      </div>
+    )
+  }
+
   if (state === 'filtered_nothing') {
     return (
       <div className="py-8 text-center">
-        <p className="text-sm font-medium text-zinc-200">No titles match these filters</p>
+        <p className="text-sm font-medium text-zinc-200">No titles match this search</p>
         <p className="mt-1 text-sm text-zinc-500">
-          Widen the search or drop a filter to see the rest of the library.
+          Search runs over the whole library, so no title matches it. Clear the search to see the
+          titles again.
         </p>
         <div className="mt-4 flex justify-center">
           <Button variant="secondary" size="sm" onClick={onClearFilters}>
@@ -61,9 +121,7 @@ function EmptyState({
   }
 
   if (state === 'sync_failed') {
-    // The detail must name the instance that is failing in the current scope,
-    // so another kind's error cannot be shown under a `kind=` filter.
-    const detail = firstSyncError(scopedInstances(instances, kind))
+    const detail = firstSyncError(instances)
     return (
       <div className="py-8 text-center">
         <p className="text-sm font-medium text-zinc-200">The last sync failed</p>
@@ -97,38 +155,61 @@ function EmptyState({
   )
 }
 
-function ItemRow({
-  item,
+/**
+ * One movie row: what it is, what languages it carries, whether it can be
+ * tagged, and where its file is. Monitored and available sit under the title as
+ * compact badges — `available` means the mirror holds a file, which is the same
+ * fact the target cell shows.
+ */
+function MovieTableRow({
+  movie,
   onRescan,
   rescanning,
   note,
 }: {
-  item: LibraryItem
+  movie: MovieRow
   onRescan?: () => void
   rescanning?: boolean
   note?: string
 }) {
-  const target = basename(item.target_file_path)
+  const target = basename(movie.targetFilePath)
+  const audioTitle =
+    movie.audioLanguages.length > 3 ? movie.audioLanguages.join(', ') : undefined
 
   return (
     <tr className="border-b border-ink-800/70 last:border-0">
-      <td className="px-4 py-3 text-sm font-medium text-zinc-100">{item.title}</td>
-      <td className="px-4 py-3 text-sm text-zinc-400">{item.year || '—'}</td>
-      <td className="whitespace-nowrap px-4 py-3 text-xs text-zinc-400">
-        {libraryTypeLabel(item)}
+      <td className="px-4 py-3">
+        <div className="text-sm font-medium text-zinc-100">{movie.title}</div>
+        <div className="mt-1 flex flex-wrap gap-1">
+          <span title="Whether Radarr is monitoring this movie.">
+            <Badge tone={movie.monitored ? 'accent' : 'neutral'}>
+              {movie.monitored ? 'Monitored' : 'Unmonitored'}
+            </Badge>
+          </span>
+          <span title="Whether the mirror holds a file for this movie.">
+            <Badge tone={movie.available ? 'success' : 'neutral'}>
+              {movie.available ? 'Available' : 'No file'}
+            </Badge>
+          </span>
+        </div>
+      </td>
+      <td className="px-4 py-3 text-sm text-zinc-400">{movie.year || '—'}</td>
+      <td className="px-4 py-3 text-sm text-zinc-400">{movie.originalLanguage || '—'}</td>
+      <td className="px-4 py-3 text-sm text-zinc-400" title={audioTitle}>
+        {languagesText(movie.audioLanguages)}
       </td>
       <td className="px-4 py-3">
-        <EligibilityBadge status={item.eligibility_status} />
+        <EligibilityBadge status={movie.eligibility} />
       </td>
       <td className="px-4 py-3">
         <span
           className="font-mono text-xs text-zinc-300"
-          title={item.target_file_path || 'No target file'}
+          title={movie.targetFilePath || 'No target file'}
         >
           {target || '—'}
         </span>
       </td>
-      <td className="px-4 py-3 text-xs text-zinc-400">{item.instance_name}</td>
+      <td className="px-4 py-3 text-xs text-zinc-400">{movie.instance || '—'}</td>
       <td className="px-4 py-3">
         <Button variant="secondary" size="sm" disabled={rescanning} onClick={onRescan}>
           {rescanning ? 'Rescanning...' : 'Rescan'}
@@ -144,48 +225,40 @@ function ItemRow({
 }
 
 /**
- * The Films tab (#56): the flat library exactly as it behaved before the split,
- * still served by GET /api/library/items. Radarr has no levels, so this list is
- * the movie side of the tree; searching, filtering and paging all go to the
- * server, and a row can still ask arr to rescan itself.
+ * The Movies tab (#128): one row per Radarr movie, read from
+ * GET /api/library/movies. That route returns movies only and carries the
+ * language, monitored and available fields; the flat /api/library/items route
+ * mixed in episode rows and had none of them, which is why this tab left it.
  *
- * Health is read and refreshed by the page shell, which passes it down so the
- * empty state can tell "never synced" from "nothing matched" — and, while it is
- * still loading, shows no empty state at all rather than the wrong one.
+ * Searching and paging go to the server. Health is read and refreshed by the
+ * page shell, which passes it down so the empty state can tell "never synced"
+ * from "nothing matched" — and, while it is still loading, shows no empty state
+ * at all rather than the wrong one.
  */
 export function MoviesTab({ health }: { health: LibraryHealthResponse | undefined }) {
   const [search, setSearch] = useState('')
   const debouncedSearch = useDebouncedValue(search, 250)
-  const [kind, setKind] = useState<LibraryKind | ''>('')
   const [eligibility, setEligibility] = useState<LibraryEligibility | ''>('')
   const [pageSize, setPageSize] = useState(LIBRARY_PAGE_SIZE)
-  const [offset, setOffset] = useState(0)
+  const [page, setPage] = useState(1)
 
   const query = debouncedSearch.trim()
-  const filtersActive = query !== '' || kind !== '' || eligibility !== ''
+  const filtersActive = query !== '' || eligibility !== ''
 
-  // Changing any filter returns to the first page. Deriving it during render
-  // avoids the extra request a post-commit effect would fire with the old offset.
-  const filterKey = [query, kind, eligibility, pageSize].join('\u0000')
+  // Changing the search, the verdict or the page size returns to the first
+  // page. Deriving it during render avoids the extra request a post-commit
+  // effect would fire with the stale page.
+  const filterKey = [query, eligibility, pageSize].join('\u0000')
   const [appliedFilterKey, setAppliedFilterKey] = useState(filterKey)
   if (appliedFilterKey !== filterKey) {
     setAppliedFilterKey(filterKey)
-    setOffset(0)
+    setPage(1)
   }
-  const effectiveOffset = appliedFilterKey === filterKey ? offset : 0
+  const effectivePage = appliedFilterKey === filterKey ? page : 1
 
-  const itemsPath = libraryItemsPath({
-    q: query,
-    kind,
-    eligibility,
-    limit: pageSize,
-    offset: effectiveOffset,
-  })
-
-  const items = useQuery<LibraryItemsResponse, Error>({
-    queryKey: ['library', 'items', itemsPath],
-    queryFn: () =>
-      fetchLibraryItems({ q: query, kind, eligibility, limit: pageSize, offset: effectiveOffset }),
+  const movies = useQuery({
+    queryKey: ['library', 'movies', query, effectivePage, pageSize],
+    queryFn: () => api.libraryMovies({ q: query, page: effectivePage, pageSize }),
     retry: false,
     staleTime: 5_000,
   })
@@ -204,29 +277,29 @@ export function MoviesTab({ health }: { health: LibraryHealthResponse | undefine
   const [rescanning, setRescanning] = useState<ReadonlySet<number>>(() => new Set())
   const [rescanNotes, setRescanNotes] = useState<Record<number, string>>({})
 
-  const startRescan = async (item: LibraryItem) => {
-    if (rescanning.has(item.id)) return
-    setRescanning((prev) => new Set(prev).add(item.id))
+  const startRescan = async (movie: MovieRow) => {
+    if (rescanning.has(movie.id)) return
+    setRescanning((prev) => new Set(prev).add(movie.id))
     setRescanNotes((prev) => {
-      if (!(item.id in prev)) return prev
+      if (!(movie.id in prev)) return prev
       const next = { ...prev }
-      delete next[item.id]
+      delete next[movie.id]
       return next
     })
     try {
-      const result = await rescanLibraryItem(item.id)
+      const result = await rescanLibraryItem(movie.id)
       // Accepted or not, what the page shows may now be stale: arr was asked to
-      // look at the item again, so re-read both queries either way.
+      // look at the movie again, so re-read both queries either way.
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['library', 'health'] }),
-        queryClient.invalidateQueries({ queryKey: ['library', 'items'] }),
+        queryClient.invalidateQueries({ queryKey: ['library', 'movies'] }),
       ])
       if (!mountedRef.current) return
       if (result.reread === 'failed') {
         const cause = result.reread_error || 'unknown error'
         setRescanNotes((prev) => ({
           ...prev,
-          [item.id]: `The rescan was accepted, but re-reading the item failed: ${cause}`,
+          [movie.id]: `The rescan was accepted, but re-reading the item failed: ${cause}`,
         }))
       }
     } catch (error) {
@@ -235,40 +308,49 @@ export function MoviesTab({ health }: { health: LibraryHealthResponse | undefine
         error instanceof LibraryRescanError || error instanceof Error
           ? error.message
           : 'unknown error'
-      setRescanNotes((prev) => ({ ...prev, [item.id]: `Could not rescan: ${message}` }))
+      setRescanNotes((prev) => ({ ...prev, [movie.id]: `Could not rescan: ${message}` }))
     } finally {
       if (mountedRef.current) {
         setRescanning((prev) => {
           const next = new Set(prev)
-          next.delete(item.id)
+          next.delete(movie.id)
           return next
         })
       }
     }
   }
 
-  const rows = items.data?.items ?? []
-  const total = items.data?.total ?? 0
+  const pageRows = (movies.data?.items ?? []).map(movieRow)
+  // The movie route filters on q / instanceId / page / pageSize / sort / dir —
+  // there is no verdict parameter, so the Eligibility control narrows the page
+  // the server returned. The pager still counts titles.
+  const rows =
+    eligibility === '' ? pageRows : pageRows.filter((row) => row.eligibility === eligibility)
+  const total = movies.data?.total ?? 0
   const instances = health?.instances ?? []
-  const emptyState =
-    items.data && health
-      ? libraryEmptyState({
-          instances,
-          cacheItems: health.cache_items,
-          kind,
-          filtersActive,
-          total,
-        })
-      : null
+  // A page the verdict filter emptied is a page-local filter hit, not an empty
+  // library: the matching titles may be on any other page.
+  let emptyState: MovieEmptyState | null = null
+  if (pageRows.length > 0 && rows.length === 0) {
+    emptyState = 'filtered_page'
+  } else if (movies.data && health) {
+    emptyState = libraryEmptyState({
+      instances,
+      // Movies, not every cache row: 12 400 episodes must not make an empty
+      // movie list look like a filter problem.
+      cacheItems: health.cache_movies,
+      filtersActive: query !== '',
+      total,
+    })
+  }
 
   const clearFilters = () => {
     setSearch('')
-    setKind('')
     setEligibility('')
   }
 
-  const first = effectiveOffset + 1
-  const last = effectiveOffset + rows.length
+  const first = (effectivePage - 1) * pageSize + 1
+  const last = first + pageRows.length - 1
 
   return (
     <div>
@@ -286,23 +368,6 @@ export function MoviesTab({ health }: { health: LibraryHealthResponse | undefine
             className="mt-1"
           />
         </div>
-        <div className="w-40">
-          <label htmlFor="library-kind" className="block text-xs font-medium text-zinc-400">
-            Kind
-          </label>
-          <Select
-            id="library-kind"
-            className="mt-1"
-            value={kind}
-            onChange={(event) => setKind(event.target.value as LibraryKind | '')}
-          >
-            {libraryKindOptions.map((option) => (
-              <option key={option.value} value={option.value}>
-                {option.label}
-              </option>
-            ))}
-          </Select>
-        </div>
         <div className="w-48">
           <label htmlFor="library-eligibility" className="block text-xs font-medium text-zinc-400">
             Eligibility
@@ -312,6 +377,7 @@ export function MoviesTab({ health }: { health: LibraryHealthResponse | undefine
             className="mt-1"
             value={eligibility}
             onChange={(event) => setEligibility(event.target.value as LibraryEligibility | '')}
+            title="Narrows the titles on this page by their Processing Gate verdict. Searching and paging stay server-side."
           >
             {libraryEligibilityOptions.map((option) => (
               <option key={option.value} value={option.value}>
@@ -343,21 +409,16 @@ export function MoviesTab({ health }: { health: LibraryHealthResponse | undefine
       </div>
 
       <Card className="overflow-hidden">
-        {items.isLoading && <Spinner label="Loading library titles" />}
-        {items.error && <Alert>Could not load the library: {items.error.message}</Alert>}
+        {movies.isLoading && <Spinner label="Loading library titles" />}
+        {movies.error && <Alert>Could not load the library: {movies.error.message}</Alert>}
 
-        {!items.isLoading && !items.error && rows.length === 0 && emptyState && (
-          <EmptyState
-            state={emptyState}
-            instances={instances}
-            kind={kind}
-            onClearFilters={clearFilters}
-          />
+        {!movies.isLoading && !movies.error && rows.length === 0 && emptyState && (
+          <EmptyState state={emptyState} instances={instances} onClearFilters={clearFilters} />
         )}
 
         {rows.length > 0 && (
           <div className="-mx-5 -mb-5 overflow-x-auto">
-            <table className="w-full min-w-[48rem] text-left" aria-label="Library titles">
+            <table className="w-full min-w-[56rem] text-left" aria-label="Library titles">
               <thead>
                 <tr className="border-b border-ink-800 text-[11px] uppercase tracking-wider text-zinc-500">
                   <th scope="col" className="px-4 pb-2 font-medium">
@@ -367,7 +428,10 @@ export function MoviesTab({ health }: { health: LibraryHealthResponse | undefine
                     Year
                   </th>
                   <th scope="col" className="px-4 pb-2 font-medium">
-                    Type
+                    Original language
+                  </th>
+                  <th scope="col" className="px-4 pb-2 font-medium">
+                    Audio languages
                   </th>
                   <th scope="col" className="px-4 pb-2 font-medium">
                     Eligibility
@@ -384,13 +448,13 @@ export function MoviesTab({ health }: { health: LibraryHealthResponse | undefine
                 </tr>
               </thead>
               <tbody>
-                {rows.map((item) => (
-                  <ItemRow
-                    key={item.id}
-                    item={item}
-                    rescanning={rescanning.has(item.id)}
-                    note={rescanNotes[item.id]}
-                    onRescan={() => void startRescan(item)}
+                {rows.map((movie) => (
+                  <MovieTableRow
+                    key={movie.id}
+                    movie={movie}
+                    rescanning={rescanning.has(movie.id)}
+                    note={rescanNotes[movie.id]}
+                    onRescan={() => void startRescan(movie)}
                   />
                 ))}
               </tbody>
@@ -403,21 +467,27 @@ export function MoviesTab({ health }: { health: LibraryHealthResponse | undefine
         <div className="mt-4 flex flex-wrap items-center justify-between gap-2">
           <p className="text-xs text-zinc-500">
             Showing {first}-{last} of {total}
+            {eligibility !== '' && pageRows.length > 0 && (
+              <span>
+                {' '}
+                · Eligibility matches {rows.length} of these {pageRows.length} titles on this page
+              </span>
+            )}
           </p>
           <div className="flex items-center gap-2">
             <Button
               variant="secondary"
               size="sm"
-              disabled={effectiveOffset === 0 || items.isFetching}
-              onClick={() => setOffset(Math.max(0, effectiveOffset - pageSize))}
+              disabled={effectivePage === 1 || movies.isFetching}
+              onClick={() => setPage(Math.max(1, effectivePage - 1))}
             >
               Previous
             </Button>
             <Button
               variant="secondary"
               size="sm"
-              disabled={last >= total || items.isFetching}
-              onClick={() => setOffset(effectiveOffset + pageSize)}
+              disabled={last >= total || movies.isFetching}
+              onClick={() => setPage(effectivePage + 1)}
             >
               Next
             </Button>

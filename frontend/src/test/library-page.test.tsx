@@ -2,7 +2,8 @@ import { cleanup, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 import { LibraryPage } from '../pages/Library'
-import type { LibraryHealthInstance, LibraryItem } from '../lib/library'
+import type { LibraryMovieResource } from '../lib/api'
+import type { LibraryHealthInstance } from '../lib/library'
 import { jsonResponse, renderWithProviders } from './helpers'
 
 function instance(overrides: Partial<LibraryHealthInstance> = {}): LibraryHealthInstance {
@@ -19,40 +20,55 @@ function instance(overrides: Partial<LibraryHealthInstance> = {}): LibraryHealth
   }
 }
 
-function movie(overrides: Partial<LibraryItem> = {}): LibraryItem {
+function movieResource(overrides: Partial<LibraryMovieResource> = {}): LibraryMovieResource {
   return {
     id: 1,
-    media_type: 'movie',
+    arr_id: 318,
+    instance_id: 1,
+    instance: 'Radarr',
     title: 'Arrival',
     year: 2016,
-    season: null,
-    episode: null,
-    kind: 'radarr',
-    instance_id: 1,
-    instance_name: 'Radarr',
-    eligibility_status: 'eligible',
-    matches_target_tags: true,
-    root_folder_path: '/media/movies',
+    original_language: 'en',
+    audio_languages: ['en'],
+    monitored: true,
+    available: true,
+    path: '/media/movies/Arrival (2016)',
     target_file_path: '/media/movies/Arrival (2016)/Arrival.2016.mkv',
-    last_seen_at: '2026-11-25 10:00:00',
+    has_file: true,
+    eligibility: 'eligible',
     updated_at: '2026-11-25 09:30:00',
     ...overrides,
   }
 }
 
-type ItemsHandler = (url: URL) => {
-  items: LibraryItem[]
+type MovieHandler = (url: URL) => {
+  page: number
+  pageSize: number
   total: number
-  limit: number
-  offset: number
+  items: LibraryMovieResource[]
 }
 
-function pageOf(items: LibraryItem[], url: URL, total = items.length) {
+function pageOf(items: LibraryMovieResource[], url: URL, total = items.length) {
   return {
-    items,
+    page: Number(url.searchParams.get('page') ?? 1),
+    pageSize: Number(url.searchParams.get('pageSize') ?? 50),
     total,
-    limit: Number(url.searchParams.get('limit') ?? 50),
-    offset: Number(url.searchParams.get('offset') ?? 0),
+    items,
+  }
+}
+
+/** A server page of `total` movies, numbered so a page boundary is visible. */
+function pagedMovies(url: URL, total: number) {
+  const page = Number(url.searchParams.get('page') ?? 1)
+  const pageSize = Number(url.searchParams.get('pageSize') ?? 50)
+  const start = (page - 1) * pageSize
+  return {
+    page,
+    pageSize,
+    total,
+    items: Array.from({ length: Math.max(0, Math.min(pageSize, total - start)) }, (_, i) =>
+      movieResource({ id: start + i + 1, title: `Title ${start + i + 1}` }),
+    ),
   }
 }
 
@@ -62,7 +78,7 @@ function mockLibrary({
   cacheItems = 0,
   cacheMovies = 0,
   cacheSeries = 0,
-  items,
+  movies,
   refresh,
   rescan,
 }: {
@@ -71,7 +87,8 @@ function mockLibrary({
   /** Films and shows in the library; the header reads these, not cacheItems. */
   cacheMovies?: number
   cacheSeries?: number
-  items: ItemsHandler
+  /** The Radarr list the Movies tab reads; `cacheMovies` is its total. */
+  movies: MovieHandler
   /** POST /api/library/refresh response; defaults to an accepted pass. */
   refresh?: () => Response | Promise<Response>
   /** POST /api/library/items/{id}/rescan response; defaults to accepted + reread ok. */
@@ -87,8 +104,13 @@ function mockLibrary({
         cache_series: cacheSeries,
       })
     }
+    if (url.pathname === '/api/library/movies') {
+      return jsonResponse(movies(url))
+    }
     if (url.pathname === '/api/library/items') {
-      return jsonResponse(items(url))
+      // The legacy flat list is still served — and stubbed — although the
+      // Movies tab no longer reads it; a regression back to it renders nothing.
+      return jsonResponse({ items: [], total: 0, limit: 50, offset: 0 })
     }
     if (url.pathname === '/api/library/refresh' && (init?.method ?? 'GET').toUpperCase() === 'POST') {
       return refresh ? await refresh() : jsonResponse({ accepted: true, kind: 'all' }, 202)
@@ -114,7 +136,7 @@ function wasCalled(
 
 describe('library page empty states (#29)', () => {
   it('never_synced: no instance has ever been polled', async () => {
-    mockLibrary({ instances: [instance()], items: (url) => pageOf([], url) })
+    mockLibrary({ instances: [instance()], movies: (url) => pageOf([], url) })
     renderWithProviders(<LibraryPage />, { route: '/library' })
 
     expect(await screen.findByText('No sync has run yet')).toBeInTheDocument()
@@ -128,7 +150,7 @@ describe('library page empty states (#29)', () => {
   })
 
   it('never_synced: points at Settings when no instance is configured at all', async () => {
-    mockLibrary({ instances: [], items: (url) => pageOf([], url) })
+    mockLibrary({ instances: [], movies: (url) => pageOf([], url) })
     renderWithProviders(<LibraryPage />, { route: '/library' })
 
     expect(await screen.findByText('No sync has run yet')).toBeInTheDocument()
@@ -144,7 +166,7 @@ describe('library page empty states (#29)', () => {
           last_error: 'dial tcp 10.0.0.2:7878: connection refused',
         }),
       ],
-      items: (url) => pageOf([], url),
+      movies: (url) => pageOf([], url),
     })
     renderWithProviders(<LibraryPage />, { route: '/library' })
 
@@ -158,7 +180,7 @@ describe('library page empty states (#29)', () => {
       instances: [
         instance({ last_ok: true, last_sync_at: '2026-11-25 09:00:00', last_attempt_at: '2026-11-25 09:00:00' }),
       ],
-      items: (url) => pageOf([], url),
+      movies: (url) => pageOf([], url),
     })
     renderWithProviders(<LibraryPage />, { route: '/library' })
 
@@ -167,13 +189,13 @@ describe('library page empty states (#29)', () => {
     expect(screen.queryByText('No sync has run yet')).not.toBeInTheDocument()
   })
 
-  it('filtered_nothing: the cache has rows but the filters hide them, with a Clear filters control', async () => {
+  it('filtered_nothing: the library has movies but the search hides them, with a Clear filters control', async () => {
     const user = userEvent.setup()
-    const titles = [movie()]
+    const titles = [movieResource()]
     mockLibrary({
       instances: [instance({ last_ok: true, items_seen: titles.length })],
-      cacheItems: titles.length,
-      items: (url) => pageOf(url.searchParams.get('q') ? [] : titles, url),
+      cacheMovies: titles.length,
+      movies: (url) => pageOf(url.searchParams.get('q') ? [] : titles, url),
     })
     renderWithProviders(<LibraryPage />, { route: '/library' })
 
@@ -181,11 +203,39 @@ describe('library page empty states (#29)', () => {
 
     await user.type(screen.getByLabelText('Search titles'), 'zzz')
     expect(
-      await screen.findByText('No titles match these filters', {}, { timeout: 2000 }),
+      await screen.findByText('No titles match this search', {}, { timeout: 2000 }),
     ).toBeInTheDocument()
+    expect(screen.queryByText(/No titles on this page/)).not.toBeInTheDocument()
 
     await user.click(screen.getByRole('button', { name: 'Clear filters' }))
     expect(await screen.findByText('Arrival')).toBeInTheDocument()
+  })
+
+  it('a page emptied by Eligibility says the page is empty, not the library', async () => {
+    const user = userEvent.setup()
+    const titles = [
+      movieResource(),
+      movieResource({ id: 2, title: 'Kayak', eligibility: 'missing_target' }),
+    ]
+    mockLibrary({
+      instances: [instance({ last_ok: true, items_seen: titles.length })],
+      cacheMovies: titles.length,
+      movies: (url) => pageOf(titles, url),
+    })
+    renderWithProviders(<LibraryPage />, { route: '/library' })
+
+    expect(await screen.findByText('Arrival')).toBeInTheDocument()
+
+    await user.selectOptions(screen.getByLabelText('Eligibility'), 'waiting_for_tags')
+
+    expect(
+      await screen.findByText('No titles on this page match these filters'),
+    ).toBeInTheDocument()
+    expect(screen.queryByText('Nothing in the library yet')).not.toBeInTheDocument()
+    expect(screen.getByText(/Showing 1-2 of 2/)).toBeInTheDocument()
+    expect(
+      screen.getByText(/Eligibility matches 0 of these 2 titles on this page/),
+    ).toBeInTheDocument()
   })
 
   it('reports a failure even when another instance has never been polled', async () => {
@@ -198,7 +248,7 @@ describe('library page empty states (#29)', () => {
         }),
         instance({ kind: 'sonarr', name: 'Sonarr' }),
       ],
-      items: (url) => pageOf([], url),
+      movies: (url) => pageOf([], url),
     })
     renderWithProviders(<LibraryPage />, { route: '/library' })
 
@@ -219,93 +269,12 @@ describe('library page empty states (#29)', () => {
           last_error: 'dial tcp 10.0.0.3:8989: connection refused',
         }),
       ],
-      items: (url) => pageOf([], url),
+      movies: (url) => pageOf([], url),
     })
     renderWithProviders(<LibraryPage />, { route: '/library' })
 
     expect(await screen.findByText('Nothing in the library yet')).toBeInTheDocument()
     expect(screen.queryByText('No sync has run yet')).not.toBeInTheDocument()
-  })
-
-  it('keeps the failure visible when a kind filter hides the only rows', async () => {
-    const user = userEvent.setup()
-    const sonarrRow = movie({
-      id: 7,
-      media_type: 'series',
-      title: 'Andor',
-      year: 2022,
-      season: 2,
-      episode: 5,
-      kind: 'sonarr',
-      instance_name: 'Sonarr',
-    })
-    mockLibrary({
-      instances: [
-        instance({
-          last_ok: false,
-          last_attempt_at: '2026-11-25 09:00:00',
-          last_error: 'dial tcp 10.0.0.2:7878: connection refused',
-        }),
-        instance({ kind: 'sonarr', name: 'Sonarr', last_ok: true, items_seen: 1 }),
-      ],
-      cacheItems: 1,
-      items: (url) =>
-        url.searchParams.get('kind') === 'radarr' ? pageOf([], url) : pageOf([sonarrRow], url),
-    })
-    renderWithProviders(<LibraryPage />, { route: '/library' })
-
-    expect(await screen.findByText('Andor')).toBeInTheDocument()
-
-    await user.selectOptions(screen.getByLabelText('Kind'), 'radarr')
-    expect(
-      await screen.findByText('The last sync failed', {}, { timeout: 2000 }),
-    ).toBeInTheDocument()
-    expect(screen.getAllByText(/connection refused/).length).toBeGreaterThan(0)
-    expect(screen.queryByText('No titles match these filters')).not.toBeInTheDocument()
-  })
-
-  it('sync_failed: with a kind filter active the detail names the failing instance in scope', async () => {
-    const user = userEvent.setup()
-    const sonarrRow = movie({
-      id: 8,
-      media_type: 'series',
-      title: 'Andor',
-      year: 2022,
-      season: 2,
-      episode: 5,
-      kind: 'sonarr',
-      instance_name: 'Sonarr',
-    })
-    mockLibrary({
-      instances: [
-        instance({
-          last_ok: false,
-          last_attempt_at: '2026-11-25 09:00:00',
-          last_error: 'radarr: dial tcp 10.0.0.2:7878: connection refused',
-        }),
-        instance({
-          kind: 'sonarr',
-          name: 'Sonarr',
-          last_ok: false,
-          last_attempt_at: '2026-11-25 09:00:00',
-          last_error: 'sonarr: 401 Unauthorized',
-          items_seen: 1,
-        }),
-      ],
-      cacheItems: 1,
-      items: (url) =>
-        url.searchParams.get('kind') === 'radarr' ? pageOf([], url) : pageOf([sonarrRow], url),
-    })
-    renderWithProviders(<LibraryPage />, { route: '/library' })
-
-    expect(await screen.findByText('Andor')).toBeInTheDocument()
-
-    await user.selectOptions(screen.getByLabelText('Kind'), 'radarr')
-
-    const heading = await screen.findByText('The last sync failed', {}, { timeout: 2000 })
-    const detail = heading.parentElement as HTMLElement
-    expect(detail).toHaveTextContent('radarr: dial tcp 10.0.0.2:7878: connection refused')
-    expect(detail).not.toHaveTextContent('sonarr: 401 Unauthorized')
   })
 })
 
@@ -316,7 +285,7 @@ describe('library header counts titles, not files', () => {
       cacheItems: 12909,
       cacheMovies: 486,
       cacheSeries: 166,
-      items: (url) => pageOf([], url),
+      movies: (url) => pageOf([], url),
     })
     renderWithProviders(<LibraryPage />, { route: '/library' })
 
@@ -336,7 +305,7 @@ describe('library header counts titles, not files', () => {
       cacheItems: 2,
       cacheMovies: 1,
       cacheSeries: 1,
-      items: (url) => pageOf([], url),
+      movies: (url) => pageOf([], url),
     })
     renderWithProviders(<LibraryPage />, { route: '/library' })
 
@@ -346,7 +315,7 @@ describe('library header counts titles, not files', () => {
     // A library that has never synced still renders the strip: "series" is
     // invariable, so zero reads "0 movies · 0 series" (never "0 serie").
     cleanup()
-    mockLibrary({ instances: [instance()], items: (url) => pageOf([], url) })
+    mockLibrary({ instances: [instance()], movies: (url) => pageOf([], url) })
     renderWithProviders(<LibraryPage />, { route: '/library' })
 
     const empty = await screen.findByLabelText('Arr sync health')
@@ -355,26 +324,24 @@ describe('library header counts titles, not files', () => {
 })
 
 describe('library page table (#29)', () => {
-  it('renders title, year, episode formatting and eligibility labels', async () => {
+  it('renders title, year, languages and eligibility labels', async () => {
     mockLibrary({
       instances: [instance({ last_ok: true, items_seen: 2 })],
-      cacheItems: 2,
-      items: (url) =>
+      cacheMovies: 2,
+      movies: (url) =>
         pageOf(
           [
-            movie(),
-            movie({
+            movieResource(),
+            movieResource({
               id: 2,
-              media_type: 'series',
-              title: 'Andor',
-              year: 2022,
-              season: 2,
-              episode: 5,
-              kind: 'sonarr',
-              instance_name: 'Sonarr',
-              eligibility_status: 'waiting_for_tags',
-              matches_target_tags: false,
-              target_file_path: '/media/tv/Andor/Season 02/Andor.S02E05.mkv',
+              title: 'Dune',
+              year: 2021,
+              audio_languages: ['en', 'da'],
+              monitored: false,
+              available: false,
+              eligibility: 'waiting_for_tags',
+              target_file_path: '',
+              has_file: false,
             }),
           ],
           url,
@@ -384,21 +351,33 @@ describe('library page table (#29)', () => {
 
     const table = await screen.findByRole('table', { name: 'Library titles' })
     expect(within(table).getByRole('columnheader', { name: 'Title' })).toBeInTheDocument()
+    expect(
+      within(table).getByRole('columnheader', { name: 'Original language' }),
+    ).toBeInTheDocument()
+    expect(
+      within(table).getByRole('columnheader', { name: 'Audio languages' }),
+    ).toBeInTheDocument()
     expect(within(table).getByRole('columnheader', { name: 'Target file' })).toBeInTheDocument()
     expect(within(table).getAllByRole('row')).toHaveLength(3)
 
     expect(within(table).getByText('Arrival')).toBeInTheDocument()
     expect(within(table).getByText('2016')).toBeInTheDocument()
-    expect(within(table).getByText('Movie')).toBeInTheDocument()
     expect(within(table).getByText('Eligible')).toBeInTheDocument()
+    expect(within(table).getByText('Monitored')).toBeInTheDocument()
+    expect(within(table).getByText('Available')).toBeInTheDocument()
 
-    expect(within(table).getByText('Andor')).toBeInTheDocument()
-    expect(within(table).getByText('S02E05')).toBeInTheDocument()
-    expect(within(table).getByText('Waiting for tags')).toBeInTheDocument()
+    const dune = within(table).getByText('Dune').closest('tr') as HTMLElement
+    expect(within(dune).getByText('en, da')).toBeInTheDocument()
+    expect(within(dune).getByText('Waiting for tags')).toBeInTheDocument()
+    // Unmonitored and file-less read as their own words, and a movie the mirror
+    // has no file for shows a dash in the target cell.
+    expect(within(dune).getByText('Unmonitored')).toBeInTheDocument()
+    expect(within(dune).getByText('No file')).toBeInTheDocument()
+    expect(within(dune).getByText('—')).toBeInTheDocument()
 
-    const target = within(table).getByText('Andor.S02E05.mkv')
-    expect(target).toHaveAttribute('title', '/media/tv/Andor/Season 02/Andor.S02E05.mkv')
-    expect(within(table).getByText('Sonarr')).toBeInTheDocument()
+    const target = within(table).getByText('Arrival.2016.mkv')
+    expect(target).toHaveAttribute('title', '/media/movies/Arrival (2016)/Arrival.2016.mkv')
+    expect(within(table).getAllByText('Radarr')).toHaveLength(2)
   })
 })
 
@@ -407,25 +386,15 @@ describe('library page filters and paging (#29)', () => {
     const user = userEvent.setup()
     const fetchMock = mockLibrary({
       instances: [instance({ last_ok: true })],
-      cacheItems: 120,
-      items: (url) => {
-        const args = pageOf([], url, 120)
-        return {
-          ...args,
-          items: Array.from({ length: Math.min(args.limit, 120 - args.offset) }, (_, i) =>
-            movie({ id: args.offset + i + 1, title: `Title ${args.offset + i + 1}` }),
-          ),
-        }
-      },
+      cacheMovies: 120,
+      movies: (url) => pagedMovies(url, 120),
     })
     renderWithProviders(<LibraryPage />, { route: '/library' })
 
     await screen.findByRole('table', { name: 'Library titles' })
     await user.click(screen.getByRole('button', { name: 'Next' }))
     await waitFor(() =>
-      expect(
-        wasCalled(fetchMock, (url) => url.searchParams.get('offset') === '50'),
-      ).toBe(true),
+      expect(wasCalled(fetchMock, (url) => url.searchParams.get('page') === '2')).toBe(true),
     )
 
     await user.type(screen.getByLabelText('Search titles'), 'arrival')
@@ -434,63 +403,45 @@ describe('library page filters and paging (#29)', () => {
         expect(
           wasCalled(
             fetchMock,
-            (url) => url.searchParams.get('q') === 'arrival' && url.searchParams.get('offset') === '0',
+            (url) => url.searchParams.get('q') === 'arrival' && url.searchParams.get('page') === '1',
           ),
         ).toBe(true),
       { timeout: 3000 },
     )
   })
 
-  it('sends the selected kind and resets the offset to the first page', async () => {
+  it('sends a new page size and resets to the first page', async () => {
     const user = userEvent.setup()
     const fetchMock = mockLibrary({
       instances: [instance({ last_ok: true })],
-      cacheItems: 120,
-      items: (url) => {
-        const args = pageOf([], url, 120)
-        return {
-          ...args,
-          items: Array.from({ length: Math.min(args.limit, 120 - args.offset) }, (_, i) =>
-            movie({ id: args.offset + i + 1, title: `Title ${args.offset + i + 1}` }),
-          ),
-        }
-      },
+      cacheMovies: 120,
+      movies: (url) => pagedMovies(url, 120),
     })
     renderWithProviders(<LibraryPage />, { route: '/library' })
 
     await screen.findByRole('table', { name: 'Library titles' })
     await user.click(screen.getByRole('button', { name: 'Next' }))
     await waitFor(() =>
-      expect(
-        wasCalled(fetchMock, (url) => url.searchParams.get('offset') === '50'),
-      ).toBe(true),
+      expect(wasCalled(fetchMock, (url) => url.searchParams.get('page') === '2')).toBe(true),
     )
 
-    await user.selectOptions(screen.getByLabelText('Kind'), 'sonarr')
+    await user.selectOptions(screen.getByLabelText('Rows per page'), '100')
     await waitFor(() =>
       expect(
         wasCalled(
           fetchMock,
-          (url) => url.searchParams.get('kind') === 'sonarr' && url.searchParams.get('offset') === '0',
+          (url) => url.searchParams.get('pageSize') === '100' && url.searchParams.get('page') === '1',
         ),
       ).toBe(true),
     )
   })
 
-  it('pages with Showing X-Y of N and Next sending the next offset', async () => {
+  it('pages with Showing X-Y of N and Next sending the next page', async () => {
     const user = userEvent.setup()
     const fetchMock = mockLibrary({
       instances: [instance({ last_ok: true })],
-      cacheItems: 120,
-      items: (url) => {
-        const args = pageOf([], url, 120)
-        return {
-          ...args,
-          items: Array.from({ length: Math.min(args.limit, 120 - args.offset) }, (_, i) =>
-            movie({ id: args.offset + i + 1, title: `Title ${args.offset + i + 1}` }),
-          ),
-        }
-      },
+      cacheMovies: 120,
+      movies: (url) => pagedMovies(url, 120),
     })
     renderWithProviders(<LibraryPage />, { route: '/library' })
 
@@ -499,9 +450,7 @@ describe('library page filters and paging (#29)', () => {
 
     await user.click(screen.getByRole('button', { name: 'Next' }))
     await waitFor(() =>
-      expect(
-        wasCalled(fetchMock, (url) => url.searchParams.get('offset') === '50'),
-      ).toBe(true),
+      expect(wasCalled(fetchMock, (url) => url.searchParams.get('page') === '2')).toBe(true),
     )
     expect(await screen.findByText('Showing 51-100 of 120')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Previous' })).toBeEnabled()
@@ -515,7 +464,7 @@ describe('library page manual refresh (#29)', () => {
     const refresh = vi.fn(() => new Promise<Response>((resolve) => (release = resolve)))
     const fetchMock = mockLibrary({
       instances: [instance()],
-      items: (url) => pageOf([movie()], url),
+      movies: (url) => pageOf([movieResource()], url),
       refresh,
     })
     renderWithProviders(<LibraryPage />, { route: '/library' })
@@ -555,7 +504,7 @@ describe('library page manual refresh (#29)', () => {
     const user = userEvent.setup()
     mockLibrary({
       instances: [instance()],
-      items: (url) => pageOf([movie()], url),
+      movies: (url) => pageOf([movieResource()], url),
       refresh: () => jsonResponse({ error: 'a sync pass is already running', code: 'busy' }, 409),
     })
     renderWithProviders(<LibraryPage />, { route: '/library' })
@@ -572,7 +521,7 @@ describe('library page manual refresh (#29)', () => {
   it('keeps the refresh controls usable with a healthy payload', async () => {
     mockLibrary({
       instances: [instance()],
-      items: (url) => pageOf([], url),
+      movies: (url) => pageOf([], url),
     })
     renderWithProviders(<LibraryPage />, { route: '/library' })
 
@@ -594,11 +543,11 @@ describe('library page per-item rescan (#29)', () => {
     const user = userEvent.setup()
     const fetchMock = mockLibrary({
       instances: [instance()],
-      items: (url) =>
+      movies: (url) =>
         pageOf(
           [
-            movie({ id: 1, title: 'Arrival' }),
-            movie({
+            movieResource({ id: 1, title: 'Arrival' }),
+            movieResource({
               id: 2,
               title: 'Dune',
               target_file_path: '/media/movies/Dune (2021)/Dune.2021.mkv',
@@ -640,7 +589,7 @@ describe('library page per-item rescan (#29)', () => {
     const user = userEvent.setup()
     mockLibrary({
       instances: [instance()],
-      items: (url) => pageOf([movie({ id: 1, title: 'Arrival' })], url),
+      movies: (url) => pageOf([movieResource({ id: 1, title: 'Arrival' })], url),
       rescan: () =>
         jsonResponse(
           {
@@ -674,11 +623,11 @@ describe('library page per-item rescan (#29)', () => {
     })
     mockLibrary({
       instances: [instance()],
-      items: (url) =>
+      movies: (url) =>
         pageOf(
           [
-            movie({ id: 1, title: 'Arrival' }),
-            movie({
+            movieResource({ id: 1, title: 'Arrival' }),
+            movieResource({
               id: 2,
               title: 'Dune',
               target_file_path: '/media/movies/Dune (2021)/Dune.2021.mkv',

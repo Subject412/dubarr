@@ -193,7 +193,9 @@ describe('first-run wizard arr step (optional)', () => {
     expect(await screen.findByRole('heading', { name: 'Radarr & Sonarr' })).toBeInTheDocument()
 
     await user.click(screen.getByRole('button', { name: 'Skip for now' }))
-    expect(await screen.findByRole('heading', { name: 'Security' })).toBeInTheDocument()
+    // Security is no longer a wizard step: the *arr step is the last form and
+    // Finish follows it directly.
+    expect(await screen.findByRole('heading', { name: 'Ready to go' })).toBeInTheDocument()
   })
 })
 

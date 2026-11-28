@@ -9,10 +9,13 @@ came from.
 
 Film, episode and season-folder patterns are operator-editable text with a small
 closed token set (`{Title}`, `{Year}`, `{Season:00}`, `{Episode:00}`,
-`{Episode Title}`, `{Variant}`, `{Codec}`, `{Channels}`). Only `{Season}` and
-`{Episode}` take a zero-padding modifier, because it is the only modifier that
-has a meaning here. Rendering substitutes, drops the separator run before an
-empty token, removes empty groups, and cleans the result; a stem that would
+`{Episode Title}`, `{Variant}`, `{Codec}`, `{Channels}`, `{TmdbId}`, `{TvdbId}`,
+`{ImdbId}`). Only `{Season}` and `{Episode}` take a zero-padding modifier,
+because it is the only modifier that has a meaning here — an id token refuses
+one rather than pad an identifier. Rendering substitutes, drops the separator
+run before an empty token, removes empty groups, and cleans the result; an id
+the mirror does not hold renders empty and takes its group with it, so
+`{Title} ({TmdbId}) [{Year}]` becomes `Title [2024]`, never `Title (0) [2024]`; a stem that would
 exceed 200 bytes, end in `.mka`, or collide with a reserved name is refused at
 validation time, naming the field that caused it. `{Language}` is deliberately
 not a token: the language is what the file *is*, and it belongs in the `.iso2.mka`

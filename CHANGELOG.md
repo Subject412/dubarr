@@ -11,6 +11,120 @@ change.
 
 _Nothing yet._
 
+## [0.6.0] - 2026-11-28
+
+Mostly a release about **telling the truth**: about what the arrs report, about
+what a number on screen means, and about what a control will do when you touch
+it. Three of the owner's long-standing complaints — series with no files, a
+header count that matched nothing, a Movies tab full of episodes — turned out to
+be one habit each: reading a legal "you did not ask for that" as a "no".
+
+### Upgrade notes — read these three
+
+1. **Sonarr 5.x is required.** Dubarr now speaks `/api/v5` (Radarr stays
+   `/api/v3`) and does not probe for a version. A Sonarr 3.x instance fails its
+   connection test with
+   `sonarr: this instance does not serve /api/v5 (404) — dubarr 0.6.0 requires Sonarr 5`.
+2. **The first sync after upgrading fills new columns.** `monitored` and the
+   audio-language lists are written by the sync, so until one pass completes
+   those rows read `monitored: false` and no languages. Nothing is lost; it is
+   simply not yet known.
+3. **Two settings are gone and two behaviours moved.** `imports.options`
+   (editable donor markers) and `mux.options.track_title_in_mkv` (track title)
+   are retired: stored values are kept but inert, and a request still sending
+   them is refused with the key named. The work folder now defaults to
+   `<data>/temp` (existing installs keep what they stored), and fresh installs
+   scan the watch folder every **60 s** instead of 10 s.
+
+### Sonarr v5, and the episodes that were never there
+
+- The episode list returns `episodeFile: null` unless the caller asks for it —
+  a legal answer meaning "you did not request the file". Dubarr asked for
+  neither the sub-resource nor the right version, so every one of ~12 000
+  episodes read as "no file" while the movies were fine. The client now requests
+  `includeSubresources=episodeFile`, and `arrmock` answers 404 on any other API
+  base so a regression fails a test instead of passing quietly.
+- ADR-0023 records why there is no version probe: no probe would have caught it,
+  because the response was valid for the request that was made.
+
+### Library
+
+- **Audio languages, original language, `monitored` and `available`** now come
+  from what the arrs report about the file (`audioStreams[].language`, or the
+  legacy `audioLanguages` string), normalised to ISO 639-1 in stream order. A
+  language that cannot be resolved is dropped, not guessed.
+- `available` means the mirror holds a target path — it does **not** stat the
+  disk, and the UI says "No file", never "on disk".
+- The header reads `486 movies · 166 series` instead of `12 909 titles cached`
+  (that was movies plus one row per episode). The strip and the Series tab now
+  derive the number from the same definition.
+- The Movies tab reads `/api/library/movies` instead of `/api/library/items`,
+  which returned movies and episode rows alike — the cause of both "series under
+  Movies" and "every row missing its target". The Kind filter is gone (the tabs
+  are the filter) and an Eligibility/Year narrowing now says *"on this page"*
+  because that is what it does.
+- Closes #127 (a `needs_attention` vault run names the files to inspect) and
+  #128.
+
+### Sync
+
+- A short dub now reports the silence it leaves at the end of the film
+  (`tail_silence_ms`), with its own row under the job. Closes #129.
+- The muxed track is named for its language (`Polish`), not by a configured
+  string; a target language mkvmerge cannot resolve writes `und` with the legacy
+  `ZZ DUB` title and logs one line, instead of failing the job at the muxer.
+
+### Identify
+
+- Identify was POSTing an endpoint that only accepts GET, so it answered
+  `HTTP 405` every time. It now issues `GET {apiBase}/parse?title=…` with the
+  release name escaped properly.
+- When the parser cannot read a name, identify no longer gives up: it searches
+  dubarr's own mirrored library with a bounded term ladder, and mirror matches
+  are capped at 0.5 confidence so a parsed hit always outranks them. A failed
+  parse with mirror hits returns 200 with `parse.error`; 502 is reserved for a
+  failed parse with nothing to offer.
+- The dialog distinguishes the two: the amber "could not parse" advice appears
+  only when there is no `parse.error`.
+
+### Settings
+
+- **Vault naming** gains `{TmdbId}`, `{TvdbId}` and `{ImdbId}`. An id the mirror
+  does not hold renders empty and takes its group with it, so a template gives
+  `Title [2024]`, never `Title (0) [2024]`; an id token refuses a padding
+  modifier.
+- **Naming style** shows "Custom (edited)" as a disabled status instead of a
+  choice that did nothing when picked.
+- **Checkpoints** are no longer editable percentages: a preset sets them, the
+  card reads the stored list back, and a list matching no preset says so instead
+  of looking broken. Stored values round-trip untouched.
+- **Tag source** is a real choice (`Filename tags` · `*arr metadata` · `Both`)
+  with editable criteria. The comment claiming *arr criteria were "stored but
+  not applied" had been false since the arr-source path landed; ADR-0017 is
+  corrected.
+- **Donor markers** (`PL.DUB`, `LEKTOR.PL`, `DUB.PL`) are fixed and labelled a
+  fallback until donors are paired by release identity (#130).
+- **Languages** are accepted in any form the lookup resolves (`pol`, `polish`,
+  `Polish`, `pt-BR`, `deu`) and stored as ISO 639-1. A value that resolves to
+  nothing is refused with the forms that would work. A list stored by an older
+  version is served back unchanged and refuses *that section's* save until
+  corrected — nothing is silently rewritten. The wizard now shows the same help
+  and presets as the Settings page.
+- **Filename-tag regex**: the mode shows an example the app actually compiles
+  (RE2, matched against the filename), a pattern that cannot compile is refused
+  on save with the engine's message, and a job already stuck on one says why.
+- **Work folder** defaults to `<data>/temp`, is created `0700` on first boot with
+  a write probe, and a folder inside the vault is refused — the next organise
+  pass would otherwise move staged files out from under a running job.
+- The first-run wizard no longer asks a fresh install to choose security options
+  (`allowed_hosts`, bind): the one step whose wrong answer can lock the operator
+  out belongs on the Settings page, where it is reversible and explained.
+
+### Everything else
+
+- The app wears its own logo — transparent outside the mark, with favicon and
+  apple-touch icons.
+
 ## [0.5.0] - 2026-11-27
 
 Pre-1.0. The sync engine learned to say how sure it is, to tell a speed drift

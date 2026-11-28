@@ -40,6 +40,9 @@ type identifyHarness struct {
 	srv    *arrmock.Server
 	sonarr *arrmock.Server
 	instID int64
+	// svc is the service behind the mux, so a test can inject the countability
+	// seams the routes otherwise keep private.
+	svc *Service
 	// sonarrID is the Sonarr instance row, so an episode cache row can be
 	// synced by the instance that actually serves it.
 	sonarrID int64
@@ -86,7 +89,7 @@ func newIdentifyHarness(t *testing.T, fx arrmock.Fixtures, timeout time.Duration
 	sonarrID := insertArrInstance(t, st.DB, "tv", "sonarr", sonarrSrv.URL, sonarrBlob)
 
 	mux := http.NewServeMux()
-	RegisterRoutes(mux, Dependencies{
+	svc := RegisterRoutes(mux, Dependencies{
 		DB:       st.DB,
 		Settings: settingsStore,
 		Secrets: fakeDecrypter{
@@ -105,6 +108,7 @@ func newIdentifyHarness(t *testing.T, fx arrmock.Fixtures, timeout time.Duration
 		media:    t.TempDir(),
 		srv:      srv,
 		sonarr:   sonarrSrv,
+		svc:      svc,
 		instID:   instID,
 		sonarrID: sonarrID,
 		settings: settingsStore,
@@ -240,6 +244,7 @@ type identifyBody struct {
 		Year       int     `json:"year"`
 		Quality    string  `json:"quality"`
 		Confidence float64 `json:"confidence"`
+		Error      string  `json:"error"`
 	} `json:"parse"`
 	Candidates []struct {
 		LibraryCacheID int64   `json:"library_cache_id"`
@@ -279,7 +284,7 @@ func decodeErrorBody(t *testing.T, rec *httptest.ResponseRecorder) errorBody {
 
 // TestIdentifyParsesViaArrMock pins the happy path: the release is parsed by the
 // instance behind the row, the verdict is returned, and the candidates are
-// ranked deterministically with the release name posted to arr.
+// ranked deterministically with the release name sent to arr.
 func TestIdentifyParsesViaArrMock(t *testing.T) {
 	h := newIdentifyHarness(t, arrmock.Fixtures{
 		Parse: arrmock.ParseResponse{Title: "Kraina Lodu", Year: 2013, Quality: "Bluray-1080p"},
@@ -361,31 +366,22 @@ func TestIdentifyColdCache(t *testing.T) {
 	}
 }
 
-// TestIdentifyUnparsableReleaseIsDistinct pins that an instance which answers
-// 200 with no recognised title is reported as *unparsable*, not as a cold cache:
-// parse.parsed is false and no candidate scan happens at all.
-//
-// The scan is made impossible rather than merely invisible: the cache's title
-// column is renamed away first, so any IdentifyCandidatePool query would fail
-// and the route would answer 500. A 200 with an empty candidate array therefore
-// proves the short-circuit ran before the library read.
+// TestIdentifyUnparsableReleaseIsDistinct pins the shape a release arr could not
+// read answers with: parsed=false, no invented title and no arr failure. With
+// nothing in the synced library that fits the name, the answer is still 200 with
+// an empty candidate list — never a 502, which would read as "identify broke".
 func TestIdentifyUnparsableReleaseIsDistinct(t *testing.T) {
 	h := newIdentifyHarness(t, arrmock.Fixtures{
 		// An all-zero fixture is an instance that could not parse anything: it
-		// echoes the posted release name as the top-level title and stops there.
+		// echoes the release name back as the top-level title and stops there.
 		Parse: arrmock.ParseResponse{},
 	}, 2*time.Second)
 	h.seedCacheRow(t, "movie", "Kraina Lodu", 2013, 1)
-	id := h.seedCandidateWithTarget(t, "Kraina.Lodu.2013.PL.mkv")
-
-	if _, err := h.db.ExecContext(context.Background(),
-		`ALTER TABLE arr_library_cache RENAME COLUMN title TO title_offline`); err != nil {
-		t.Fatalf("rename cache title column: %v", err)
-	}
+	id := h.seedCandidateWithTarget(t, "Nieznany.Film.PL.DUB-GRP.mkv")
 
 	rec := h.post("/api/queue/"+itoa(id)+"/identify", "")
 	if rec.Code != http.StatusOK {
-		t.Fatalf("identify = %d, body %s (a candidate scan must not run)", rec.Code, rec.Body.String())
+		t.Fatalf("identify = %d, body %s (an unparsable name is not an arr failure)", rec.Code, rec.Body.String())
 	}
 	body := decodeIdentify(t, rec)
 	if body.Parse.Parsed {
@@ -394,11 +390,302 @@ func TestIdentifyUnparsableReleaseIsDistinct(t *testing.T) {
 	if body.Parse.Title != "" {
 		t.Errorf("parse.title = %q, want empty (no invented title)", body.Parse.Title)
 	}
+	// arr answered; it simply could not read the name, so there is no failure
+	// message to show.
+	if body.Parse.Error != "" {
+		t.Errorf("parse.error = %q, want empty: the instance answered", body.Parse.Error)
+	}
 	if !strings.Contains(rec.Body.String(), `"candidates":[]`) {
 		t.Errorf("body %s does not carry an empty candidate array", rec.Body.String())
 	}
 	if len(body.Candidates) != 0 {
-		t.Errorf("candidates = %+v, want none", body.Candidates)
+		t.Errorf("candidates = %+v, want none: nothing in the library fits", body.Candidates)
+	}
+}
+
+// TestIdentifyFallsBackToTheMirrorWhenParseFails pins the fallback: a name arr
+// cannot parse is exactly the case where the synced library should answer, so
+// identify still searches it and offers what fits. Failing today would answer
+// 200 with an empty candidate array and the operator would see nothing.
+func TestIdentifyFallsBackToTheMirrorWhenParseFails(t *testing.T) {
+	h := newIdentifyHarness(t, arrmock.Fixtures{
+		// {"parsed": false} in arr terms: a 200 with no recognised title.
+		Parse: arrmock.ParseResponse{},
+	}, 2*time.Second)
+	shrek := h.seedCacheRow(t, "movie", "Shrek", 2001, 1)
+	id := h.seedCandidateWithTarget(t, "Shrek.2001.1080p.PL.DUB-GRP.mkv")
+
+	rec := h.post("/api/queue/"+itoa(id)+"/identify", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("identify = %d, body %s", rec.Code, rec.Body.String())
+	}
+	body := decodeIdentify(t, rec)
+	if body.Parse.Parsed {
+		t.Fatalf("parse.parsed = true, want false (the fixture parses nothing): %+v", body.Parse)
+	}
+	if len(body.Candidates) != 1 {
+		t.Fatalf("candidates = %+v, want the one Shrek row from the mirror", body.Candidates)
+	}
+	got := body.Candidates[0]
+	if got.LibraryCacheID != shrek {
+		t.Errorf("candidate id = %d, want %d", got.LibraryCacheID, shrek)
+	}
+	if got.MatchedBy != "mirror" {
+		t.Errorf("matched_by = %q, want mirror", got.MatchedBy)
+	}
+	if got.Confidence <= 0 {
+		t.Errorf("confidence = %v, want a positive score", got.Confidence)
+	}
+	// A substring hit must never outrank a parse, and 0.5 is the parse floor.
+	if got.Confidence > 0.5 {
+		t.Errorf("confidence = %v, want <= 0.5 (a mirror hit is the weaker evidence)", got.Confidence)
+	}
+	if got.Title != "Shrek" || got.Year != 2001 {
+		t.Errorf("candidate = %+v, want Shrek (2001)", got)
+	}
+}
+
+// TestIdentifyMergePutsParseBeforeMirrorAndDedupes pins the merge order: the
+// rows arr's parser named come first, in their ranked order, then only the
+// mirror hits the parse did not already offer. A row both searches found is
+// listed once, carrying the parse score, because a second entry would read to
+// the operator as two different films.
+//
+// The release is named "Dune.2024" while arr resolves it to "Dune Part Two",
+// which is how the 2024 file is really named, so the parse and the mirror
+// really do search the same library rows here.
+func TestIdentifyMergePutsParseBeforeMirrorAndDedupes(t *testing.T) {
+	h := newIdentifyHarness(t, arrmock.Fixtures{
+		Parse: arrmock.ParseResponse{Title: "Dune Part Two", Year: 2024, Quality: "Bluray-1080p"},
+	}, 2*time.Second)
+	// The sequel: the parse's exact hit, and a weaker mirror hit on "Dune".
+	sequel := h.seedCacheRow(t, "movie", "Dune Part Two", 2024, 1)
+	// The 1984 original: both lists carry it, so the merge must keep it once.
+	original := h.seedCacheRow(t, "movie", "Dune", 1984, 2)
+	// A third Dune the parser does not name: it shares no title with the parse,
+	// so it reaches the operator from the mirror alone.
+	third := h.seedCacheRow(t, "movie", "Dune Prophecy", 2024, 3)
+	id := h.seedCandidateWithTarget(t, "Dune.2024.PL.1080p-GRP.mkv")
+
+	rec := h.post("/api/queue/"+itoa(id)+"/identify", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("identify = %d, body %s", rec.Code, rec.Body.String())
+	}
+	body := decodeIdentify(t, rec)
+	if !body.Parse.Parsed {
+		t.Fatalf("parse.parsed = false, want the fixture's verdict: %+v", body.Parse)
+	}
+	if len(body.Candidates) != 3 {
+		t.Fatalf("candidates = %+v, want the parse hits then the mirror-only row", body.Candidates)
+	}
+
+	// Parse first (ranked 1 then 0.6), the mirror-only row last.
+	want := []int64{sequel, original, third}
+	for i, wantID := range want {
+		if body.Candidates[i].LibraryCacheID != wantID {
+			t.Errorf("candidate[%d].library_cache_id = %d, want %d (candidates %+v)",
+				i, body.Candidates[i].LibraryCacheID, wantID, body.Candidates)
+		}
+	}
+
+	// The row both searches found appears exactly once.
+	counts := make(map[int64]int, len(body.Candidates))
+	for _, cand := range body.Candidates {
+		counts[cand.LibraryCacheID]++
+	}
+	if counts[original] != 1 {
+		t.Errorf("candidate %d appears %d times, want exactly once: %+v", original, counts[original], body.Candidates)
+	}
+
+	if got := body.Candidates[0]; got.Confidence != 1 || got.MatchedBy != "parse" {
+		t.Errorf("candidate[0] = %+v, want the parsed sequel at confidence 1 labelled parse", got)
+	}
+	// The doubly-matched row keeps the parse score: 0.6 outranks the 0.5 mirror
+	// cap, and its label must not flip to mirror just because the mirror saw it.
+	if got := body.Candidates[1]; got.Confidence != 0.6 || got.MatchedBy != "parse" {
+		t.Errorf("the doubly-matched row = %+v, want the parse confidence 0.6 labelled parse, not the capped mirror 0.5", got)
+	}
+	if got := body.Candidates[2]; got.Confidence != 0.5 || got.MatchedBy != "mirror" {
+		t.Errorf("candidate[2] = %+v, want the mirror-only row at the 0.5 ceiling labelled mirror", got)
+	}
+}
+
+// TestMergeIdentifyCandidatesCapsTheTotal pins the limit against the mirror: it
+// is a cap on the whole list, not on each search. A parse list already at the
+// cap must not receive one mirror row on top of it — the check used to sit after
+// the append, so a full first call still let the second call add a 21st row.
+func TestMergeIdentifyCandidatesCapsTheTotal(t *testing.T) {
+	parse := make([]identifyCandidate, 0, identifyCandidateLimit)
+	for i := 0; i < identifyCandidateLimit; i++ {
+		parse = append(parse, identifyCandidate{
+			LibraryCacheID: int64(100 + i),
+			Title:          "Kraina Lodu",
+			Confidence:     1,
+			MatchedBy:      "parse",
+		})
+	}
+	mirror := []identifyCandidate{{
+		LibraryCacheID: 999,
+		Title:          "Shrek",
+		Confidence:     mirrorCandidateCeiling,
+		MatchedBy:      "mirror",
+	}}
+
+	got := mergeIdentifyCandidates(parse, mirror)
+	if len(got) != identifyCandidateLimit {
+		t.Fatalf("merged %d candidates, want %d: the limit caps the total, so a full parse list leaves no room for the mirror",
+			len(got), identifyCandidateLimit)
+	}
+	for i, cand := range got {
+		if cand.LibraryCacheID != parse[i].LibraryCacheID || cand.MatchedBy != "parse" {
+			t.Errorf("candidate[%d] = %+v, want the parse candidate %d intact",
+				i, cand, parse[i].LibraryCacheID)
+		}
+	}
+	for _, cand := range got {
+		if cand.LibraryCacheID == mirror[0].LibraryCacheID {
+			t.Errorf("mirror row %d was padded onto a full parse list: %+v", cand.LibraryCacheID, got)
+		}
+	}
+}
+
+// TestIdentifyArrUnreachableStillOffersTheMirror pins the shape an unreachable
+// instance answers with: 200, parse.error set, parsed still false, and the one
+// row the synced library already holds. A transport failure must not deny the
+// operator the library they have — answering 502 because arr is down would hide
+// a match the appliance can prove from its own cache.
+func TestIdentifyArrUnreachableStillOffersTheMirror(t *testing.T) {
+	h := newIdentifyHarness(t, arrmock.Fixtures{
+		Parse: arrmock.ParseResponse{Title: "Kraina Lodu", Year: 2013, Quality: "Bluray-1080p"},
+	}, 2*time.Second)
+	shrek := h.seedCacheRow(t, "movie", "Shrek", 2001, 1)
+	id := h.seedCandidateWithTarget(t, "Shrek.2001.1080p.PL.DUB-GRP.mkv")
+
+	// Nothing listens on loopback port 1, so the parse dies in transport before
+	// arr ever reads a body.
+	if _, err := h.db.ExecContext(context.Background(),
+		`UPDATE arr_instances SET base_url = 'http://127.0.0.1:1' WHERE id = ?`, h.instID); err != nil {
+		t.Fatalf("break the arr base URL: %v", err)
+	}
+
+	rec := h.post("/api/queue/"+itoa(id)+"/identify", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("identify = %d, body %s (an unreachable arr with a mirror hit is not a 502)", rec.Code, rec.Body.String())
+	}
+	body := decodeIdentify(t, rec)
+	if body.Parse.Error == "" {
+		t.Errorf("parse.error is empty: an unreachable instance must say why it could not parse: %+v", body.Parse)
+	}
+	if body.Parse.Parsed {
+		t.Errorf("parse.parsed = true, want false (the verdict is unknown, not successful): %+v", body.Parse)
+	}
+	if len(body.Candidates) != 1 {
+		t.Fatalf("candidates = %+v, want the one cached Shrek row", body.Candidates)
+	}
+	got := body.Candidates[0]
+	if got.LibraryCacheID != shrek {
+		t.Errorf("candidate id = %d, want %d", got.LibraryCacheID, shrek)
+	}
+	if got.MatchedBy != "mirror" {
+		t.Errorf("matched_by = %q, want mirror: arr never named this row", got.MatchedBy)
+	}
+}
+
+// TestIdentifyMirrorSearchIsBounded pins the ladder's cost: however unhelpful the
+// release name is, one identify reads the pool at most four times. The counting
+// lookup answers every rung with an empty pool, which is the worst case — no
+// rung satisfies the ladder, so it must walk its rungs and stop there.
+func TestIdentifyMirrorSearchIsBounded(t *testing.T) {
+	cases := map[string]string{
+		"forty words": strings.TrimSpace(strings.Repeat("slowowolny ", 40)),
+		// Wide gaps between words: Fields keeps three words, and the ladder must
+		// still not re-query the same rung.
+		"many spaces": "slowowolny" + strings.Repeat(" ", 60) + "film" + strings.Repeat(" ", 60) + "tytul",
+	}
+	for name, title := range cases {
+		t.Run(name, func(t *testing.T) {
+			// An instance that parses nothing, so the parse pool is never read:
+			// every pool read counted here belongs to the mirror ladder.
+			h := newIdentifyHarness(t, arrmock.Fixtures{Parse: arrmock.ParseResponse{}}, 2*time.Second)
+			var terms []string
+			h.svc.identifyPool = func(_ context.Context, _ int64, _ string, term string) ([]store.LibraryCandidate, error) {
+				terms = append(terms, term)
+				return nil, nil
+			}
+			id := h.seedCandidateWithTarget(t, "Nieznany.Film.PL.DUB-GRP.mkv")
+
+			body, err := json.Marshal(map[string]string{"title": title})
+			if err != nil {
+				t.Fatalf("marshal override: %v", err)
+			}
+			rec := h.post("/api/queue/"+itoa(id)+"/identify", string(body))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("identify = %d, body %s", rec.Code, rec.Body.String())
+			}
+
+			if len(terms) == 0 {
+				t.Fatal("the mirror never searched the library: the bound must not be met by not searching")
+			}
+			if len(terms) > 4 {
+				t.Errorf("IdentifyCandidatePool calls = %d (%v), want at most 4: the ladder must stop", len(terms), terms)
+			}
+			seen := make(map[string]struct{}, len(terms))
+			for _, term := range terms {
+				if _, dup := seen[term]; dup {
+					t.Errorf("the ladder queried %q twice: %v", term, terms)
+				}
+				seen[term] = struct{}{}
+			}
+		})
+	}
+}
+
+// TestIdentifyOverrideSteersTheMirror pins that an operator's override is also
+// the name the mirror searches: a file named Shrek.2001... posted with the
+// override "Dune.Part.Two.2024.1080p" offers the Dune (1984) row and not Shrek,
+// even though Shrek is in the same library and is the file's own name.
+//
+// This is intended, not a bug. The override is the operator saying what the
+// release IS, so the mirror searching it agrees with the parse instead of
+// contradicting it. A wrong override is an operator decision; quietly falling
+// back to the filename would second-guess a human who just told the route the
+// answer. The parse fixture parses nothing, so the Dune row can only be the
+// mirror's answer for the override.
+func TestIdentifyOverrideSteersTheMirror(t *testing.T) {
+	h := newIdentifyHarness(t, arrmock.Fixtures{
+		Parse: arrmock.ParseResponse{},
+	}, 2*time.Second)
+	h.seedCacheRow(t, "movie", "Shrek", 2001, 1)
+	dune := h.seedCacheRow(t, "movie", "Dune", 1984, 2)
+	id := h.seedCandidateWithTarget(t, "Shrek.2001.1080p.PL.DUB-GRP.mkv")
+
+	// The operator's override names a different film; the route may not ignore it.
+	override := `{"title":"Dune.Part.Two.2024.1080p"}`
+	rec := h.post("/api/queue/"+itoa(id)+"/identify", override)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("identify with override = %d, body %s", rec.Code, rec.Body.String())
+	}
+	body := decodeIdentify(t, rec)
+	if body.Parse.Parsed {
+		t.Fatalf("parse.parsed = true, want false (the fixture parses nothing): %+v", body.Parse)
+	}
+	if len(body.Candidates) != 1 {
+		t.Fatalf("candidates = %+v, want only the Dune row the override names", body.Candidates)
+	}
+	got := body.Candidates[0]
+	if got.LibraryCacheID != dune {
+		t.Errorf("candidate id = %d, want %d: the mirror must search the override, not the file stem", got.LibraryCacheID, dune)
+	}
+	if got.MatchedBy != "mirror" {
+		t.Errorf("matched_by = %q, want mirror", got.MatchedBy)
+	}
+	if got.Title != "Dune" || got.Year != 1984 {
+		t.Errorf("candidate = %+v, want Dune (1984)", got)
+	}
+	for _, cand := range body.Candidates {
+		if cand.Title == "Shrek" {
+			t.Errorf("candidates carry Shrek %+v: the override named Dune, so the file's own name must not be searched too", cand)
+		}
 	}
 }
 

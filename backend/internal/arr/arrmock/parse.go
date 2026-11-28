@@ -1,16 +1,18 @@
-// M13 identify mock: POST {base}/parse for both products.
+// M13 identify mock: GET {base}/parse?title=<release name> for both products.
 //
-// The real instances answer the same route with different payloads (Radarr:
+// The real instances expose the route as [HttpGet] Parse(string title) and
+// answer 405 to anything else (Sonarr.Api.V5/Parse/ParseController.cs:29,
+// Radarr.Api.V3/Parse/ParseController.cs:39), so the fake does the same: a
+// client that posts 405s here exactly as it would against a live instance.
+//
+// The products answer the same route with different payloads (Radarr:
 // parsedMovieInfo/movie, Sonarr: parsedEpisodeInfo/series), so the fake builds
-// the product-shaped body from one fixture. The release name the client posted
-// is echoed back as the top-level title, exactly like a real instance, and
+// the product-shaped body from one fixture. The release name the client sent is
+// echoed back as the top-level title, exactly like a real instance, and
 // recorded so a test can assert what was asked.
 package arrmock
 
-import (
-	"encoding/json"
-	"net/http"
-)
+import "net/http"
 
 // ParseResponse is the parsed verdict the fake reports. Radarr reads Title/Year/
 // Quality; Sonarr reads SeriesTitle/SeriesYear/Quality. An all-zero fixture is
@@ -25,31 +27,27 @@ type ParseResponse struct {
 	SeriesYear  int    `json:"series_year,omitempty"`
 }
 
-// parseRequest is the body Dubarr sends: {"title": "<release name>"}.
-type parseRequest struct {
-	Title string `json:"title"`
-}
-
-// serveParse answers POST {base}/parse in the shape of the given product.
+// serveParse answers GET {base}/parse?title=... in the shape of the given
+// product, and 405 to every other verb.
 func (s *Server) serveParse(kind Kind, resp ParseResponse) http.HandlerFunc {
 	return s.handle(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
+		if r.Method != http.MethodGet {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"message": "method not allowed"})
 			return
 		}
-		var req parseRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"message": "invalid parse body"})
+		title := r.URL.Query().Get("title")
+		if title == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"message": "parse needs a title"})
 			return
 		}
 		s.mu.Lock()
-		s.parses = append(s.parses, req.Title)
+		s.parses = append(s.parses, title)
 		s.mu.Unlock()
 
 		quality := map[string]any{"quality": map[string]any{"name": resp.Quality}}
 		if kind == Radarr {
 			body := map[string]any{
-				"title":   req.Title,
+				"title":   title,
 				"quality": quality,
 			}
 			if resp.Year > 0 {
@@ -66,7 +64,7 @@ func (s *Server) serveParse(kind Kind, resp ParseResponse) http.HandlerFunc {
 			return
 		}
 		body := map[string]any{
-			"title":   req.Title,
+			"title":   title,
 			"quality": quality,
 		}
 		if resp.SeriesTitle != "" {
@@ -80,7 +78,7 @@ func (s *Server) serveParse(kind Kind, resp ParseResponse) http.HandlerFunc {
 	})
 }
 
-// ParseRequests returns a copy of the release names posted to {base}/parse,
+// ParseRequests returns a copy of the release names sent to {base}/parse,
 // oldest first.
 func (s *Server) ParseRequests() []string {
 	s.mu.Lock()

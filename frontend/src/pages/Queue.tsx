@@ -397,7 +397,7 @@ function IdentifyResult({
 }) {
   return (
     <div className="mt-2" data-testid="identify-result">
-      {result.parse.parsed ? (
+      {result.parse.parsed && (
         <p className="text-xs text-zinc-400">
           arr parsed{' '}
           <span className="font-medium text-zinc-200">
@@ -407,16 +407,35 @@ function IdentifyResult({
           {result.parse.quality ? ` · ${result.parse.quality}` : ''}
           {result.parse.confidence ? ` · ${Math.round(result.parse.confidence * 100)}%` : ''}
         </p>
-      ) : (
+      )}
+      {!result.parse.parsed && !result.parse.error && (
         // An unparsable release is not an empty library: say which one it is.
+        // A failed call is a different story — parsed is false there only
+        // because arr never answered — so its red line explains it instead, and
+        // the amber advice would send the operator to retype a name that was
+        // never the problem.
         <p className="text-xs text-amber-300/90" data-testid="identify-unparsable">
           arr could not parse this release name. Enter a title and try again.
         </p>
       )}
-      {!result.parse.parsed ? null : result.candidates.length === 0 ? (
-        <p className="mt-1 text-xs text-zinc-500">
-          No library candidates — sync the arr library, or search it manually below.
+      {result.parse.error ? (
+        // arr refused the request outright: say why, and still offer whatever
+        // the synced library knows. Only a real failure reaches this line.
+        <p className="mt-1 text-xs text-red-400" data-testid="identify-parse-error">
+          {result.parse.error}
         </p>
+      ) : null}
+      {!result.parse.parsed && result.candidates.length > 0 && (
+        // A parse failure does not empty the library, so say where these came
+        // from instead of letting them pass for arr's own verdict.
+        <p className="mt-2 text-xs text-zinc-400">From your synced library</p>
+      )}
+      {result.candidates.length === 0 ? (
+        result.parse.parsed ? (
+          <p className="mt-1 text-xs text-zinc-500">
+            No library candidates — sync the arr library, or search it manually below.
+          </p>
+        ) : null
       ) : (
         <ul className="mt-2 space-y-1">
           {result.candidates.map((candidate) => (

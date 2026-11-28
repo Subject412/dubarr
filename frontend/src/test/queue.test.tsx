@@ -177,6 +177,48 @@ const unparsableRelease = {
   candidates: [],
 }
 
+// mirrorOnlyRelease is what identify answers when arr cannot read the name but
+// the synced library knows the film: no parse verdict, one mirror candidate.
+const mirrorOnlyRelease = {
+  parse: { parsed: false, title: '', year: 0, quality: '', confidence: 0 },
+  candidates: [
+    {
+      library_cache_id: 7,
+      title: 'Kraina Lodu',
+      year: 2013,
+      media_type: 'movie',
+      external_item_id: 812,
+      confidence: 0.5,
+      matched_by: 'mirror',
+    },
+  ],
+}
+
+// unreachableRelease is what identify answers when the instance could not be
+// asked at all: no verdict, the failure message, and the mirror row it still
+// found in the synced library.
+const unreachableRelease = {
+  parse: {
+    parsed: false,
+    title: '',
+    year: 0,
+    quality: '',
+    confidence: 0,
+    error: 'could not reach the instance: check the base URL and network',
+  },
+  candidates: [
+    {
+      library_cache_id: 7,
+      title: 'Kraina Lodu',
+      year: 2013,
+      media_type: 'movie',
+      external_item_id: 812,
+      confidence: 0.5,
+      matched_by: 'mirror',
+    },
+  ],
+}
+
 // ambiguousEnvelope is the 409 envelope the server sends when both libraries are
 // enabled and the release proves no kind: it names the choice it will accept.
 const ambiguousEnvelope = {
@@ -515,6 +557,33 @@ describe('approval queue page', () => {
     ).toBe(true)
   })
 
+  it('shows only the arr failure when the instance could not be asked', async () => {
+    // parsed:false with parse.error is an unreachable instance or a refused key,
+    // not a name arr could not read: "enter a title and try again" would send
+    // the operator to retype a filename that was never the problem, while the
+    // real cause is the red line the server sent.
+    vi.stubGlobal('fetch', identifyFetch(undefined, unreachableRelease))
+    const user = userEvent.setup()
+    renderWithProviders(<QueuePage />, { route: '/queue' })
+
+    const card = await screen.findByTestId('queue-item-3')
+    await user.click(within(card).getByRole('button', { name: /identify with arr/i }))
+
+    const result = await within(card).findByTestId('identify-result')
+    expect(within(result).getByTestId('identify-parse-error')).toHaveTextContent(
+      /could not reach the instance/i,
+    )
+    expect(within(result).queryByTestId('identify-unparsable')).not.toBeInTheDocument()
+    expect(
+      within(result).queryByText(/arr could not parse this release name/i),
+    ).not.toBeInTheDocument()
+    // The library the appliance already has is still offered, and labelled.
+    expect(within(result).getByText(/From your synced library/i)).toBeInTheDocument()
+    expect(within(result).getByRole('button', { name: /Kraina Lodu \(2013\)/ })).toHaveTextContent(
+      '50%',
+    )
+  })
+
   it('shows an unparsable message instead of an empty candidate list', async () => {
     vi.stubGlobal('fetch', identifyFetch(undefined, unparsableRelease))
     const user = userEvent.setup()
@@ -525,13 +594,33 @@ describe('approval queue page', () => {
 
     const result = await within(card).findByTestId('identify-result')
     // An unparsable release is named as such, not shown as an empty library.
-    expect(
-      within(result).getByText(/arr could not parse this release name/i),
-    ).toBeInTheDocument()
+    // No parse.error here: the instance answered, it just could not read the
+    // name, so the advice is the only explanation and must be shown.
+    expect(within(result).getByTestId('identify-unparsable')).toHaveTextContent(
+      /arr could not parse this release name/i,
+    )
+    expect(within(result).queryByTestId('identify-parse-error')).not.toBeInTheDocument()
     expect(within(result).queryByText(/No library candidates/i)).not.toBeInTheDocument()
     expect(within(result).queryByText(/arr parsed/i)).not.toBeInTheDocument()
     // The manual path stays usable so the operator can act on the message.
     expect(within(card).getByPlaceholderText(/search the arr library/i)).toBeInTheDocument()
+  })
+
+  it('shows mirror candidates when arr could not parse the name', async () => {
+    vi.stubGlobal('fetch', identifyFetch(undefined, mirrorOnlyRelease))
+    const user = userEvent.setup()
+    renderWithProviders(<QueuePage />, { route: '/queue' })
+
+    const card = await screen.findByTestId('queue-item-3')
+    await user.click(within(card).getByRole('button', { name: /identify with arr/i }))
+
+    const result = await within(card).findByTestId('identify-result')
+    // The unparsable sentence stays, but it no longer hides the library list.
+    expect(within(result).getByText(/arr could not parse this release name/i)).toBeInTheDocument()
+    expect(within(result).getByText(/From your synced library/i)).toBeInTheDocument()
+    expect(within(result).getByRole('button', { name: /Kraina Lodu \(2013\)/ })).toHaveTextContent(
+      '50%',
+    )
   })
 
   it('picking a candidate persists the match and refreshes the card', async () => {

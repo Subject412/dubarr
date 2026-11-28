@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -51,22 +53,146 @@ func TestParseRadarrNormalisesShape(t *testing.T) {
 		t.Errorf("Raw does not carry the Radarr payload: %s", res.Raw)
 	}
 
-	// The release name was posted as the request title, and the key was sent.
+	// The release name was sent as the title query value of a GET, and the key
+	// was sent.
 	got := srv.ParseRequests()
 	if len(got) != 1 || got[0] != "Shrek.2001.1080p.BluRay.x264-GRP" {
 		t.Fatalf("parse requests = %v", got)
 	}
 	var sawParse bool
 	for _, req := range srv.Requests() {
-		if req.Path == "/api/v3/parse" && req.Method == "POST" {
+		if req.Path == "/api/v3/parse" && req.Method == http.MethodGet {
 			sawParse = true
+			if req.Query != "title=Shrek.2001.1080p.BluRay.x264-GRP" {
+				t.Errorf("query = %q, want the title as one value", req.Query)
+			}
 			if req.APIKey != srv.APIKey() {
 				t.Errorf("X-Api-Key = %q, want the configured key", req.APIKey)
 			}
 		}
 	}
 	if !sawParse {
-		t.Errorf("no POST /api/v3/parse request was recorded: %+v", srv.Requests())
+		t.Errorf("no GET /api/v3/parse request was recorded: %+v", srv.Requests())
+	}
+}
+
+// TestParseUsesGet pins the verb: both products expose [HttpGet] Parse(string
+// title), so the client asks with a GET carrying the name as a query value. A
+// POST here is the live 405 the owner kept hitting.
+func TestParseUsesGet(t *testing.T) {
+	ctx := context.Background()
+	srv := arrmock.New(arrmock.Radarr, "", arrmock.Fixtures{
+		Parse: arrmock.ParseResponse{Title: "Kraina Lodu", Year: 2013, Quality: "Bluray-1080p"},
+	})
+	defer srv.Close()
+
+	c, err := arr.NewRadarrClient(srv.URL, srv.APIKey(), 2*time.Second)
+	if err != nil {
+		t.Fatalf("NewRadarrClient: %v", err)
+	}
+	res, err := c.Parse(ctx, "Kraina.Lodu.2013.PL")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if res.Title != "Kraina Lodu" || res.Year != 2013 {
+		t.Errorf("result = %+v, want Kraina Lodu (2013)", res)
+	}
+
+	var parseReqs []arrmock.RecordedRequest
+	for _, req := range srv.Requests() {
+		if req.Path == "/api/v3/parse" {
+			parseReqs = append(parseReqs, req)
+		}
+	}
+	if len(parseReqs) != 1 {
+		t.Fatalf("parse requests = %+v, want exactly one", parseReqs)
+	}
+	if parseReqs[0].Method != http.MethodGet {
+		t.Errorf("method = %q, want GET (the fake answers 405 to POST)", parseReqs[0].Method)
+	}
+	if parseReqs[0].Query != "title=Kraina.Lodu.2013.PL" {
+		t.Errorf("query = %q, want the release name as the title value", parseReqs[0].Query)
+	}
+}
+
+// TestParseEscapesTheTitle pins that a name carrying URL syntax reaches arr as
+// ONE query value: "&" and "#" would otherwise split the query or drop the rest
+// of the name, and a "+" would arrive as a space.
+func TestParseEscapesTheTitle(t *testing.T) {
+	ctx := context.Background()
+	const title = `Kraina Lodu 2: Ogień & Przygoda #1 + więcej`
+	srv := arrmock.New(arrmock.Radarr, "", arrmock.Fixtures{
+		Parse: arrmock.ParseResponse{Title: "Kraina Lodu 2", Year: 2019},
+	})
+	defer srv.Close()
+
+	c, err := arr.NewRadarrClient(srv.URL, srv.APIKey(), 2*time.Second)
+	if err != nil {
+		t.Fatalf("NewRadarrClient: %v", err)
+	}
+	if _, err := c.Parse(ctx, title); err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	// The fake decoded the query, so its echo is the name that actually arrived.
+	if got := srv.ParseRequests(); len(got) != 1 || got[0] != title {
+		t.Fatalf("arr received %q, want the whole title", got)
+	}
+	var raw string
+	for _, req := range srv.Requests() {
+		if req.Path == "/api/v3/parse" && req.Method == http.MethodGet {
+			raw = req.Query
+		}
+	}
+	if raw == "" {
+		t.Fatalf("no parse request was recorded: %+v", srv.Requests())
+	}
+	values, err := url.ParseQuery(raw)
+	if err != nil {
+		t.Fatalf("query %q is not parseable: %v", raw, err)
+	}
+	if got := values.Get("title"); got != title {
+		t.Errorf("title value = %q, want %q", got, title)
+	}
+	if strings.Contains(raw, "&") || strings.Contains(raw, "#") {
+		t.Errorf("query %q carries an unescaped separator", raw)
+	}
+}
+
+// TestSonarrParseUsesTheV5Path pins the verb and the path together on a Sonarr
+// instance: the v5 prefix comes from the constructor, and the request is a GET.
+func TestSonarrParseUsesTheV5Path(t *testing.T) {
+	ctx := context.Background()
+	srv := arrmock.New(arrmock.Sonarr, "", arrmock.Fixtures{
+		Parse: arrmock.ParseResponse{SeriesTitle: "The Expanse", SeriesYear: 2015},
+	})
+	defer srv.Close()
+
+	c, err := arr.NewSonarrClient(srv.URL, srv.APIKey(), 2*time.Second)
+	if err != nil {
+		t.Fatalf("NewSonarrClient: %v", err)
+	}
+	if _, err := c.Parse(ctx, "The.Expanse.S01E01.1080p.WEB-DL"); err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	var parseReqs []arrmock.RecordedRequest
+	for _, req := range srv.Requests() {
+		if strings.HasSuffix(req.Path, "/parse") {
+			parseReqs = append(parseReqs, req)
+		}
+	}
+	if len(parseReqs) != 1 {
+		t.Fatalf("parse requests = %+v, want exactly one", parseReqs)
+	}
+	if parseReqs[0].Path != "/api/v5/parse" {
+		t.Errorf("path = %q, want /api/v5/parse", parseReqs[0].Path)
+	}
+	if parseReqs[0].Method != http.MethodGet {
+		t.Errorf("method = %q, want GET", parseReqs[0].Method)
+	}
+	if parseReqs[0].Query != "title=The.Expanse.S01E01.1080p.WEB-DL" {
+		t.Errorf("query = %q, want the release name as the title value", parseReqs[0].Query)
 	}
 }
 
@@ -165,6 +291,34 @@ func TestParseErrorModel(t *testing.T) {
 		}
 	})
 
+	// The parse route carries the release name as a query value, so a failure
+	// must quote the path alone: an error that echoed ?title=… would copy a
+	// release name into a log and into the operator's UI.
+	t.Run("parse failure never quotes the release name", func(t *testing.T) {
+		srv := arrmock.New(arrmock.Sonarr, apiKey, arrmock.Fixtures{})
+		defer srv.Close()
+		srv.FailAll(500)
+		c, err := arr.NewSonarrClient(srv.URL, apiKey, time.Second)
+		if err != nil {
+			t.Fatalf("NewSonarrClient: %v", err)
+		}
+		const title = "The.Expanse.S01E01.1080p.WEB-DL"
+		_, err = c.Parse(ctx, title)
+		if err == nil {
+			t.Fatal("Parse of a failing instance returned no error")
+		}
+		if strings.Contains(err.Error(), title) || strings.Contains(err.Error(), "title=") {
+			t.Errorf("error quotes the release name: %v", err)
+		}
+		var status *arr.StatusError
+		if !errors.As(err, &status) {
+			t.Fatalf("error = %v, want a StatusError", err)
+		}
+		if status.Path != "/api/v5/parse" {
+			t.Errorf("status path = %q, want the path without its query", status.Path)
+		}
+	})
+
 	t.Run("network failure", func(t *testing.T) {
 		srv := arrmock.New(arrmock.Radarr, apiKey, arrmock.Fixtures{})
 		c, err := arr.NewRadarrClient(srv.URL, apiKey, time.Second)
@@ -178,6 +332,11 @@ func TestParseErrorModel(t *testing.T) {
 		}
 		if strings.Contains(err.Error(), apiKey) {
 			t.Errorf("error leaks the key: %v", err)
+		}
+		// A transport error echoes the request URL, so the query that carries
+		// the release name must be gone from the message too.
+		if strings.Contains(err.Error(), "Shrek.2001.1080p") {
+			t.Errorf("error quotes the release name: %v", err)
 		}
 	})
 

@@ -102,7 +102,9 @@ describe('info tooltip (issue #3)', () => {
     expect(screen.getByLabelText('Export mode')).toHaveAttribute('aria-describedby')
     expect(screen.getByLabelText('Output mode')).toHaveAttribute('aria-describedby')
     expect(screen.getByLabelText('Add target language')).toHaveAttribute('aria-describedby')
-    expect(screen.getByLabelText('Checkpoint positions (%)')).toHaveAttribute('aria-describedby')
+    // U09: the checkpoint percent lists are read-only now, so the number field
+    // takes their place as the "numeric control wires help" case.
+    expect(screen.getByLabelText('Max offset (s)')).toHaveAttribute('aria-describedby')
   })
 
   it('wires help to a switch control, not just inputs and selects', async () => {

@@ -8,14 +8,6 @@ import { SettingsPage } from '../pages/Settings'
 import { SetupPage } from '../pages/Setup'
 import { isMethod, jsonResponse, renderWithProviders } from './helpers'
 
-const SYNC_DEFAULTS = {
-  max_offset_sec: 180,
-  checkpoint_positions_pct: [10],
-  checkpoint_window_sec: 150,
-  preview_positions_pct: [10],
-  preview_window_sec: 60,
-}
-
 function statusFetch(overrides: Record<string, (init?: RequestInit) => Response | Promise<Response>> = {}) {
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input)
@@ -202,35 +194,5 @@ describe('settings export (IMP-2e, MIN-4c)', () => {
 
     await waitFor(() => expect(click).toHaveBeenCalled())
     expect(download).toBe('dubarr-settings-2026-01-02T03-04-05Z.json')
-  })
-})
-
-describe('list editor typing (IMP-1)', () => {
-  it('keeps raw comma text while typing and commits numbers on blur', async () => {
-    const user = userEvent.setup()
-    const fetchMock = statusFetch({
-      '/api/settings': (init) =>
-        isMethod(init, 'PUT')
-          ? jsonResponse({ settings: { 'sync.defaults': SYNC_DEFAULTS } })
-          : jsonResponse({ settings: { 'sync.defaults': SYNC_DEFAULTS } }),
-    })
-    renderWithProviders(<SettingsPage />, { route: '/settings' })
-
-    const input = await screen.findByLabelText('Checkpoint positions (%)')
-    await user.clear(input)
-    await user.type(input, '10,25,40')
-    expect(input).toHaveValue('10,25,40')
-
-    await user.tab()
-    await user.click(screen.getByLabelText('Save Sync defaults'))
-
-    await waitFor(() => {
-      expect(fetchMock.mock.calls.some(([, init]) => isMethod(init, 'PUT'))).toBe(true)
-    })
-    const put = fetchMock.mock.calls.find(([, init]) => isMethod(init, 'PUT'))
-    const body = JSON.parse(String(put?.[1]?.body)) as {
-      settings: { 'sync.defaults': { checkpoint_positions_pct: number[] } }
-    }
-    expect(body.settings['sync.defaults'].checkpoint_positions_pct).toEqual([10, 25, 40])
   })
 })

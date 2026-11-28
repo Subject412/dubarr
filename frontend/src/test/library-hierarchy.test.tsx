@@ -110,6 +110,9 @@ type EpisodePage = {
 type Fixtures = {
   instances?: LibraryHealthInstance[]
   cacheItems?: number
+  /** Films and shows in the health payload's header counts. */
+  cacheMovies?: number
+  cacheSeries?: number
   /** The flat Films list (GET /api/library/items). */
   movies?: LibraryItem[]
   series?: (url: URL) => SeriesPage
@@ -128,6 +131,8 @@ function mockLibrary(fixtures: Fixtures) {
       return jsonResponse({
         instances: fixtures.instances ?? [],
         cache_items: fixtures.cacheItems ?? 0,
+        cache_movies: fixtures.cacheMovies ?? 0,
+        cache_series: fixtures.cacheSeries ?? 0,
       })
     }
     if (url.pathname === '/api/library/items') {

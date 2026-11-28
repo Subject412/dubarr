@@ -93,8 +93,11 @@ function HealthStrip({
       <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
         <h2 className="text-[11px] uppercase tracking-wider text-zinc-500">Sync health</h2>
         <div className="flex items-center gap-3">
+          {/* Titles, not cache rows: 486 films + ~12 400 episode rows would
+              read as 12 909 "titles cached". "series" is invariable. */}
           <p className="text-xs text-zinc-400">
-            {health.cache_items} {health.cache_items === 1 ? 'title' : 'titles'} cached
+            {health.cache_movies} {health.cache_movies === 1 ? 'movie' : 'movies'} ·{' '}
+            {health.cache_series} series
           </p>
           <Button
             variant="secondary"

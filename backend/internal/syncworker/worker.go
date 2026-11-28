@@ -119,7 +119,7 @@ type Dependencies struct {
 	Store *store.Store
 	// Settings supplies storage.paths, target.tag_filter, mux.options and
 	// security.options. Optional: without it the gate is non-enforcing and the
-	// default track title is used.
+	// mux runs in replace mode.
 	Settings *settings.Store
 	// Executor runs the M4-6 analysis. Required.
 	Executor Executor
@@ -639,7 +639,6 @@ func (w *Worker) processJob(ctx context.Context, id int64) error {
 		TargetLangISO2: rec.TargetLangISO2,
 		AudioPath:      audio,
 		SyncOffsetMS:   offset,
-		TrackTitle:     w.trackTitle(opts),
 		OutputMode:     mode,
 		OutputDir:      outputDir,
 		Gate:           rule,
@@ -998,13 +997,9 @@ func (w *Worker) forceOverride(ctx context.Context) bool {
 	return sec.AllowForceTagOverride
 }
 
-func (w *Worker) trackTitle(opts settings.MuxOptions) string {
-	return strings.TrimSpace(opts.TrackTitleInMKV)
-}
-
 // muxOptions reads settings mux.options once per job. ok=false means the
 // settings are unavailable, and the caller falls back to the shipped defaults
-// (empty track title, replace mode).
+// (replace mode).
 func (w *Worker) muxOptions(ctx context.Context) (settings.MuxOptions, bool) {
 	if w.settings == nil {
 		return settings.MuxOptions{}, false
@@ -1081,8 +1076,9 @@ func (w *Worker) transcodePlan(ctx context.Context, rec store.SyncJobRecord) (tr
 // Timing and transcoding are one encode (Q20): the mux path's offset is an
 // mkvmerge `--sync` flag, not a re-encode, and any tempo factor must be folded
 // into this same plan (Plan.WithTempo) rather than applied as a second pass.
-// Language and title survive because mux writes them onto the appended track
-// (mux.options.track_title_in_mkv), and the encode carries the language tag.
+// Language and title survive because mux writes both onto the appended track —
+// the language tag and that language's own name (U10) — so the encode does not
+// have to carry them.
 //
 // segs, when non-empty, is the #84 piecewise render: the same one pass cuts,
 // pads and concatenates the segments, which is why a piecewise job's log line

@@ -178,8 +178,8 @@ func TestTranscodeRulePublishesRequestedStream(t *testing.T) {
 	if got.language != "pol" && got.language != "pl" {
 		t.Fatalf("published language = %q, want the archived Polish tag", got.language)
 	}
-	if got.title != "Polski Dubbing" {
-		t.Fatalf("published title = %q, want mux.options.track_title_in_mkv", got.title)
+	if got.title != "Polish" {
+		t.Fatalf("published title = %q, want the language name", got.title)
 	}
 	bps := audioBitrateBPS(t, target, got.index)
 	if bps < 48000 || bps > 192000 {

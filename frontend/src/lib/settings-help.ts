@@ -107,7 +107,6 @@ export const SETTINGS_HELP: Record<SettingsSectionKey, Record<string, string>> =
       'A cap on the result. A real re-cut has a handful of joins; a hit count in the dozens means the boundaries are noise. Allowed 2..40.',
   },
   'mux.options': {
-    track_title_in_mkv: 'Track title written into the Matroska container for the muxed audio.',
     output_mode:
       'Replace: atomically overwrite the library file. Write to the mux output folder: save <name>.dubarr.mkv in the Mux output folder instead, refuse to overwrite an existing file and skip the *arr rescan.',
   },

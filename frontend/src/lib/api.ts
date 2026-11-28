@@ -182,7 +182,6 @@ export type SecurityOptions = {
 export type MuxOutputMode = 'replace' | 'separate'
 
 export type MuxOptions = {
-  track_title_in_mkv: string
   /** replace: atomically overwrite the Target; separate: write to output_dir (ADR-0011). */
   output_mode: MuxOutputMode
 }

@@ -172,6 +172,25 @@ func ISO639_2B(raw string) string {
 	return "und"
 }
 
+// LanguageName is the human-readable English name of a language ("Polish",
+// "French") with its first letter upper-cased, resolved through the same table
+// and aliases as ISO639_1 — so "pl", "pol" and "polish" all name Polish.
+//
+// It returns "" when ISO639_1 cannot resolve the token: an absent, "und" or
+// unknown language has no name to write, and the caller decides what to show
+// instead.
+func LanguageName(raw string) string {
+	iso1 := ISO639_1(raw)
+	if iso1 == "" {
+		return ""
+	}
+	entry, ok := iso639Table[iso1]
+	if !ok || entry.name == "" {
+		return ""
+	}
+	return strings.ToUpper(entry.name[:1]) + entry.name[1:]
+}
+
 // normalizeLangToken lower-cases a language token, trims padding and reduces
 // a BCP-47/Matroska tag to its primary subtag ("en-US" -> "en").
 func normalizeLangToken(raw string) string {

@@ -62,7 +62,9 @@ type Job struct {
 	// the copy read it; it is never edited in place.
 	TargetPath string
 	// TargetLangISO2 is the language of the incoming track (audio_tracks
-	// lang_iso2), written as the Matroska track language.
+	// lang_iso2), written as the Matroska track language. A code that cannot
+	// be resolved to an ISO 639-2 language is written as "und" (see
+	// [Muxer.Mux]); mkvmerge rejects such a code outright.
 	TargetLangISO2 string
 	// AudioPath is the synced .mka already staged by Copy-on-Work under
 	// {WORK_DIR}/jobs/{id}/.
@@ -71,8 +73,9 @@ type Job struct {
 	// delays the donor (mkvmerge --sync 0:+N), negative advances it
 	// (GLOSSARY "Sync Offset").
 	SyncOffsetMS int64
-	// TrackTitle is the Matroska track name (settings mux.options
-	// track_title_in_mkv). Empty selects [DefaultTrackTitle].
+	// TrackTitle is the Matroska track name. It is an explicit override for a
+	// caller that knows better (tests, the mux re-check path); empty selects
+	// [DefaultTrackTitle], which names the track after its language.
 	TrackTitle string
 	// SetDefault marks the appended track as the container default.
 	SetDefault bool
@@ -113,7 +116,8 @@ type Result struct {
 	WorkCopy string
 	// AudioPath is the staged .mka that was appended; see WorkCopy.
 	AudioPath string
-	// Language and TrackTitle are what were written onto the new track.
+	// Language and TrackTitle are what were written onto the new track;
+	// Language is "und" when the job's language could not be resolved.
 	Language   string
 	TrackTitle string
 	// Command is the exact mkvmerge argv (including argv[0]) for job logs.
@@ -241,6 +245,18 @@ func (m *Muxer) Mux(ctx context.Context, job Job) (Result, error) {
 	if title == "" {
 		title = DefaultTrackTitle(lang)
 	}
+	// probe.ISO639_1 deliberately passes an unmapped but structurally valid
+	// two-letter code ("zz") through, and mkvmerge refuses exactly those with
+	// exit 2 ("'zz' is not a valid ISO 639-2 language code") — which would kill
+	// the job here, after the Copy-on-Work copy and before any publish, leaving
+	// the "ZZ DUB" title fallback above unreachable for the languages that need
+	// it. Resolve the code once, before mkvmerge, and write und when the table
+	// cannot: an unlabelled track in a published file beats a failed job.
+	containerLang := muxLanguage(lang)
+	if containerLang != lang {
+		m.warnf("mux: target language %q is not a resolvable ISO 639-2 language; writing und on the appended track of %s",
+			lang, filepath.Base(target))
+	}
 
 	// Resolve (and in separate mode validate and reserve) the publish
 	// destination before any write, so an unusable destination cannot leave a
@@ -317,7 +333,7 @@ func (m *Muxer) Mux(ctx context.Context, job Job) (Result, error) {
 		"-o", temp,
 		"--quiet",
 		workCopy,
-		"--language", "0:" + lang,
+		"--language", "0:" + containerLang,
 		"--track-name", "0:" + title,
 		"--sync", "0:" + strconv.FormatInt(job.SyncOffsetMS, 10),
 		"--default-track-flag", "0:" + yesNo(job.SetDefault),
@@ -378,7 +394,7 @@ func (m *Muxer) Mux(ctx context.Context, job Job) (Result, error) {
 		OutputPath: dest,
 		WorkCopy:   workCopy,
 		AudioPath:  audio,
-		Language:   lang,
+		Language:   containerLang,
 		TrackTitle: title,
 		Command:    append([]string{bin}, args...),
 	}, nil
@@ -683,11 +699,34 @@ func (m *Muxer) validatePublished(ctx context.Context, bin, path string, beforeA
 	return nil
 }
 
-// DefaultTrackTitle is the fallback Matroska track name: the ISO-2 language
-// plus the dub marker, rendered like the vault badge "PL DUB".
-// A configured mux.options.track_title_in_mkv (default "Polski Dubbing")
-// overrides it.
+// muxLanguage is the track language handed to mkvmerge as
+// `--language 0:<code>`.
+//
+// [probe.ISO639_1] deliberately lets an unmapped but structurally valid
+// two-letter code through ("zz"), and mkvmerge rejects exactly those: exit 2,
+// "'zz' is not a valid ISO 639-2 language code". Reaching the argument list
+// meant the job died after the work copy and published nothing. A language
+// [probe.ISO639_2B] cannot resolve to an ISO 639-2 code is therefore written as
+// "und", Matroska's own "undetermined" value: an unlabelled track in a
+// published file beats a failed job. A guessed language is never substituted —
+// the caller logs the unresolvable code instead.
+func muxLanguage(lang string) string {
+	if probe.ISO639_2B(lang) == "und" {
+		return "und"
+	}
+	return lang
+}
+
+// DefaultTrackTitle is the Matroska track name for an empty [Job.TrackTitle]:
+// the language's own name, "Polish" or "French", so a player shows a name the
+// operator recognises instead of a bare code.
+//
+// A language the table cannot resolve ("zz", "und", "") keeps the historical
+// dub marker fallback ("ZZ DUB"), because --track-name must never be empty.
 func DefaultTrackTitle(iso2 string) string {
+	if name := probe.LanguageName(iso2); name != "" {
+		return name
+	}
 	return strings.ToUpper(iso2) + " DUB"
 }
 

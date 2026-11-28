@@ -87,8 +87,8 @@ type Request struct {
 	SourceChannels   int
 	SourceDurationMS int64
 	// LangISO2/Title are copied onto the encoded stream so a later mux keeps
-	// the archived language tag and the configured track title even if the
-	// muxer ever stops writing them itself.
+	// the archived language tag and a title even if the muxer ever stops
+	// writing them itself.
 	LangISO2 string
 	Title    string
 	// Segments, when non-empty, is the #84 piecewise render: the dub is cut per

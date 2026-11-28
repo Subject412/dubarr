@@ -9,7 +9,7 @@
 //	target.tag_filter  Processing Gate: filename tags + optional arr tags/roots (ADR-0005, ADR-0009)
 //	sync.defaults      max offset, checkpoint/preview sampling positions, parallel checkpoints
 //	security.options   tag override
-//	mux.options        track title written into Matroska
+//	mux.options        mux output destination mode, replace or separate (ADR-0011)
 //	audio.options      opt-in Transcode Rules: codec/channels/bitrate/sample rate (ADR-0010)
 //	watch.options      watch-folder scan cadence and stability window
 //	arr.options        Radarr/Sonarr polling cadence
@@ -17,7 +17,7 @@
 //	vault.naming       arr-style vault file name patterns and the season folder
 //
 // mux/watch/arr sections are an extension of the original key list: the spec
-// only names the first five, but the settled defaults for the track title,
+// only names the first five, but the settled defaults for the mux output mode,
 // the 10 s watch scan and the 300 s *arr poll need a home. They live as
 // separate sections rather than being smuggled into sync.defaults.
 //
@@ -345,9 +345,9 @@ const (
 	MuxOutputSeparate = "separate"
 )
 
-// MuxOptions control atomic muxing side effects.
+// MuxOptions control atomic muxing side effects. The Matroska track title is
+// not configurable (U10): mux names the track after its language.
 type MuxOptions struct {
-	TrackTitleInMKV string `json:"track_title_in_mkv"`
 	// OutputMode is "replace" (atomically replace the Target, current
 	// behaviour) or "separate" (write <basename>.dubarr.mkv into
 	// storage.paths.output_dir and leave the Target untouched, ADR-0011).
@@ -534,8 +534,7 @@ func Defaults(dataDir string) map[string]any {
 			AllowForceTagOverride: false,
 		},
 		KeyMuxOptions: MuxOptions{
-			TrackTitleInMKV: "Polski Dubbing",
-			OutputMode:      MuxOutputReplace,
+			OutputMode: MuxOutputReplace,
 		},
 		KeyWatchOptions: WatchOptions{
 			ScanIntervalSec:           10,
@@ -637,11 +636,12 @@ func serveable(key, value string) json.RawMessage {
 		}
 		return blob
 	case KeyMuxOptions:
-		// A row written before keep_bak was retired still carries it, and
-		// MuxOptions.UnmarshalJSON is strict about unknown fields, so the key
-		// is dropped before decoding. Re-marshalling the current schema then
-		// guarantees the API never serves a setting that no longer exists.
-		// The stored row is left untouched.
+		// A row written before keep_bak or track_title_in_mkv was retired
+		// still carries it, and MuxOptions.UnmarshalJSON is strict about
+		// unknown fields, so the keys are dropped before decoding.
+		// Re-marshalling the current schema then guarantees the API never
+		// serves a setting that no longer exists. The stored row is left
+		// untouched.
 		var fields map[string]json.RawMessage
 		if err := json.Unmarshal(raw, &fields); err != nil {
 			return raw // a malformed legacy row keeps its raw bytes
@@ -651,8 +651,10 @@ func serveable(key, value string) json.RawMessage {
 		// unknown to it. Every spelling has to go, otherwise the strict decode
 		// below rejects the row and it is served raw with the retired key in it.
 		for name := range fields {
-			if strings.EqualFold(name, "keep_bak") {
-				delete(fields, name)
+			for _, retired := range []string{"keep_bak", "track_title_in_mkv"} {
+				if strings.EqualFold(name, retired) {
+					delete(fields, name)
+				}
 			}
 		}
 		cleaned, err := json.Marshal(fields)
@@ -991,9 +993,6 @@ func normalize(key string, raw json.RawMessage) (string, error) {
 	case KeyMuxOptions:
 		var p MuxOptions
 		err = strict(raw, &p)
-		if err == nil && strings.TrimSpace(p.TrackTitleInMKV) == "" {
-			err = errors.New("track_title_in_mkv is required")
-		}
 		if err == nil {
 			err = validateMuxOptions(&p)
 		}

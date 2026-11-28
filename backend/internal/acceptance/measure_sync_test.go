@@ -928,7 +928,6 @@ func TestMeasureSyncResources(t *testing.T) {
 		TargetLangISO2: "pl",
 		AudioPath:      audio,
 		SyncOffsetMS:   syncOffsetMS,
-		TrackTitle:     "Polski Dubbing",
 		OutputMode:     mux.OutputModeReplace,
 		Gate:           rule,
 		Report:         report,

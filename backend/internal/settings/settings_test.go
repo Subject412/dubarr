@@ -81,7 +81,7 @@ func TestSeedDefaults(t *testing.T) {
 	}
 
 	mux := decode[MuxOptions](t, all[KeyMuxOptions])
-	if mux.TrackTitleInMKV != "Polski Dubbing" || mux.OutputMode != MuxOutputReplace {
+	if mux.OutputMode != MuxOutputReplace {
 		t.Errorf("mux options = %+v", mux)
 	}
 
@@ -216,7 +216,7 @@ func TestSetRejectsInvalidValues(t *testing.T) {
 		KeyWatchOptions:    `{"scan_interval_sec":0}`,
 		KeySecurityOptions: `{"allow_force_tag_override":"yes"}`,
 		KeyStoragePaths:    `{"media_roots":"not-a-list"}`,
-		KeyMuxOptions:      `{"track_title_in_mkv":""}`,
+		KeyMuxOptions:      `{"output_mode":"elsewhere"}`,
 	}
 	for key, body := range cases {
 		if err := s.Set(ctx, key, json.RawMessage(body)); err == nil {
@@ -282,7 +282,7 @@ func mustGet(t *testing.T, s *Store, ctx context.Context, key string) json.RawMe
 
 // A null JSON token decodes into a struct as a no-op, so without an explicit
 // object check it would persist an all-zero section: mux.options would lose its
-// track title and storage.paths would lose its roots.
+// output mode and storage.paths would lose its roots.
 func TestSetRejectsNullAndNonObjectSections(t *testing.T) {
 	ctx := context.Background()
 	s := openStore(t)
@@ -489,7 +489,7 @@ func TestMuxOutputMode(t *testing.T) {
 	}
 
 	for _, mode := range []string{MuxOutputReplace, MuxOutputSeparate} {
-		raw := json.RawMessage(`{"track_title_in_mkv":"Polski Dubbing","output_mode":"` + mode + `"}`)
+		raw := json.RawMessage(`{"output_mode":"` + mode + `"}`)
 		if err := s.Set(ctx, KeyMuxOptions, raw); err != nil {
 			t.Fatalf("Set(%s): %v", mode, err)
 		}
@@ -498,14 +498,14 @@ func TestMuxOutputMode(t *testing.T) {
 		}
 	}
 
-	bad := json.RawMessage(`{"track_title_in_mkv":"Polski Dubbing","output_mode":"elsewhere"}`)
+	bad := json.RawMessage(`{"output_mode":"elsewhere"}`)
 	if err := s.Set(ctx, KeyMuxOptions, bad); err == nil {
 		t.Fatal("Set accepted an unknown output_mode")
 	}
 
 	// A row written before the field existed must read back as replace, both
 	// from Get and from All (both pass through serveable).
-	legacy := `{"keep_bak":true,"track_title_in_mkv":"Polski Dubbing"}`
+	legacy := `{"keep_bak":true}`
 	if _, err := s.db.ExecContext(ctx, `UPDATE settings SET value = ? WHERE key = ?`, legacy, KeyMuxOptions); err != nil {
 		t.Fatalf("write legacy row: %v", err)
 	}
@@ -531,7 +531,7 @@ func TestMuxOptionsRetiredKeepBak(t *testing.T) {
 	if err := s.Seed(ctx, t.TempDir()); err != nil {
 		t.Fatalf("Seed: %v", err)
 	}
-	legacy := `{"keep_bak":true,"track_title_in_mkv":"Polski Dubbing"}`
+	legacy := `{"keep_bak":true}`
 	if _, err := s.db.ExecContext(ctx, `UPDATE settings SET value = ? WHERE key = ?`, legacy, KeyMuxOptions); err != nil {
 		t.Fatalf("write legacy row: %v", err)
 	}
@@ -543,7 +543,7 @@ func TestMuxOptionsRetiredKeepBak(t *testing.T) {
 	if strings.Contains(string(served), "keep_bak") {
 		t.Errorf("served mux.options still exposes keep_bak: %s", served)
 	}
-	if got := decode[MuxOptions](t, served); got.TrackTitleInMKV != "Polski Dubbing" || got.OutputMode != MuxOutputReplace {
+	if got := decode[MuxOptions](t, served); got.OutputMode != MuxOutputReplace {
 		t.Errorf("served mux.options = %+v", got)
 	}
 
@@ -588,7 +588,7 @@ func TestMuxOptionsRetiredKeepBakCaseInsensitive(t *testing.T) {
 		t.Fatalf("Seed: %v", err)
 	}
 	for _, variant := range []string{"Keep_Bak", "KEEP_BAK", "keep_Bak"} {
-		legacy := `{"` + variant + `":true,"track_title_in_mkv":"Polski Dubbing"}`
+		legacy := `{"` + variant + `":true}`
 		if _, err := s.db.ExecContext(ctx, `UPDATE settings SET value = ? WHERE key = ?`, legacy, KeyMuxOptions); err != nil {
 			t.Fatalf("write legacy row: %v", err)
 		}
@@ -600,7 +600,7 @@ func TestMuxOptionsRetiredKeepBakCaseInsensitive(t *testing.T) {
 		if strings.Contains(strings.ToLower(string(served)), "keep_bak") {
 			t.Errorf("%s: served mux.options still exposes the retired key: %s", variant, served)
 		}
-		if got := decode[MuxOptions](t, served); got.TrackTitleInMKV != "Polski Dubbing" || got.OutputMode != MuxOutputReplace {
+		if got := decode[MuxOptions](t, served); got.OutputMode != MuxOutputReplace {
 			t.Errorf("%s: served mux.options = %+v", variant, got)
 		}
 
@@ -619,6 +619,86 @@ func TestMuxOptionsRetiredKeepBakCaseInsensitive(t *testing.T) {
 		if strings.Contains(strings.ToLower(string(exp.Settings[KeyMuxOptions])), "keep_bak") {
 			t.Errorf("%s: Export still exposes the retired key: %s", variant, exp.Settings[KeyMuxOptions])
 		}
+	}
+}
+
+// TestStoredTrackTitleIsRetired is U10: the operator's free-text Matroska track
+// title is gone, so a row stored before 0.6.0 still loads and serves, but the
+// retired key is dropped before the API hands it out and the stored bytes stay
+// untouched. A PUT that still carries it is rejected naming the field.
+func TestStoredTrackTitleIsRetired(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	if err := s.Seed(ctx, t.TempDir()); err != nil {
+		t.Fatalf("Seed: %v", err)
+	}
+	legacy := `{"track_title_in_mkv":"Polski Dubbing","output_mode":"replace"}`
+	if _, err := s.db.ExecContext(ctx, `UPDATE settings SET value = ? WHERE key = ?`, legacy, KeyMuxOptions); err != nil {
+		t.Fatalf("write legacy row: %v", err)
+	}
+
+	served, ok, err := s.Get(ctx, KeyMuxOptions)
+	if err != nil || !ok {
+		t.Fatalf("Get = %v ok=%v", err, ok)
+	}
+	if strings.Contains(string(served), "track_title_in_mkv") {
+		t.Errorf("served mux.options still exposes the retired key: %s", served)
+	}
+	if got := decode[MuxOptions](t, served); got.OutputMode != MuxOutputReplace {
+		t.Errorf("served mux.options = %+v", got)
+	}
+
+	// The stored bytes are left alone; only what the API serves is cleaned.
+	var stored string
+	if err := s.db.QueryRowContext(ctx, `SELECT value FROM settings WHERE key = ?`, KeyMuxOptions).Scan(&stored); err != nil {
+		t.Fatalf("read stored row: %v", err)
+	}
+	if stored != legacy {
+		t.Errorf("stored row changed: %s", stored)
+	}
+	// The served section is still a valid body to save back.
+	if err := s.Set(ctx, KeyMuxOptions, served); err != nil {
+		t.Errorf("served mux.options no longer validates: %v", err)
+	}
+
+	all, err := s.All(ctx)
+	if err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	if strings.Contains(string(all[KeyMuxOptions]), "track_title_in_mkv") {
+		t.Errorf("All still exposes the retired key: %s", all[KeyMuxOptions])
+	}
+	exp, err := s.Export(ctx)
+	if err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+	if strings.Contains(string(exp.Settings[KeyMuxOptions]), "track_title_in_mkv") {
+		t.Errorf("Export still exposes the retired key: %s", exp.Settings[KeyMuxOptions])
+	}
+
+	if err := s.Set(ctx, KeyMuxOptions, json.RawMessage(legacy)); err == nil {
+		t.Fatal("Set accepted the retired track_title_in_mkv field")
+	} else if !strings.Contains(err.Error(), "track_title_in_mkv") {
+		t.Errorf("Set error %q should name track_title_in_mkv", err)
+	}
+}
+
+// TestDefaultsHaveNoTrackTitle: a fresh install ships no track title at all —
+// the muxer names the track after its language.
+func TestDefaultsHaveNoTrackTitle(t *testing.T) {
+	mux, ok := Defaults("")[KeyMuxOptions].(MuxOptions)
+	if !ok {
+		t.Fatalf("Defaults()[%s] is not a MuxOptions", KeyMuxOptions)
+	}
+	raw, err := json.Marshal(mux)
+	if err != nil {
+		t.Fatalf("marshal defaults: %v", err)
+	}
+	if strings.Contains(string(raw), "track_title_in_mkv") {
+		t.Errorf("mux.options defaults still carry a track title: %s", raw)
+	}
+	if mux.OutputMode != MuxOutputReplace {
+		t.Errorf("default output_mode = %q, want %q", mux.OutputMode, MuxOutputReplace)
 	}
 }
 

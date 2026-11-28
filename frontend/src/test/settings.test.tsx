@@ -116,7 +116,7 @@ describe('settings section save', () => {
       'security.options': {
         allow_force_tag_override: false,
       },
-      'mux.options': { track_title_in_mkv: 'Polski Dubbing' },
+      'mux.options': { output_mode: 'replace' },
       'watch.options': { scan_interval_sec: 10, stability_check_interval_sec: 4 },
       'arr.options': { poll_interval_sec: 300 },
     }
@@ -331,7 +331,7 @@ describe('mux options (retired keep_bak switch)', () => {
       }
       if (url.includes('/api/settings')) {
         return jsonResponse({
-          settings: { 'mux.options': { track_title_in_mkv: 'Polski Dubbing' } },
+          settings: { 'mux.options': { output_mode: 'replace' } },
         })
       }
       return jsonResponse({ error: 'unexpected' }, 404)
@@ -360,7 +360,32 @@ describe('mux options (retired keep_bak switch)', () => {
       settings: { 'mux.options': Record<string, unknown> }
     }
     expect(body.settings['mux.options']).not.toHaveProperty('keep_bak')
-    expect(body.settings['mux.options'].track_title_in_mkv).toBe('Polski Dubbing')
+    expect(body.settings['mux.options']).toEqual({ output_mode: 'replace' })
+  })
+
+  // U10: the Matroska track title is derived from the language, so the operator
+  // has no field for it and none is posted back.
+  it('is not an input and is not part of the saved payload', async () => {
+    const user = userEvent.setup()
+    const fetchMock = mockMuxFetch()
+    renderWithProviders(<SettingsPage />, { route: '/settings' })
+    expect(await screen.findByRole('heading', { name: 'Mux options' })).toBeInTheDocument()
+
+    const card = document.getElementById(settingsSectionId('mux.options')) as HTMLElement | null
+    expect(card).not.toBeNull()
+    expect(within(card as HTMLElement).queryByLabelText(/track title/i)).toBeNull()
+    expect(screen.queryByRole('button', { name: /about track title/i })).toBeNull()
+    expect(within(card as HTMLElement).getByText(/named after its language/i)).toBeInTheDocument()
+
+    await user.click(screen.getByLabelText('Save Mux options'))
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([, init]) => isMethod(init, 'PUT'))).toBe(true)
+    })
+    const put = fetchMock.mock.calls.find(([, init]) => isMethod(init, 'PUT'))
+    const body = JSON.parse(String(put?.[1]?.body)) as {
+      settings: { 'mux.options': Record<string, unknown> }
+    }
+    expect(body.settings['mux.options']).not.toHaveProperty('track_title_in_mkv')
   })
 })
 
@@ -551,7 +576,6 @@ describe('mux output destination', () => {
         media_roots: [],
       },
       'mux.options': {
-        track_title_in_mkv: 'Polski Dubbing',
         output_mode: outputMode,
       },
     }
@@ -609,7 +633,6 @@ describe('mux output destination', () => {
 
     await waitFor(() => expect(fetchMock.mock.calls.some(([, init]) => isMethod(init, 'PUT'))).toBe(true))
     expect(savedSection(fetchMock, 'mux.options')).toMatchObject({
-      track_title_in_mkv: 'Polski Dubbing',
       output_mode: 'separate',
     })
   })

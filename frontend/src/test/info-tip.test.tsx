@@ -44,7 +44,7 @@ const SETTINGS = {
   },
   // `separate` keeps the dependent Mux output folder in the form, so every
   // authored help entry has a control to document.
-  'mux.options': { track_title_in_mkv: 'Polski Dubbing', output_mode: 'separate' },
+  'mux.options': { output_mode: 'separate' },
   'audio.options': {
     rules: [
       {
@@ -150,12 +150,12 @@ describe('info tooltip (issue #3)', () => {
     const user = userEvent.setup()
     await renderSettings()
 
-    const trigger = screen.getByRole('button', { name: 'About Track title written into Matroska' })
+    const trigger = screen.getByRole('button', { name: 'About Output mode' })
 
     act(() => trigger.focus())
     // The tip carries the authored help for the mux option it documents.
     expect(await screen.findByRole('tooltip')).toHaveTextContent(
-      SETTINGS_HELP['mux.options'].track_title_in_mkv,
+      SETTINGS_HELP['mux.options'].output_mode,
     )
 
     await user.keyboard('{Escape}')

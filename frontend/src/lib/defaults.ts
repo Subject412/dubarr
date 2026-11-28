@@ -91,7 +91,6 @@ export const DEFAULT_SETTINGS: DubarrSettings = {
     },
   } as SyncStrategy,
   'mux.options': {
-    track_title_in_mkv: 'Polski Dubbing',
     output_mode: 'replace',
   },
   // Shipped default: no rules, no transcoding (ADR-0010).

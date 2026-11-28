@@ -395,7 +395,7 @@ func (w *Writer) storagePaths(ctx context.Context) (vaultDir, workDir string, er
 		if strings.TrimSpace(w.dataDir) == "" {
 			return "", "", errors.New("vault: work directory is not configured")
 		}
-		workDir = filepath.Join(w.dataDir, "work")
+		workDir = filepath.Join(w.dataDir, "temp")
 	}
 	workDir, err = filepath.EvalSymlinks(workDir)
 	if err != nil {

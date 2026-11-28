@@ -204,3 +204,101 @@ func TestSupervisorWarnsInsteadOfSwappingPaths(t *testing.T) {
 		t.Error("no restart-required warning logged for the changed watch_dir")
 	}
 }
+
+// TestBootCreatesTheTempFolder pins U13: a fresh install stages under
+// <DATA_DIR>/temp, the folder boot creates with 0700, and that same path is what
+// the settings section serves — so the operator sees where work happens instead
+// of an empty field that falls back at job time.
+func TestBootCreatesTheTempFolder(t *testing.T) {
+	dir := t.TempDir()
+	srv, err := newServerWithSecrets(
+		Config{DataDir: dir, Listen: "127.0.0.1:0"},
+		secrets.Options{DataDir: dir},
+	)
+	if err != nil {
+		t.Fatalf("newServerWithSecrets: %v", err)
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+
+	root := filepath.Join(dir, "temp")
+	info, err := os.Stat(root)
+	if err != nil {
+		t.Fatalf("boot did not create the temp folder %s: %v", root, err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("%s mode = %v, want a directory", root, info.Mode())
+	}
+	if perm := info.Mode().Perm(); perm != 0o700 {
+		t.Errorf("%s mode = %o, want 700", root, perm)
+	}
+
+	paths, err := loadStoragePaths(context.Background(), srv.settings)
+	if err != nil {
+		t.Fatalf("loadStoragePaths: %v", err)
+	}
+	if paths.WorkDir != root {
+		t.Errorf("seeded work_dir = %q, want %q", paths.WorkDir, root)
+	}
+	// jobs/ belongs to the first stage, not to boot: an empty root is correct.
+	if _, err := os.Stat(filepath.Join(root, "jobs")); !os.IsNotExist(err) {
+		t.Errorf("boot created the per-job jobs folder (stat err = %v)", err)
+	}
+}
+
+// TestBootSurvivesAnUnwritableTempFolder pins the appliance rule: a bad mount
+// must not stop boot. The supervisor warns and the server keeps serving; the
+// job that needs the folder fails with its own error.
+func TestBootSurvivesAnUnwritableTempFolder(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	rig := newSupervisorRig(t)
+	parent := rig.mkdir("read-only")
+	if err := os.Chmod(parent, 0o500); err != nil {
+		t.Fatalf("chmod parent: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(parent, 0o700) })
+
+	workDir := filepath.Join(parent, "temp")
+	rig.setStoragePaths(settings.StoragePaths{WorkDir: workDir, VaultDir: rig.mkdir("vault")})
+
+	rig.sup.adoptBoot(context.Background(), bootSubsystems{})
+
+	if !rig.hasLog("warn", "storage", "temp folder is not usable") {
+		t.Error("boot did not warn about an unwritable temp folder")
+	}
+	if _, err := os.Stat(workDir); !os.IsNotExist(err) {
+		t.Errorf("an unwritable parent grew %s (stat err = %v)", workDir, err)
+	}
+}
+
+// TestBootRefusesATempFolderInsideTheVault pins the containment rule: a stored
+// row from before the check existed must not make boot create a staging root
+// inside the vault, where the next pass would reorganise the staged copies. The
+// save route refuses the value; this is the upgrade path.
+func TestBootRefusesATempFolderInsideTheVault(t *testing.T) {
+	ctx := context.Background()
+	rig := newSupervisorRig(t)
+	vault := rig.mkdir("vault")
+	workDir := filepath.Join(vault, "temp")
+
+	legacy, err := json.Marshal(settings.StoragePaths{VaultDir: vault, WorkDir: workDir})
+	if err != nil {
+		t.Fatalf("marshal storage paths: %v", err)
+	}
+	if _, err := rig.store.DB.ExecContext(ctx,
+		`INSERT INTO settings (key, value) VALUES (?, ?)
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+		settings.KeyStoragePaths, string(legacy)); err != nil {
+		t.Fatalf("seed legacy storage.paths: %v", err)
+	}
+
+	rig.sup.adoptBoot(ctx, bootSubsystems{})
+
+	if _, err := os.Stat(workDir); !os.IsNotExist(err) {
+		t.Fatalf("boot created %s inside the vault (stat err = %v)", workDir, err)
+	}
+	if !rig.hasLog("warn", "storage", "temp folder is not usable") {
+		t.Error("boot did not warn that the temp folder is inside the vault")
+	}
+}

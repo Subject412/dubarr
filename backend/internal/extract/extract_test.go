@@ -161,7 +161,10 @@ func newHarness(t *testing.T) *harness {
 	if err != nil {
 		t.Fatalf("extract.New: %v", err)
 	}
-	return &harness{t: t, ctx: context.Background(), db: st, data: dir, work: filepath.Join(dir, "work"), worker: w}
+	// Seed writes the settled default WORK_DIR (<DATA_DIR>/temp); read it back
+	// from the same Defaults table so this fixture cannot drift from it again.
+	paths, _ := settings.Defaults(dir)[settings.KeyStoragePaths].(settings.StoragePaths)
+	return &harness{t: t, ctx: context.Background(), db: st, data: dir, work: paths.WorkDir, worker: w}
 }
 
 // seedExtracting registers a donor, pairs it with itself and moves it to the

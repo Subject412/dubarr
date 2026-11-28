@@ -387,7 +387,7 @@ func TestSettingsPutRejectsNullSections(t *testing.T) {
 	if err := json.Unmarshal(env.Settings[settings.KeyStoragePaths], &sp); err != nil {
 		t.Fatalf("decode storage: %v", err)
 	}
-	if sp.WorkDir != filepath.Join(h.dataDir, "work") {
+	if sp.WorkDir != filepath.Join(h.dataDir, "temp") {
 		t.Errorf("null write cleared storage.paths: %+v", sp)
 	}
 }

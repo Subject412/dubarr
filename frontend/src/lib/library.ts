@@ -56,7 +56,14 @@ export type LibraryHealthInstance = {
 
 export type LibraryHealthResponse = {
   instances: LibraryHealthInstance[]
+  /** Every cache row: films plus one row per episode (the empty state's signal). */
   cache_items: number
+  /**
+   * The library counted in titles, not files. Required, with no fallback to
+   * `cache_items`: a silent fallback would hide a wiring regression.
+   */
+  cache_movies: number
+  cache_series: number
 }
 
 export type LibraryItemsQuery = {

@@ -339,6 +339,112 @@ func TestListLibraryPagesDuplicateTitles(t *testing.T) {
 	}
 }
 
+// TestLibraryMediaCountsMatchTheListTotals pins the claim in
+// LibraryMediaCounts' comment: the header's films/shows numbers are the same
+// numbers the movies and series tabs report, computed from the same table. The
+// fixture carries the edge case the spec names — one episode row whose series_id
+// is NULL — which must inflate neither count but must stay a cached item.
+//
+// The header and the tabs must never quote different numbers for the same library.
+func TestLibraryMediaCountsMatchTheListTotals(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	ctx := context.Background()
+
+	radarr := libraryInstance(t, s, ctx, "Radarr", "radarr")
+	sonarr := libraryInstance(t, s, ctx, "Sonarr", "sonarr")
+
+	// 2 movies.
+	for i, title := range []string{"Arrival", "Tenet"} {
+		hierarchyMovie(t, s, ctx, radarr, int64(i+1), title, "", 2016,
+			"/media/movies/"+title+".mkv", "eligible")
+	}
+
+	// 6 episodes across 2 distinct series, three rows each.
+	for i, series := range []struct {
+		id    int64
+		title string
+	}{{101, "The Expanse"}, {202, "Severance"}} {
+		for ep := 1; ep <= 3; ep++ {
+			hierarchyEpisode(t, s, ctx, sonarr, series.id, 1, ep, series.title, 2015+i,
+				hierarchyEpisodeOpts{})
+		}
+	}
+
+	// An episode the sync could not attribute to a series: media_type 'episode'
+	// with a NULL series_id. It is a cached row, so it must be visible to the
+	// item count, and it must not be counted as a show or a film.
+	if _, err := s.DB.ExecContext(ctx,
+		`INSERT INTO arr_library_cache
+		 (arr_instance_id, media_type, external_item_id, series_id, title, eligibility_status)
+		 VALUES (?, 'episode', 900101, NULL, 'Orphan Episode', 'missing_target')`,
+		sonarr); err != nil {
+		t.Fatalf("insert NULL-series episode: %v", err)
+	}
+
+	movies, series, err := s.LibraryMediaCounts(ctx)
+	if err != nil {
+		t.Fatalf("LibraryMediaCounts: %v", err)
+	}
+	if movies != 2 || series != 2 {
+		t.Fatalf("LibraryMediaCounts = %d movies / %d series, want 2/2 "+
+			"(the NULL series_id row is neither)", movies, series)
+	}
+
+	// The movies tab: same number as the header.
+	movieTotal, movieRows, err := s.ListMovies(ctx, HierarchyFilter{})
+	if err != nil {
+		t.Fatalf("ListMovies: %v", err)
+	}
+	if movieTotal != movies {
+		t.Errorf("movies tab total = %d, header says %d", movieTotal, movies)
+	}
+	if int64(len(movieRows)) != movieTotal {
+		t.Errorf("ListMovies returned %d rows for a total of %d", len(movieRows), movieTotal)
+	}
+
+	// The series tab: same number as the header, and the orphan belongs to no
+	// series, so the grouped episode counts still sum to the 6 attributed rows.
+	seriesTotal, seriesRows, err := s.ListSeries(ctx, HierarchyFilter{})
+	if err != nil {
+		t.Fatalf("ListSeries: %v", err)
+	}
+	if seriesTotal != series {
+		t.Errorf("series tab total = %d, header says %d", seriesTotal, series)
+	}
+	if int64(len(seriesRows)) != seriesTotal {
+		t.Errorf("ListSeries returned %d rows for a total of %d", len(seriesRows), seriesTotal)
+	}
+	var grouped int64
+	for _, row := range seriesRows {
+		grouped += int64(row.EpisodeCount)
+	}
+	if grouped != 6 {
+		t.Errorf("series rows cover %d episodes, want 6 (the NULL series_id row belongs to none)", grouped)
+	}
+
+	// The item count still sees all 9 rows, orphan included. That total is the
+	// same one the health payload reports alongside the header numbers.
+	itemTotal, err := s.ListLibrary(ctx, ListLibraryFilter{})
+	if err != nil {
+		t.Fatalf("ListLibrary: %v", err)
+	}
+	if itemTotal.Total != 9 {
+		t.Fatalf("library item total = %d, want 9 (2 movies + 6 episodes + 1 orphan)", itemTotal.Total)
+	}
+	_, cacheItems, err := s.ArrLibraryHealth(ctx)
+	if err != nil {
+		t.Fatalf("ArrLibraryHealth: %v", err)
+	}
+	if cacheItems != itemTotal.Total {
+		t.Errorf("cache_items = %d, list item total = %d; the two counts must agree",
+			cacheItems, itemTotal.Total)
+	}
+}
+
 // TestListLibraryRejectsUnknownKindAndEligibility keeps bad filter values a
 // typed error instead of a silently empty page.
 func TestListLibraryRejectsUnknownKindAndEligibility(t *testing.T) {

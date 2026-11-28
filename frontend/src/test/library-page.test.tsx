@@ -1,4 +1,4 @@
-import { screen, waitFor, within } from '@testing-library/react'
+import { cleanup, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 import { LibraryPage } from '../pages/Library'
@@ -60,12 +60,17 @@ function pageOf(items: LibraryItem[], url: URL, total = items.length) {
 function mockLibrary({
   instances,
   cacheItems = 0,
+  cacheMovies = 0,
+  cacheSeries = 0,
   items,
   refresh,
   rescan,
 }: {
   instances: LibraryHealthInstance[]
   cacheItems?: number
+  /** Films and shows in the library; the header reads these, not cacheItems. */
+  cacheMovies?: number
+  cacheSeries?: number
   items: ItemsHandler
   /** POST /api/library/refresh response; defaults to an accepted pass. */
   refresh?: () => Response | Promise<Response>
@@ -75,7 +80,12 @@ function mockLibrary({
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input), 'http://localhost')
     if (url.pathname === '/api/library/health') {
-      return jsonResponse({ instances, cache_items: cacheItems })
+      return jsonResponse({
+        instances,
+        cache_items: cacheItems,
+        cache_movies: cacheMovies,
+        cache_series: cacheSeries,
+      })
     }
     if (url.pathname === '/api/library/items') {
       return jsonResponse(items(url))
@@ -296,6 +306,51 @@ describe('library page empty states (#29)', () => {
     const detail = heading.parentElement as HTMLElement
     expect(detail).toHaveTextContent('radarr: dial tcp 10.0.0.2:7878: connection refused')
     expect(detail).not.toHaveTextContent('sonarr: 401 Unauthorized')
+  })
+})
+
+describe('library header counts titles, not files', () => {
+  it('never adds films and episodes: 486 movies and 166 series, no cache row total', async () => {
+    mockLibrary({
+      instances: [instance({ last_ok: true, items_seen: 12909 })],
+      cacheItems: 12909,
+      cacheMovies: 486,
+      cacheSeries: 166,
+      items: (url) => pageOf([], url),
+    })
+    renderWithProviders(<LibraryPage />, { route: '/library' })
+
+    const strip = await screen.findByLabelText('Arr sync health')
+    // 12 909 is every cache row (486 films + ~12 400 episodes): a file count,
+    // so the header sentence must never carry it, whatever cache_items says.
+    // The per-instance "Items seen" diagnostic keeps its own row count.
+    const counts = within(strip).getByText(/486 movies/)
+    expect(counts).toHaveTextContent('486 movies · 166 series')
+    expect(counts).not.toHaveTextContent('12909')
+    expect(within(strip).queryByText(/titles cached/)).not.toBeInTheDocument()
+  })
+
+  it('handles the singular and the empty library without hiding the strip', async () => {
+    mockLibrary({
+      instances: [instance({ last_ok: true, items_seen: 2 })],
+      cacheItems: 2,
+      cacheMovies: 1,
+      cacheSeries: 1,
+      items: (url) => pageOf([], url),
+    })
+    renderWithProviders(<LibraryPage />, { route: '/library' })
+
+    const single = await screen.findByLabelText('Arr sync health')
+    expect(within(single).getByText('1 movie · 1 series')).toBeInTheDocument()
+
+    // A library that has never synced still renders the strip: "series" is
+    // invariable, so zero reads "0 movies · 0 series" (never "0 serie").
+    cleanup()
+    mockLibrary({ instances: [instance()], items: (url) => pageOf([], url) })
+    renderWithProviders(<LibraryPage />, { route: '/library' })
+
+    const empty = await screen.findByLabelText('Arr sync health')
+    expect(within(empty).getByText('0 movies · 0 series')).toBeInTheDocument()
   })
 })
 

@@ -36,8 +36,15 @@ type instanceHealth struct {
 }
 
 type healthResponse struct {
-	Instances  []instanceHealth `json:"instances"`
-	CacheItems int64            `json:"cache_items"`
+	Instances []instanceHealth `json:"instances"`
+	// CacheItems is every arr_library_cache row: films plus one row per
+	// episode. The empty state and the queue diagnostics still distinguish
+	// "never synced" from "empty library" with it, so it stays.
+	CacheItems int64 `json:"cache_items"`
+	// CacheMovies and CacheSeries are the same library counted in the terms
+	// the operator thinks in: films and shows (distinct series_id), not files.
+	CacheMovies int64 `json:"cache_movies"`
+	CacheSeries int64 `json:"cache_series"`
 }
 
 // handleHealth merges two sources into one list keyed by kind:
@@ -58,6 +65,13 @@ func (s *Service) handleHealth(w http.ResponseWriter, r *http.Request) {
 	rows, cacheItems, err := s.store.ArrLibraryHealth(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "could not read arr sync health")
+		return
+	}
+	// Same table as the read above, so a failure here is the same kind of
+	// failure: without both numbers the strip would print a wrong size.
+	movies, series, err := s.store.LibraryMediaCounts(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not read the library size")
 		return
 	}
 	instances := make([]instanceHealth, 0, len(rows))
@@ -112,8 +126,10 @@ func (s *Service) handleHealth(w http.ResponseWriter, r *http.Request) {
 		return strings.ToLower(instances[i].Name) < strings.ToLower(instances[j].Name)
 	})
 	writeJSON(w, http.StatusOK, healthResponse{
-		Instances:  instances,
-		CacheItems: cacheItems,
+		Instances:   instances,
+		CacheItems:  cacheItems,
+		CacheMovies: movies,
+		CacheSeries: series,
 	})
 }
 

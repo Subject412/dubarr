@@ -332,3 +332,24 @@ func (s *Store) ArrLibraryHealth(ctx context.Context) ([]ArrInstanceHealth, int6
 	}
 	return out, cacheItems, nil
 }
+
+// LibraryMediaCounts is the library's size in the terms the operator thinks in:
+// films and shows, not files. cache_series counts distinct series_id, because
+// one show is ~75 episode rows.
+//
+// Both numbers come from the same table and definition as the tab totals
+// (/api/library/movies and /api/library/series), so the header and the tabs
+// cannot disagree. SQLite evaluates the boolean expressions as 0/1, and the
+// CASE inside COUNT(DISTINCT …) is what keeps a NULL series_id from counting as
+// a show: COUNT(DISTINCT) ignores NULL but the CASE makes that explicit rather
+// than relying on movies never carrying one.
+func (s *Store) LibraryMediaCounts(ctx context.Context) (movies, series int64, err error) {
+	err = s.DB.QueryRowContext(ctx,
+		`SELECT COALESCE(SUM(media_type = 'movie'), 0),
+		       COUNT(DISTINCT CASE WHEN media_type = 'episode' THEN series_id END)
+		 FROM arr_library_cache`).Scan(&movies, &series)
+	if err != nil {
+		return 0, 0, fmt.Errorf("store: count library media: %w", err)
+	}
+	return movies, series, nil
+}

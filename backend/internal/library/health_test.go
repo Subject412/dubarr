@@ -57,6 +57,11 @@ type healthPayload struct {
 		ItemsSeen     int64   `json:"items_seen"`
 	} `json:"instances"`
 	CacheItems int64 `json:"cache_items"`
+	// CacheMovies and CacheSeries are the library's size in films and shows;
+	// CacheItems is every cache row (episodes included) and stays for the
+	// empty-state and queue diagnostics.
+	CacheMovies int64 `json:"cache_movies"`
+	CacheSeries int64 `json:"cache_series"`
 }
 
 // healthRaw decodes the health payload and also returns the raw body so a test
@@ -223,6 +228,39 @@ func TestLibraryHealthCountsItemsSeen(t *testing.T) {
 	}
 	if body.CacheItems != 5 {
 		t.Errorf("cache_items = %d, want 5", body.CacheItems)
+	}
+}
+
+// TestHealthReportsPerMediaCounts pins the header's two numbers. cache_items
+// stays the whole-table row total (the empty state and the queue diagnostics
+// read it), while cache_movies/cache_series say how big the library is in the
+// terms the operator thinks in: 2 films and 2 shows, even though those shows
+// are 6 episode rows.
+func TestHealthReportsPerMediaCounts(t *testing.T) {
+	h := newHarness(t)
+	moviesID := h.insertInstance(t, "movies", "radarr", true)
+	tvID := h.insertInstance(t, "tv", "sonarr", true)
+
+	h.insertCacheRow(t, moviesID, 1)
+	h.insertCacheRow(t, moviesID, 2)
+
+	// One show is many episode rows: three rows for series 100, three for 200.
+	for _, episodeID := range []int64{11, 12, 13} {
+		h.insertEpisodeCacheRow(t, tvID, episodeID, 100)
+	}
+	for _, episodeID := range []int64{21, 22, 23} {
+		h.insertEpisodeCacheRow(t, tvID, episodeID, 200)
+	}
+
+	body := h.health(t)
+	if body.CacheItems != 8 {
+		t.Errorf("cache_items = %d, want 8 (every cache row)", body.CacheItems)
+	}
+	if body.CacheMovies != 2 {
+		t.Errorf("cache_movies = %d, want 2", body.CacheMovies)
+	}
+	if body.CacheSeries != 2 {
+		t.Errorf("cache_series = %d, want 2 (distinct series_id, not episode rows)", body.CacheSeries)
 	}
 }
 

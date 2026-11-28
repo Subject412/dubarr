@@ -129,6 +129,20 @@ func (h *harness) insertCacheRow(t *testing.T, instanceID, externalID int64) {
 	}
 }
 
+// insertEpisodeCacheRow seeds one episode cache row the way a Sonarr sync
+// writes it: media_type 'episode' with the series id set. Many rows share one
+// series_id, which is why the series count is distinct.
+func (h *harness) insertEpisodeCacheRow(t *testing.T, instanceID, externalID, seriesID int64) {
+	t.Helper()
+	if _, err := h.db.DB.ExecContext(context.Background(),
+		`INSERT INTO arr_library_cache
+		 (arr_instance_id, media_type, external_item_id, series_id, title, eligibility_status)
+		 VALUES (?, 'episode', ?, ?, 'Episode', 'missing_target')`,
+		instanceID, externalID, seriesID); err != nil {
+		t.Fatalf("insert episode cache row %d: %v", externalID, err)
+	}
+}
+
 // sortedKeys returns the object's keys in a stable order for exact-set checks.
 func sortedKeys(m map[string]json.RawMessage) []string {
 	keys := make([]string, 0, len(m))

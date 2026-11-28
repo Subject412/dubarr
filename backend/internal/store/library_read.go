@@ -53,9 +53,11 @@ type ListLibraryFilter struct {
 }
 
 // LibraryListItem is one row of the Library page. It carries only the columns
-// the page needs: the JSON blob columns (raw_metadata_json,
-// audio_languages_json, arr_tag_ids_json, arr_tag_labels_json) are never
-// selected, so a page cannot accidentally ship them to a client.
+// the page needs: the JSON blob columns (raw_metadata_json, arr_tag_ids_json,
+// arr_tag_labels_json) are never selected, so a page cannot accidentally ship
+// them to a client. audio_languages_json *is* read, but only through
+// decodeAudioLanguages: the client gets the decoded code array, never the stored
+// blob.
 type LibraryListItem struct {
 	ID             int64  `json:"id"`
 	ArrInstanceID  int64  `json:"arr_instance_id"`
@@ -69,10 +71,16 @@ type LibraryListItem struct {
 	IMDBID         string `json:"imdb_id"`
 	Title          string `json:"title"`
 	OriginalTitle  string `json:"original_title"`
-	Year           int    `json:"year"`
-	SeasonNumber   *int   `json:"season_number,omitempty"`
-	EpisodeNumber  *int   `json:"episode_number,omitempty"`
-	EpisodeTitle   string `json:"episode_title"`
+	// OriginalLanguageISO2 is arr's original language as an ISO 639-1 code;
+	// AudioLanguages are the codes of the target file's audio tracks, in the
+	// order arr reported them. Both are empty when the mirror has no value
+	// (an old row, or a file whose languages Dubarr cannot resolve).
+	OriginalLanguageISO2 string   `json:"original_language_iso2"`
+	AudioLanguages       []string `json:"audio_languages"`
+	Year                 int      `json:"year"`
+	SeasonNumber         *int     `json:"season_number,omitempty"`
+	EpisodeNumber        *int     `json:"episode_number,omitempty"`
+	EpisodeTitle         string   `json:"episode_title"`
 	// MediaFolderPath is the arr folder; RootFolderPath is the canonical arr
 	// root containing it (ADR-0009, empty when no configured root matches);
 	// TargetFilePath is the resolved video (empty while arr has no file).
@@ -186,19 +194,27 @@ func (s *Store) LibraryItemByID(ctx context.Context, id int64) (LibraryListItem,
 
 func libraryItemScan(rows *sql.Rows) (LibraryListItem, error) {
 	var (
-		item     LibraryListItem
-		season   sql.NullInt64
-		episode  sql.NullInt64
-		lastSeen sql.NullString
+		item      LibraryListItem
+		season    sql.NullInt64
+		episode   sql.NullInt64
+		lastSeen  sql.NullString
+		audioJSON string
 	)
 	if err := rows.Scan(&item.ID, &item.ArrInstanceID, &item.InstanceName, &item.InstanceType,
 		&item.MediaType, &item.ExternalItemID, &item.SeriesID, &item.TMDBID, &item.TVDBID,
-		&item.IMDBID, &item.Title, &item.OriginalTitle, &item.Year, &season, &episode,
+		&item.IMDBID, &item.Title, &item.OriginalTitle,
+		&item.OriginalLanguageISO2, &audioJSON,
+		&item.Year, &season, &episode,
 		&item.EpisodeTitle, &item.MediaFolderPath, &item.RootFolderPath, &item.TargetFilePath,
 		&item.MatchesTargetTags, &item.EligibilityStatus, &item.VideoCodec,
 		&item.UpdatedAt, &lastSeen); err != nil {
 		return LibraryListItem{}, err
 	}
+	languages, err := decodeAudioLanguages(audioJSON)
+	if err != nil {
+		return LibraryListItem{}, err
+	}
+	item.AudioLanguages = languages
 	if season.Valid {
 		v := int(season.Int64)
 		item.SeasonNumber = &v
@@ -211,15 +227,17 @@ func libraryItemScan(rows *sql.Rows) (LibraryListItem, error) {
 	return item, nil
 }
 
-// libraryPageColumns is the page projection. The JSON blob columns are
-// intentionally absent: raw_metadata_json and audio_languages_json are
-// diagnostics for other screens, and the arr tag snapshots are internal to
-// eligibility.
+// libraryPageColumns is the page projection. The raw JSON blob columns are
+// intentionally absent: raw_metadata_json is a diagnostic for other screens and
+// the arr tag snapshots are internal to eligibility. audio_languages_json is
+// selected only so it can be decoded into a code array (see libraryItemScan).
 const libraryPageColumns = `
 	SELECT c.id, c.arr_instance_id, i.name, i.type,
 	       c.media_type, c.external_item_id, COALESCE(c.series_id, 0),
 	       COALESCE(c.tmdb_id, 0), COALESCE(c.tvdb_id, 0), COALESCE(c.imdb_id, ''),
-	       c.title, COALESCE(c.original_title, ''), COALESCE(c.year, 0),
+	       c.title, COALESCE(c.original_title, ''),
+	       COALESCE(c.original_language_iso2, ''), COALESCE(c.audio_languages_json, '[]'),
+	       COALESCE(c.year, 0),
 	       c.season_number, c.episode_number, COALESCE(c.episode_title, ''),
 	       COALESCE(c.media_folder_path, ''), COALESCE(c.root_folder_path, ''),
 	       COALESCE(c.target_file_path, ''),

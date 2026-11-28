@@ -9,23 +9,40 @@ import (
 	"strings"
 )
 
+// MediaInfo is the media-info block a fake file carries. Both shapes a real
+// instance can send are modelled: the v3 "/"-joined display string and the
+// per-stream list (which is all Sonarr v5 sends). A test sets whichever one the
+// product under test would actually answer with.
+type MediaInfo struct {
+	AudioLanguages string           `json:"audioLanguages,omitempty"`
+	AudioStreams   []MediaInfoAudio `json:"audioStreams,omitempty"`
+}
+
+// MediaInfoAudio is one entry of MediaInfo.AudioStreams; Language is a
+// media-info display name, not an ISO code.
+type MediaInfoAudio struct {
+	Language string `json:"language"`
+}
+
 // MovieFile is a Radarr movieFile element (nested in Movie).
 type MovieFile struct {
-	ID           int    `json:"id"`
-	MovieID      int    `json:"movieId"`
-	RelativePath string `json:"relativePath"`
-	Path         string `json:"path"`
-	Size         int64  `json:"size"`
+	ID           int        `json:"id"`
+	MovieID      int        `json:"movieId"`
+	RelativePath string     `json:"relativePath"`
+	Path         string     `json:"path"`
+	Size         int64      `json:"size"`
+	MediaInfo    *MediaInfo `json:"mediaInfo,omitempty"`
 }
 
 // EpisodeFile is a Sonarr episodeFile element (nested in Episode).
 type EpisodeFile struct {
-	ID           int    `json:"id"`
-	SeriesID     int    `json:"seriesId"`
-	SeasonNumber int    `json:"seasonNumber"`
-	RelativePath string `json:"relativePath"`
-	Path         string `json:"path"`
-	Size         int64  `json:"size"`
+	ID           int        `json:"id"`
+	SeriesID     int        `json:"seriesId"`
+	SeasonNumber int        `json:"seasonNumber"`
+	RelativePath string     `json:"relativePath"`
+	Path         string     `json:"path"`
+	Size         int64      `json:"size"`
+	MediaInfo    *MediaInfo `json:"mediaInfo,omitempty"`
 }
 
 // Episode is a Sonarr /api/v5/episode element.

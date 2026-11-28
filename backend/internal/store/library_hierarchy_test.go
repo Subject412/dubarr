@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"slices"
 	"testing"
 )
 
@@ -151,6 +152,165 @@ func TestListMoviesPaginatesAndCountsWholeSet(t *testing.T) {
 	if total != 250 || len(rows) != 0 {
 		t.Fatalf("page 6 = %d rows / total %d, want 0/250", len(rows), total)
 	}
+}
+
+// TestMovieRowCarriesLanguages pins the movie projection: the original language
+// and the file's audio codes reach the row, and monitored/available come from
+// the mirror's columns rather than being inferred.
+func TestMovieRowCarriesLanguages(t *testing.T) {
+	s, ctx, _ := hierarchyStore(t)
+	radarr := libraryInstance(t, s, ctx, "Radarr", "radarr")
+	languageMovie(t, s, ctx, radarr, 12, "Spirited Away", "ja", `["ja","en"]`, true)
+
+	total, rows, err := s.ListMovies(ctx, HierarchyFilter{})
+	if err != nil {
+		t.Fatalf("ListMovies: %v", err)
+	}
+	if total != 1 || len(rows) != 1 {
+		t.Fatalf("ListMovies = %d rows / total %d, want 1/1", len(rows), total)
+	}
+	row := rows[0]
+	if row.OriginalLanguageISO2 != "ja" {
+		t.Errorf("OriginalLanguageISO2 = %q, want ja", row.OriginalLanguageISO2)
+	}
+	if want := []string{"ja", "en"}; !slices.Equal(row.AudioLanguages, want) {
+		t.Errorf("AudioLanguages = %v, want %v (stream order)", row.AudioLanguages, want)
+	}
+	if !row.Monitored {
+		t.Error("Monitored = false, want true")
+	}
+	if !row.Available || !row.HasFile {
+		t.Errorf("available/has_file = %v/%v, want both true", row.Available, row.HasFile)
+	}
+}
+
+// TestSeriesRowCarriesOriginalLanguageOnly pins that a series aggregate reports
+// the series' language and its monitored state, and that availability is the
+// existence of at least one episode file. Audio languages are deliberately not
+// a series-level value: they are per file.
+func TestSeriesRowCarriesOriginalLanguageOnly(t *testing.T) {
+	s, ctx, sonarr := hierarchyStore(t)
+	languageEpisode(t, s, ctx, sonarr, 7, 2, 1, "The Office", "ja", `["ja","en"]`, true, "/media/tv/s02e1.mkv")
+	// This series has no file at all, so it is not available.
+	languageEpisode(t, s, ctx, sonarr, 8, 1, 1, "Lost", "en", `[]`, true, "")
+
+	total, rows, err := s.ListSeries(ctx, HierarchyFilter{PageSize: 50})
+	if err != nil {
+		t.Fatalf("ListSeries: %v", err)
+	}
+	if total != 2 || len(rows) != 2 {
+		t.Fatalf("ListSeries = %d rows / total %d, want 2/2", len(rows), total)
+	}
+	byID := map[int64]SeriesRow{}
+	for _, row := range rows {
+		byID[row.SeriesID] = row
+	}
+	office := byID[7]
+	if office.OriginalLanguageISO2 != "ja" {
+		t.Errorf("series 7 OriginalLanguageISO2 = %q, want ja", office.OriginalLanguageISO2)
+	}
+	if !office.Monitored {
+		t.Error("series 7 Monitored = false, want true")
+	}
+	if !office.Available {
+		t.Error("series 7 Available = false, want true (it has a file)")
+	}
+	lost := byID[8]
+	if lost.Available {
+		t.Error("series 8 Available = true, want false (no episode has a file)")
+	}
+}
+
+// TestLegacyRowWithoutLanguageColumnsReadsEmpty pins the upgrade path: a row
+// written before this unit has audio_languages_json '[]', a NULL original
+// language and monitored 0, and must read as empty/unknown instead of failing
+// the whole page.
+func TestLegacyRowWithoutLanguageColumnsReadsEmpty(t *testing.T) {
+	s, ctx, _ := hierarchyStore(t)
+	radarr := libraryInstance(t, s, ctx, "Radarr", "radarr")
+	if _, err := s.DB.ExecContext(ctx,
+		`INSERT INTO arr_library_cache
+		 (arr_instance_id, media_type, external_item_id, title, matches_target_tags, eligibility_status)
+		 VALUES (?, 'movie', 99, 'Legacy', 0, 'missing_target')`, radarr); err != nil {
+		t.Fatalf("insert legacy movie: %v", err)
+	}
+
+	_, rows, err := s.ListMovies(ctx, HierarchyFilter{})
+	if err != nil {
+		t.Fatalf("ListMovies: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("ListMovies rows = %d, want 1", len(rows))
+	}
+	row := rows[0]
+	if row.OriginalLanguageISO2 != "" {
+		t.Errorf("OriginalLanguageISO2 = %q, want empty", row.OriginalLanguageISO2)
+	}
+	if row.AudioLanguages == nil {
+		t.Error("AudioLanguages is nil, want an empty slice")
+	}
+	if len(row.AudioLanguages) != 0 {
+		t.Errorf("AudioLanguages = %v, want none", row.AudioLanguages)
+	}
+	// monitored was never written by a sync pass, so the column default (0)
+	// reads as false — it is not a claim that arr unmonitors the film.
+	if row.Monitored {
+		t.Error("Monitored = true, want the column default false")
+	}
+	if row.Available {
+		t.Error("Available = true, want false (the mirror holds no target path)")
+	}
+}
+
+// languageMovie inserts one cached Radarr row with the language and monitored
+// columns set. audioJSON is the raw column payload, so a test can model both a
+// populated row ('["ja","en"]') and an empty one ('[]').
+func languageMovie(t *testing.T, s *Store, ctx context.Context, instanceID, externalID int64,
+	title, originalLanguage, audioJSON string, monitored bool) int64 {
+	t.Helper()
+	res, err := s.DB.ExecContext(ctx,
+		`INSERT INTO arr_library_cache
+		 (arr_instance_id, media_type, external_item_id, title, original_language_iso2,
+		  audio_languages_json, monitored, media_folder_path, target_file_path,
+		  matches_target_tags, eligibility_status, updated_at)
+		 VALUES (?, 'movie', ?, ?, ?, ?, ?, '/media/movies/' || ?, '/media/movies/f.mkv',
+		         1, 'eligible', '2026-01-02 03:04:05')`,
+		instanceID, externalID, title, nullIfEmpty(originalLanguage), audioJSON, monitored, title)
+	if err != nil {
+		t.Fatalf("insert movie %q: %v", title, err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		t.Fatalf("movie id %q: %v", title, err)
+	}
+	return id
+}
+
+// languageEpisode inserts one cached Sonarr episode row with the language and
+// monitored columns set, so the series aggregate can be asserted. targetFile ""
+// models an episode without a file.
+func languageEpisode(t *testing.T, s *Store, ctx context.Context, instanceID, seriesID int64,
+	season, episode int, seriesTitle, originalLanguage, audioJSON string, monitored bool, targetFile string) int64 {
+	t.Helper()
+	externalID := seriesID*100000 + int64(season)*1000 + int64(episode)
+	res, err := s.DB.ExecContext(ctx,
+		`INSERT INTO arr_library_cache
+		 (arr_instance_id, media_type, external_item_id, series_id, title,
+		  original_language_iso2, audio_languages_json, monitored, year, season_number,
+		  episode_number, episode_title, media_folder_path, target_file_path,
+		  matches_target_tags, eligibility_status, updated_at)
+		 VALUES (?, 'episode', ?, ?, ?, ?, ?, ?, 2005, ?, ?, 'Episode', '/media/tv/' || ?,
+		         ?, 1, 'eligible', '2026-01-02 03:04:05')`,
+		instanceID, externalID, seriesID, seriesTitle, nullIfEmpty(originalLanguage), audioJSON,
+		monitored, season, episode, seriesTitle, nullIfEmpty(targetFile))
+	if err != nil {
+		t.Fatalf("insert episode %s S%02dE%02d: %v", seriesTitle, season, episode, err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		t.Fatalf("episode id: %v", err)
+	}
+	return id
 }
 
 // TestListMoviesSearchMatchesTitleAndOriginalTitle pins a case-insensitive

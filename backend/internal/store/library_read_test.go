@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -229,31 +230,89 @@ func TestListLibraryExcludesJsonBlobs(t *testing.T) {
 		t.Fatal("no items to inspect")
 	}
 
-	// No struct field may carry a JSON blob column.
+	// No struct field may carry a raw JSON blob column. audio_languages_json is
+	// decoded into AudioLanguages by the read, so the *field* is legitimate —
+	// the stored blob string is what must never be shipped.
 	typ := reflect.TypeOf(LibraryListItem{})
 	for i := 0; i < typ.NumField(); i++ {
 		name := strings.ToLower(typ.Field(i).Name)
 		tag := strings.ToLower(typ.Field(i).Tag.Get("json"))
-		for _, banned := range []string{"raw", "metadata", "audio_language", "arr_tag", "tag_ids", "tag_labels"} {
+		for _, banned := range []string{"raw", "metadata", "arr_tag", "tag_ids", "tag_labels", "_json"} {
 			if strings.Contains(name, banned) || strings.Contains(tag, banned) {
 				t.Errorf("LibraryListItem field %q (json %q) exposes %q", typ.Field(i).Name, tag, banned)
 			}
 		}
 	}
 
-	// And the marshalled row must not contain the columns either.
+	// And the marshalled row must not contain the columns either — the decoded
+	// language array is the only form that leaves the store.
 	raw, err := json.Marshal(page.Items[0])
 	if err != nil {
 		t.Fatalf("marshal item: %v", err)
 	}
-	for _, banned := range []string{"raw_metadata", "audio_languages", "arr_tag_ids", "arr_tag_labels", "raw"} {
+	for _, banned := range []string{"raw_metadata", "audio_languages_json", "arr_tag_ids", "arr_tag_labels", "raw"} {
 		if strings.Contains(string(raw), banned) {
 			t.Errorf("marshalled item contains %q: %s", banned, raw)
 		}
 	}
+	if !strings.Contains(string(raw), `"audio_languages":[`) {
+		t.Errorf("marshalled item has no decoded audio_languages array: %s", raw)
+	}
 	if strings.Contains(string(raw), "secret") {
 		t.Errorf("marshalled item leaked the raw metadata payload: %s", raw)
 	}
+}
+
+// TestLegacyRowWithEmptyLanguagesDecodes pins the two read cases of the language
+// columns: a row whose audio_languages_json is the '[]' default and whose
+// original language is NULL decodes to an empty slice and "", and a populated
+// row keeps the stored order.
+func TestLegacyRowWithEmptyLanguagesDecodes(t *testing.T) {
+	s, ctx, radarr, _ := libraryReadFixture(t)
+	// A row as it looked before this unit: every language column at its default.
+	if _, err := s.DB.ExecContext(ctx,
+		`INSERT INTO arr_library_cache
+		 (arr_instance_id, media_type, external_item_id, title, matches_target_tags, eligibility_status)
+		 VALUES (?, 'movie', 900, 'Legacy', 0, 'missing_target')`, radarr); err != nil {
+		t.Fatalf("insert legacy row: %v", err)
+	}
+
+	legacy, err := s.ListLibrary(ctx, ListLibraryFilter{Q: "legacy"})
+	if err != nil {
+		t.Fatalf("ListLibrary: %v", err)
+	}
+	if len(legacy.Items) != 1 {
+		t.Fatalf("legacy rows = %d, want 1", len(legacy.Items))
+	}
+	item := legacy.Items[0]
+	if item.OriginalLanguageISO2 != "" {
+		t.Errorf("OriginalLanguageISO2 = %q, want empty", item.OriginalLanguageISO2)
+	}
+	if item.AudioLanguages == nil {
+		t.Error("AudioLanguages is nil, want an empty slice (never null)")
+	}
+	if len(item.AudioLanguages) != 0 {
+		t.Errorf("AudioLanguages = %v, want none", item.AudioLanguages)
+	}
+
+	// The fixture's populated rows carry '["ja"]' in the column.
+	shrek, err := s.LibraryItemByID(ctx, libraryReadFixtureShrekID(t, s, ctx))
+	if err != nil {
+		t.Fatalf("LibraryItemByID: %v", err)
+	}
+	if want := []string{"ja"}; !slices.Equal(shrek.AudioLanguages, want) {
+		t.Errorf("Shrek AudioLanguages = %v, want %v", shrek.AudioLanguages, want)
+	}
+}
+
+// libraryReadFixtureShrekID finds the id of the fixture's "Shrek" row.
+func libraryReadFixtureShrekID(t *testing.T, s *Store, ctx context.Context) int64 {
+	t.Helper()
+	page, err := s.ListLibrary(ctx, ListLibraryFilter{Q: "shrek", Limit: 1})
+	if err != nil || len(page.Items) == 0 {
+		t.Fatalf("find Shrek row: %v (%d items)", err, len(page.Items))
+	}
+	return page.Items[0].ID
 }
 
 // TestListLibraryEscapesLikeWildcards guards the LIKE escaping: rows whose

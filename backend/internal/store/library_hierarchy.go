@@ -80,22 +80,27 @@ func (f HierarchyFilter) ValidateOrder() error {
 // TargetFilePath: the mirror records "no file" as NULL or an empty path, never
 // as a separate flag. SizeOnDisk ships as 0 because the mirror does not record
 // it, and stat-ing one row per page would be N syscalls that lie under
-// concurrent writes.
+// concurrent writes. Available is the same derivation as HasFile, under the name
+// the library column uses.
 type MovieRow struct {
-	ID              int64
-	ExternalItemID  int64
-	ArrInstanceID   int64
-	InstanceName    string
-	Title           string
-	OriginalTitle   string
-	Year            int
-	MediaFolderPath string
-	TargetFilePath  string
-	HasFile         bool
-	SizeOnDisk      int64
-	Eligibility     string
-	VideoCodec      string
-	UpdatedAt       string
+	ID                   int64
+	ExternalItemID       int64
+	ArrInstanceID        int64
+	InstanceName         string
+	Title                string
+	OriginalTitle        string
+	Year                 int
+	OriginalLanguageISO2 string
+	AudioLanguages       []string
+	Monitored            bool
+	MediaFolderPath      string
+	TargetFilePath       string
+	HasFile              bool
+	Available            bool
+	SizeOnDisk           int64
+	Eligibility          string
+	VideoCodec           string
+	UpdatedAt            string
 }
 
 // SeriesRow is one Sonarr series, aggregated from its episode rows.
@@ -103,18 +108,26 @@ type MovieRow struct {
 // SeriesID is arr_library_cache.series_id (the Sonarr seriesId). Title is the
 // series title, identical on every episode row. Eligibility is the worst
 // verdict across the series: waiting_for_tags > missing_target > eligible.
+//
+// OriginalLanguageISO2 is the series' own language (Sonarr repeats it on every
+// episode row, so the aggregate is stable). AudioLanguages are deliberately
+// absent: they are per file, and an aggregate must not invent one for the
+// series. Available means at least one episode of the series has a file.
 type SeriesRow struct {
-	SeriesID         int64
-	ArrInstanceID    int64
-	InstanceName     string
-	Title            string
-	Year             int
-	MediaFolderPath  string
-	SeasonCount      int
-	EpisodeCount     int
-	EpisodeFileCount int
-	Eligibility      string
-	UpdatedAt        string
+	SeriesID             int64
+	ArrInstanceID        int64
+	InstanceName         string
+	Title                string
+	Year                 int
+	OriginalLanguageISO2 string
+	Monitored            bool
+	MediaFolderPath      string
+	SeasonCount          int
+	EpisodeCount         int
+	EpisodeFileCount     int
+	Available            bool
+	Eligibility          string
+	UpdatedAt            string
 }
 
 // SeasonRow is one season of a series, aggregated in SQL. PercentEpisodes is
@@ -170,13 +183,24 @@ func (s *Store) ListMovies(ctx context.Context, f HierarchyFilter) (int64, []Mov
 
 	out := make([]MovieRow, 0, limit)
 	for rows.Next() {
-		var row MovieRow
+		var (
+			row       MovieRow
+			audioJSON string
+		)
 		if err := rows.Scan(&row.ID, &row.ExternalItemID, &row.ArrInstanceID, &row.InstanceName,
-			&row.Title, &row.OriginalTitle, &row.Year, &row.MediaFolderPath,
-			&row.TargetFilePath, &row.Eligibility, &row.VideoCodec, &row.UpdatedAt); err != nil {
+			&row.Title, &row.OriginalTitle, &row.Year,
+			&row.OriginalLanguageISO2, &audioJSON, &row.Monitored,
+			&row.MediaFolderPath, &row.TargetFilePath,
+			&row.Eligibility, &row.VideoCodec, &row.UpdatedAt); err != nil {
 			return 0, nil, fmt.Errorf("store: scan movie: %w", err)
 		}
+		languages, err := decodeAudioLanguages(audioJSON)
+		if err != nil {
+			return 0, nil, fmt.Errorf("store: scan movie %d: %w", row.ID, err)
+		}
+		row.AudioLanguages = languages
 		row.HasFile = row.TargetFilePath != ""
+		row.Available = row.HasFile
 		out = append(out, row)
 	}
 	if err := rows.Err(); err != nil {
@@ -360,11 +384,14 @@ func hierarchyPageBounds(page, pageSize, defaultSize, maxSize int) (limit, offse
 	return pageSize, (page - 1) * pageSize
 }
 
-// hierarchyMovieColumns is the movie projection: the JSON blob columns never
-// appear, so a page cannot ship diagnostics to the client.
+// hierarchyMovieColumns is the movie projection: the raw JSON blob columns never
+// appear, so a page cannot ship diagnostics to the client. audio_languages_json
+// is selected only to be decoded into a code array before the row is returned.
 const hierarchyMovieColumns = `
 	SELECT c.id, c.external_item_id, c.arr_instance_id, i.name,
 	       c.title, COALESCE(c.original_title, ''), COALESCE(c.year, 0),
+	       COALESCE(c.original_language_iso2, ''), COALESCE(c.audio_languages_json, '[]'),
+	       COALESCE(c.monitored, 0),
 	       COALESCE(c.media_folder_path, ''), COALESCE(c.target_file_path, ''),
 	       c.eligibility_status, COALESCE(c.video_codec, ''), COALESCE(c.updated_at, '')
 	FROM arr_library_cache c
@@ -414,6 +441,7 @@ const hierarchySeriesAggregate = `
 	SELECT c.series_id,
 	       MIN(c.arr_instance_id), MIN(i.name),
 	       MIN(c.title), COALESCE(MIN(c.year), 0), COALESCE(MIN(c.media_folder_path), ''),
+	       COALESCE(MIN(c.original_language_iso2), ''), MIN(c.monitored),
 	       COUNT(DISTINCT c.season_number),
 	       COUNT(*),
 	       SUM(CASE WHEN c.target_file_path IS NOT NULL AND c.target_file_path <> ''
@@ -466,11 +494,14 @@ func hierarchySeriesOrder(f HierarchyFilter) string {
 }
 
 // hierarchySeriesScan reads the hierarchySeriesAggregate projection from
-// either *sql.Rows or *sql.Row.
+// either *sql.Rows or *sql.Row. Available is derived from the file count: a
+// series is available once any of its episodes has a target path.
 func hierarchySeriesScan(scan func(...any) error) (SeriesRow, error) {
 	var row SeriesRow
 	err := scan(&row.SeriesID, &row.ArrInstanceID, &row.InstanceName, &row.Title,
-		&row.Year, &row.MediaFolderPath, &row.SeasonCount, &row.EpisodeCount,
+		&row.Year, &row.MediaFolderPath, &row.OriginalLanguageISO2, &row.Monitored,
+		&row.SeasonCount, &row.EpisodeCount,
 		&row.EpisodeFileCount, &row.Eligibility, &row.UpdatedAt)
+	row.Available = row.EpisodeFileCount > 0
 	return row, err
 }

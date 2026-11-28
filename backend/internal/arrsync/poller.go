@@ -475,8 +475,12 @@ func (p *Poller) listItems(ctx context.Context, conn settings.ArrConnection, api
 		items := make([]store.LibraryCacheItem, 0, len(movies))
 		for _, movie := range movies {
 			target := ""
+			// The file's languages go with the file: a fileless movie keeps
+			// an empty list, never the codes of a file that is gone.
+			languages := []string{}
 			if movie.HasFile && movie.MovieFile != nil {
 				target = movie.MovieFile.Path
+				languages = movie.MovieFile.MediaInfo.AudioLanguageCodes()
 			}
 			arrIDs, arrLabels := resolveArrTags(movie.Tags, labels)
 			root := rootFolderFor(movie.Path, roots)
@@ -495,6 +499,8 @@ func (p *Poller) listItems(ctx context.Context, conn settings.ArrConnection, api
 				OriginalTitle:        movie.OriginalTitle,
 				OriginalLanguageISO2: probe.ISO639_1(movie.OriginalLanguage.Name),
 				Year:                 movie.Year,
+				AudioLanguages:       languages,
+				Monitored:            movie.Monitored,
 				MediaFolderPath:      movie.Path,
 				RootFolderPath:       root,
 				ArrTagIDs:            arrIDs,
@@ -532,8 +538,10 @@ func (p *Poller) listItems(ctx context.Context, conn settings.ArrConnection, api
 			root := rootFolderFor(show.Path, roots)
 			for _, episode := range episodes {
 				target := ""
+				languages := []string{}
 				if episode.HasFile && episode.EpisodeFile != nil {
 					target = episode.EpisodeFile.Path
+					languages = episode.EpisodeFile.MediaInfo.AudioLanguageCodes()
 				}
 				status, matches := classifyTarget(rule, target, gate.ArrMetadata{
 					Found:      true,
@@ -552,16 +560,21 @@ func (p *Poller) listItems(ctx context.Context, conn settings.ArrConnection, api
 					OriginalTitle:        show.OriginalTitle,
 					OriginalLanguageISO2: lang,
 					Year:                 show.Year,
-					SeasonNumber:         &season,
-					EpisodeNumber:        &number,
-					EpisodeTitle:         episode.Title,
-					MediaFolderPath:      show.Path,
-					RootFolderPath:       root,
-					ArrTagIDs:            arrIDs,
-					ArrTagLabels:         arrLabels,
-					TargetFilePath:       target,
-					MatchesTargetTags:    matches,
-					EligibilityStatus:    status,
+					AudioLanguages:       languages,
+					// Sonarr's monitored flag lives on the series; the
+					// episode rows repeat it so the series aggregate is
+					// unambiguous.
+					Monitored:         show.Monitored,
+					SeasonNumber:      &season,
+					EpisodeNumber:     &number,
+					EpisodeTitle:      episode.Title,
+					MediaFolderPath:   show.Path,
+					RootFolderPath:    root,
+					ArrTagIDs:         arrIDs,
+					ArrTagLabels:      arrLabels,
+					TargetFilePath:    target,
+					MatchesTargetTags: matches,
+					EligibilityStatus: status,
 				})
 			}
 		}

@@ -105,12 +105,63 @@ func TestSeedDefaults(t *testing.T) {
 	}
 
 	w := decode[WatchOptions](t, all[KeyWatchOptions])
-	if w.ScanIntervalSec != 10 || w.StabilityCheckIntervalSec < 4 {
+	if w.ScanIntervalSec != 60 || w.StabilityCheckIntervalSec < 4 {
 		t.Errorf("watch options = %+v", w)
 	}
 	a := decode[ArrOptions](t, all[KeyArrOptions])
 	if a.PollIntervalSec != 300 {
 		t.Errorf("arr options = %+v", a)
+	}
+}
+
+func TestDefaultScanIntervalIs60(t *testing.T) {
+	w, ok := Defaults("/data")[KeyWatchOptions].(WatchOptions)
+	if !ok {
+		t.Fatalf("Defaults()[%s] is not a WatchOptions", KeyWatchOptions)
+	}
+	if w.ScanIntervalSec != 60 {
+		t.Errorf("default scan_interval_sec = %d, want 60", w.ScanIntervalSec)
+	}
+}
+
+// The range is not part of this change; pin it so moving the default cannot
+// drift the bounds.
+func TestScanIntervalBoundsUnchanged(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	body := func(sec int) json.RawMessage {
+		return json.RawMessage(fmt.Sprintf(
+			`{"scan_interval_sec":%d,"stability_check_interval_sec":4}`, sec))
+	}
+	for _, sec := range []int{0, 3601} {
+		if err := s.Set(ctx, KeyWatchOptions, body(sec)); err == nil {
+			t.Errorf("Set accepted scan_interval_sec=%d", sec)
+		}
+	}
+	for _, sec := range []int{1, 3600} {
+		if err := s.Set(ctx, KeyWatchOptions, body(sec)); err != nil {
+			t.Errorf("Set rejected scan_interval_sec=%d: %v", sec, err)
+		}
+	}
+}
+
+// A row written by a previous release keeps its stored cadence: Seed writes
+// only absent keys, so the new default never rewrites an existing install.
+func TestSeedKeepsStoredScanInterval(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	stored := `{"scan_interval_sec":10,"stability_check_interval_sec":4}`
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`,
+		KeyWatchOptions, stored); err != nil {
+		t.Fatalf("pre-seed watch.options: %v", err)
+	}
+	if err := s.Seed(ctx, t.TempDir()); err != nil {
+		t.Fatalf("Seed: %v", err)
+	}
+	got := decode[WatchOptions](t, mustGet(t, s, ctx, KeyWatchOptions))
+	if got.ScanIntervalSec != 10 {
+		t.Errorf("stored scan_interval_sec = %d after Seed, want 10", got.ScanIntervalSec)
 	}
 }
 

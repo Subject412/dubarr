@@ -1020,6 +1020,12 @@ func (p watchSettingsProvider) watchOptions() (settings.WatchOptions, error) {
 }
 
 // ScanInterval implements watch.OptionsProvider.
+//
+// A non-positive stored value cannot come from the API (validation enforces
+// 1..3600), so it means a hand-written or restored row: it falls back to
+// watch.DefaultInterval, which is pinned equal to the seeded settings default
+// (watch.TestDefaultIntervalMatchesSettingsDefault), so the fallback lane and
+// every UI surface state the same cadence.
 func (p watchSettingsProvider) ScanInterval() (time.Duration, error) {
 	opts, err := p.watchOptions()
 	if err != nil {

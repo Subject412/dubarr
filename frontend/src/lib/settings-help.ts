@@ -142,7 +142,8 @@ export const SETTINGS_HELP: Record<SettingsSectionKey, Record<string, string>> =
       'Disabled rules stay in the list but are never matched. Rules are evaluated top to bottom; move a rule up to give it priority.',
   },
   'watch.options': {
-    scan_interval_sec: 'How often the Watch Folder is scanned for new donors.',
+    scan_interval_sec:
+      'How often the Watch Folder is scanned for new donors. A file is only queued once two scans have seen the same size and modification time at least the stability window apart (4 s by default), so the confirming check always lands on a later scan: at 60 s a copy is usually picked up one to two scans after it finishes, up to about two minutes, not in the minute it arrived in. Lowering the interval shortens that wait. Cost: every scan walks the whole Watch Folder, so on a large folder or a network share a short interval spends proportionally more disk and CPU time.',
     stability_check_interval_sec:
       'Minimum time between the two size checks that mark a file as stable.',
   },

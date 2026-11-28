@@ -21,9 +21,13 @@ import (
 	"time"
 )
 
-// DefaultInterval is the settled watch-folder cadence (PLAN.md M2-3,
-// settings.KeyWatchOptions default scan_interval_sec = 10).
-const DefaultInterval = 10 * time.Second
+// DefaultInterval is the fallback watch-folder cadence for a stored interval of
+// exactly 0 (settings validation rejects 0, so a fresh install runs at
+// settings.KeyWatchOptions' default) and the number the UI advertises. It is
+// deliberately equal to settings.Defaults()[settings.KeyWatchOptions]
+// .ScanIntervalSec so the fallback and the seeded default can never disagree;
+// TestDefaultIntervalMatchesSettingsDefault pins the pair.
+const DefaultInterval = 60 * time.Second
 
 // DefaultStabilityWindow is the settled stability window (settings
 // watch.options.stability_check_interval_sec default = 4, validated >= 4).
@@ -167,10 +171,11 @@ type Scanner struct {
 
 // New builds a Scanner for the given roots. The provider is read for the
 // initial cadence and stability window and again once per loop iteration, so
-// settings changes apply live. An interval <= 0 selects DefaultInterval; a
-// non-positive stability window selects DefaultStabilityWindow, so a zero
-// window can never silently disable the stability gate. A negative interval is
-// an error.
+// settings changes apply live. An interval of exactly 0 selects DefaultInterval;
+// a negative interval is an error and never falls back, so a bad provider value
+// cannot quietly pick a cadence. A non-positive stability window selects
+// DefaultStabilityWindow, so a zero window can never silently disable the
+// stability gate.
 // Every root must be an absolute, existing directory; it is resolved with
 // filepath.EvalSymlinks so confinement checks compare canonical paths.
 func New(store CandidateStore, roots []string, provider OptionsProvider) (*Scanner, error) {

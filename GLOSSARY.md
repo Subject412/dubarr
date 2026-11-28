@@ -178,8 +178,12 @@ The machine-readable reason a card is not ready: no match, no target file, missi
 _Avoid_: reason, error code
 
 **Identify**:
-An operator-initiated lookup that asks the card's own arr instance to parse the release name and returns ranked library candidates. Identify only suggests; a separate explicit pick persists the match, and the server never chooses on the operator's behalf.
+An operator-initiated lookup that returns ranked candidates for a queue card: first what the card's own arr instance parses from the release name, then what dubarr's own mirror matches by name. Identify only suggests; a separate explicit pick persists the match, and the server never chooses on the operator's behalf. A name the parser cannot read still yields mirror candidates — a release-name convention the parser rejects must not leave the operator with an empty screen.
 _Avoid_: auto-match, guess
+
+**Mirror Match**:
+An identify candidate found in dubarr's own mirrored library instead of derived from the arr parser, recorded as `matched_by: mirror` and scored no higher than 0.5 so a parsed hit always outranks it. It exists for the names a parser refuses: a narrow-release dub with no year, an unknown group tag, a title in another language. A transport failure still offers mirror matches; only a failed parse *and* an empty mirror is an error.
+_Avoid_: fallback, fuzzy match
 
 **Parse Confidence**:
 How a queue row's library match was established. The only value recorded today is `manual` — an operator chose the item by hand — and that is deliberately distinct from a parser-derived match. The other values the schema reserves (`exact`, `ambiguous`, `unmatched`) name parser outcomes and no code path writes them yet.

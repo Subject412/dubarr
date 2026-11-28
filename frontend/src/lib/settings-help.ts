@@ -47,13 +47,19 @@ export const SETTINGS_HELP: Record<SettingsSectionKey, Record<string, string>> =
   },
   'target.tag_filter': {
     source_mode:
-      'Where tags come from. Only tags in the Target filename are applied today, so this is fixed to Filename tags. A filter previously stored with the Radarr/Sonarr sources (arr or both) is shown read-only and its stored *arr criteria are kept, but they do not filter anything yet.',
+      'Where the gate reads tags from. Filename tags are matched in the Target filename; *arr metadata is the Radarr/Sonarr tag labels and root folders the sync worker hands to every job; Both requires the filename tags AND the *arr criteria. An empty *arr list matches everything: with no criteria stored, every title Dubarr has matched to a Radarr/Sonarr entry passes that source and no default tag is filled in. Titles with no *arr match are rejected while enforcement is on.',
     required_filename_tags:
       'Tags in the Target filename that make it eligible. The match mode decides how many of them must be present.',
     excluded_filename_tags:
       'Tags that always make a Target ineligible, whatever else matches.',
+    required_arr_tags:
+      'Radarr/Sonarr tag labels that make a Target eligible from the *arr source. The match mode decides how many must be present; an empty list matches every matched title.',
+    excluded_arr_tags:
+      'Radarr/Sonarr tag labels that always make a Target ineligible, whatever else matches.',
+    root_folder_paths:
+      'Allowlist of Radarr/Sonarr root folders, exactly as the *arr server reports them. Empty means any folder.',
     tag_match_mode:
-      'ANY: at least one required tag; ALL: every required tag; REGEX: each entry is treated as a regular expression. Applies to the required filename tags.',
+      'ANY: at least one required tag; ALL: every required tag; REGEX: each entry is treated as a regular expression. Applies to the required tags of whichever sources are active.',
     tag_case_sensitive: 'Match tags with exact letter case; off ignores case.',
     enforce_tag_filter:
       'Reject Targets that do not satisfy the filter. Donor ingestion into the Audio Vault is never gated.',

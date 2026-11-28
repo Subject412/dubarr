@@ -11,6 +11,7 @@ import type {
   StoragePaths,
   SyncDefaults,
   SyncStrategy,
+  TagSourceMode,
   TargetTagFilter,
   VaultNaming,
   WatchOptions,
@@ -56,85 +57,122 @@ const REFERENCE_TOKEN_PRESETS = [
 ]
 
 /**
- * The tag sources the card can display. Only `filename` is applied: nothing
- * feeds the Processing Gate arr metadata yet (`gate.ArrMetadata` is built in
- * tests only), so `arr` and `both` are shown as stored-but-inactive instead of
- * being silently rewritten to `filename`.
+ * The three tag sources the Processing Gate reads, all of them live. The sync
+ * worker hands Radarr/Sonarr metadata to every job (`Arr: gate.ArrMetadata{…}`
+ * in `syncworker/worker.go`) and `gate.Rule.Classify` consults `SourceMode`:
+ * `filename` matches the Target filename, `arr` matches the *arr tags and root
+ * folders, `both` requires the filename tags *and* the arr criteria.
  */
-const TAG_SOURCE_LABELS: Record<TargetTagFilter['source_mode'], string> = {
-  filename: 'Filename tags',
-  arr: 'Radarr/Sonarr tags',
-  both: 'Filename and Radarr/Sonarr tags',
-}
+const TAG_SOURCE_OPTIONS: ReadonlyArray<{ value: TagSourceMode; label: string }> = [
+  { value: 'filename', label: 'Filename tags' },
+  { value: 'arr', label: '*arr metadata' },
+  { value: 'both', label: 'Both' },
+]
 
-/** Read-only truth for a filter stored with an arr source mode. */
-function StoredArrSourceNote({ filter }: { filter: TargetTagFilter }) {
-  const mode = filter.source_mode ?? 'filename'
-  const criteria = (
-    [
-      ['Required *arr tags', filter.required_arr_tags ?? []],
-      ['Excluded *arr tags', filter.excluded_arr_tags ?? []],
-      ['Root folders', filter.root_folder_paths ?? []],
-    ] as Array<[string, string[]]>
-  ).filter(([, values]) => values.length > 0)
-
-  return (
-    <div
-      role="note"
-      aria-label="Stored tag source"
-      className="space-y-1.5 rounded-lg border border-ink-700 bg-ink-800/50 px-3 py-2 text-sm"
-    >
-      <p className="font-medium text-zinc-200">
-        Stored tag source: {TAG_SOURCE_LABELS[mode]}
-      </p>
-      <p className="text-zinc-400">
-        Radarr/Sonarr criteria are not applied yet — only tags in the Target filename decide which
-        files are processed. The stored *arr values below are kept unchanged and saved back with
-        this section.
-      </p>
-      {criteria.length > 0 && (
-        <dl className="space-y-0.5 text-xs text-zinc-500">
-          {criteria.map(([label, values]) => (
-            <div key={label} className="flex gap-1">
-              <dt>{label}:</dt>
-              <dd>{values.join(', ')}</dd>
-            </div>
-          ))}
-        </dl>
-      )}
-    </div>
-  )
+/** What each source actually reads, the way the gate applies it (D11 rule). */
+const TAG_SOURCE_HINTS: Record<TagSourceMode, string> = {
+  filename: 'Only tags in the Target filename are matched.',
+  arr: 'Only Radarr/Sonarr tags and root folders are matched. Filename tags are ignored.',
+  both: 'A file must pass the filename tags and the *arr criteria.',
 }
 
 /**
- * One source mode at a time. `filename` is the only mode that can be selected;
- * a stored `arr`/`both` stays visible (and unchangeable) next to a note saying
- * its criteria are not applied — never silently dropped from the UI.
+ * The source selector plus the *arr criteria editors. All three sources are
+ * choosable; the stored arrays are patched, never rebuilt, so switching modes
+ * keeps the other mode's criteria intact.
  */
-function TagSourceFields({ filter }: { filter: TargetTagFilter }) {
+function TagSourceFields({
+  filter,
+  onChange,
+  enforce,
+}: {
+  filter: TargetTagFilter
+  onChange: (next: TargetTagFilter) => void
+  /** A missing *arr row only blocks a file while the gate is enforced. */
+  enforce: boolean
+}) {
   const mode = filter.source_mode ?? 'filename'
-  const arrStored = mode !== 'filename'
+  const arrActive = mode !== 'filename'
+  const noCriteria =
+    (filter.required_arr_tags ?? []).length === 0 &&
+    (filter.excluded_arr_tags ?? []).length === 0 &&
+    (filter.root_folder_paths ?? []).length === 0
 
   return (
     <>
       <Field
         label="Tag source"
         htmlFor="tag-source-mode"
-        hint={
-          arrStored
-            ? 'Stored but not applied: only filename tags filter files today.'
-            : 'Only tags in the Target filename are matched.'
-        }
+        hint={TAG_SOURCE_HINTS[mode]}
         help={settingsHelp('target.tag_filter', 'source_mode')}
       >
-        <Select id="tag-source-mode" value={mode} disabled>
-          <option value={mode}>
-            {TAG_SOURCE_LABELS[mode]}
-            {arrStored ? ' (stored, not applied)' : ''}
-          </option>
+        <Select
+          id="tag-source-mode"
+          value={mode}
+          onChange={(event) =>
+            onChange({ ...filter, source_mode: event.target.value as TagSourceMode })
+          }
+        >
+          {TAG_SOURCE_OPTIONS.map((option) => (
+            <option key={option.value} value={option.value}>
+              {option.label}
+            </option>
+          ))}
         </Select>
       </Field>
-      {arrStored && <StoredArrSourceNote filter={filter} />}
+      {arrActive && (
+        <>
+          {/* D-TAGS: arr/both with no stored criteria is a legitimate choice,
+              not a broken form — an empty list matches every title the gate has
+              arr metadata for. Say so; never invent default tags. */}
+          {(noCriteria || enforce) && (
+            <div className="space-y-1.5 rounded-lg border border-ink-700 bg-ink-800/50 px-3 py-2 text-sm text-zinc-400">
+              {noCriteria && (
+                <p role="note" aria-label="Empty *arr criteria">
+                  No *arr criteria are stored, so this source matches every title Dubarr has
+                  matched to a Radarr/Sonarr entry. Add a required tag, an excluded tag or a root
+                  folder to narrow it — Dubarr does not fill in default tags.
+                </p>
+              )}
+              {enforce && (
+                <p>
+                  Files Dubarr has not matched to a Radarr/Sonarr title are rejected while
+                  enforcement is on.
+                </p>
+              )}
+            </div>
+          )}
+          <StringListEditor
+            label="Required *arr tags"
+            inputLabel="Add required *arr tag"
+            values={filter.required_arr_tags ?? []}
+            onChange={(required_arr_tags) => onChange({ ...filter, required_arr_tags })}
+            help={settingsHelp('target.tag_filter', 'required_arr_tags')}
+          />
+          <StringListEditor
+            label="Excluded *arr tags"
+            inputLabel="Add excluded *arr tag"
+            values={filter.excluded_arr_tags ?? []}
+            onChange={(excluded_arr_tags) => onChange({ ...filter, excluded_arr_tags })}
+            help={settingsHelp('target.tag_filter', 'excluded_arr_tags')}
+          />
+          <div className="space-y-1">
+            <StringListEditor
+              label="Root folders"
+              inputLabel="Add root folder"
+              values={filter.root_folder_paths ?? []}
+              onChange={(root_folder_paths) => onChange({ ...filter, root_folder_paths })}
+              placeholder="/media/movies"
+              help={settingsHelp('target.tag_filter', 'root_folder_paths')}
+            />
+            {/* A plain text list: the local path picker browses this machine,
+                not the Radarr/Sonarr host, so it would pick the wrong folder. */}
+            <p className="text-xs text-zinc-500">
+              Type the paths here — the local path picker browses this machine, not the *arr host.
+            </p>
+          </div>
+        </>
+      )}
     </>
   )
 }
@@ -635,7 +673,11 @@ export function SettingsPage() {
           >
             {(draft, update) => (
               <>
-                <TagSourceFields filter={draft} />
+                <TagSourceFields
+                  filter={draft}
+                  onChange={(next) => update(next)}
+                  enforce={draft.enforce_tag_filter}
+                />
                 <StringListEditor
                   label="Required filename tags"
                   inputLabel="Add required tag"

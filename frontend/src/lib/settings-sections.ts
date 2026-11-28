@@ -40,7 +40,7 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
     key: 'target.tag_filter',
     title: 'Process only files tagged as …',
     description:
-      'Only files that carry a required tag in the filename are processed. Radarr/Sonarr criteria are stored but not applied yet.',
+      'Which files the Processing Gate admits: tags in the Target filename, Radarr/Sonarr tags and root folders, or both. Donor ingestion is never gated.',
   },
   {
     key: 'security.options',

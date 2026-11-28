@@ -20,7 +20,13 @@ const SETTINGS = {
     export_mode: 'rule_based',
   },
   'target.tag_filter': {
+    // `both` keeps the *arr criteria editors mounted: with `filename` the four
+    // arr tips are hidden and the help-button count below drifts down.
+    source_mode: 'both',
     required_filename_tags: ['[ArcA310]'],
+    required_arr_tags: ['Polish Dubbing'],
+    excluded_arr_tags: ['cam'],
+    root_folder_paths: ['/media/movies'],
     tag_match_mode: 'ANY',
     tag_case_sensitive: false,
     excluded_filename_tags: [],
@@ -74,6 +80,12 @@ async function renderSettings() {
   expect(await screen.findByRole('heading', { name: 'Storage paths' })).toBeInTheDocument()
 }
 
+/**
+ * Canary: every authored help key must have a rendered tip. The expectation is
+ * derived, so it is only as good as the fixture above — this fixture must enable
+ * the *arr source (`source_mode: 'both'`) or the arr tips stay hidden and the
+ * count drifts below the authored total instead of failing loudly.
+ */
 const helpCount = Object.values(SETTINGS_HELP).reduce(
   (total, fields) => total + Object.keys(fields).length,
   0,

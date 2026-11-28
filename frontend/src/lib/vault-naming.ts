@@ -25,6 +25,10 @@ export type VaultNameSample = {
   year: number
   season: number
   episode: number
+  /** The ids the backend mirrors; 0 / "" means "unknown" and renders empty. */
+  tmdb_id: number
+  tvdb_id: number
+  imdb_id: string
 }
 
 /** The shipped patterns (`settings.Default*`), mirrored for the card's fallback. */
@@ -46,6 +50,10 @@ export const MOVIE_SAMPLE: VaultNameSample = {
   year: 2001,
   season: 0,
   episode: 0,
+  // A film has no TVDB id, so {TvdbId} shows the drop rule in the preview.
+  tmdb_id: 129,
+  tvdb_id: 0,
+  imdb_id: 'tt0245429',
 }
 
 /** An episode row: `naming.sampleTrack`, the values the backend validates with. */
@@ -59,11 +67,14 @@ export const EPISODE_SAMPLE: VaultNameSample = {
   year: 2005,
   season: 2,
   episode: 3,
+  tmdb_id: 0,
+  tvdb_id: 81189,
+  imdb_id: 'tt0386676',
 }
 
 /** The token list the error text quotes, in the order the card shows it. */
 export const VAULT_TOKEN_LIST =
-  '{Title}, {Year}, {Season:00}, {Episode:00}, {Episode Title}, {Variant}, {Codec}, {Channels}'
+  '{Title}, {Year}, {Season:00}, {Episode:00}, {Episode Title}, {Variant}, {Codec}, {Channels}, {TmdbId}, {TvdbId}, {ImdbId}'
 
 const MAX_NAME_BYTES = 200
 
@@ -76,6 +87,9 @@ type TokenID =
   | 'variant'
   | 'codec'
   | 'channels'
+  | 'tmdbid'
+  | 'tvdbid'
+  | 'imdbid'
 
 const TOKEN_PADDED: Record<TokenID, boolean> = {
   title: false,
@@ -86,6 +100,9 @@ const TOKEN_PADDED: Record<TokenID, boolean> = {
   variant: false,
   codec: false,
   channels: false,
+  tmdbid: false,
+  tvdbid: false,
+  imdbid: false,
 }
 
 /** Tokens an arr user reaches for first, refused with a reason (not "unknown"). */
@@ -225,6 +242,16 @@ function tokenValue(token: TokenID, pad: number, sample: VaultNameSample): strin
       return cleanVaultTitle(sample.codec.trim().toUpperCase())
     case 'channels':
       return cleanVaultTitle(sample.channels.trim())
+    // The id tokens render bare for the same reason as the backend: the
+    // template supplies the brackets, so one spelling works in a folder name
+    // and in a file name. An unknown id (0 / "") renders empty and its group
+    // is dropped by collapse().
+    case 'tmdbid':
+      return sample.tmdb_id > 0 ? String(sample.tmdb_id) : ''
+    case 'tvdbid':
+      return sample.tvdb_id > 0 ? String(sample.tvdb_id) : ''
+    case 'imdbid':
+      return sample.imdb_id.trim()
     default:
       // Unreachable — TokenID is closed — but keeps the renderer total.
       return ''

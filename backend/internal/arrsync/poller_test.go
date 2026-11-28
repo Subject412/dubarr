@@ -10,6 +10,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Subject412/dubarr/backend/internal/arr"
 	"github.com/Subject412/dubarr/backend/internal/arr/arrmock"
@@ -1745,4 +1746,103 @@ func TestTriggerRejectsWhileScheduledPassRuns(t *testing.T) {
 		t.Errorf("arr listings = %d, want 1: a refused trigger must not reach arr", got)
 	}
 	close(src.release)
+}
+
+// TestIMDBIDIsMirrored pins U07's mirror half: Radarr's imdbId reaches
+// arr_library_cache.imdb_id (a naming token reads it), an id carrying a path
+// separator is refused at the door, and a later pass that omits the field leaves
+// the stored id alone — an arr does not "forget" an id, and the omission must not
+// count as a change either.
+func TestIMDBIDIsMirrored(t *testing.T) {
+	r := newRig(t)
+	r.configure(settings.ArrConnection{Kind: "radarr", BaseURL: "http://radarr.invalid", Enabled: true})
+	if err := r.secrets.Set("arr.radarr.api_key", "key"); err != nil {
+		t.Fatalf("set secret: %v", err)
+	}
+
+	src := &fakeRadarr{movies: []arr.Movie{
+		{
+			ID: 7, Title: "Spirited Away", Year: 2001, TmdbID: 129, ImdbID: "tt0245429",
+			OriginalLanguage: arr.Language{ID: 1, Name: "Japanese"},
+		},
+		{
+			// A hostile id: it would become a path separator inside a name.
+			ID: 8, Title: "Broken Id", Year: 2002, TmdbID: 130, ImdbID: "../../etc/passwd",
+			OriginalLanguage: arr.Language{ID: 1, Name: "English"},
+		},
+	}}
+	p, err := New(Deps{
+		Store:     r.store,
+		Settings:  r.settings,
+		Secrets:   r.secrets,
+		Interval:  time.Minute,
+		NewRadarr: func(baseURL, apiKey string) (RadarrSource, error) { return src, nil },
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	imdbOf := func(externalID int64) string {
+		t.Helper()
+		var imdb string
+		if err := r.store.DB.QueryRow(
+			`SELECT COALESCE(imdb_id, '') FROM arr_library_cache
+			  WHERE media_type = 'movie' AND external_item_id = ?`, externalID).Scan(&imdb); err != nil {
+			t.Fatalf("read imdb id of movie %d: %v", externalID, err)
+		}
+		return imdb
+	}
+
+	if _, err := p.Sync(context.Background()); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if got := imdbOf(7); got != "tt0245429" {
+		t.Fatalf("imdb id = %q, want the arr's tt0245429", got)
+	}
+	if got := imdbOf(8); got != "" {
+		t.Fatalf("imdb id with a path separator = %q, want it dropped", got)
+	}
+
+	// The next pass omits imdbId entirely: the column keeps what it holds.
+	src.movies = []arr.Movie{
+		{ID: 7, Title: "Spirited Away", Year: 2001, TmdbID: 129,
+			OriginalLanguage: arr.Language{ID: 1, Name: "Japanese"}},
+		{ID: 8, Title: "Broken Id", Year: 2002, TmdbID: 130,
+			OriginalLanguage: arr.Language{ID: 1, Name: "English"}},
+	}
+	stats, err := p.Sync(context.Background())
+	if err != nil {
+		t.Fatalf("Sync (id omitted): %v", err)
+	}
+	if stats.Updated != 0 {
+		t.Fatalf("updated = %d, want 0: an omitted id is not a change", stats.Updated)
+	}
+	if got := imdbOf(7); got != "tt0245429" {
+		t.Fatalf("imdb id after an id-less pass = %q, want it kept", got)
+	}
+}
+
+// TestIMDBIDDropWarningIsBounded pins the log half of U07: a junk id can be a
+// whole path, and that warning is a line an operator pastes into an issue, so it
+// quotes a bounded prefix — cut on a rune boundary, so the %q around it stays
+// valid UTF-8 and still escapes control characters.
+func TestIMDBIDDropWarningIsBounded(t *testing.T) {
+	long := "/media/library/" + strings.Repeat("segment/", 40) + "movie.mkv"
+	got := clipForLog(long, imdbIDLogLimit)
+	if len(got) > imdbIDLogLimit {
+		t.Fatalf("clipped length = %d, want <= %d", len(got), imdbIDLogLimit)
+	}
+	if !strings.HasPrefix(long, got) {
+		t.Fatalf("clip %q is not a prefix of the quoted value", got)
+	}
+
+	// Every rune is two bytes, so a naive byte cut would land mid-rune.
+	wide := strings.Repeat("ż", imdbIDLogLimit)
+	if cut := clipForLog(wide, imdbIDLogLimit-1); !utf8.ValidString(cut) {
+		t.Fatalf("clip split a rune: %q", cut)
+	}
+
+	if got := clipForLog("tt0245429", imdbIDLogLimit); got != "tt0245429" {
+		t.Fatalf("a short id was clipped: %q", got)
+	}
 }

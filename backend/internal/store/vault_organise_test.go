@@ -10,6 +10,7 @@ import (
 // all inside the given folders, plus the arr mirror row that names S02E03.
 type organiseFixture struct {
 	store      *Store
+	instanceID int64
 	seriesID   int64
 	movieID    int64
 	episode1   VaultTrackRecord
@@ -87,7 +88,7 @@ func seedOrganiseFixture(t *testing.T) *organiseFixture {
 	}
 
 	return &organiseFixture{
-		store: st, seriesID: seriesID, movieID: movieID,
+		store: st, instanceID: instanceID, seriesID: seriesID, movieID: movieID,
 		episode1: episode1, episode2: episode2, movieTrack: movieTrack,
 	}
 }
@@ -148,6 +149,226 @@ func TestVaultTrackPlanRowsJoinsEpisodeTitle(t *testing.T) {
 	}
 	if _, err := f.store.VaultTrackPlanRows(context.Background(), "episode", nil); err == nil {
 		t.Fatal("an unknown media type was accepted")
+	}
+}
+
+// TestPlanRowCarriesIDs pins U07's source columns: the numeric ids come from
+// vault_media itself, the IMDb id from the arr mirror row matched on the same id
+// pair the episode-title subquery uses.
+func TestPlanRowCarriesIDs(t *testing.T) {
+	f := seedOrganiseFixture(t)
+	ctx := context.Background()
+
+	// The movie's mirror row: same tmdb id, so the correlated subquery finds it.
+	if _, err := f.store.DB.ExecContext(ctx,
+		`INSERT INTO arr_library_cache
+		 (arr_instance_id, media_type, external_item_id, tmdb_id, imdb_id, title,
+		  year, eligibility_status)
+		 VALUES (?, 'movie', 7, 129, 'tt0245429', 'Spirited Away', 2001, 'eligible')`,
+		f.instanceID); err != nil {
+		t.Fatalf("insert movie cache row: %v", err)
+	}
+
+	rows, err := f.store.VaultTrackPlanRows(ctx, "all", nil)
+	if err != nil {
+		t.Fatalf("VaultTrackPlanRows: %v", err)
+	}
+	byID := map[int64]VaultTrackPlanRow{}
+	for _, row := range rows {
+		byID[row.TrackID] = row
+	}
+
+	movie := byID[f.movieTrack.ID]
+	if movie.TMDBID != 129 {
+		t.Fatalf("movie tmdb id = %d, want 129 (vault_media)", movie.TMDBID)
+	}
+	if movie.TVDBID != 0 {
+		t.Fatalf("movie tvdb id = %d, want 0 (vault_media has none)", movie.TVDBID)
+	}
+	if movie.IMDBID != "tt0245429" {
+		t.Fatalf("movie imdb id = %q, want the mirror's tt0245429", movie.IMDBID)
+	}
+
+	// The series' tvdb id is 42 in the fixture; its mirror rows carry no IMDb id,
+	// so the token would render empty rather than invent one.
+	ep := byID[f.episode1.ID]
+	if ep.TVDBID != 42 {
+		t.Fatalf("episode tvdb id = %d, want 42 (vault_media)", ep.TVDBID)
+	}
+	if ep.TMDBID != 0 {
+		t.Fatalf("episode tmdb id = %d, want 0 (the series has no tmdb id)", ep.TMDBID)
+	}
+	if ep.IMDBID != "" {
+		t.Fatalf("episode imdb id = %q, want empty (never invented)", ep.IMDBID)
+	}
+}
+
+// TestPlanRowIMDBIDResolvesToTheOwningMirrorRow pins U07's imdb scoping: the
+// media's own kind decides which cache rows may answer, the row agreeing with
+// vault_media's tmdb id beats a newer tvdb-only row, and two rows that both
+// agree resolve by the documented tiebreak (highest cache id) rather than by
+// whichever row a subquery happened to reach first.
+func TestPlanRowIMDBIDResolvesToTheOwningMirrorRow(t *testing.T) {
+	f := seedOrganiseFixture(t)
+	ctx := context.Background()
+
+	// A movie carrying both ids — the shape the unscoped subquery got wrong: it
+	// joined on either id and ordered by c.id alone.
+	mediaID, err := f.store.EnsureVaultMedia(ctx, VaultMediaRecord{
+		MediaType: "movie", Title: "Both Ids", Year: 1999, TMDBID: 129, TVDBID: 77,
+		FolderPath: "/vault/Both Ids (1999)",
+	})
+	if err != nil {
+		t.Fatalf("EnsureVaultMedia(both ids): %v", err)
+	}
+	trackID, err := f.store.RecordVaultTrack(ctx, VaultTrackRecord{
+		VaultMediaID: mediaID, GroupUUID: "g-both", LangISO2: "pl", Variant: "dubbing",
+		FilePath: "/vault/Both Ids (1999)/both.pl.mka", SHA256: "dd",
+		Codec: "eac3", Channels: "5.1", ChannelCount: 6,
+	})
+	if err != nil {
+		t.Fatalf("RecordVaultTrack(both ids): %v", err)
+	}
+
+	// A second connection, so the two mirror rows come from different instances.
+	res, err := f.store.DB.ExecContext(ctx,
+		`INSERT INTO arr_instances (name, type, base_url, api_key_enc, api_key_last4, enabled)
+		 VALUES ('radarr-2', 'radarr', 'http://radarr2:7878', 'enc', '0001', 1)`)
+	if err != nil {
+		t.Fatalf("insert second arr instance: %v", err)
+	}
+	secondInstance, err := res.LastInsertId()
+	if err != nil {
+		t.Fatalf("second instance id: %v", err)
+	}
+
+	insertCache := func(instanceID int64, mediaType string, externalID int64, tmdbID, tvdbID *int64, imdb string) int64 {
+		t.Helper()
+		res, err := f.store.DB.ExecContext(ctx,
+			`INSERT INTO arr_library_cache
+			 (arr_instance_id, media_type, external_item_id, tmdb_id, tvdb_id, imdb_id,
+			  title, year, eligibility_status)
+			 VALUES (?, ?, ?, ?, ?, ?, 'Both Ids', 1999, 'eligible')`,
+			instanceID, mediaType, externalID, tmdbID, tvdbID, imdb)
+		if err != nil {
+			t.Fatalf("insert %s cache row %q: %v", mediaType, imdb, err)
+		}
+		id, err := res.LastInsertId()
+		if err != nil {
+			t.Fatalf("cache row id: %v", err)
+		}
+		return id
+	}
+	clearCache := func() {
+		t.Helper()
+		if _, err := f.store.DB.ExecContext(ctx, `DELETE FROM arr_library_cache`); err != nil {
+			t.Fatalf("clear arr cache: %v", err)
+		}
+	}
+	imdbOfTrack := func() string {
+		t.Helper()
+		rows, err := f.store.VaultTrackPlanRows(ctx, "movie", []int64{trackID})
+		if err != nil {
+			t.Fatalf("VaultTrackPlanRows: %v", err)
+		}
+		if len(rows) != 1 {
+			t.Fatalf("movie rows = %d, want 1", len(rows))
+		}
+		return rows[0].IMDBID
+	}
+
+	tmdb, tvdb := int64(129), int64(77)
+
+	// Two rows for one media, from two instances: the tmdb row is inserted
+	// first (lower id), the tvdb row second (higher id), so ordering by c.id
+	// alone would answer ttBY_TVDB. The tmdb row is the one that agrees with
+	// vault_media's own id, so it wins regardless of insertion order.
+	clearCache()
+	tmdbRow := insertCache(f.instanceID, "movie", 301, &tmdb, nil, "ttBY_TMDB")
+	tvdbRow := insertCache(secondInstance, "movie", 302, nil, &tvdb, "ttBY_TVDB")
+	if tvdbRow <= tmdbRow {
+		t.Fatalf("fixture order: tvdb row %d should be newer than tmdb row %d", tvdbRow, tmdbRow)
+	}
+	if got := imdbOfTrack(); got != "ttBY_TMDB" {
+		t.Fatalf("imdb id = %q, want ttBY_TMDB (the row agreeing with vault_media.tmdb_id), not the newer tvdb row", got)
+	}
+
+	// A row of the wrong kind never answers, even when both ids and the cache id
+	// point at it: a movie does not borrow an episode's imdb id.
+	clearCache()
+	insertCache(secondInstance, "episode", 303, &tmdb, &tvdb, "ttEPISODE")
+	if got := imdbOfTrack(); got != "" {
+		t.Fatalf("imdb id from an episode row = %q, want empty (wrong media kind)", got)
+	}
+
+	// Two connections that agree on the tmdb id: vault_media records no
+	// arr_instance_id, so the tiebreak is the highest cache id (the most
+	// recently mirrored row) — arbitrary but deterministic, so the same plan is
+	// built every time.
+	clearCache()
+	firstRow := insertCache(f.instanceID, "movie", 304, &tmdb, nil, "ttFIRST")
+	secondRow := insertCache(secondInstance, "movie", 305, &tmdb, nil, "ttSECOND")
+	if secondRow <= firstRow {
+		t.Fatalf("fixture order: second row %d should be newer than first row %d", secondRow, firstRow)
+	}
+	if got := imdbOfTrack(); got != "ttSECOND" {
+		t.Fatalf("imdb id with two agreeing instances = %q, want ttSECOND (highest cache id)", got)
+	}
+	if _, err := f.store.DB.ExecContext(ctx, `DELETE FROM arr_library_cache WHERE id = ?`, secondRow); err != nil {
+		t.Fatalf("delete newer mirror row: %v", err)
+	}
+	if got := imdbOfTrack(); got != "ttFIRST" {
+		t.Fatalf("imdb id after the newer row left = %q, want ttFIRST", got)
+	}
+}
+
+// TestPlanRowWithoutAMirrorRowStillPlans: the ids in vault_media survive a cache
+// row that left the mirror, and the IMDb token simply renders empty — the plan
+// must not fail because the mirror forgot a title.
+func TestPlanRowWithoutAMirrorRowStillPlans(t *testing.T) {
+	f := seedOrganiseFixture(t)
+	ctx := context.Background()
+
+	// Seed a movie mirror row, read it, then delete it as a sync pass would.
+	res, err := f.store.DB.ExecContext(ctx,
+		`INSERT INTO arr_library_cache
+		 (arr_instance_id, media_type, external_item_id, tmdb_id, imdb_id, title,
+		  year, eligibility_status)
+		 VALUES (?, 'movie', 7, 129, 'tt0245429', 'Spirited Away', 2001, 'eligible')`,
+		f.instanceID)
+	if err != nil {
+		t.Fatalf("insert movie cache row: %v", err)
+	}
+	mirrorID, err := res.LastInsertId()
+	if err != nil {
+		t.Fatalf("mirror row id: %v", err)
+	}
+
+	read := func() VaultTrackPlanRow {
+		t.Helper()
+		rows, err := f.store.VaultTrackPlanRows(ctx, "movie", nil)
+		if err != nil {
+			t.Fatalf("VaultTrackPlanRows: %v", err)
+		}
+		if len(rows) != 1 {
+			t.Fatalf("movie rows = %d, want 1", len(rows))
+		}
+		return rows[0]
+	}
+
+	if got := read().IMDBID; got != "tt0245429" {
+		t.Fatalf("imdb id with a mirror row = %q, want tt0245429", got)
+	}
+
+	if _, err := f.store.DB.ExecContext(ctx, `DELETE FROM arr_library_cache WHERE id = ?`, mirrorID); err != nil {
+		t.Fatalf("delete mirror row: %v", err)
+	}
+	row := read()
+	if row.IMDBID != "" {
+		t.Fatalf("imdb id without a mirror row = %q, want empty", row.IMDBID)
+	}
+	if row.TMDBID != 129 {
+		t.Fatalf("tmdb id without a mirror row = %d, want 129 from vault_media", row.TMDBID)
 	}
 }
 

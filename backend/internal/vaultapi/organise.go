@@ -709,6 +709,9 @@ func renderDestination(cfg namingConfig, row store.VaultTrackPlanRow) (string, e
 		Channels:     row.Channels,
 		LangISO2:     row.LangISO2,
 		EpisodeTitle: row.EpisodeTitle,
+		TMDBID:       row.TMDBID,
+		TVDBID:       row.TVDBID,
+		IMDBID:       row.IMDBID,
 	}
 	if row.Season != nil {
 		tr.Season = *row.Season

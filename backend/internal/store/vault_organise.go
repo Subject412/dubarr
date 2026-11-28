@@ -64,6 +64,14 @@ type VaultTrackPlanRow struct {
 	// already owns, never re-derived from a template.
 	MediaFolderPath string
 	EpisodeTitle    string
+	// TMDBID and TVDBID come from vault_media (the row the organiser already
+	// reads); IMDBID comes from the arr mirror, scoped to the media's own kind
+	// (movie rows for a movie, episode rows for a series) and preferring the
+	// mirror row whose tmdb id matches vault_media's, then the highest cache id
+	// as a deterministic tiebreak. It is empty when the mirror has no row.
+	TMDBID int
+	TVDBID int
+	IMDBID string
 }
 
 // VaultTrackPlanRows returns every archived track in scope, ordered by track id
@@ -91,6 +99,7 @@ func (s *Store) VaultTrackPlanRows(ctx context.Context, mediaType string, ids []
 		SELECT t.id, m.id, m.media_type, m.title, COALESCE(m.year, 0),
 		       t.season_number, t.episode_number, t.variant, t.codec, t.channels,
 		       t.lang_iso2, t.file_path, m.vault_folder_path,
+		       COALESCE(m.tmdb_id, 0), COALESCE(m.tvdb_id, 0),
 		       COALESCE((
 		           SELECT c.episode_title
 		             FROM arr_library_cache c
@@ -102,7 +111,29 @@ func (s *Store) VaultTrackPlanRows(ctx context.Context, mediaType string, ids []
 		              AND ((m.tvdb_id IS NOT NULL AND c.tvdb_id = m.tvdb_id)
 		                OR (m.tmdb_id IS NOT NULL AND c.tmdb_id = m.tmdb_id))
 		            ORDER BY c.id DESC
-		            LIMIT 1), '') AS episode_title
+		            LIMIT 1), '') AS episode_title,
+		       -- The IMDb id is scoped to the row's own kind and its own id pair. The
+		       -- media's type decides which cache rows can own its id (vault_media
+		       -- 'series' is mirrored as 'episode' rows, never 'series'), so a movie
+		       -- never borrows an episode's id. vault_media carries no
+		       -- arr_instance_id, so this cannot prefer the instance an operator
+		       -- connected: it prefers the row that agrees with vault_media's own id,
+		       -- tmdb first (the id both mirrors agree on), then the highest cache id
+		       -- so two instances that disagree still resolve the same way on every
+		       -- read. Tiebreak is arbitrary but deterministic — Dubarr cannot know
+		       -- which connection is authoritative from this row.
+		       -- The subquery's media_type CASE maps vault_media's vocabulary onto the
+		       -- mirror's: 'movie' -> 'movie', 'series' -> 'episode'.
+		       COALESCE((
+		           SELECT c.imdb_id
+		             FROM arr_library_cache c
+		            WHERE c.media_type = CASE m.media_type WHEN 'movie' THEN 'movie' ELSE 'episode' END
+		              AND c.imdb_id IS NOT NULL AND c.imdb_id <> ''
+		              AND ((m.tmdb_id IS NOT NULL AND c.tmdb_id = m.tmdb_id)
+		                OR (m.tvdb_id IS NOT NULL AND c.tvdb_id = m.tvdb_id))
+		            ORDER BY CASE WHEN m.tmdb_id IS NOT NULL AND c.tmdb_id = m.tmdb_id THEN 0 ELSE 1 END,
+		                     c.id DESC
+		            LIMIT 1), '') AS imdb_id
 		  FROM audio_tracks t
 		  JOIN vault_media m ON m.id = t.vault_media_id`)
 	if mediaType != "all" {
@@ -138,7 +169,8 @@ func (s *Store) VaultTrackPlanRows(ctx context.Context, mediaType string, ids []
 		)
 		if err := rows.Scan(&row.TrackID, &row.MediaID, &row.MediaType, &row.Title,
 			&row.Year, &season, &episode, &row.Variant, &row.Codec, &row.Channels,
-			&row.LangISO2, &row.FilePath, &row.MediaFolderPath, &row.EpisodeTitle); err != nil {
+			&row.LangISO2, &row.FilePath, &row.MediaFolderPath,
+			&row.TMDBID, &row.TVDBID, &row.EpisodeTitle, &row.IMDBID); err != nil {
 			return nil, fmt.Errorf("store: scan vault organise plan row: %w", err)
 		}
 		if season.Valid {

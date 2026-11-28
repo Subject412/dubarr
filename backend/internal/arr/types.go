@@ -31,6 +31,7 @@ type Movie struct {
 	OriginalTitle    string   `json:"originalTitle"`
 	Year             int      `json:"year"`
 	TmdbID           int      `json:"tmdbId"`
+	ImdbID           string   `json:"imdbId"`
 	Path             string   `json:"path"`
 	FolderName       string   `json:"folderName"`
 	QualityProfileID int      `json:"qualityProfileId"`
@@ -51,6 +52,7 @@ type Series struct {
 	OriginalTitle    string `json:"originalTitle"`
 	Year             int    `json:"year"`
 	TvdbID           int    `json:"tvdbId"`
+	ImdbID           string `json:"imdbId"`
 	Path             string `json:"path"`
 	FolderName       string `json:"folderName"`
 	QualityProfileID int    `json:"qualityProfileId"`

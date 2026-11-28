@@ -49,6 +49,7 @@ type LibraryCacheItem struct {
 	SeriesID int64
 	TMDBID   int64
 	TVDBID   int64
+	IMDBID   string
 	Title    string
 	// OriginalTitle is arr's originalTitle when it differs; empty otherwise.
 	OriginalTitle string
@@ -448,7 +449,7 @@ func (s *Store) libraryCacheRowByKey(ctx context.Context, instanceID int64, medi
 // single-key lookup share it, so the two can never compare against different
 // data.
 const libraryCacheRowColumns = `SELECT id, media_type, external_item_id, COALESCE(series_id, 0),
-	        COALESCE(tmdb_id, 0), COALESCE(tvdb_id, 0), title,
+	        COALESCE(tmdb_id, 0), COALESCE(tvdb_id, 0), COALESCE(imdb_id, ''), title,
 	        COALESCE(original_title, ''), COALESCE(original_language_iso2, ''),
 	        COALESCE(year, 0), season_number, episode_number,
 	        COALESCE(episode_title, ''), COALESCE(media_folder_path, ''),
@@ -476,7 +477,7 @@ func scanLibraryCacheRow(row rowScanner) (libraryCacheRow, error) {
 		langJSON string
 	)
 	if err := row.Scan(&out.ID, &media, &external, &out.SeriesID, &out.TMDBID, &out.TVDBID,
-		&out.Title, &out.OriginalTitle, &out.OriginalLanguageISO2, &out.Year,
+		&out.IMDBID, &out.Title, &out.OriginalTitle, &out.OriginalLanguageISO2, &out.Year,
 		&season, &episode, &out.EpisodeTitle, &out.MediaFolderPath, &out.TargetFilePath,
 		&out.MatchesTargetTags, &out.EligibilityStatus, &idsJSON, &lblJSON,
 		&out.RootFolderPath, &langJSON, &out.Monitored); err != nil {
@@ -519,21 +520,24 @@ func scanLibraryCacheRow(row rowScanner) (libraryCacheRow, error) {
 //
 // The conflict target covers the key columns, which are never rewritten; every
 // other synced column plus updated_at/last_seen_at is overwritten exactly like
-// updateLibraryCacheRow does. Columns the sync does not own (imdb_id,
-// video_codec, raw_metadata_json) keep their values.
+// updateLibraryCacheRow does. Columns the sync does not own (video_codec,
+// raw_metadata_json) keep their values. imdb_id is kept when the incoming row
+// carries none (COALESCE), so an instance that stops reporting the id cannot
+// erase the one already cached.
 func insertLibraryCacheRow(ctx context.Context, tx *sql.Tx, instanceID int64, item LibraryCacheItem, now string) error {
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO arr_library_cache
-		 (arr_instance_id, media_type, external_item_id, series_id, tmdb_id, tvdb_id,
+		 (arr_instance_id, media_type, external_item_id, series_id, tmdb_id, tvdb_id, imdb_id,
 		  title, original_title, original_language_iso2, year, season_number, episode_number,
 		  episode_title, media_folder_path, root_folder_path, target_file_path,
 		  arr_tag_ids_json, arr_tag_labels_json, matches_target_tags,
 		  eligibility_status, audio_languages_json, monitored, updated_at, last_seen_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(arr_instance_id, media_type, external_item_id) DO UPDATE SET
 		     series_id = excluded.series_id,
 		     tmdb_id = excluded.tmdb_id,
 		     tvdb_id = excluded.tvdb_id,
+		     imdb_id = COALESCE(excluded.imdb_id, imdb_id),
 		     title = excluded.title,
 		     original_title = excluded.original_title,
 		     original_language_iso2 = excluded.original_language_iso2,
@@ -553,7 +557,8 @@ func insertLibraryCacheRow(ctx context.Context, tx *sql.Tx, instanceID int64, it
 		     updated_at = excluded.updated_at,
 		     last_seen_at = excluded.last_seen_at`,
 		instanceID, item.MediaType, item.ExternalItemID, nullInt(item.SeriesID),
-		nullInt(item.TMDBID), nullInt(item.TVDBID), item.Title, nullStr(item.OriginalTitle),
+		nullInt(item.TMDBID), nullInt(item.TVDBID), nullStr(item.IMDBID), item.Title,
+		nullStr(item.OriginalTitle),
 		nullStr(item.OriginalLanguageISO2), nullInt(int64(item.Year)),
 		nullIntPtr(item.SeasonNumber), nullIntPtr(item.EpisodeNumber),
 		nullStr(item.EpisodeTitle), nullStr(item.MediaFolderPath), nullStr(item.RootFolderPath),
@@ -577,14 +582,16 @@ func insertLibraryCacheRow(ctx context.Context, tx *sql.Tx, instanceID int64, it
 func updateLibraryCacheRow(ctx context.Context, tx *sql.Tx, instanceID, id int64, item LibraryCacheItem, now string) error {
 	res, err := tx.ExecContext(ctx,
 		`UPDATE arr_library_cache
-		 SET series_id = ?, tmdb_id = ?, tvdb_id = ?, title = ?, original_title = ?,
+		 SET series_id = ?, tmdb_id = ?, tvdb_id = ?, imdb_id = COALESCE(?, imdb_id),
+		     title = ?, original_title = ?,
 		     original_language_iso2 = ?, year = ?, season_number = ?, episode_number = ?,
 		     episode_title = ?, media_folder_path = ?, root_folder_path = ?, target_file_path = ?,
 		     arr_tag_ids_json = ?, arr_tag_labels_json = ?,
 		     matches_target_tags = ?, eligibility_status = ?,
 		     audio_languages_json = ?, monitored = ?, updated_at = ?, last_seen_at = ?
 		 WHERE id = ?`,
-		nullInt(item.SeriesID), nullInt(item.TMDBID), nullInt(item.TVDBID), item.Title,
+		nullInt(item.SeriesID), nullInt(item.TMDBID), nullInt(item.TVDBID), nullStr(item.IMDBID),
+		item.Title,
 		nullStr(item.OriginalTitle), nullStr(item.OriginalLanguageISO2), nullInt(int64(item.Year)),
 		nullIntPtr(item.SeasonNumber), nullIntPtr(item.EpisodeNumber),
 		nullStr(item.EpisodeTitle), nullStr(item.MediaFolderPath), nullStr(item.RootFolderPath),
@@ -765,15 +772,18 @@ func decodeAudioLanguages(raw string) ([]string, error) {
 	return out, nil
 }
 
-// libraryItemEqual compares every synced field. updated_at, imdb_id,
-// video_codec and raw_metadata_json are deliberately not compared: the sync does
-// not own them.
+// libraryItemEqual compares every synced field. updated_at, video_codec and
+// raw_metadata_json are deliberately not compared: the sync does not own them.
+// imdb_id is compared only when arr reported one, because an instance that
+// stops sending imdbId must not erase the id the cache already holds — and
+// must not make every pass look like a change either.
 func libraryItemEqual(row libraryCacheRow, item LibraryCacheItem) bool {
 	return row.MediaType == item.MediaType &&
 		row.ExternalItemID == item.ExternalItemID &&
 		row.SeriesID == item.SeriesID &&
 		row.TMDBID == item.TMDBID &&
 		row.TVDBID == item.TVDBID &&
+		(item.IMDBID == "" || row.IMDBID == item.IMDBID) &&
 		row.Title == item.Title &&
 		row.OriginalTitle == item.OriginalTitle &&
 		row.OriginalLanguageISO2 == item.OriginalLanguageISO2 &&

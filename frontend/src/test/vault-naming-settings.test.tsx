@@ -2,6 +2,7 @@ import { fireEvent, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 import { SettingsPage } from '../pages/Settings'
+import { VAULT_TOKEN_LIST } from '../lib/vault-naming'
 import { isMethod, jsonResponse, renderWithProviders } from '../test/helpers'
 
 const NAMING = {
@@ -158,5 +159,50 @@ describe('vault naming settings (#47)', () => {
     expect(screen.getByLabelText('Season folder')).toHaveValue('Season {Season:00}')
     expect(select).toHaveValue('title_year')
     expect(within(select).queryByRole('option', { name: 'Custom (edited)' })).toBeNull()
+  })
+
+  it('TestTokenHelpListsTheIDs: the token list and help name eleven tokens and the preview renders them', async () => {
+    const user = userEvent.setup()
+    await renderSettings()
+
+    // The picker's list is the closed set: the three ids last, each once.
+    expect(VAULT_TOKEN_LIST.split(', ')).toEqual([
+      '{Title}',
+      '{Year}',
+      '{Season:00}',
+      '{Episode:00}',
+      '{Episode Title}',
+      '{Variant}',
+      '{Codec}',
+      '{Channels}',
+      '{TmdbId}',
+      '{TvdbId}',
+      '{ImdbId}',
+    ])
+
+    const trigger = screen.getByRole('button', { name: 'About Movie file name' })
+    await user.hover(trigger)
+    const tooltip = await screen.findByRole('tooltip')
+    for (const token of ['{TmdbId}', '{TvdbId}', '{ImdbId}']) {
+      expect(tooltip).toHaveTextContent(token)
+    }
+    await user.unhover(trigger)
+
+    // The preview accepts the new tokens and renders the bare id.
+    fireEvent.change(screen.getByLabelText('Movie file name'), {
+      target: { value: '{Title} ({Year}) [{TmdbId}][{ImdbId}]' },
+    })
+    expect(screen.getByTestId('vault-naming-preview-movie')).toHaveTextContent(
+      'Spirited Away (2001) [129][tt0245429].pl.mka',
+    )
+
+    // A film has no TVDB id: the token drops its group, never "[]" or 0.
+    fireEvent.change(screen.getByLabelText('Movie file name'), {
+      target: { value: '{Title} ({Year}) [{TvdbId}]' },
+    })
+    expect(screen.getByTestId('vault-naming-preview-movie')).toHaveTextContent(
+      'Spirited Away (2001).pl.mka',
+    )
+    expect(within(screen.getByTestId('vault-naming-movie')).queryByRole('alert')).toBeNull()
   })
 })

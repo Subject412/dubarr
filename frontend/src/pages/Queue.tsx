@@ -649,6 +649,17 @@ function QueueCard({
         </p>
       )}
 
+      {/* #155: a pattern the regex engine refuses can never match, so adding a
+          tag would not help. Saying that next to the missing-tag line is the
+          difference between "wait" and "fix the setting". Only a row that is
+          still waiting can carry it: an eligible row has no wait to explain, so
+          a leftover reason must not be rendered as one. */}
+      {item.eligibility === 'waiting_for_tags' && item.gate_reason && (
+        <p data-testid="queue-gate-reason" className="mt-3 text-xs text-amber-200">
+          Cannot become eligible: {item.gate_reason}
+        </p>
+      )}
+
       {/* The override, worded as what it does and how far it reaches: one job,
           one tag gate, and a file the pipeline may still replace later. */}
       {offerForce && (

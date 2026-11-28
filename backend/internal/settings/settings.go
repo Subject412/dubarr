@@ -1212,6 +1212,27 @@ func validateLanguages(p *LanguagesPolicy) error {
 	return nil
 }
 
+// CompileTagPattern compiles one filename- or arr-tag criterion exactly as the
+// Processing Gate runs it (#155): the entry is trimmed the way the gate trims
+// its lists, and — unless the criterion is case-sensitive — prefixed with
+// "(?i)". Settings validation and the gate's matcher both call this function,
+// so "valid on save" and "runnable by the gate" cannot drift apart.
+func CompileTagPattern(pattern string, caseSensitive bool) (*regexp.Regexp, error) {
+	expr := strings.TrimSpace(pattern)
+	if !caseSensitive {
+		expr = "(?i)" + expr
+	}
+	return regexp.Compile(expr)
+}
+
+// TagPatternError words a compile failure the same way everywhere: the
+// criterion the operator typed the pattern into, the pattern itself and the
+// engine's own message. The settings form and the queue card therefore show
+// one sentence, and it names the thing to fix.
+func TagPatternError(criterion, pattern string, err error) error {
+	return fmt.Errorf("%s tag pattern %q is not a valid regular expression: %v", criterion, pattern, err)
+}
+
 func validateTagFilter(p *TargetTagFilter) error {
 	if p.RequiredFilenameTags == nil {
 		p.RequiredFilenameTags = []string{}
@@ -1235,6 +1256,30 @@ func validateTagFilter(p *TargetTagFilter) error {
 		p.TagMatchMode = strings.ToUpper(p.TagMatchMode)
 	default:
 		return errors.New(`tag_match_mode must be ALL, ANY or REGEX`)
+	}
+	// REGEX entries are patterns to the gate, so one the engine cannot compile
+	// could never match anything: allowing it would store a filter that waits
+	// forever with no explanation (#155). ANY/ALL entries are literal substrings
+	// and are never compiled.
+	if p.TagMatchMode == "REGEX" {
+		for _, list := range []struct {
+			criterion string
+			items     []string
+		}{
+			{"filename", p.RequiredFilenameTags},
+			{"filename", p.ExcludedFilenameTags},
+			{"arr", p.RequiredArrTags},
+			{"arr", p.ExcludedArrTags},
+		} {
+			for _, pattern := range list.items {
+				if strings.TrimSpace(pattern) == "" {
+					continue
+				}
+				if _, err := CompileTagPattern(pattern, p.TagCaseSensitive); err != nil {
+					return TagPatternError(list.criterion, pattern, err)
+				}
+			}
+		}
 	}
 	if p.RequiredArrTags == nil {
 		p.RequiredArrTags = []string{}

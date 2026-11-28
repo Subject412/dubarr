@@ -59,7 +59,7 @@ export const SETTINGS_HELP: Record<SettingsSectionKey, Record<string, string>> =
     root_folder_paths:
       'Allowlist of Radarr/Sonarr root folders, exactly as the *arr server reports them. Empty means any folder.',
     tag_match_mode:
-      "ANY: at least one required tag is present; ALL: every required tag is present; REGEX: each entry is compiled as a Go regular expression (RE2) and matched against the filename, not the folder path. Applies to the required tags of whichever sources are active. REGEX is RE2, not PCRE: backreferences (\\1) and lookaround ((?=…), (?<=…)) do not compile, so the entry never matches.",
+      "ANY: at least one required tag is present; ALL: every required tag is present; REGEX: each entry is compiled as a Go regular expression (RE2) and matched against the filename, not the folder path. Applies to the required tags of whichever sources are active. REGEX is RE2, not PCRE: backreferences (\\1) and lookaround ((?=…), (?<=…)) do not compile, so such an entry is refused when you save; a pattern stored before this check can never match, and the queue says why.",
     tag_case_sensitive: 'Match tags with exact letter case; off ignores case.',
     enforce_tag_filter:
       'Reject Targets that do not satisfy the filter. Donor ingestion into the Audio Vault is never gated.',

@@ -320,6 +320,12 @@ export type QueueItem = {
   eligibility: QueueEligibility
   matched_tags: string[]
   missing_tags: string[]
+  /**
+   * Why no filename tag can ever satisfy the gate — the configured pattern does
+   * not compile (#155). Empty/absent when every pattern compiled, so the card
+   * only shows it when the wait cannot end by adding a tag.
+   */
+  gate_reason?: string
   donor_candidates: QueueDonorCandidate[]
   /** Whether the row carries an arr library identity; when false the operator must match it manually. */
   matched: boolean

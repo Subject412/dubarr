@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/Subject412/dubarr/backend/internal/arr"
+	"github.com/Subject412/dubarr/backend/internal/gate"
 	"github.com/Subject412/dubarr/backend/internal/settings"
 	"github.com/Subject412/dubarr/backend/internal/store"
 )
@@ -128,23 +129,27 @@ type DonorCandidate struct {
 
 // QueueItem is one approval card.
 type QueueItem struct {
-	ID               int64            `json:"id"`
-	SourceFile       string           `json:"source_file_path"`
-	Filename         string           `json:"filename"`
-	FileSize         int64            `json:"file_size"`
-	Status           string           `json:"status"`
-	Title            string           `json:"title"`
-	Year             int              `json:"year,omitempty"`
-	MediaType        string           `json:"media_type,omitempty"`
-	SeasonNumber     *int             `json:"season_number,omitempty"`
-	EpisodeNumber    *int             `json:"episode_number,omitempty"`
-	TargetPath       string           `json:"target_path"`
-	OriginalLanguage string           `json:"original_language,omitempty"`
-	AudioLanguages   []string         `json:"audio_languages"`
-	Eligibility      string           `json:"eligibility"`
-	MatchedTags      []string         `json:"matched_tags"`
-	MissingTags      []string         `json:"missing_tags"`
-	DonorCandidates  []DonorCandidate `json:"donor_candidates"`
+	ID               int64    `json:"id"`
+	SourceFile       string   `json:"source_file_path"`
+	Filename         string   `json:"filename"`
+	FileSize         int64    `json:"file_size"`
+	Status           string   `json:"status"`
+	Title            string   `json:"title"`
+	Year             int      `json:"year,omitempty"`
+	MediaType        string   `json:"media_type,omitempty"`
+	SeasonNumber     *int     `json:"season_number,omitempty"`
+	EpisodeNumber    *int     `json:"episode_number,omitempty"`
+	TargetPath       string   `json:"target_path"`
+	OriginalLanguage string   `json:"original_language,omitempty"`
+	AudioLanguages   []string `json:"audio_languages"`
+	Eligibility      string   `json:"eligibility"`
+	MatchedTags      []string `json:"matched_tags"`
+	MissingTags      []string `json:"missing_tags"`
+	// GateReason explains why no filename tag can ever satisfy the gate: the
+	// configured pattern does not compile (#155). Empty when every pattern
+	// compiled, so the card only shows it when the wait cannot end.
+	GateReason      string           `json:"gate_reason,omitempty"`
+	DonorCandidates []DonorCandidate `json:"donor_candidates"`
 	// Matched reports whether the row carries an arr library identity; when
 	// false the UI must ask the operator to pick one via search-library.
 	Matched      bool   `json:"matched"`
@@ -476,8 +481,13 @@ func (s *Service) handleList(w http.ResponseWriter, r *http.Request) {
 	// list and the badge on the same value. The derivation itself no longer
 	// takes it: eligibility stopped being a blocker (#48).
 	forceOverride := s.forceTagOverrideAllowed(r.Context())
+	// Read the live rule once for the whole page: a stale reason is only worth
+	// re-proving against one rule, and one read keeps every card on the same
+	// settings snapshot.
+	gateRule := s.currentGateRule(r.Context())
 	items := make([]QueueItem, 0, len(rows))
 	for _, row := range rows {
+		row = s.refreshGateVerdict(gateRule, row)
 		donors, donorErr := pairDonors(row.TargetPath, patterns)
 		matchState, matchReason, matchBlocker := deriveMatchState(row, donors, donorErr, patterns)
 		item := QueueItem{
@@ -497,6 +507,7 @@ func (s *Service) handleList(w http.ResponseWriter, r *http.Request) {
 			Eligibility:      row.Eligibility,
 			MatchedTags:      row.Gate.MatchedTags,
 			MissingTags:      row.Gate.MissingTags,
+			GateReason:       row.Gate.Reason,
 			DonorCandidates:  donors,
 			Matched:          row.Matched,
 			LibraryTitle:     row.LibraryTitle,
@@ -680,6 +691,70 @@ func (s *Service) handleApprove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, approvedResponse{Approved: true})
+}
+
+// currentGateRule reads target.tag_filter as a filename-only gate rule, the
+// shape the gate service classified queue rows with (donor drops are never
+// gated by arr metadata, ADR-0005). It returns nil when the section cannot be
+// read or decoded: a listing must never fail because an operator's settings row
+// is unreadable, and a verdict this handler cannot re-prove is worse than the
+// stored one.
+func (s *Service) currentGateRule(ctx context.Context) *gate.Rule {
+	if s.settings == nil {
+		return nil
+	}
+	raw, ok, err := s.settings.Get(ctx, settings.KeyTargetTagFilter)
+	if err != nil {
+		slog.Default().Warn("queue list: read target.tag_filter",
+			"component", "queue", "error", err)
+		return nil
+	}
+	var tf settings.TargetTagFilter
+	if !ok {
+		def, _ := settings.Defaults("")[settings.KeyTargetTagFilter].(settings.TargetTagFilter)
+		tf = def
+	} else if err := json.Unmarshal(raw, &tf); err != nil {
+		slog.Default().Warn("queue list: decode target.tag_filter",
+			"component", "queue", "error", err)
+		return nil
+	}
+	rule := gate.RuleFromTagFilter(tf).FilenameOnly()
+	return &rule
+}
+
+// refreshGateVerdict re-proves a stale gate snapshot against the rule as it
+// stands now (#155).
+//
+// The verdict — including the reason a required pattern does not compile — is
+// written once, at discovery (the watch scanner's candidate hook). Nothing
+// reclassifies an existing row afterwards, so an operator who fixed the typo
+// kept reading "Cannot become eligible: …" until that target was dropped again.
+// The list is exactly where the operator looks after saving the fix, so the row
+// is reclassified here with the same FilenameOnly evaluation that wrote the
+// snapshot: the two cannot disagree, and the status shown is the verdict of this
+// moment rather than the one of discovery.
+//
+// Only a row that carries a reason is touched: a row without one has nothing
+// that can have gone stale, and re-deriving every row would turn a projection
+// into a rewrite of verdicts nobody asked about. A target that is no longer a
+// regular file is left as stored, because Classify cannot report a missing
+// target and answering "eligible" for a vanished file would be a new lie. The
+// table is never written from here: a GET does not persist, and Eligibility has
+// always been a projection of the last classification.
+func (s *Service) refreshGateVerdict(rule *gate.Rule, row store.ImportCandidateSummary) store.ImportCandidateSummary {
+	if rule == nil || !row.HasGate || row.Gate.Reason == "" || strings.TrimSpace(row.TargetPath) == "" {
+		return row
+	}
+	if info, err := os.Stat(row.TargetPath); err != nil || info.IsDir() {
+		return row
+	}
+	fresh := rule.Classify(row.TargetPath)
+	row.Gate.Status = string(fresh.Status)
+	row.Gate.MatchedTags = fresh.Matched
+	row.Gate.MissingTags = fresh.Missing
+	row.Gate.Reason = fresh.Reason
+	row.Eligibility = string(fresh.Status)
+	return row
 }
 
 // forceTagOverrideAllowed reports whether security.options.allow_force_tag_override

@@ -2,7 +2,6 @@ package gate
 
 import (
 	"path/filepath"
-	"regexp"
 	"strings"
 
 	"github.com/Subject412/dubarr/backend/internal/settings"
@@ -74,6 +73,12 @@ type Result struct {
 	// ArrMatched/ArrMissing do the same for the arr tag criterion.
 	ArrMatched []string `json:"arr_matched_tags,omitempty"`
 	ArrMissing []string `json:"arr_missing_tags,omitempty"`
+	// Reason explains a required pattern the engine could not compile, so a
+	// target waiting on a typo reads as "this pattern is broken" rather than
+	// as "the tag is not there yet" (#155). Empty when every required pattern
+	// compiled — and on an eligible target (#155 keeps the status as
+	// waiting_for_tags; the reason is additive).
+	Reason string `json:"reason,omitempty"`
 }
 
 // Rule is the settled tag gate: the required processed-tags, optional exclusion
@@ -186,9 +191,23 @@ func (r Rule) Classify(filename string, arr ...ArrMetadata) Result {
 	if blocked {
 		res.Status = StatusWaitingForTags
 	} else {
+		// A broken pattern on a target that is eligible anyway explains
+		// nothing: Reason is only ever the reason a target cannot become
+		// eligible.
+		res.Reason = ""
 		res.Status = StatusEligible
 	}
 	return res
+}
+
+// noteCompileFailure records the first required pattern the engine refused.
+// Only the first is kept: settings validation now refuses such a save (#155),
+// so a row carrying several is a hand-written/legacy one, and one honest
+// reason the card can render beats a list it would have to lay out.
+func (res *Result) noteCompileFailure(criterion, pattern string, err error) {
+	if res.Reason == "" {
+		res.Reason = settings.TagPatternError(criterion, pattern, err).Error()
+	}
 }
 
 // EligiblePath answers the only question the eligibility projection asks: does
@@ -211,7 +230,11 @@ func (r Rule) classifyFilename(filename string, res *Result) bool {
 	hay := r.haystack(filename)
 	required := trimAll(r.Required)
 	for _, want := range required {
-		if r.matches(want, hay) {
+		ok, err := r.matches(want, hay)
+		if err != nil {
+			res.noteCompileFailure("filename", want, err)
+		}
+		if ok {
 			res.Matched = append(res.Matched, want)
 		} else {
 			res.Missing = append(res.Missing, want)
@@ -220,7 +243,10 @@ func (r Rule) classifyFilename(filename string, res *Result) bool {
 
 	blocked := false
 	for _, excl := range trimAll(r.Excluded) {
-		if r.matches(excl, hay) {
+		// A pattern that cannot compile cannot exclude anything, and an
+		// exclusion never makes a target stuck: only a required pattern's
+		// failure is worth explaining (Result.Reason).
+		if ok, _ := r.matches(excl, hay); ok {
 			blocked = true
 		}
 	}
@@ -246,7 +272,11 @@ func (r Rule) classifyArr(meta ArrMetadata, res *Result) bool {
 	hay := r.arrHaystack(meta.Tags)
 	required := trimAll(r.RequiredArrTags)
 	for _, want := range required {
-		if r.matches(want, hay) {
+		ok, err := r.matches(want, hay)
+		if err != nil {
+			res.noteCompileFailure("arr", want, err)
+		}
+		if ok {
 			res.ArrMatched = append(res.ArrMatched, want)
 		} else {
 			res.ArrMissing = append(res.ArrMissing, want)
@@ -254,7 +284,9 @@ func (r Rule) classifyArr(meta ArrMetadata, res *Result) bool {
 	}
 
 	for _, excl := range trimAll(r.ExcludedArrTags) {
-		if r.matches(excl, hay) {
+		// As with the filename exclusion: a broken pattern excludes nothing,
+		// so it is not the reason a target waits.
+		if ok, _ := r.matches(excl, hay); ok {
 			return true
 		}
 	}
@@ -344,27 +376,27 @@ func (r Rule) arrHaystack(tags []string) []string {
 }
 
 // matches reports whether want is present in the haystack under the rule's
-// match mode. An invalid regular expression never matches, so a typo in the
-// settings can block muxing but can never let an untagged file through.
-func (r Rule) matches(want string, hay []string) bool {
+// match mode. An invalid regular expression never matches — so a typo in the
+// settings can block muxing but can never let an untagged file through — and
+// the compile failure is returned so Classify can say why the target waits
+// (#155). The compile itself is settings.CompileTagPattern, the same function
+// settings validation runs on save, so the two cannot disagree about what a
+// valid pattern is.
+func (r Rule) matches(want string, hay []string) (bool, error) {
 	if want == "" {
-		return false
+		return false, nil
 	}
 	if r.Mode == MatchRegex {
-		expr := want
-		if !r.CaseSensitive {
-			expr = "(?i)" + expr
-		}
-		re, err := regexp.Compile(expr)
+		re, err := settings.CompileTagPattern(want, r.CaseSensitive)
 		if err != nil {
-			return false
+			return false, err
 		}
 		for _, entry := range hay {
 			if re.MatchString(entry) {
-				return true
+				return true, nil
 			}
 		}
-		return false
+		return false, nil
 	}
 	needle := want
 	if !r.CaseSensitive {
@@ -372,10 +404,10 @@ func (r Rule) matches(want string, hay []string) bool {
 	}
 	for _, entry := range hay {
 		if strings.Contains(entry, needle) {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 // trimAll drops blank entries so an empty list item cannot make the gate

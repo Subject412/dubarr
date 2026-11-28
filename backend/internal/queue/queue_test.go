@@ -634,6 +634,142 @@ func TestQueueMatchStateGateVerdictIsNotABlocker(t *testing.T) {
 	}
 }
 
+// TestDonorPatternsAreFixed is U11: the markers are a property of how Polish
+// dubs are named, not a preference, so the fixed list is the only source and it
+// carries exactly the three the reference workflow uses.
+func TestDonorPatternsAreFixed(t *testing.T) {
+	want := []string{"PL.DUB", "LEKTOR.PL", "DUB.PL"}
+	patterns := DonorPatterns()
+	if len(patterns) != len(want) {
+		t.Fatalf("DonorPatterns() = %v, want %v", patterns, want)
+	}
+	for i, marker := range want {
+		if patterns[i] != marker {
+			t.Fatalf("DonorPatterns() = %v, want %v", patterns, want)
+		}
+	}
+	for _, marker := range want {
+		if !matchesDonorPattern("Film.2020."+marker+".mkv", patterns) {
+			t.Errorf("a filename carrying %q was not detected as a donor", marker)
+		}
+	}
+	// The accessor hands out a copy: mutating it must not rewrite the markers
+	// the pairing reads on its next call.
+	patterns[0] = "CUSTOM"
+	if again := DonorPatterns(); again[0] != want[0] {
+		t.Fatalf("DonorPatterns() = %v after a caller mutated its copy, want %v", again, want)
+	}
+}
+
+// TestDonorMarkerMatchingSemantics pins what the fixed list inherits from
+// pairDonors' matcher, because the markers are now the only thing an operator
+// cannot tune (identity-based pairing is #130).
+//
+// A marker without "*" is a substring match, compared case-insensitively:
+//
+//   - pl.dub and PL.DUB are the same marker, so a lower-case rip still pairs;
+//   - PL.DUBB and DUB.PL1 still pair, because "PL.DUB"/"DUB.PL" are substrings
+//     of them. Widening this to exact tokens is a matching-rule change, not a
+//     settings change, so it is recorded here rather than fixed here.
+//   - a different naming convention ("POL", "DUB PL") is not a donor at all:
+//     the row reports the donor_pattern blocker and the approval card still
+//     lists every sibling, so the operator can pick one by hand.
+func TestDonorMarkerMatchingSemantics(t *testing.T) {
+	tests := []struct {
+		name string
+		file string
+		want bool
+	}{
+		{"pl.dub marker", "Film.2020.PL.DUB.mkv", true},
+		{"lektor.pl marker", "Film.2020.LEKTOR.PL.mkv", true},
+		{"dub.pl marker", "Film.2020.DUB.PL.mkv", true},
+		{"lower-case marker still pairs", "film.2020.pl.dub.mkv", true},
+		{"trailing letter is still a substring", "Film.2020.PL.DUBB.mkv", true},
+		{"trailing digit is still a substring", "Film.2020.DUB.PL1.mkv", true},
+		{"a different convention does not pair", "Film.2020.POL.mkv", false},
+		{"a spaced convention does not pair", "Film.2020.DUB PL.mkv", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := matchesDonorPattern(tc.file, DonorPatterns()); got != tc.want {
+				t.Errorf("matchesDonorPattern(%q, DonorPatterns()) = %v, want %v", tc.file, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRetiredDonorPatternSettingIsInert is U11: a row written by an install that
+// still had the `imports.options` card is kept but never read, so a stored
+// "CUSTOM" list neither suppresses the PL.DUB pairing nor pairs a CUSTOM
+// sibling. The row is left byte-identical.
+func TestRetiredDonorPatternSettingIsInert(t *testing.T) {
+	tests := []struct {
+		name  string
+		store bool
+	}{
+		{name: "stored CUSTOM list", store: true},
+		{name: "no stored row", store: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			h.seedCandidate(t,
+				"Minions and Monsters (2026) - [ArcA310][Remux-2160p][HDR10][Opus 7.1][AV1][imdb-tt32890033]-FraMeSToR.mkv",
+				"eligible", `["en","pl"]`)
+			for _, name := range []string{"Film.2020.PL.DUB.mkv", "Film.2020.CUSTOM.mkv"} {
+				if err := os.WriteFile(filepath.Join(h.media, name), []byte("donor"), 0o644); err != nil {
+					t.Fatalf("write %s: %v", name, err)
+				}
+			}
+			legacy := `{"donor_patterns":["CUSTOM"]}`
+			if tc.store {
+				if _, err := h.db.Exec(
+					`INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('imports.options', ?, '2026-01-01 00:00:00')`,
+					legacy); err != nil {
+					t.Fatalf("store retired row: %v", err)
+				}
+			}
+
+			item := onlyMatchItem(t, h.listMatchItems(t))
+			if item.MatchState != MatchStateReady {
+				t.Fatalf("match_state = %q (%s), want %q", item.MatchState, item.MatchReason, MatchStateReady)
+			}
+			if len(item.Donors) != 1 {
+				t.Fatalf("donor candidates = %d, want only the PL.DUB sibling", len(item.Donors))
+			}
+			if got := filepath.Base(item.Donors[0].Path); got != "Film.2020.PL.DUB.mkv" {
+				t.Errorf("paired donor = %q, want Film.2020.PL.DUB.mkv", got)
+			}
+			patterns := DonorPatterns()
+			if len(item.DonorPatterns) != len(patterns) {
+				t.Fatalf("item donor_patterns = %v, want the fixed list %v", item.DonorPatterns, patterns)
+			}
+			for i, marker := range patterns {
+				if item.DonorPatterns[i] != marker {
+					t.Errorf("item donor_patterns = %v, want %v", item.DonorPatterns, patterns)
+				}
+			}
+			if tc.store {
+				var stored string
+				if err := h.db.QueryRow(`SELECT value FROM settings WHERE key = 'imports.options'`).Scan(&stored); err != nil {
+					t.Fatalf("read retired row: %v", err)
+				}
+				if stored != legacy {
+					t.Errorf("retired row was rewritten: %s, want %s", stored, legacy)
+				}
+			} else {
+				var n int
+				if err := h.db.QueryRow(`SELECT COUNT(*) FROM settings WHERE key = 'imports.options'`).Scan(&n); err != nil {
+					t.Fatalf("count retired row: %v", err)
+				}
+				if n != 0 {
+					t.Errorf("settings seeded a retired imports.options row")
+				}
+			}
+		})
+	}
+}
+
 // TestQueueMatchStateUnreadableTargetFolder pins that an unlistable folder is
 // reported as such: an unmounted library has no donors to see, so claiming that
 // no sibling carries the marker would be a confident falsehood.
@@ -727,7 +863,7 @@ func TestQueueMatchStateNoTargetFileBlocker(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			state, reason, blocker := deriveMatchState(tc.row, nil, nil, defaultDonorPatterns)
+			state, reason, blocker := deriveMatchState(tc.row, nil, nil, DonorPatterns())
 			if state != MatchStateMatchedNoDonor {
 				t.Errorf("match_state = %q, want %q", state, MatchStateMatchedNoDonor)
 			}
@@ -998,7 +1134,11 @@ type queueMatchItem struct {
 	MatchState   string `json:"match_state"`
 	MatchReason  string `json:"match_reason"`
 	MatchBlocker string `json:"match_blocker"`
-	Donors       []struct {
+	// DonorPatterns is the per-item report of the markers that were searched
+	// for. The item field stays (clients branch on it); only the *setting* is
+	// gone, so it always carries the fixed list now.
+	DonorPatterns []string `json:"donor_patterns"`
+	Donors        []struct {
 		Path string `json:"path"`
 	} `json:"donor_candidates"`
 }

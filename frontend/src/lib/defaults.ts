@@ -2,7 +2,6 @@ import type {
   ArrOptions,
   AudioOptions,
   DubarrSettings,
-  ImportsOptions,
   LanguagesPolicy,
   MuxOptions,
   SecurityOptions,
@@ -97,7 +96,6 @@ export const DEFAULT_SETTINGS: DubarrSettings = {
   'audio.options': { rules: [] } as AudioOptions,
   'watch.options': { scan_interval_sec: 60, stability_check_interval_sec: 4 },
   'arr.options': { poll_interval_sec: 300 },
-  'imports.options': { donor_patterns: ['PL.DUB'] },
   // The shipped naming patterns (#47, `settings.Default*`). Nothing is renamed
   // until an operator previews and applies a plan on the Vault page.
   'vault.naming': {
@@ -111,7 +109,6 @@ export const DEFAULT_SETTINGS: DubarrSettings = {
 export type {
   ArrOptions,
   AudioOptions,
-  ImportsOptions,
   LanguagesPolicy,
   MuxOptions,
   SecurityOptions,

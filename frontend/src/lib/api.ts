@@ -235,11 +235,6 @@ export type ArrConnectionTestPayload = {
   api_key?: string
 }
 
-/** Sibling filenames that mark a dropped file as a donor dub. */
-export type ImportsOptions = {
-  donor_patterns: string[]
-}
-
 /**
  * `vault.naming`: the patterns that decide the *stem* of an archived track
  * inside the folder Dubarr already owns (#47). They never carry the extension —
@@ -264,7 +259,6 @@ export type DubarrSettings = {
   'audio.options': AudioOptions
   'watch.options': WatchOptions
   'arr.options': ArrOptions
-  'imports.options': ImportsOptions
   'vault.naming': VaultNaming
 }
 
@@ -341,10 +335,11 @@ export type QueueItem = {
    */
   match_blocker?: QueueMatchBlocker
   /**
-   * The configured donor filename patterns (blank entries dropped). Empty means
-   * no donor pattern is configured at all, which is a different next step from
-   * "nothing in the folder matched it". Absent on older payloads, in which case
-   * the card does not claim either cause.
+   * The donor markers the pairing searched for (blank entries dropped). The
+   * backend reports its fixed list (U11), so an empty list only ever comes from
+   * an older payload or a direct caller with none — a different next step from
+   * "nothing in the folder matched a marker". Absent on older payloads, in
+   * which case the card does not claim either cause.
    */
   donor_patterns?: string[]
 }

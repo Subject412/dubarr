@@ -883,7 +883,7 @@ describe('approval queue page', () => {
     expect(within(ready).queryByRole('button', { name: /identify/i })).not.toBeInTheDocument()
   })
 
-  it('gives the excluded tag and a missing donor pattern their own next step', async () => {
+  it('gives the excluded tag and an empty marker list their own next step', async () => {
     // gate_excluded is not a missing tag: telling the operator to ADD a tag
     // sends them the wrong way, so the exclusion gets its own sentence.
     const excluded = {
@@ -895,9 +895,8 @@ describe('approval queue page', () => {
       match_reason: 'Target is not eligible for processing (the target carries an excluded tag).',
       match_blocker: 'gate_excluded',
     }
-    // No donor pattern configured at all: pointing at the watch folder would
-    // send the operator to a folder nothing ever scans. The payload proves it
-    // with an empty list.
+    // An older payload can still report an empty marker list. There is no
+    // setting to point at any more (U11): the copy says the markers are fixed.
     const noPattern = { ...items[1], id: 42, donor_patterns: [] }
     vi.stubGlobal(
       'fetch',
@@ -915,7 +914,7 @@ describe('approval queue page', () => {
 
     const noPatternCard = screen.getByTestId('queue-item-42')
     expect(within(noPatternCard).getByTestId('queue-instruction')).toHaveTextContent(
-      /configure the donor filename pattern/i,
+      /built-in donor marker/i,
     )
     expect(within(noPatternCard).getByTestId('queue-instruction')).not.toHaveTextContent(
       /watch folder/i,

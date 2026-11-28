@@ -344,7 +344,7 @@ func (s *Service) handleMatch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "queue item not found")
 		return
 	}
-	patterns := s.donorPatterns(ctx)
+	patterns := DonorPatterns()
 	donors, donorErr := pairDonors(row.TargetPath, patterns)
 	state, _, _ := deriveMatchState(row, donors, donorErr, patterns)
 	writeJSON(w, http.StatusOK, matchResponse{MatchState: state})

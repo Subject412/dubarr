@@ -146,10 +146,6 @@ export const SETTINGS_HELP: Record<SettingsSectionKey, Record<string, string>> =
     stability_check_interval_sec:
       'Minimum time between the two size checks that mark a file as stable.',
   },
-  'imports.options': {
-    donor_patterns:
-      'Sibling filenames that mark a dropped file as a donor dub. Without * a pattern is a substring match; with * it is a glob.',
-  },
   'arr.connections': {
     radarr_base_url:
       'Root URL of the Radarr instance including the scheme, e.g. http://192.168.1.10:7878. A missing http:// or https:// is rejected, never guessed.',

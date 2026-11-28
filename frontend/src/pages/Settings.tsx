@@ -3,7 +3,6 @@ import { useSearchParams } from 'react-router-dom'
 import type {
   ArrOptions,
   AudioOptions,
-  ImportsOptions,
   LanguagesPolicy,
   MuxOptions,
   SecurityOptions,
@@ -982,23 +981,6 @@ export function SettingsPage() {
                   help={settingsHelp('watch.options', 'stability_check_interval_sec')}
                 />
               </div>
-            )}
-          </Section>
-
-          <Section<ImportsOptions>
-            sectionKey="imports.options"
-            value={(data['imports.options'] as ImportsOptions) ?? DEFAULTS['imports.options']}
-            save={save}
-          >
-            {(draft, update) => (
-              <StringListEditor
-                label="Donor patterns"
-                inputLabel="Add donor pattern"
-                values={draft.donor_patterns ?? []}
-                onChange={(donor_patterns) => update({ donor_patterns })}
-                placeholder="PL.DUB"
-                help={settingsHelp('imports.options', 'donor_patterns')}
-              />
             )}
           </Section>
 

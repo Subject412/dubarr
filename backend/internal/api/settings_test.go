@@ -212,6 +212,8 @@ func TestSettingsPutRejectsProtectedAndUnknown(t *testing.T) {
 		map[string]any{"settings": map[string]any{"secrets.master_key": "deadbeef"}},
 		map[string]any{"settings": map[string]any{"totally.unknown": map[string]any{"a": 1}}},
 		map[string]any{"settings": map[string]any{settings.KeyTargetTagFilter: map[string]any{"tag_match_mode": "NOPE"}}},
+		// U11: the donor markers are fixed, so the section is gone.
+		map[string]any{"settings": map[string]any{settings.KeyImportsOptions: map[string]any{"donor_patterns": []string{"CUSTOM"}}}},
 	} {
 		code, body := h.do(http.MethodPut, "/api/settings", payload)
 		if code != http.StatusBadRequest {
@@ -224,6 +226,50 @@ func TestSettingsPutRejectsProtectedAndUnknown(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("auth.session_key rows = %d, want the untouched original", n)
+	}
+}
+
+// TestRetiredImportsOptionsIsNotServedNorWritable is U11: the donor markers are
+// fixed, so `imports.options` left the settings contract. A row written by an
+// install that still had the card stays in the kv table, untouched and never
+// served, and a PUT that still carries the section is refused as an unknown key.
+func TestRetiredImportsOptionsIsNotServedNorWritable(t *testing.T) {
+	h := newHarness(t)
+	h.setupAdmin()
+	legacy := `{"donor_patterns":["CUSTOM"]}`
+	if _, err := h.db.Exec(
+		`INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, '2026-01-01 00:00:00')`,
+		settings.KeyImportsOptions, legacy); err != nil {
+		t.Fatalf("store legacy row: %v", err)
+	}
+
+	code, body := h.do(http.MethodGet, "/api/settings", nil)
+	if code != http.StatusOK {
+		t.Fatalf("GET /api/settings = %d: %s", code, body)
+	}
+	var env testSettingsEnvelope
+	if err := json.Unmarshal(body, &env); err != nil {
+		t.Fatalf("decode settings: %v (%s)", err, body)
+	}
+	if raw, ok := env.Settings[settings.KeyImportsOptions]; ok {
+		t.Errorf("GET /api/settings served the retired section: %s", raw)
+	}
+
+	code, body = h.do(http.MethodPut, "/api/settings", map[string]any{
+		"settings": map[string]any{
+			settings.KeyImportsOptions: map[string]any{"donor_patterns": []string{"CUSTOM"}},
+		},
+	})
+	if code != http.StatusBadRequest {
+		t.Errorf("PUT /api/settings with the retired section = %d, want 400: %s", code, body)
+	}
+
+	var stored string
+	if err := h.db.QueryRow(`SELECT value FROM settings WHERE key = ?`, settings.KeyImportsOptions).Scan(&stored); err != nil {
+		t.Fatalf("read stored row: %v", err)
+	}
+	if stored != legacy {
+		t.Errorf("stored row changed: %s, want %s", stored, legacy)
 	}
 }
 

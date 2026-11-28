@@ -17,23 +17,49 @@ import (
 // non-positive timeout.
 const DefaultTimeout = 30 * time.Second
 
+// API bases. Dubarr speaks only the newest API each product ships — Sonarr 5,
+// Radarr 3 — and never probes for an older one or falls back to it (owner
+// decision 2026-11-28). The old prefix is not "still supported": Sonarr's v3
+// episode list answers hasFile:true with no episodeFile unless the caller asks
+// for the sub-resource, which is the bug that left every episode without a
+// target path.
+const (
+	apiBaseSonarr = "/api/v5"
+	apiBaseRadarr = "/api/v3"
+)
+
+// pinnedRelease is the dubarr release that pinned the API versions above, and
+// the only place that release is named. It is prose for the operator reading
+// the API-version error, not a build version: the binary's own version lives in
+// cmd/dubarr/main.go behind -ldflags and is not importable from internal/arr.
+// Nothing enforces it, so bump it in the same commit that changes the accepted
+// versions — otherwise the error keeps naming a release that never required the
+// version the code now asks for.
+const pinnedRelease = "0.6.0"
+
 // ErrKindMismatch means the instance reported an appName the client does not
 // serve, for example a Radarr client configured with a Sonarr URL.
 var ErrKindMismatch = errors.New("arr: instance app kind mismatch")
 
 // Client is the read surface Dubarr needs from any *arr instance
 // (ADR-0007). Credentials are supplied per client; this package stores none.
+//
+// Every route below is requested under the product's own API base:
+// /api/v5 for Sonarr, /api/v3 for Radarr.
 type Client interface {
 	// Kind identifies the application this client talks to.
 	Kind() Kind
-	// Ping calls /api/v3/system/status as a connection test.
+	// Ping calls {apiBase}/system/status as a connection test. A 404 there is
+	// not a transient error: the instance does not serve the API version
+	// dubarr requires, and Ping reports that as an *APIVersionError naming
+	// the product, the expected version and the path tried.
 	Ping(ctx context.Context) error
 	// QualityProfiles lists configured quality profiles.
 	QualityProfiles(ctx context.Context) ([]QualityProfile, error)
 	// RootFolders lists configured media roots.
 	RootFolders(ctx context.Context) ([]RootFolder, error)
-	// Tags lists configured tags (GET /api/v3/tag). Both products expose the
-	// same endpoint and payload.
+	// Tags lists configured tags (GET {apiBase}/tag). Both products expose the
+	// route under their own base with the same payload.
 	Tags(ctx context.Context) ([]Tag, error)
 }
 
@@ -61,13 +87,13 @@ type Sonarr interface {
 	Client
 	// Series lists the Sonarr library.
 	Series(ctx context.Context) ([]Series, error)
-	// SeriesByID reads one series (GET /api/v3/series/{id}). It is the read
+	// SeriesByID reads one series (GET /api/v5/series/{id}). It is the read
 	// half of a per-item rescan for an episode row.
 	SeriesByID(ctx context.Context, seriesID int) (Series, error)
 	// RescanSeries asks Sonarr to rescan one series (command RescanSeries).
 	RescanSeries(ctx context.Context, seriesID int) error
 	// Parse asks Sonarr's own parser to identify one release name
-	// (POST /api/v3/parse), normalised onto ParseResult.
+	// (POST /api/v5/parse), normalised onto ParseResult.
 	Parse(ctx context.Context, title string) (ParseResult, error)
 }
 
@@ -75,6 +101,11 @@ type Sonarr interface {
 type core struct {
 	kind    Kind
 	baseURL string
+	// apiBase is the product's API prefix, set once by the constructor that
+	// knows the product: "/api/v5" for Sonarr, "/api/v3" for Radarr. No
+	// request path may hardcode a version; that is how the two products are
+	// kept apart without a probe.
+	apiBase string
 	apiKey  string
 	http    *http.Client
 }
@@ -82,7 +113,7 @@ type core struct {
 // RadarrClient is an HTTP client for the Radarr REST v3 API.
 type RadarrClient struct{ core }
 
-// SonarrClient is an HTTP client for the Sonarr REST v3 API.
+// SonarrClient is an HTTP client for the Sonarr REST v5 API.
 type SonarrClient struct{ core }
 
 var (
@@ -91,24 +122,30 @@ var (
 )
 
 // NewRadarrClient builds a Radarr client. baseURL is the instance root (for
-// example http://radarr:7878); apiKey is sent as X-Api-Key. A non-positive
-// timeout falls back to DefaultTimeout. No credentials are read from the
-// environment or persisted here.
+// example http://radarr:7878); apiKey is sent as X-Api-Key. Radarr ships only
+// v3, so every request goes to /api/v3 — the newest API Radarr has. A
+// non-positive timeout falls back to DefaultTimeout. No credentials are read
+// from the environment or persisted here.
 func NewRadarrClient(baseURL, apiKey string, timeout time.Duration) (*RadarrClient, error) {
 	c, err := newCore(KindRadarr, baseURL, apiKey, timeout)
 	if err != nil {
 		return nil, err
 	}
+	// The constructor is the only place that knows which product this is, so
+	// it is the only place that picks the prefix.
+	c.apiBase = apiBaseRadarr
 	return &RadarrClient{core: c}, nil
 }
 
 // NewSonarrClient builds a Sonarr client with the same semantics as
-// NewRadarrClient.
+// NewRadarrClient, pinned to Sonarr's v5 API. v3 is not a fallback: it answers
+// the episode list without the file sub-resource, so dubarr never asks it.
 func NewSonarrClient(baseURL, apiKey string, timeout time.Duration) (*SonarrClient, error) {
 	c, err := newCore(KindSonarr, baseURL, apiKey, timeout)
 	if err != nil {
 		return nil, err
 	}
+	c.apiBase = apiBaseSonarr
 	return &SonarrClient{core: c}, nil
 }
 
@@ -154,14 +191,17 @@ func (e *KindMismatchError) Error() string {
 func (e *KindMismatchError) Is(target error) bool { return target == ErrKindMismatch }
 
 // Ping implements Client. It validates the instance's appName so a Radarr
-// client pointed at Sonarr (or vice versa) fails instead of pinging OK.
+// client pointed at Sonarr (or vice versa) fails instead of pinging OK, and it
+// treats a 404 on the API base as "this instance does not serve the version
+// dubarr requires" — a loud *APIVersionError, never a reason to try an older
+// prefix.
 func (c *core) Ping(ctx context.Context) error {
 	var status struct {
 		AppName string `json:"appName"`
 		Version string `json:"version"`
 	}
-	if err := c.get(ctx, "/api/v3/system/status", &status); err != nil {
-		return err
+	if err := c.get(ctx, c.apiBase+"/system/status", &status); err != nil {
+		return c.apiVersionError(err)
 	}
 	if !strings.EqualFold(status.AppName, string(c.kind)) {
 		return &KindMismatchError{Expected: c.kind, Got: status.AppName}
@@ -169,39 +209,56 @@ func (c *core) Ping(ctx context.Context) error {
 	return nil
 }
 
+// apiVersionError maps a 404 from a route that always exists on a working
+// instance — the system status, the library lists, tags, profiles, root folders
+// and commands — onto the loud "this instance does not serve /api/v5" failure.
+// A by-id read keeps its plain StatusError, because a missing movie or series is
+// a real 404 and says nothing about the API version.
+//
+// This is a classification, not a probe: nothing is retried and no prefix is
+// remembered. It is what turns the first failing call of a poll pass into one
+// specific line instead of one 404 per series.
+func (c *core) apiVersionError(err error) error {
+	var se *StatusError
+	if errors.As(err, &se) && se.Code == http.StatusNotFound {
+		return &APIVersionError{Kind: c.kind, APIBase: c.apiBase, Code: se.Code, Err: se}
+	}
+	return err
+}
+
 // QualityProfiles implements Client.
 func (c *core) QualityProfiles(ctx context.Context) ([]QualityProfile, error) {
 	out := []QualityProfile{}
-	err := c.get(ctx, "/api/v3/qualityprofile", &out)
+	err := c.apiVersionError(c.get(ctx, c.apiBase+"/qualityprofile", &out))
 	return out, err
 }
 
 // RootFolders implements Client.
 func (c *core) RootFolders(ctx context.Context) ([]RootFolder, error) {
 	out := []RootFolder{}
-	err := c.get(ctx, "/api/v3/rootfolder", &out)
+	err := c.apiVersionError(c.get(ctx, c.apiBase+"/rootfolder", &out))
 	return out, err
 }
 
-// Tags implements Client. Radarr and Sonarr share GET /api/v3/tag, so one
-// implementation serves both.
+// Tags implements Client. Radarr and Sonarr both serve GET {apiBase}/tag with
+// the same payload, so one implementation serves both.
 func (c *core) Tags(ctx context.Context) ([]Tag, error) {
 	out := []Tag{}
-	err := c.get(ctx, "/api/v3/tag", &out)
+	err := c.apiVersionError(c.get(ctx, c.apiBase+"/tag", &out))
 	return out, err
 }
 
 // Movies implements Radarr.
 func (c *RadarrClient) Movies(ctx context.Context) ([]Movie, error) {
 	out := []Movie{}
-	err := c.get(ctx, "/api/v3/movie", &out)
+	err := c.apiVersionError(c.get(ctx, c.apiBase+"/movie", &out))
 	return out, err
 }
 
 // Series implements Sonarr.
 func (c *SonarrClient) Series(ctx context.Context) ([]Series, error) {
 	out := []Series{}
-	err := c.get(ctx, "/api/v3/series", &out)
+	err := c.apiVersionError(c.get(ctx, c.apiBase+"/series", &out))
 	return out, err
 }
 
@@ -209,14 +266,14 @@ func (c *SonarrClient) Series(ctx context.Context) ([]Series, error) {
 // shared error model reports as a StatusError.
 func (c *RadarrClient) MovieByID(ctx context.Context, movieID int) (Movie, error) {
 	var out Movie
-	err := c.get(ctx, "/api/v3/movie/"+strconv.Itoa(movieID), &out)
+	err := c.get(ctx, c.apiBase+"/movie/"+strconv.Itoa(movieID), &out)
 	return out, err
 }
 
 // SeriesByID implements Sonarr.
 func (c *SonarrClient) SeriesByID(ctx context.Context, seriesID int) (Series, error) {
 	var out Series
-	err := c.get(ctx, "/api/v3/series/"+strconv.Itoa(seriesID), &out)
+	err := c.get(ctx, c.apiBase+"/series/"+strconv.Itoa(seriesID), &out)
 	return out, err
 }
 
@@ -227,7 +284,7 @@ func (c *RadarrClient) RescanMovie(ctx context.Context, movieID int) error {
 		Name    string `json:"name"`
 		MovieID int    `json:"movieId"`
 	}{Name: "RescanMovie", MovieID: movieID}
-	return c.post(ctx, "/api/v3/command", body)
+	return c.apiVersionError(c.post(ctx, c.apiBase+"/command", body))
 }
 
 // RescanSeries implements Sonarr.
@@ -236,7 +293,7 @@ func (c *SonarrClient) RescanSeries(ctx context.Context, seriesID int) error {
 		Name     string `json:"name"`
 		SeriesID int    `json:"seriesId"`
 	}{Name: "RescanSeries", SeriesID: seriesID}
-	return c.post(ctx, "/api/v3/command", body)
+	return c.apiVersionError(c.post(ctx, c.apiBase+"/command", body))
 }
 
 // get performs one authenticated GET and decodes a 2xx JSON body into out.
@@ -275,7 +332,7 @@ func (c *core) post(ctx context.Context, path string, payload any) error {
 }
 
 // postJSON is post plus an optional 2xx response body decoded into out (nil
-// discards it). Both products answer /api/v3/parse with a payload, so the
+// discards it). Both products answer {apiBase}/parse with a payload, so the
 // decode shares this one request/error path instead of copying it.
 func (c *core) postJSON(ctx context.Context, path string, payload any, out any) error {
 	body, err := json.Marshal(payload)

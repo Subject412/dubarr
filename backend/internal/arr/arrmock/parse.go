@@ -1,4 +1,4 @@
-// M13 identify mock: POST /api/v3/parse for both products.
+// M13 identify mock: POST {base}/parse for both products.
 //
 // The real instances answer the same route with different payloads (Radarr:
 // parsedMovieInfo/movie, Sonarr: parsedEpisodeInfo/series), so the fake builds
@@ -30,7 +30,7 @@ type parseRequest struct {
 	Title string `json:"title"`
 }
 
-// serveParse answers POST /api/v3/parse in the shape of the given product.
+// serveParse answers POST {base}/parse in the shape of the given product.
 func (s *Server) serveParse(kind Kind, resp ParseResponse) http.HandlerFunc {
 	return s.handle(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -80,7 +80,7 @@ func (s *Server) serveParse(kind Kind, resp ParseResponse) http.HandlerFunc {
 	})
 }
 
-// ParseRequests returns a copy of the release names posted to /api/v3/parse,
+// ParseRequests returns a copy of the release names posted to {base}/parse,
 // oldest first.
 func (s *Server) ParseRequests() []string {
 	s.mu.Lock()

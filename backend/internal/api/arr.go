@@ -408,8 +408,15 @@ type arrTestFailure struct {
 
 // arrTestError maps a client failure to an operator-facing message that carries
 // no credentials (the clients scrub keys already; the messages stay generic).
+// The one deliberate exception is the API-version failure: it names the
+// product, the version dubarr requires and the path tried, because "wrong API
+// version" and "unexpected status 404" are different problems and only the
+// specific text tells the operator which one they have.
 func arrTestError(err error) string {
+	var versionErr *arr.APIVersionError
 	switch {
+	case errors.As(err, &versionErr):
+		return versionErr.Error()
 	case errors.Is(err, arr.ErrAuth):
 		return "authentication failed: the API key was rejected"
 	case errors.Is(err, arr.ErrNetwork):

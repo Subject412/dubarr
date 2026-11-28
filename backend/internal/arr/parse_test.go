@@ -121,9 +121,9 @@ func TestParseSonarrNormalisesShape(t *testing.T) {
 	}
 }
 
-// TestParseErrorModel pins that /api/v3/parse fails through the shared error
-// model, so the identify route can classify it, and that the API key never
-// appears in an error.
+// TestParseErrorModel pins that parse fails through the shared error model on
+// both products, each at its own base, so the identify route can classify it,
+// and that the API key never appears in an error.
 func TestParseErrorModel(t *testing.T) {
 	ctx := context.Background()
 	const apiKey = "parse-secret-key-do-not-leak"

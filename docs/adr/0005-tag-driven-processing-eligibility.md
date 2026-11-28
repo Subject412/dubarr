@@ -4,6 +4,8 @@ The Processing Gate decides which **target** files Dubarr acts on. It is a user-
 
 **Criteria.** Required/excluded filename tags with ANY / ALL / REGEX match mode, case-sensitivity and the enforce toggle (`settings.target.tag_filter`), plus the optional arr criterion of ADR-0009 (arr tags and root folders, AND-ed across sources, failing closed when the arr criterion is active and no row exists).
 
+**REGEX entries are Go regular expressions (RE2) matched against the file's own name**, not its folder and not a shell glob: there are no backreferences and no lookaround, and a pattern that does not compile matches nothing. The settings page shows an example that the same compile path is tested against, so the illustrated dialect cannot drift from the one that runs.
+
 **Targets are gated; donors are never tag-gated.** Donor ingestion follows the Export Policy and Vault rules of ADR-0002 — every file dropped into `WATCH_DIR` or imported through the GUI is processed as a donor (probe, arr identification with automatic then manual fallback, approval queue, export-policy extraction into the Audio Vault), regardless of its filename tags. Nothing in this gate may be read as donor gating.
 
 A target without the configured tags is left completely alone: no sync, no Studio preview, no mux — even when matching donor tracks are already available in the Vault. Coverage spans **all** jobs that consume the target, so an ineligible target is rejected at sync-job creation, at mux re-check and in Studio preview alike.

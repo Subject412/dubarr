@@ -57,7 +57,7 @@ The language used to pick the Reference Track: original language first, then any
 _Avoid_: sync language
 
 **Target Language**:
-The two-letter language of the track being muxed into the Target (e.g. pl).
+The language of the track being muxed into the Target, stored as its ISO 639-1 code (e.g. pl). Input accepts any form the lookup resolves — `pol`, `polish`, `Polish`, `pt-BR` — and is normalised on save, so a value that resolves to nothing is refused instead of being stored as a language that matches no track.
 _Avoid_: dub language, import language
 
 **Original Language**:

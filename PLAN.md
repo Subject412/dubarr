@@ -29,7 +29,7 @@ outstanding. Windows support is dropped (ADR-0016).
 - Untagged (`und`) donor tracks: manual pick only, never auto-imported.
 - Vault read-only 0444: ON (`settings.security.vault_read_only: true`).
 - `.bak` after verified mux: keep (`settings.mux.keep_bak: true`), opt-in auto-clean.
-- Track title in MKV: `Polski Dubbing` (configurable).
+- Track title in MKV: the language name (`Polish`), derived from the track's language tag; not configurable — 0.6.0 retired the setting (ADR-0004).
 - Verification: native Linux + Docker. Windows dropped, not deferred (ADR-0016).
 - arr integration: mock-first (httptest), no live instance.
 - Repo: `~/Dokumenty/GitHub/dubarr`, conventional commits on branches, merged via PR to `main`.
@@ -40,7 +40,7 @@ outstanding. Windows support is dropped (ADR-0016).
 - `force_ignore_tag_filter` honored only when `settings.security.allow_force_tag_override: true` (default false).
 - `sync.defaults.max_offset_sec` default 180 — enforced Go-side; the engine CLI has no such flag (only `--selftest`).
 - `--desktop` = open default browser at listen addr (`xdg-open`); no embedded webview v1.
-- Watch scan 10s (stability: two size checks ≥4s apart); arr sync manual + 5-min poll.
+- Watch scan 60s default for fresh installs (stability: two size checks ≥4s apart); a stored interval is never overwritten; arr sync manual + 5-min poll.
 - Go directive 1.26 (floor required by modernc.org/sqlite v1.62; toolchain 1.27), Rust edition 2021, module `github.com/Subject412/dubarr/backend`. Docker build image must be golang 1.27+.
 - License: MIT.
 
@@ -86,7 +86,7 @@ Full acceptance pass: container zero-env build+start, wizard creates admin + per
 ### M2 tasks (drafted at gate, 2026-11-22)
 - M2-1 — Mock-first arr integration: `internal/arr` client interface (Radarr + Sonarr REST v3) with a mock server implementation (ADR-0007); real client behind the same interface; table-driven tests against mocks (list series/movies, quality profiles, paths, test-connection). No live keys in tests.
 - M2-2 — Arr settings + key storage: base URLs + API keys stored via `internal/secrets` (UI-only entry, never env/chat); settings CRUD + connection-test endpoint; per-arr enabled flag.
-- M2-3 — Watch scanner: `internal/watch` periodic scan (10s default, settled), detects new media files in configured roots (canonicalized paths, symlink-confined), debounces, registers candidates in DB.
+- M2-3 — Watch scanner: `internal/watch` periodic scan (60s default since 0.6.0; a stored value is never overwritten), detects new media files in configured roots (canonicalized paths, symlink-confined), debounces, registers candidates in DB.
 - M2-4 — ffprobe probe + ISO-639-2: probe target/donor audio tracks (codec, channels, language tags) via ffprobe; map language names/codes to ISO-639-2; cache probe results per file (mtime-keyed).
 - M2-5 — Processing Gate eligibility: user-configured filename tags (empty default = neutral, ADR-0012; force-override OFF): eligible vs waiting_for_tags classification on candidates; rule-based export policy (policy tracks default, extras opt-in — settled). Donors are never tag-gated.
 - M2-6 — Approval Queue: backend queue API + frontend queue UI; donor drop → approval card pre-selected (target + matched donor, languages, eligibility badge); approve/reject actions (no mux in M2 — approval only).

@@ -102,6 +102,43 @@ type Stager struct {
 	tracks  TrackReader
 }
 
+// EnsureRoot creates the staging root with 0700 and proves it is usable: a path
+// that exists as a regular file, an unwritable parent or a read-only mount is
+// reported here — at boot — instead of mid-job. It never removes anything, so a
+// mount that is missing right now stays a warning rather than a data-loss
+// event, and a root that already exists keeps its mode. The per-job jobs/
+// folder is still created by the first Stage.
+func EnsureRoot(path string) error {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ErrNoWorkDir
+	}
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return fmt.Errorf("workdir: create work root %s: %w", path, err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("workdir: stat work root %s: %w", path, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("workdir: work root %s is not a directory", path)
+	}
+	probe, err := os.CreateTemp(path, ".write-probe-*")
+	if err != nil {
+		return fmt.Errorf("workdir: work root %s is not writable: %w", path, err)
+	}
+	name := probe.Name()
+	closeErr := probe.Close()
+	removeErr := os.Remove(name)
+	if closeErr != nil {
+		return fmt.Errorf("workdir: close write probe %s: %w", name, closeErr)
+	}
+	if removeErr != nil {
+		return fmt.Errorf("workdir: remove write probe %s: %w", name, removeErr)
+	}
+	return nil
+}
+
 // New validates deps and builds a Stager rooted at workDir. workDir is the
 // storage.paths.work_dir setting; the package never guesses it.
 func New(workDir string, tracks TrackReader) (*Stager, error) {

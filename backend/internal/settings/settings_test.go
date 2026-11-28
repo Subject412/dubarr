@@ -97,8 +97,8 @@ func TestSeedDefaults(t *testing.T) {
 	}
 
 	sp := decode[StoragePaths](t, all[KeyStoragePaths])
-	if sp.WorkDir != filepath.Join(dir, "work") {
-		t.Errorf("work dir = %q, want %q", sp.WorkDir, filepath.Join(dir, "work"))
+	if sp.WorkDir != filepath.Join(dir, "temp") {
+		t.Errorf("work dir = %q, want %q", sp.WorkDir, filepath.Join(dir, "temp"))
 	}
 	if sp.MediaRoots == nil {
 		t.Errorf("media_roots should be an empty slice, not null")
@@ -303,7 +303,7 @@ func TestSetRejectsNullAndNonObjectSections(t *testing.T) {
 		t.Errorf("security.options changed by a rejected write: %+v", sec)
 	}
 	sp := decode[StoragePaths](t, mustGet(t, s, ctx, KeyStoragePaths))
-	if sp.WorkDir != filepath.Join(dir, "work") || len(sp.MediaRoots) != 0 {
+	if sp.WorkDir != filepath.Join(dir, "temp") || len(sp.MediaRoots) != 0 {
 		t.Errorf("storage.paths changed by a rejected write: %+v", sp)
 	}
 	if sp.MediaRoots == nil {
@@ -471,6 +471,78 @@ func TestStorageOutputDirValidation(t *testing.T) {
 			}
 			if !tc.wantErr && err != nil {
 				t.Fatalf("Set(%q): %v", tc.dir, err)
+			}
+		})
+	}
+}
+
+// TestDefaultWorkDirIsTemp pins the documented temp-folder default: it is
+// <DATA_DIR>/temp, so a fresh install stages under a folder the operator can
+// see in Settings → Storage instead of an unset field that falls back at job
+// time, and it never shares the data volume's top level with the database.
+func TestDefaultWorkDirIsTemp(t *testing.T) {
+	cases := []struct{ dataDir, want string }{
+		{dataDir: "/config", want: "/config/temp"},
+		{dataDir: "/srv/dubarr", want: "/srv/dubarr/temp"},
+		{dataDir: "/srv/dubarr/", want: "/srv/dubarr/temp"},
+	}
+	for _, tc := range cases {
+		paths, ok := Defaults(tc.dataDir)[KeyStoragePaths].(StoragePaths)
+		if !ok {
+			t.Fatalf("Defaults(%q) has no storage.paths section", tc.dataDir)
+		}
+		if paths.WorkDir != tc.want {
+			t.Errorf("Defaults(%q).WorkDir = %q, want %q", tc.dataDir, paths.WorkDir, tc.want)
+		}
+	}
+	if paths := Defaults("")[KeyStoragePaths].(StoragePaths); paths.WorkDir != "" {
+		t.Errorf("Defaults(\"\").WorkDir = %q, want empty: no data dir to derive from", paths.WorkDir)
+	}
+}
+
+// TestStorageWorkDirVaultContainment pins that a temp folder inside the Audio
+// Vault is refused with ErrWorkDirInVault instead of being stored: the next
+// vault pass reorganises anything it finds there, so a staged copy would be
+// moved out from under a running job.
+func TestStorageWorkDirVaultContainment(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	if err := s.Seed(ctx, t.TempDir()); err != nil {
+		t.Fatalf("Seed: %v", err)
+	}
+	cases := []struct {
+		name    string
+		workDir string
+		refused bool
+	}{
+		{name: "sibling of the vault", workDir: "/temp"},
+		{name: "unset", workDir: ""},
+		{name: "vault itself", workDir: "/vault", refused: true},
+		{name: "inside the vault", workDir: "/vault/temp", refused: true},
+		{name: "vault with trailing slash", workDir: "/vault/", refused: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := json.Marshal(StoragePaths{VaultDir: "/vault", WorkDir: tc.workDir})
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			err = s.Set(ctx, KeyStoragePaths, raw)
+			if !tc.refused {
+				if err != nil {
+					t.Fatalf("Set(work_dir=%q): %v", tc.workDir, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Set accepted work_dir %q inside the vault", tc.workDir)
+			}
+			if !strings.Contains(err.Error(), "work_dir must not be") {
+				t.Fatalf("Set(work_dir=%q) = %v, want the work_dir containment message", tc.workDir, err)
+			}
+			// The rule itself carries a sentinel, so boot can recognise it.
+			if err := CheckWorkDirOutsideVault(tc.workDir, "/vault"); !errors.Is(err, ErrWorkDirInVault) {
+				t.Fatalf("CheckWorkDirOutsideVault(%q) = %v, want ErrWorkDirInVault", tc.workDir, err)
 			}
 		})
 	}

@@ -98,10 +98,13 @@ each on its own directory, never inside another. For a single combined bind
 | `storage.paths.watch_dir` | `/media/download` |
 | `storage.paths.vault_dir` | `/media/vault` |
 | `storage.paths.media_roots` | `/media/content` |
-| `storage.paths.work_dir` | `/config/work` |
+| `storage.paths.work_dir` | `/config/temp` |
 
-`/config/work` is also the default when `work_dir` is left unset
-(`<DATA_DIR>/work`). `storage.paths.output_dir` is only used when
+`/config/temp` is the default when `work_dir` is left unset (`<DATA_DIR>/temp`)
+and it is created at startup: put it on a fast local disk, not on the media
+mount. A separate volume mounted at that path is preferred for large jobs (a
+job stages full copies of its track and references). An existing install keeps
+the `work_dir` it already stored. `storage.paths.output_dir` is only used when
 `mux.options.output_mode=separate`, and it must not sit inside the vault.
 
 Or build and run without Compose from the repository root:

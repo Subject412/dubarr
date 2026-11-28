@@ -73,7 +73,7 @@ type Dependencies struct {
 	// Store persists queue transitions. Required.
 	Store JobStore
 	// Settings supplies storage.paths and languages.policy. Optional: without
-	// it, WORK_DIR falls back to DATA_DIR/work and the default policy is used.
+	// it, WORK_DIR falls back to DATA_DIR/temp and the default policy is used.
 	Settings SettingsReader
 	// DataDir is the fallback base for WORK_DIR when storage.paths.work_dir is
 	// unset.
@@ -318,7 +318,9 @@ func (w *Worker) stagingRoot(ctx context.Context) (string, error) {
 	return root, nil
 }
 
-// workDir reads storage.paths.work_dir, falling back to DATA_DIR/work.
+// workDir reads storage.paths.work_dir, falling back to DATA_DIR/temp — the
+// same path the seeded default names, so a degraded read cannot make the worker
+// stage into a folder boot never created.
 func (w *Worker) workDir(ctx context.Context) (string, error) {
 	if w.settings != nil {
 		raw, ok, err := w.settings.Get(ctx, settings.KeyStoragePaths)
@@ -330,7 +332,7 @@ func (w *Worker) workDir(ctx context.Context) (string, error) {
 		}
 	}
 	if strings.TrimSpace(w.dataDir) != "" {
-		return filepath.Join(w.dataDir, "work"), nil
+		return filepath.Join(w.dataDir, "temp"), nil
 	}
 	return "", ErrNoStagingRoot
 }

@@ -488,12 +488,14 @@ func (s *Store) notifyWrite(keys ...string) {
 func (s *Store) DB() *sql.DB { return s.db }
 
 // Defaults returns the settled first-run configuration. dataDir supplies the
-// default WORK_DIR (<DATA_DIR>/work); the other paths are deliberately empty so
-// the wizard forces an explicit choice.
+// default temp folder (<DATA_DIR>/temp), so the staging root resolves without
+// an operator setting and never shares the data volume's top level with the
+// database and logs; the other paths are deliberately empty so the wizard
+// forces an explicit choice.
 func Defaults(dataDir string) map[string]any {
 	workDir := ""
 	if dataDir != "" {
-		workDir = filepath.Join(dataDir, "work")
+		workDir = filepath.Join(dataDir, "temp")
 	}
 	return map[string]any{
 		KeyStoragePaths: StoragePaths{
@@ -890,6 +892,10 @@ var (
 	ErrProtectedKey = errors.New("settings: protected key")
 	ErrInvalidKey   = errors.New("settings: invalid key")
 	ErrInvalidValue = errors.New("settings: invalid value")
+	// ErrWorkDirInVault reports a temp folder that is the vault root or a path
+	// below it. A staged copy there would be reorganised by the next vault
+	// pass, so the setting is refused instead of silently accepted.
+	ErrWorkDirInVault = errors.New("settings: work_dir must not be the vault folder or inside it")
 )
 
 var protectedKeys = map[string]struct{}{
@@ -1089,6 +1095,29 @@ func validateStorage(p *StoragePaths) error {
 		if pathWithin(filepath.Clean(p.VaultDir), filepath.Clean(p.OutputDir)) {
 			return errors.New("output_dir must not be the vault folder or inside it")
 		}
+	}
+	// The temp folder is written constantly while a job runs. Inside the vault
+	// those staged copies would be reorganised by the next vault pass and the
+	// job would read a path that no longer exists, so it is refused here too.
+	if p.WorkDir != "" && p.VaultDir != "" {
+		if err := CheckWorkDirOutsideVault(p.WorkDir, p.VaultDir); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// CheckWorkDirOutsideVault reports ErrWorkDirInVault when workDir is the vault
+// root or a path below it. The comparison is lexical on cleaned paths, so a
+// temp folder that does not exist yet is still checked; boot calls it before
+// creating anything so a bad mount cannot stage files into the vault.
+func CheckWorkDirOutsideVault(workDir, vaultDir string) error {
+	workDir, vaultDir = strings.TrimSpace(workDir), strings.TrimSpace(vaultDir)
+	if workDir == "" || vaultDir == "" {
+		return nil
+	}
+	if pathWithin(filepath.Clean(vaultDir), filepath.Clean(workDir)) {
+		return fmt.Errorf("%w: %s", ErrWorkDirInVault, workDir)
 	}
 	return nil
 }

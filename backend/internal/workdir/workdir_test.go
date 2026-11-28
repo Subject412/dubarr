@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -286,6 +287,125 @@ func TestNewValidatesWorkDirAndStore(t *testing.T) {
 	}
 	if _, err := New(t.TempDir(), nil); err == nil {
 		t.Fatal("New with nil track reader succeeded")
+	}
+}
+
+// TestEnsureRootCreates0700 pins the boot contract: a missing staging root is
+// created with 0700, a second call is a no-op that keeps the mode, and the
+// write probe leaves nothing behind.
+func TestEnsureRootCreates0700(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "temp")
+	if err := EnsureRoot(root); err != nil {
+		t.Fatalf("EnsureRoot(%s): %v", root, err)
+	}
+	info, err := os.Stat(root)
+	if err != nil {
+		t.Fatalf("stat root: %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("root mode = %v, want a directory", info.Mode())
+	}
+	if perm := info.Mode().Perm(); perm != 0o700 {
+		t.Fatalf("root mode = %o, want 700", perm)
+	}
+
+	if err := EnsureRoot(root); err != nil {
+		t.Fatalf("second EnsureRoot(%s): %v", root, err)
+	}
+	again, err := os.Stat(root)
+	if err != nil {
+		t.Fatalf("stat root after second call: %v", err)
+	}
+	if again.Mode().Perm() != 0o700 {
+		t.Fatalf("root mode after second call = %o, want 700", again.Mode().Perm())
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatalf("read root: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("EnsureRoot left %d entries in the root, want none", len(entries))
+	}
+}
+
+// TestEnsureRootRefusesAFile pins that a path that exists as a regular file is
+// reported with the path in the error and left untouched.
+func TestEnsureRootRefusesAFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "temp")
+	if err := os.WriteFile(path, []byte("not a folder"), 0o600); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+	err := EnsureRoot(path)
+	if err == nil {
+		t.Fatalf("EnsureRoot(%s) succeeded over a regular file", path)
+	}
+	if !strings.Contains(err.Error(), path) {
+		t.Fatalf("error %q does not name the path %s", err, path)
+	}
+	data, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatalf("file was disturbed: %v", readErr)
+	}
+	if string(data) != "not a folder" {
+		t.Fatalf("file contents changed to %q", data)
+	}
+}
+
+// TestEnsureRootReportsAnUnwritableParent pins that an unusable parent is an
+// error, not a panic: boot turns it into a warning.
+func TestEnsureRootReportsAnUnwritableParent(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	parent := t.TempDir()
+	if err := os.Chmod(parent, 0o500); err != nil {
+		t.Fatalf("chmod parent: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(parent, 0o700) })
+
+	if err := EnsureRoot(filepath.Join(parent, "temp")); err == nil {
+		t.Fatal("EnsureRoot created a root under a 0500 parent")
+	}
+}
+
+// TestEnsureRootReportsAnUnwritableExistingRoot pins the write probe itself: a
+// root that already exists but refuses writes is still an error at boot.
+// MkdirAll succeeds on an existing directory, so this case is only caught by
+// the CreateTemp probe — deleting the probe must fail this test.
+func TestEnsureRootReportsAnUnwritableExistingRoot(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	root := filepath.Join(t.TempDir(), "temp")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatalf("seed root: %v", err)
+	}
+	if err := os.Chmod(root, 0o500); err != nil {
+		t.Fatalf("chmod root: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(root, 0o700) })
+
+	err := EnsureRoot(root)
+	if err == nil {
+		t.Fatal("EnsureRoot accepted an existing 0500 root, want a not-writable error")
+	}
+	if !strings.Contains(err.Error(), root) || !strings.Contains(err.Error(), "not writable") {
+		t.Fatalf("error %q does not report %s as not writable", err, root)
+	}
+	info, statErr := os.Stat(root)
+	if statErr != nil {
+		t.Fatalf("existing root disappeared: %v", statErr)
+	}
+	if perm := info.Mode().Perm(); perm != 0o500 {
+		t.Fatalf("root mode = %o, want 500 (an existing root keeps its mode)", perm)
+	}
+}
+
+// TestEnsureRootRefusesAnEmptyPath pins the shared sentinel: an empty temp
+// folder is ErrNoWorkDir, so boot and the workers report the same condition.
+func TestEnsureRootRefusesAnEmptyPath(t *testing.T) {
+	if err := EnsureRoot("   "); !errors.Is(err, ErrNoWorkDir) {
+		t.Fatalf("EnsureRoot(blank) = %v, want ErrNoWorkDir", err)
 	}
 }
 

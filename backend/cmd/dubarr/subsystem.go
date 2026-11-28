@@ -33,6 +33,7 @@ import (
 	"github.com/Subject412/dubarr/backend/internal/store"
 	"github.com/Subject412/dubarr/backend/internal/syncworker"
 	"github.com/Subject412/dubarr/backend/internal/watch"
+	"github.com/Subject412/dubarr/backend/internal/workdir"
 )
 
 // supervisorWiring is the collaborator set for the post-boot supervisor. It
@@ -120,6 +121,8 @@ func (s *subsystemSupervisor) adoptBoot(ctx context.Context, boot bootSubsystems
 	if err != nil {
 		// A snapshot is a diagnostic, not a gate: reconcile re-reads anyway.
 		paths = settings.StoragePaths{}
+	} else {
+		s.ensureWorkRoot(paths)
 	}
 	if boot.Scanner != nil {
 		s.scanner = boot.Scanner
@@ -141,6 +144,27 @@ func (s *subsystemSupervisor) adoptBoot(ctx context.Context, boot bootSubsystems
 		s.library = boot.Library
 		s.libraryStop = boot.LibraryStop
 	}
+}
+
+// ensureWorkRoot creates the temp folder at boot, so a missing folder, a
+// read-only mount or a path that is a regular file is visible now instead of at
+// the operator's first job. Every failure is a warning, not a boot error: the
+// appliance keeps serving and the job that needs it fails with its own error.
+//
+// A temp folder inside the vault is refused outright. Staged copies are deleted
+// per job, and the next vault pass would reorganise anything it finds there, so
+// creating the folder inside the vault is the one outcome worth preventing.
+func (s *subsystemSupervisor) ensureWorkRoot(paths settings.StoragePaths) {
+	workDir := strings.TrimSpace(paths.WorkDir)
+	err := settings.CheckWorkDirOutsideVault(workDir, strings.TrimSpace(paths.VaultDir))
+	if err == nil {
+		err = workdir.EnsureRoot(workDir)
+	}
+	if err == nil {
+		return
+	}
+	s.logger.Logger().Warn("temp folder is not usable; jobs will fail until it is fixed",
+		"component", "storage", "setting", "storage.paths.work_dir", "path", workDir, "error", err)
 }
 
 // HandleSettingsWrite is the settings.Store write hook: after a save commits it

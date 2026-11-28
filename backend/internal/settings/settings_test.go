@@ -755,6 +755,71 @@ func TestStoredTrackTitleIsRetired(t *testing.T) {
 	}
 }
 
+// TestImportsOptionsIsNotAKnownKey is U11: the donor markers are a fixed part of
+// how the queue pairs siblings, so `imports.options` is no longer a settings
+// section at all. A row written before 0.6.0 must not break a settings read: All
+// skips unknown keys, so the row becomes invisible without deleting it.
+func TestImportsOptionsIsNotAKnownKey(t *testing.T) {
+	ctx := context.Background()
+
+	if isKnownKey(KeyImportsOptions) {
+		t.Errorf("IsKnownKey(%q) = true, want false: the section is retired", KeyImportsOptions)
+	}
+	for _, key := range KnownKeys() {
+		if key == KeyImportsOptions {
+			t.Errorf("KnownKeys still lists %q", KeyImportsOptions)
+		}
+	}
+	if _, ok := Defaults("")[KeyImportsOptions]; ok {
+		t.Errorf("Defaults still carries %q", KeyImportsOptions)
+	}
+
+	s := openStore(t)
+	if err := s.Seed(ctx, t.TempDir()); err != nil {
+		t.Fatalf("Seed: %v", err)
+	}
+	legacy := `{"donor_patterns":["CUSTOM"]}`
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, '2026-01-01 00:00:00')`,
+		KeyImportsOptions, legacy); err != nil {
+		t.Fatalf("write legacy row: %v", err)
+	}
+
+	// A legacy row must not make the settings read fail or leak into the
+	// envelope the SPA renders.
+	all, err := s.All(ctx)
+	if err != nil {
+		t.Fatalf("All with a retired row: %v", err)
+	}
+	if _, ok := all[KeyImportsOptions]; ok {
+		t.Errorf("All served the retired %q section: %s", KeyImportsOptions, all[KeyImportsOptions])
+	}
+	if _, ok, err := s.Get(ctx, KeyImportsOptions); !errors.Is(err, ErrUnknownKey) || ok {
+		t.Errorf("Get(%q) = ok=%v err=%v, want ErrUnknownKey", KeyImportsOptions, ok, err)
+	}
+	exp, err := s.Export(ctx)
+	if err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+	if _, ok := exp.Settings[KeyImportsOptions]; ok {
+		t.Errorf("Export served the retired %q section", KeyImportsOptions)
+	}
+	if err := s.Set(ctx, KeyImportsOptions, json.RawMessage(legacy)); !errors.Is(err, ErrUnknownKey) {
+		t.Errorf("Set(%q) = %v, want ErrUnknownKey", KeyImportsOptions, err)
+	} else if !strings.Contains(err.Error(), KeyImportsOptions) {
+		t.Errorf("Set error %q should name %s", err, KeyImportsOptions)
+	}
+
+	// The stored bytes are left alone: no migration, no rewrite.
+	var stored string
+	if err := s.db.QueryRowContext(ctx, `SELECT value FROM settings WHERE key = ?`, KeyImportsOptions).Scan(&stored); err != nil {
+		t.Fatalf("read stored row: %v", err)
+	}
+	if stored != legacy {
+		t.Errorf("stored row changed: %s", stored)
+	}
+}
+
 // TestDefaultsHaveNoTrackTitle: a fresh install ships no track title at all —
 // the muxer names the track after its language.
 func TestDefaultsHaveNoTrackTitle(t *testing.T) {

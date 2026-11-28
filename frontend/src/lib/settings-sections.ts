@@ -74,12 +74,6 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
     description: 'Donor-folder scanning cadence and stability window.',
   },
   {
-    key: 'imports.options',
-    title: 'Donor patterns',
-    description:
-      'Sibling filenames that mark a dropped file as a donor dub. Matching is case-insensitive; a pattern without * is a substring match, with * a glob.',
-  },
-  {
     key: 'arr.connections',
     title: 'Radarr / Sonarr connections',
     description:

@@ -1,10 +1,8 @@
-import { screen, waitFor, within } from '@testing-library/react'
+import { screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 import { SettingsPage } from '../pages/Settings'
 import { isMethod, jsonResponse, renderWithProviders } from '../test/helpers'
-
-type SettingsBody = { settings: Record<string, unknown> }
 
 function mockSettings(
   settings: Record<string, unknown>,
@@ -23,57 +21,19 @@ function mockSettings(
   return fetchMock
 }
 
-function lastPut(fetchMock: ReturnType<typeof vi.fn>): SettingsBody {
-  const put = fetchMock.mock.calls.find(([, init]) => isMethod(init, 'PUT'))
-  expect(put).toBeDefined()
-  return JSON.parse(String(put?.[1]?.body)) as SettingsBody
-}
-
-describe('donor patterns settings card (imports.options)', () => {
-  it('renders the stored patterns and saves an added one via the settings PUT', async () => {
-    const user = userEvent.setup()
-    const fetchMock = mockSettings({
-      'imports.options': { donor_patterns: ['PL.DUB'] },
-    })
+// U11: the three donor markers are fixed in the backend, so the card that let
+// an operator edit them is gone. A legacy appliance can still serve the row; it
+// must not resurrect a control nothing reads any more.
+describe('donor markers are fixed (U11)', () => {
+  it('renders no donor-pattern card or control, even when a legacy row is served', async () => {
+    mockSettings({ 'imports.options': { donor_patterns: ['PL.DUB'] } })
     renderWithProviders(<SettingsPage />, { route: '/settings' })
 
-    expect(await screen.findByRole('heading', { name: 'Donor patterns' })).toBeInTheDocument()
-    expect(screen.getByText('PL.DUB')).toBeInTheDocument()
-
-    await user.type(screen.getByLabelText('Add donor pattern'), '*LEKTOR.PL*')
-    const card = screen.getByRole('heading', { name: 'Donor patterns' }).closest('section')
-    expect(card).not.toBeNull()
-    await user.click(within(card as HTMLElement).getByRole('button', { name: 'Add' }))
-    await user.click(screen.getByLabelText('Save Donor patterns'))
-
-    await waitFor(() => {
-      expect(fetchMock.mock.calls.some(([, init]) => isMethod(init, 'PUT'))).toBe(true)
-    })
-    const body = lastPut(fetchMock)
-    expect(Object.keys(body.settings)).toEqual(['imports.options'])
-    expect(body.settings['imports.options']).toEqual({
-      donor_patterns: ['PL.DUB', '*LEKTOR.PL*'],
-    })
-    expect(await screen.findByText('saved')).toBeInTheDocument()
-  })
-
-  it('removes a pattern before saving', async () => {
-    const user = userEvent.setup()
-    const fetchMock = mockSettings({
-      'imports.options': { donor_patterns: ['PL.DUB', '*LEKTOR.PL*'] },
-    })
-    renderWithProviders(<SettingsPage />, { route: '/settings' })
-
-    expect(await screen.findByRole('heading', { name: 'Donor patterns' })).toBeInTheDocument()
-    await user.click(screen.getByLabelText('Remove PL.DUB'))
-    await user.click(screen.getByLabelText('Save Donor patterns'))
-
-    await waitFor(() => {
-      expect(fetchMock.mock.calls.some(([, init]) => isMethod(init, 'PUT'))).toBe(true)
-    })
-    expect(lastPut(fetchMock).settings['imports.options']).toEqual({
-      donor_patterns: ['*LEKTOR.PL*'],
-    })
+    expect(await screen.findByRole('heading', { name: 'Storage paths' })).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'Donor patterns' })).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('Add donor pattern')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('Save Donor patterns')).not.toBeInTheDocument()
+    expect(document.getElementById('settings-imports-options')).toBeNull()
   })
 })
 

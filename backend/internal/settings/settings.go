@@ -61,16 +61,21 @@ const (
 	KeyWatchOptions    = "watch.options"
 	KeyArrOptions      = "arr.options"
 	KeyArrConnections  = "arr.connections"
-	KeyImportsOptions  = "imports.options"
 	KeyAudioOptions    = "audio.options"
 	KeyVaultNaming     = "vault.naming"
 )
 
+// KeyImportsOptions was the donor-pattern section. It is retired (U11): the
+// three markers are fixed in queue.DonorPatterns(), so this section is neither
+// served nor writable. The name stays only so the orphan row a pre-0.6.0
+// install left in the kv table can be named; All and Export skip it because it
+// is not a known key, and the row itself is never deleted or rewritten.
+const KeyImportsOptions = "imports.options"
+
 var knownKeys = []string{
 	KeyStoragePaths, KeyLanguagesPolicy, KeyTargetTagFilter, KeySyncDefaults,
 	KeySyncStrategy, KeySecurityOptions, KeyMuxOptions, KeyWatchOptions,
-	KeyArrOptions, KeyArrConnections, KeyImportsOptions, KeyAudioOptions,
-	KeyVaultNaming,
+	KeyArrOptions, KeyArrConnections, KeyAudioOptions, KeyVaultNaming,
 }
 
 // KnownKeys returns the writable section keys in stable order.
@@ -394,13 +399,6 @@ type ArrOptions struct {
 	PollIntervalSec int `json:"poll_interval_sec"`
 }
 
-// ImportsOptions configure approval-queue donor pairing. DonorPatterns are
-// matched case-insensitively against sibling filenames; a pattern without '*'
-// is a substring match, with '*' it is a glob (e.g. "PL.DUB", "*LEKTOR.PL*").
-type ImportsOptions struct {
-	DonorPatterns []string `json:"donor_patterns"`
-}
-
 // ArrConnection is one Radarr or Sonarr instance. The API key is deliberately
 // absent: it lives in the encrypted secrets store and only a masked suffix is
 // derived when the API lists connections.
@@ -547,9 +545,6 @@ func Defaults(dataDir string) map[string]any {
 		},
 		KeyArrConnections: ArrConnections{
 			Instances: []ArrConnection{},
-		},
-		KeyImportsOptions: ImportsOptions{
-			DonorPatterns: []string{"PL.DUB"},
 		},
 		KeyAudioOptions: AudioOptions{
 			// Shipped default: no rules, no transcoding (ADR-0010).
@@ -1027,13 +1022,6 @@ func normalize(key string, raw json.RawMessage) (string, error) {
 			err = validateArrConnections(&p)
 		}
 		v = p
-	case KeyImportsOptions:
-		var p ImportsOptions
-		err = strict(raw, &p)
-		if err == nil {
-			err = validateImports(&p)
-		}
-		v = p
 	case KeyAudioOptions:
 		var p AudioOptions
 		err = strict(raw, &p)
@@ -1292,18 +1280,6 @@ func validateArrConnections(p *ArrConnections) error {
 			return fmt.Errorf("instance %d: base_url must be an absolute http(s) URL", i)
 		}
 		inst.BaseURL = strings.TrimRight(inst.BaseURL, "/")
-	}
-	return nil
-}
-
-func validateImports(p *ImportsOptions) error {
-	if p.DonorPatterns == nil {
-		p.DonorPatterns = []string{}
-	}
-	for _, pattern := range p.DonorPatterns {
-		if strings.TrimSpace(pattern) == "" {
-			return errors.New("donor_patterns entries must not be empty")
-		}
 	}
 	return nil
 }

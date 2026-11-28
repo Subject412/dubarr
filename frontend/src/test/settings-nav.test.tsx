@@ -41,7 +41,6 @@ const SETTINGS = {
   'mux.options': { output_mode: 'replace' },
   'watch.options': { scan_interval_sec: 10, stability_check_interval_sec: 4 },
   'arr.options': { poll_interval_sec: 300 },
-  'imports.options': { donor_patterns: ['PL.DUB'] },
 }
 
 /** jsdom has no IntersectionObserver; tests drive entries through this stub. */
@@ -127,6 +126,20 @@ describe('settings submenu (issue #13)', () => {
     const links = within(submenu()).getAllByRole('link')
     expect(links).toHaveLength(SETTINGS_SECTIONS.length)
     expect(links.map((link) => link.textContent)).toEqual(SETTINGS_SECTIONS.map((s) => s.title))
+  })
+
+  // U11: the donor markers are fixed in the backend, so the category is gone
+  // from the nav and from the page — the operator picks a donor by hand when no
+  // sibling carries one of the three markers.
+  it('has no donor-patterns category', async () => {
+    mockFetch()
+    renderShell('/settings')
+    expect(await screen.findByRole('heading', { name: 'Storage paths' })).toBeInTheDocument()
+
+    expect(within(submenu()).queryByRole('link', { name: 'Donor patterns' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'Donor patterns' })).not.toBeInTheDocument()
+    expect(document.getElementById('settings-imports-options')).toBeNull()
+    expect(within(submenu()).getAllByRole('link')).toHaveLength(SETTINGS_SECTIONS.length)
   })
 
   it('gives every rendered section the id derived from its section key', async () => {

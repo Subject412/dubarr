@@ -89,8 +89,12 @@ function blockerOf(item: QueueItem): Blocker {
 
 /** The next step for that blocker, pointing at the thing the operator can change. */
 const blockerNextStep: Record<Blocker, string> = {
-  donor: 'Drop a donor release matching the configured pattern next to the target in the watch folder, then refresh.',
-  donor_pattern: 'Configure the donor filename pattern under Settings → Imports, then refresh.',
+  donor:
+    'Drop a donor release carrying one of the built-in donor markers (PL.DUB, LEKTOR.PL, DUB.PL) next to the target in the watch folder, then refresh.',
+  // The markers are a fixed fallback until pairing goes by release identity
+  // (#130); there is no setting to change, so point at the card's sibling list.
+  donor_pattern:
+    'No sibling filename carries a built-in donor marker. Those markers are fixed until donors are paired by release identity (#130) — pick the donor by hand on the approval card.',
   gate_tag: 'Add the required filename tag to the target, then refresh.',
   gate_excluded: 'Remove the excluded filename tag from the target, then refresh.',
   mount: 'Check that the library mount is reachable, then refresh.',
@@ -291,7 +295,8 @@ function DonorLine({ item }: { item: QueueItem }) {
   if (item.donor_candidates.length === 0) {
     return (
       <p className="text-sm text-amber-300/90">
-        No donor paired — drop a release matching the configured donor pattern next to the target.
+        No donor paired — drop a release carrying a built-in donor marker (PL.DUB, LEKTOR.PL,
+        DUB.PL) next to the target, or pick a sibling by hand.
       </p>
     )
   }

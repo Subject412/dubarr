@@ -28,10 +28,30 @@ import (
 	"github.com/Subject412/dubarr/backend/internal/store"
 )
 
-// defaultDonorPatterns pairs a target with sibling releases whose filename
-// carries the configured dubbing marker. It matches the fixture drop
-// ("Minions ... PL.DUB ... mp4" next to a tag-eligible target).
-var defaultDonorPatterns = []string{"PL.DUB"}
+// donorPatterns are the substrings that mark a sibling file as a donor for the
+// target in the same folder. They are a property of how Polish dubs are named in
+// a library, not a per-install preference: a typo in a free-text setting used to
+// mean "no donor" with no error anywhere, so the list is hardcoded (U11) and
+// kept in one place so the pairing and the blocked reason can never disagree.
+//
+// The matching itself is pairDonors': a pattern without '*' is a substring of
+// the basename, compared case-insensitively, so "pl.dub" and "PL.DUB" are the
+// same marker and "PL.DUBB" still pairs. Pairing on release identity instead of
+// filenames is #130, not a change to this list.
+//
+// The markers live in an unexported array and are only ever handed out by
+// DonorPatterns(), which copies: no caller can alias the backing storage, so a
+// slice it mutates cannot rewrite the markers for every other caller.
+var donorPatterns = [...]string{"PL.DUB", "LEKTOR.PL", "DUB.PL"}
+
+// DonorPatterns returns a copy of the fixed donor markers, in declaration order.
+// It copies on every call so callers (and tests) observe the list by value and
+// cannot mutate the markers the pairing and the blocked reason read.
+func DonorPatterns() []string {
+	out := make([]string, len(donorPatterns))
+	copy(out, donorPatterns[:])
+	return out
+}
 
 // Dependencies are the collaborators the queue API needs.
 type Dependencies struct {
@@ -140,10 +160,11 @@ type QueueItem struct {
 	// the MatchBlocker* values. Clients branch on this and never parse
 	// MatchReason, so rewording the prose cannot change what the UI offers.
 	MatchBlocker string `json:"match_blocker"`
-	// DonorPatterns are the configured donor filename patterns (blank entries
-	// dropped), so the UI can tell "no donor pattern is configured" from "no
-	// sibling matched the pattern" without reading MatchReason. Empty means
-	// nothing is configured.
+	// DonorPatterns is the marker list the pairing used (blank entries
+	// dropped), so the UI can tell "nothing was searched for" from "no sibling
+	// matched the marker" without reading MatchReason. Since U11 the list is
+	// the fixed donorPatterns, so the API always reports it non-empty; the
+	// field stays because clients branch on it.
 	DonorPatterns []string `json:"donor_patterns"`
 }
 
@@ -446,7 +467,10 @@ func (s *Service) handleList(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "could not read the approval queue")
 		return
 	}
-	patterns := s.donorPatterns(r.Context())
+	// The markers are fixed (U11): the pairing, the item's donor_patterns report
+	// and the blocked reason all read the same list, taken by value so nothing
+	// in this handler can alias the package's markers.
+	patterns := DonorPatterns()
 	// Read the escape hatch once: the diagnostics report it once and the card
 	// uses it to decide whether to offer the override, so one read keeps the
 	// list and the badge on the same value. The derivation itself no longer
@@ -633,7 +657,7 @@ func (s *Service) handleApprove(w http.ResponseWriter, r *http.Request) {
 	// Pair the donor exactly as the list endpoint does. The listing error is a
 	// different failure from "no matching sibling": an unreadable folder must
 	// not be reported as a missing donor.
-	donors, donorErr := pairDonors(target, s.donorPatterns(r.Context()))
+	donors, donorErr := pairDonors(target, DonorPatterns())
 	if donorErr != nil {
 		writeError(w, http.StatusConflict, "the target folder could not be read - check the library mount")
 		return
@@ -729,23 +753,6 @@ func (s *Service) handleReject(w http.ResponseWriter, r *http.Request) {
 			"component", "queue", "queue_id", id, "error", err)
 	}
 	writeJSON(w, http.StatusOK, transitionResponse{ID: id, Status: "ignored"})
-}
-
-// donorPatterns reads imports.options from the settings kv, falling back to the
-// fixture-compatible default when the section is missing or unset.
-func (s *Service) donorPatterns(ctx context.Context) []string {
-	if s.settings == nil {
-		return defaultDonorPatterns
-	}
-	raw, ok, err := s.settings.Get(ctx, settings.KeyImportsOptions)
-	if err != nil || !ok {
-		return defaultDonorPatterns
-	}
-	var opts settings.ImportsOptions
-	if err := json.Unmarshal(raw, &opts); err != nil || len(opts.DonorPatterns) == 0 {
-		return defaultDonorPatterns
-	}
-	return opts.DonorPatterns
 }
 
 // pairDonors lists regular sibling files of targetPath whose basename matches

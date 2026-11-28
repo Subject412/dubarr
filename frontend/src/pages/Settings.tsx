@@ -941,17 +941,12 @@ export function SettingsPage() {
                     <option value="separate">Write to the mux output folder</option>
                   </Select>
                 </Field>
-                <Field
-                  label="Track title written into Matroska"
-                  htmlFor="track-title"
-                  help={settingsHelp('mux.options', 'track_title_in_mkv')}
-                >
-                  <Input
-                    id="track-title"
-                    value={draft.track_title_in_mkv}
-                    onChange={(event) => update({ track_title_in_mkv: event.target.value })}
-                  />
-                </Field>
+                {/* U10: the track title is not a setting. Nothing to configure. */}
+                <p className="text-xs text-zinc-500">
+                  The new track is named after its language (Polish, French …) and tagged{' '}
+                  <code className="font-mono text-zinc-400">pol</code>,{' '}
+                  <code className="font-mono text-zinc-400">fre</code> … in the container.
+                </p>
               </>
             )}
           </Section>

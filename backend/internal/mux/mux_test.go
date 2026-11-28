@@ -490,13 +490,13 @@ func TestMuxPublishesAtomically(t *testing.T) {
 	}
 
 	// Exactly one audio track was appended, tagged with the vault track's ISO2
-	// language and the dub marker ("PL DUB").
+	// language and named after it (U10: "Polish", not a free-text title).
 	if got, want := len(audioStreams(afterProbe)), len(audioStreams(beforeProbe))+1; got != want {
 		t.Fatalf("audio tracks = %d, want %d", got, want)
 	}
-	added, ok := findAudio(afterProbe, "pl", "PL DUB")
+	added, ok := findAudio(afterProbe, "pl", "Polish")
 	if !ok {
-		t.Fatalf("no pl/PL DUB audio track in %+v", audioStreams(afterProbe))
+		t.Fatalf("no pl/Polish audio track in %+v", audioStreams(afterProbe))
 	}
 	if ietf := audioTrackIETF(t, h.target); ietf != "pl" {
 		t.Errorf("LanguageIETF = %q, want pl", ietf)
@@ -515,7 +515,7 @@ func TestMuxPublishesAtomically(t *testing.T) {
 	// Command shape (ADR-0004): target as input, then the
 	// appended audio with language, title, sync and default-flag options.
 	joined := strings.Join(res.Command, " ")
-	for _, want := range []string{"--language 0:pl", "--track-name 0:PL DUB", "--sync 0:-750", "--default-track-flag 0:no"} {
+	for _, want := range []string{"--language 0:pl", "--track-name 0:Polish", "--sync 0:-750", "--default-track-flag 0:no"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("command %q missing %q", joined, want)
 		}
@@ -525,14 +525,155 @@ func TestMuxPublishesAtomically(t *testing.T) {
 func TestExplicitTrackTitleOverridesDubMarker(t *testing.T) {
 	h := newHarness(t)
 	job := h.job()
-	job.TrackTitle = "Polski Dubbing"
+	job.TrackTitle = "Director commentary"
 	if _, err := New(Dependencies{}).Mux(context.Background(), job); err != nil {
 		t.Fatalf("Mux: %v", err)
 	}
 	doc := probeFile(t, h.target)
-	if _, ok := findAudio(doc, "pl", "Polski Dubbing"); !ok {
-		t.Errorf("no pl/Polski Dubbing track in %+v", audioStreams(doc))
+	if _, ok := findAudio(doc, "pl", "Director commentary"); !ok {
+		t.Errorf("no pl/Director commentary track in %+v", audioStreams(doc))
 	}
+}
+
+// TestTrackTitleIsTheLanguageName is U10: with no explicit title the appended
+// track is named after its language, so a player shows "Polish" rather than a
+// bare code or whatever free text an operator once typed.
+func TestTrackTitleIsTheLanguageName(t *testing.T) {
+	h := newHarness(t)
+	if _, err := New(Dependencies{}).Mux(context.Background(), h.job()); err != nil {
+		t.Fatalf("Mux(pl): %v", err)
+	}
+	doc := probeFile(t, h.target)
+	if _, ok := findAudio(doc, "pl", "Polish"); !ok {
+		t.Errorf("no pl/Polish track in %+v", audioStreams(doc))
+	}
+
+	other := newHarness(t)
+	fr := other.job()
+	fr.TargetLangISO2 = "fr"
+	// The queued candidate is the pl track; a fr job has none to disambiguate.
+	fr.Candidates = nil
+	res, err := New(Dependencies{}).Mux(context.Background(), fr)
+	if err != nil {
+		t.Fatalf("Mux(fr): %v", err)
+	}
+	if joined := strings.Join(res.Command, " "); !strings.Contains(joined, "--track-name 0:French") {
+		t.Errorf("command %q missing --track-name 0:French", joined)
+	}
+	if res.TrackTitle != "French" {
+		t.Errorf("result track title = %q, want French", res.TrackTitle)
+	}
+}
+
+// TestTrackTitleFallsBackForAnUnknownLanguage: a language the table cannot
+// resolve still gets a name, and Mux never hands --track-name an empty value.
+// The fallback lives in DefaultTrackTitle, the only source of a title when the
+// job carries none.
+func TestTrackTitleFallsBackForAnUnknownLanguage(t *testing.T) {
+	if got, want := DefaultTrackTitle("zz"), "ZZ DUB"; got != want {
+		t.Errorf("DefaultTrackTitle(zz) = %q, want %q", got, want)
+	}
+	for _, unknown := range []string{"und", "unknown", "", "zz"} {
+		got := DefaultTrackTitle(unknown)
+		if got == "" {
+			t.Errorf("DefaultTrackTitle(%q) is empty; --track-name must never be", unknown)
+		}
+		if !strings.HasSuffix(got, " DUB") {
+			t.Errorf("DefaultTrackTitle(%q) = %q, want the dub marker fallback", unknown, got)
+		}
+	}
+}
+
+// TestTrackTitleIsTitleCasedNotUpper pins the casing the owner asked for: the
+// language name as written, not the old upper-case badge.
+func TestTrackTitleIsTitleCasedNotUpper(t *testing.T) {
+	if got := DefaultTrackTitle("pl"); got != "Polish" {
+		t.Errorf("DefaultTrackTitle(pl) = %q, want Polish", got)
+	}
+	if got := DefaultTrackTitle("pl"); got == strings.ToUpper(got) {
+		t.Errorf("DefaultTrackTitle(pl) = %q, want title case not upper case", got)
+	}
+}
+
+// TestMuxLanguageResolvesOrWritesUnd pins the guard the mux path applies before
+// mkvmerge: a language the table knows keeps its ISO 639-1 code
+// (`--language 0:pl`), and a code mkvmerge would reject becomes und instead of
+// killing the job.
+func TestMuxLanguageResolvesOrWritesUnd(t *testing.T) {
+	for _, lang := range []string{"pl", "fr", "de", "zh"} {
+		if got := muxLanguage(lang); got != lang {
+			t.Errorf("muxLanguage(%q) = %q, want the resolvable code unchanged", lang, got)
+		}
+	}
+	for _, lang := range []string{"zz", "qq", "", "und", "unknown"} {
+		if got := muxLanguage(lang); got != "und" {
+			t.Errorf("muxLanguage(%q) = %q, want und", lang, got)
+		}
+	}
+}
+
+// TestUnresolvedLanguageMuxesAsUnd is the defect this unit fixes: a target
+// language the table cannot resolve ("zz") used to reach mkvmerge verbatim,
+// where `--language 0:zz` exits 2 ("'zz' is not a valid ISO 639-2 language
+// code") and the job died without producing a file. It now writes
+// `--language 0:und` and keeps the "ZZ DUB" title. This drives the real
+// mkvmerge the fixture harness already provides, so the assertions cover the
+// built argv and the published file rather than a fake runner.
+func TestUnresolvedLanguageMuxesAsUnd(t *testing.T) {
+	h := newHarness(t)
+	var warnings []string
+	job := h.job()
+	job.TargetLangISO2 = "zz"
+	// The queued candidate is Polish; a zz job has no track to pair with it.
+	job.Candidates = nil
+
+	res, err := New(Dependencies{Warnf: func(format string, args ...any) {
+		warnings = append(warnings, fmt.Sprintf(format, args...))
+	}}).Mux(context.Background(), job)
+	if err != nil {
+		t.Fatalf("Mux(zz): %v", err)
+	}
+
+	joined := strings.Join(res.Command, " ")
+	if !strings.Contains(joined, "--language 0:und") {
+		t.Errorf("command %q missing --language 0:und", joined)
+	}
+	if strings.Contains(joined, "0:zz") {
+		t.Errorf("command %q still hands mkvmerge the unresolvable code", joined)
+	}
+	if !strings.Contains(joined, "--track-name 0:ZZ DUB") {
+		t.Errorf("command %q missing --track-name 0:ZZ DUB", joined)
+	}
+	if res.Language != "und" || res.TrackTitle != "ZZ DUB" {
+		t.Errorf("result language/title = %q/%q, want und/ZZ DUB", res.Language, res.TrackTitle)
+	}
+
+	// The substitution is announced, never silent, and named after the code.
+	named := 0
+	for _, w := range warnings {
+		if strings.Contains(w, "zz") {
+			named++
+		}
+	}
+	if named != 1 {
+		t.Errorf("warnings = %q, want exactly one line naming zz", warnings)
+	}
+
+	// The file published, with exactly one appended track under the dub title.
+	doc := probeFile(t, h.target)
+	if got, want := len(audioStreams(doc)), 2; got != want {
+		t.Errorf("audio tracks = %d, want %d", got, want)
+	}
+	titled := 0
+	for _, s := range audioStreams(doc) {
+		if s.Title == "ZZ DUB" {
+			titled++
+		}
+	}
+	if titled != 1 {
+		t.Errorf("tracks titled ZZ DUB = %d in %+v, want exactly one", titled, audioStreams(doc))
+	}
+	noTempsLeft(t, h.target)
 }
 
 func TestAmbiguousQueuedTracksAbortBeforeWrites(t *testing.T) {
@@ -903,8 +1044,8 @@ func TestConcurrentMuxesOnDistinctTargetsPublishIndependently(t *testing.T) {
 		if got, want := len(audioStreams(doc)), before[i]+1; got != want {
 			t.Errorf("target %d audio tracks = %d, want %d", i, got, want)
 		}
-		if _, ok := findAudio(doc, "pl", "PL DUB"); !ok {
-			t.Errorf("target %d has no pl/PL DUB track", i)
+		if _, ok := findAudio(doc, "pl", "Polish"); !ok {
+			t.Errorf("target %d has no pl/Polish track", i)
 		}
 	}
 }
@@ -1184,8 +1325,8 @@ func TestSeparateModeWritesDeterministicOutputAndKeepsTarget(t *testing.T) {
 	if got, want := len(audioStreams(doc)), beforeAudio+1; got != want {
 		t.Fatalf("output audio tracks = %d, want %d", got, want)
 	}
-	if _, ok := findAudio(doc, "pl", "PL DUB"); !ok {
-		t.Errorf("no pl/PL DUB audio track in %+v", audioStreams(doc))
+	if _, ok := findAudio(doc, "pl", "Polish"); !ok {
+		t.Errorf("no pl/Polish audio track in %+v", audioStreams(doc))
 	}
 }
 
@@ -1348,8 +1489,8 @@ func TestSeparateModePublishesWhenTargetChangesMidMux(t *testing.T) {
 	if got, want := len(audioStreams(doc)), before+1; got != want {
 		t.Fatalf("deliverable audio tracks = %d, want %d", got, want)
 	}
-	if _, ok := findAudio(doc, "pl", "PL DUB"); !ok {
-		t.Errorf("no pl/PL DUB track in %+v", audioStreams(doc))
+	if _, ok := findAudio(doc, "pl", "Polish"); !ok {
+		t.Errorf("no pl/Polish track in %+v", audioStreams(doc))
 	}
 	entries, err := os.ReadDir(outDir)
 	if err != nil {

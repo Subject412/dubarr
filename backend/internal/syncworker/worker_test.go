@@ -277,9 +277,11 @@ func TestProcessOnceRunsExecuteMuxRescanChain(t *testing.T) {
 }
 
 // TestProcessOnceToleratesRetiredKeepBakRow: a mux.options row stored before
-// keep_bak was retired must still feed the muxer — the deleted key is dropped
-// on read rather than failing the decode — and the job carries the surviving
-// options. This replaces the old keep_bak -> mux.Job plumbing test.
+// keep_bak and the free-text track title were retired must still feed the
+// muxer — the deleted keys are dropped on read rather than failing the decode —
+// and the job carries no title, so the muxer names the track after its language
+// (U10) instead of resurrecting the stored one. This replaces the old
+// keep_bak -> mux.Job plumbing test.
 func TestProcessOnceToleratesRetiredKeepBakRow(t *testing.T) {
 	ctx := context.Background()
 	r := newRig(t)
@@ -300,8 +302,11 @@ func TestProcessOnceToleratesRetiredKeepBakRow(t *testing.T) {
 	if len(mx.jobs) != 1 {
 		t.Fatalf("Mux calls = %d, want 1", len(mx.jobs))
 	}
-	if got := mx.jobs[0].TrackTitle; got != "Polski Dubbing" {
-		t.Errorf("mux track title = %q, want the stored title", got)
+	if got := mx.jobs[0].TrackTitle; got != "" {
+		t.Errorf("mux track title = %q, want the stale stored title ignored", got)
+	}
+	if got := mx.jobs[0].OutputMode; got != settings.MuxOutputReplace {
+		t.Errorf("mux output mode = %q, want %q", got, settings.MuxOutputReplace)
 	}
 	rec, ok, err := r.store.SyncJobByID(ctx, jobID)
 	if err != nil || !ok {
@@ -561,7 +566,7 @@ func TestProcessOnceSeparateModeSkipsRescanAndRecordsOutputPath(t *testing.T) {
 		WorkDir: r.workDir, VaultDir: vaultDir, OutputDir: outDir,
 	})
 	setMuxOptions(t, r.settings, settings.MuxOptions{
-		TrackTitleInMKV: "Polski Dubbing", OutputMode: settings.MuxOutputSeparate,
+		OutputMode: settings.MuxOutputSeparate,
 	})
 
 	jobID := r.newJob(t)
@@ -625,7 +630,7 @@ func TestProcessOnceSeparateModeRejectsVaultOutputDir(t *testing.T) {
 		t.Fatalf("write storage.paths row: %v", err)
 	}
 	setMuxOptions(t, r.settings, settings.MuxOptions{
-		TrackTitleInMKV: "Polski Dubbing", OutputMode: settings.MuxOutputSeparate,
+		OutputMode: settings.MuxOutputSeparate,
 	})
 
 	jobID := r.newJob(t)
@@ -662,7 +667,7 @@ func TestProcessOnceSeparateModeRequiresExistingOutputDir(t *testing.T) {
 				WorkDir: r.workDir, VaultDir: filepath.Join(t.TempDir(), "vault"), OutputDir: tc.dir,
 			})
 			setMuxOptions(t, r.settings, settings.MuxOptions{
-				TrackTitleInMKV: "Polski Dubbing", OutputMode: settings.MuxOutputSeparate,
+				OutputMode: settings.MuxOutputSeparate,
 			})
 			jobID := r.newJob(t)
 			r.stage(t, jobID)

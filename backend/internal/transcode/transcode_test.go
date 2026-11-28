@@ -28,7 +28,7 @@ func TestBuildArgsIsSinglePass(t *testing.T) {
 		Codec: CodecOpus, BitrateBPS: 160000, Channels: 2, ChannelLayout: "stereo",
 		SampleRate: 48000, TempoFactor: 1.001,
 	}
-	args, err := BuildArgs(Request{Input: "/work/in.mka", Output: "/work/out.mka", Plan: plan, LangISO2: "pl", Title: "Polski Dubbing"})
+	args, err := BuildArgs(Request{Input: "/work/in.mka", Output: "/work/out.mka", Plan: plan, LangISO2: "pl", Title: "Polish"})
 	if err != nil {
 		t.Fatalf("BuildArgs: %v", err)
 	}
@@ -41,7 +41,7 @@ func TestBuildArgsIsSinglePass(t *testing.T) {
 		"atempo=1.001000",
 		"aformat=channel_layouts=stereo",
 		"language=pl",
-		"title=Polski Dubbing",
+		"title=Polish",
 		"-f matroska /work/out.mka",
 	} {
 		if !strings.Contains(joined, want) {
@@ -128,7 +128,7 @@ func TestTranscodeOpusStereoFromPCM(t *testing.T) {
 	defer cancel()
 	res, err := tr.Transcode(ctx, Request{
 		Input: src, Output: out, Plan: plan, SourceChannels: 6, SourceDurationMS: 6000,
-		LangISO2: "pl", Title: "Polski Dubbing",
+		LangISO2: "pl", Title: "Polish",
 	})
 	if err != nil {
 		t.Fatalf("Transcode: %v", err)

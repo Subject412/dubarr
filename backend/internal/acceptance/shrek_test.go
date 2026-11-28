@@ -267,12 +267,12 @@ func TestShrekEndToEnd(t *testing.T) {
 	}
 	foundPol := false
 	for _, tag := range tags {
-		if strings.HasPrefix(tag, "pol|") && strings.Contains(tag, "Polski Dubbing") {
+		if strings.HasPrefix(tag, "pol|") && strings.Contains(tag, "Polish") {
 			foundPol = true
 		}
 	}
 	if !foundPol {
-		t.Fatalf("published target audio tags = %v, want a pol track titled Polski Dubbing", tags)
+		t.Fatalf("published target audio tags = %v, want a pol track named Polish", tags)
 	}
 	if got := videoStreamHash(t, target); got != preVideo {
 		t.Fatalf("video stream hash changed: %s → %s (target video must never be transcoded)", preVideo, got)

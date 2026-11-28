@@ -20,7 +20,7 @@ func track(index int, lang, title string, comment bool) probe.AudioTrack {
 
 func TestSplitExportTracksRuleBased(t *testing.T) {
 	tracks := []probe.AudioTrack{
-		track(1, "pol", "Polski Dubbing", false),
+		track(1, "pol", "Polish", false),
 		track(2, "eng", "", false),
 		track(3, "jpn", "", false),
 		track(4, "und", "", false),
@@ -201,7 +201,7 @@ func indexes(tracks []probe.AudioTrack) []int {
 // title-only commentary language: that is exactly what the resolver excludes.
 func TestUsableLanguagesSkipsTitleOnlyCommentary(t *testing.T) {
 	tracks := []probe.AudioTrack{
-		track(1, "pol", "Polski Dubbing", false),
+		track(1, "pol", "Polish", false),
 		track(2, "eng", "", false),
 		track(3, "jpn", "Director commentary", false),
 	}

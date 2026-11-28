@@ -38,7 +38,7 @@ const SETTINGS = {
   'security.options': {
     allow_force_tag_override: false,
   },
-  'mux.options': { track_title_in_mkv: 'Polski Dubbing' },
+  'mux.options': { output_mode: 'replace' },
   'watch.options': { scan_interval_sec: 10, stability_check_interval_sec: 4 },
   'arr.options': { poll_interval_sec: 300 },
   'imports.options': { donor_patterns: ['PL.DUB'] },

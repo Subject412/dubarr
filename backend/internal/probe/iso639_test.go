@@ -97,6 +97,37 @@ func TestISO639_1To2BRoundTrip(t *testing.T) {
 	}
 }
 
+// TestLanguageName pins the track-title source: the table's English name with
+// the first letter upper-cased, for both ISO 639-1 and 639-2 spellings, and ""
+// for anything the table cannot resolve (so the muxer falls back, never an
+// empty --track-name).
+func TestLanguageName(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{"pl", "Polish"},
+		{"pol", "Polish"},
+		{"polish", "Polish"},
+		{"PL", "Polish"},
+		{"fr", "French"},
+		{"fre", "French"},
+		{"fra", "French"},
+		{"pt-BR", "Portuguese"},
+		// Unresolvable: absent, undetermined and unknown all fall back.
+		{"", ""},
+		{"und", ""},
+		{"Undetermined", ""},
+		{"zz", ""},
+		{"Klingon", ""},
+	}
+	for _, tc := range tests {
+		if got := LanguageName(tc.in); got != tc.want {
+			t.Errorf("LanguageName(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
 func TestISO639TableIntegrity(t *testing.T) {
 	for iso1, entry := range iso639Table {
 		if len(iso1) != 2 {

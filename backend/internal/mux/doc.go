@@ -21,8 +21,13 @@
 //     let mkvmerge read only that copy plus the staged .mka. The target itself
 //     is opened read-only.
 //  6. Append the .mka with `--language 0:<iso2> --track-name 0:<title>
-//     --sync 0:<offset>` (ADR-0004). The target's video and existing
-//     audio are copied as-is, never transcoded.
+//     --sync 0:<offset>` (ADR-0004). <title> is the language's own name
+//     ("Polish"), never a configured string, and [DefaultTrackTitle] falls back
+//     to a dub marker only for a language it cannot resolve. <iso2> is the
+//     job's language as mkvmerge accepts it: a language that cannot be
+//     resolved to an ISO 639-2 code ("zz") is written as `und` with one log
+//     line, so the container stays valid and the job still publishes. The
+//     target's video and existing audio are copied as-is, never transcoded.
 //  7. Validate the muxed temp with ffprobe (ADR-0004): the probe must succeed
 //     and exactly one audio track must have been appended. A failure returns
 //     [ErrPublish] with the original untouched.

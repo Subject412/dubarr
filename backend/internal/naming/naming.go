@@ -11,7 +11,12 @@
 // case-insensitively and render in canonical form:
 //
 //	{Title} {Year} {Season:00} {Episode:00} {Episode Title}
-//	{Variant} {Codec} {Channels}
+//	{Variant} {Codec} {Channels} {TmdbId} {TvdbId} {ImdbId}
+//
+// The ID tokens carry the ids the arr mirror already stores, rendered bare
+// ("129", "tt0245429") so the template supplies the decoration: a folder name
+// and a file name can then share one spelling. An id the mirror does not know
+// renders empty and drops its group, never "0".
 //
 // Only {Season} and {Episode} take a modifier, and only zero padding (":00" is
 // two digits, ":000" three). Anything else — an unknown token, a rejected token
@@ -73,6 +78,13 @@ type Track struct {
 	Year         int
 	Season       int
 	Episode      int
+	// TMDBID, TVDBID and IMDBID are the ids the arr mirror stores
+	// (vault_media.tmdb_id/tvdb_id, arr_library_cache.imdb_id). A non-positive
+	// number or an empty string is "the mirror does not know it": the token
+	// renders empty and never "0".
+	TMDBID int
+	TVDBID int
+	IMDBID string
 	// MediaFolderPath is the folder Dubarr already owns (vault_media.
 	// vault_folder_path). Directory choice is never re-derived from a
 	// template, so this is only carried for [VaultPath].
@@ -91,6 +103,9 @@ const (
 	tokenVariant
 	tokenCodec
 	tokenChannels
+	tokenTMDB
+	tokenTVDB
+	tokenIMDB
 )
 
 // canonical token names, used by the error text and the UI's token list.
@@ -103,10 +118,13 @@ var tokenNames = map[token]string{
 	tokenVariant:      "Variant",
 	tokenCodec:        "Codec",
 	tokenChannels:     "Channels",
+	tokenTMDB:         "TmdbId",
+	tokenTVDB:         "TvdbId",
+	tokenIMDB:         "ImdbId",
 }
 
 // TokenList is the documented token set, in the order the settings UI lists it.
-const TokenList = "{Title}, {Year}, {Season:00}, {Episode:00}, {Episode Title}, {Variant}, {Codec}, {Channels}"
+const TokenList = "{Title}, {Year}, {Season:00}, {Episode:00}, {Episode Title}, {Variant}, {Codec}, {Channels}, {TmdbId}, {TvdbId}, {ImdbId}"
 
 var tokenByName = map[string]token{
 	"title":         tokenTitle,
@@ -117,6 +135,9 @@ var tokenByName = map[string]token{
 	"variant":       tokenVariant,
 	"codec":         tokenCodec,
 	"channels":      tokenChannels,
+	"tmdbid":        tokenTMDB,
+	"tvdbid":        tokenTVDB,
+	"imdbid":        tokenIMDB,
 }
 
 // rejectedTokens are named individually because they are the tokens an arr user
@@ -363,8 +384,27 @@ func (tok token) value(tr Track, pad int) string {
 		return CleanTitle(strings.ToUpper(strings.TrimSpace(tr.Codec)))
 	case tokenChannels:
 		return CleanTitle(strings.TrimSpace(tr.Channels))
+	case tokenTMDB:
+		return idValue(tr.TMDBID)
+	case tokenTVDB:
+		return idValue(tr.TVDBID)
+	case tokenIMDB:
+		// Rendered verbatim: the mirror stores IMDb's own "tt…" spelling and a
+		// token must not add or strip a prefix. The store refuses an id with a
+		// path separator (arrsync), and the rendered stem is cleaned anyway.
+		return strings.TrimSpace(tr.IMDBID)
 	}
 	return ""
+}
+
+// idValue renders a numeric id bare, and the empty string when the mirror does
+// not know it. The template owns the decoration ("[{TmdbId}]"), so the token
+// works the same in a folder name and in a file name.
+func idValue(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return strconv.Itoa(n)
 }
 
 // padNumber renders a season/episode number. A non-positive number is unknown:
@@ -536,6 +576,9 @@ func sampleTrack() Track {
 		Year:         2005,
 		Season:       2,
 		Episode:      3,
+		TMDBID:       129,
+		TVDBID:       81189,
+		IMDBID:       "tt0245429",
 	}
 }
 

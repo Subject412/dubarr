@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Subject412/dubarr/backend/internal/arr"
 	"github.com/Subject412/dubarr/backend/internal/gate"
@@ -455,6 +456,28 @@ func (p *Poller) ensureInstance(ctx context.Context, conn settings.ArrConnection
 
 // listItems lists one instance and turns it into cache items.
 func (p *Poller) listItems(ctx context.Context, conn settings.ArrConnection, apiKey string, rule gate.Rule) ([]store.LibraryCacheItem, error) {
+	// mirrorIMDBID is the only way an arr imdb id reaches the cache. arr's
+	// imdbId is "tt" plus digits, so a value carrying a path separator is
+	// dropped: an id is substituted into a naming template, and a template
+	// must never be able to write outside the media folder. The warning is
+	// once per pass rather than once per row, so a broken instance cannot
+	// flood the log. The value it quotes is cut to imdbIDLogLimit bytes (on a
+	// rune boundary) because the operator pastes that line into an issue and a
+	// junk id can be a whole path.
+	var imdbWarned bool
+	mirrorIMDBID := func(id string) string {
+		id = strings.TrimSpace(id)
+		if id != "" && strings.ContainsAny(id, `/\`) {
+			if !imdbWarned {
+				p.debugf("arrsync: dropping an imdb id containing a path separator (first: %q)",
+					clipForLog(id, imdbIDLogLimit))
+				imdbWarned = true
+			}
+			return ""
+		}
+		return id
+	}
+
 	switch conn.Kind {
 	case "radarr":
 		client, err := p.radarr(conn.BaseURL, apiKey)
@@ -495,6 +518,7 @@ func (p *Poller) listItems(ctx context.Context, conn settings.ArrConnection, api
 				MediaType:            "movie",
 				ExternalItemID:       int64(movie.ID),
 				TMDBID:               int64(movie.TmdbID),
+				IMDBID:               mirrorIMDBID(movie.ImdbID),
 				Title:                movie.Title,
 				OriginalTitle:        movie.OriginalTitle,
 				OriginalLanguageISO2: probe.ISO639_1(movie.OriginalLanguage.Name),
@@ -556,6 +580,7 @@ func (p *Poller) listItems(ctx context.Context, conn settings.ArrConnection, api
 					ExternalItemID:       int64(episode.ID),
 					SeriesID:             int64(show.ID),
 					TVDBID:               int64(show.TvdbID),
+					IMDBID:               mirrorIMDBID(show.ImdbID),
 					Title:                show.Title,
 					OriginalTitle:        show.OriginalTitle,
 					OriginalLanguageISO2: lang,
@@ -1006,4 +1031,23 @@ func kindOrAll(kind string) string {
 		return "all"
 	}
 	return kind
+}
+
+// imdbIDLogLimit caps the junk id the drop warning quotes. An arr imdb id is
+// "tt" plus digits, so anything longer is already garbage; 120 bytes is enough
+// to recognise the value without pasting a whole path into a log line.
+const imdbIDLogLimit = 120
+
+// clipForLog returns at most limit bytes of s, cut on a rune boundary so the
+// result stays valid UTF-8 for the %q that prints it. A cut value is not marked:
+// the caller's message already says the value is junk.
+func clipForLog(s string, limit int) string {
+	if len(s) <= limit {
+		return s
+	}
+	cut := limit
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
 }

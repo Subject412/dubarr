@@ -262,6 +262,98 @@ func TestRenderRejectsEmptyStemAndReservedName(t *testing.T) {
 	}
 }
 
+// TestIDTokensRender pins U07: {TmdbId}, {TvdbId} and {ImdbId} render the bare
+// id the mirror stores, never a prefixed label, and an unknown id renders
+// empty so its group is dropped exactly like an unknown {Year}.
+func TestIDTokensRender(t *testing.T) {
+	movie := Track{Title: "Spirited Away", Year: 2001, TMDBID: 129, IMDBID: "tt0245429", LangISO2: "pl"}
+	stem, err := mustParse(t, "{Title} ({Year}) [{TmdbId}][{TvdbId}][{ImdbId}]").Render(movie)
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if want := "Spirited Away (2001) [129][tt0245429]"; stem != want {
+		t.Fatalf("stem = %q, want %q", stem, want)
+	}
+	for _, bad := range []string{"[]", "()", "  "} {
+		if strings.Contains(stem, bad) {
+			t.Fatalf("stem %q still contains %q", stem, bad)
+		}
+	}
+
+	// A series with TVDB but no TMDB: the missing token drops its group and
+	// leaves no empty bracket pair or doubled separator behind.
+	show := Track{Title: "The Office", TVDBID: 81189}
+	stem, err = mustParse(t, "{Title} [{TmdbId} {TvdbId}] [{ImdbId}]").Render(show)
+	if err != nil {
+		t.Fatalf("Render(show): %v", err)
+	}
+	if want := "The Office [81189]"; stem != want {
+		t.Fatalf("show stem = %q, want %q", stem, want)
+	}
+	for _, bad := range []string{"[]", "()", "  ", " -"} {
+		if strings.Contains(stem, bad) {
+			t.Fatalf("show stem %q still contains %q", stem, bad)
+		}
+	}
+
+	// The token never renders "0" for an unknown id, and a group that held only
+	// the unknown id disappears whole.
+	stem, err = mustParse(t, "{Title} ({TmdbId})").Render(Track{Title: "Spirited Away"})
+	if err != nil {
+		t.Fatalf("Render(no ids): %v", err)
+	}
+	if want := "Spirited Away"; stem != want {
+		t.Fatalf("stem without ids = %q, want %q", stem, want)
+	}
+}
+
+// TestIDTokenIsCaseInsensitiveButNotModifiered: the IDs join the closed set, so
+// they parse in any case and refuse a modifier like every non-numeric token.
+func TestIDTokenIsCaseInsensitiveButNotModifiered(t *testing.T) {
+	for _, raw := range []string{"{tmdbid}", "{TMDBID}", "{TmdbId}", "{tvdbid}", "{imdbid}", "{ImdbId}"} {
+		if _, err := Parse(raw); err != nil {
+			t.Fatalf("Parse(%q) = %v, want it accepted", raw, err)
+		}
+	}
+	if _, err := Parse("{TmdbId:00}"); err == nil {
+		t.Fatal("a modifier on {TmdbId} was accepted")
+	} else if !strings.Contains(err.Error(), "zero padding") {
+		t.Fatalf("error = %v, want the zero-padding refusal", err)
+	}
+}
+
+// TestIDTokensAreNotInRejectedTokens: {Imdb} is a different name and stays an
+// unknown token, and the refusal still quotes the whole (now eleven-entry) set.
+func TestIDTokensAreNotInRejectedTokens(t *testing.T) {
+	_, err := Parse("{Imdb}")
+	if err == nil {
+		t.Fatal("{Imdb} was accepted; the token is named ImdbId")
+	}
+	for _, want := range []string{"{Imdb}", "unknown token", "{TmdbId}", "{TvdbId}", "{ImdbId}"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %v, want it to contain %q", err, want)
+		}
+	}
+}
+
+// TestTokenListIsTheDocumentedSet pins the order and the count: the settings
+// help, the frontend list and this string must name the same eleven tokens.
+func TestTokenListIsTheDocumentedSet(t *testing.T) {
+	want := "{Title}, {Year}, {Season:00}, {Episode:00}, {Episode Title}, {Variant}, {Codec}, {Channels}, {TmdbId}, {TvdbId}, {ImdbId}"
+	if TokenList != want {
+		t.Fatalf("TokenList = %q, want %q", TokenList, want)
+	}
+	names := strings.Split(TokenList, ", ")
+	if len(names) != 11 {
+		t.Fatalf("TokenList has %d entries, want 11: %q", len(names), TokenList)
+	}
+	for _, id := range []string{"{TmdbId}", "{TvdbId}", "{ImdbId}"} {
+		if strings.Count(TokenList, id) != 1 {
+			t.Fatalf("TokenList contains %s %d times, want once", id, strings.Count(TokenList, id))
+		}
+	}
+}
+
 func TestVaultPathAlwaysAppendsIso2Suffix(t *testing.T) {
 	tr := Track{LangISO2: "pl"}
 	if got, want := VaultPath("/vault/Show", "", tr, "Stem"), "/vault/Show/Stem.pl.mka"; got != want {
